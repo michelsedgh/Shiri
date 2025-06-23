@@ -59,9 +59,8 @@ class DockerManager: ObservableObject {
     func start(bridge: BridgeConfig, bridgeManager: BridgeManager) async {
         print("Attempting to start bridge: \(bridge.name)")
         
-        // Use Documents directory instead of /tmp for better sandbox compatibility
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        let tempDir = homeDir.appendingPathComponent("Documents/Shiri/\(bridge.containerName)").path
+        // Use /tmp since we're no longer sandboxed
+        let tempDir = "/tmp/\(bridge.containerName)"
         
         do {
             try FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true, attributes: nil)
