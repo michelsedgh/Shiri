@@ -77,7 +77,14 @@ class DockerAPI {
         let bootstrap = makeBootstrap(for: promise)
 
         bootstrap.connect(unixDomainSocketPath: socketPath).whenSuccess { channel in
-            self.sendRequest(on: channel, method: .POST, path: path, bodyData: nil, promise: promise)
+            var request = HTTPRequestHead(version: .http1_1, method: .POST, uri: path)
+            request.headers.add(name: "Host", value: "localhost")
+            request.headers.add(name: "Content-Length", value: "0")
+            
+            channel.write(HTTPClientRequestPart.head(request), promise: nil)
+            channel.writeAndFlush(HTTPClientRequestPart.end(nil)).whenFailure { error in
+                promise.fail(error)
+            }
         }
         
         bootstrap.connect(unixDomainSocketPath: socketPath).whenFailure { error in
@@ -204,6 +211,7 @@ private class HTTPResponseHandler<T>: ChannelInboundHandler {
     private let promise: EventLoopPromise<T>
     private var responseBodyData = Data()
     private var isCompleted = false
+    private var httpStatus: HTTPResponseStatus?
 
     init(promise: EventLoopPromise<T>) {
         self.promise = promise
@@ -216,22 +224,23 @@ private class HTTPResponseHandler<T>: ChannelInboundHandler {
         
         switch responsePart {
         case .head(let httpResponseHead):
-            guard httpResponseHead.status.code >= 200 && httpResponseHead.status.code < 300 else {
-                isCompleted = true
-                promise.fail(DockerAPIError.badResponse(httpResponseHead.status))
-                context.close(promise: nil)
-                return
-            }
-            if T.self == Void.self {
-                // For empty responses, we can succeed as soon as we get a good header.
+            httpStatus = httpResponseHead.status
+            
+            // For 2xx responses and Void types, we can succeed immediately
+            if httpResponseHead.status.code >= 200 && httpResponseHead.status.code < 300 && T.self == Void.self {
                 isCompleted = true
                 promise.succeed(() as! T)
                 context.close(promise: nil)
                 return
             }
+            
+            // For error responses, continue reading to get the error message
+            // Don't fail here - wait for the body to get the error details
+            
         case .body(let byteBuffer):
             let data = Data(byteBuffer.readableBytesView)
             responseBodyData.append(data)
+            
         case .end:
             guard !isCompleted else {
                 context.close(promise: nil)
@@ -239,53 +248,73 @@ private class HTTPResponseHandler<T>: ChannelInboundHandler {
             }
             isCompleted = true
             
-            // Handle String responses (for ping) - try this first
-            if T.self == String.self {
-                let result = String(data: responseBodyData, encoding: .utf8) ?? ""
-                promise.succeed(result as! T)
+            guard let status = httpStatus else {
+                promise.fail(DockerAPIError.missingBody)
                 context.close(promise: nil)
                 return
             }
             
-            // Handle empty responses
-            if responseBodyData.isEmpty {
-                if T.self == Void.self {
-                    // This shouldn't happen as Void responses are handled in .head
-                    promise.succeed(() as! T)
-                } else {
-                    // For ping, if we get no body but good status, return "OK"
-                    if T.self == String.self {
+            // Handle error responses
+            if status.code >= 400 {
+                if !responseBodyData.isEmpty {
+                    if let errorMessage = String(data: responseBodyData, encoding: .utf8) {
+                        print("Docker API error response: \(errorMessage)")
+                    }
+                }
+                promise.fail(DockerAPIError.badResponse(status))
+                context.close(promise: nil)
+                return
+            }
+            
+            // Handle successful responses
+            if status.code >= 200 && status.code < 300 {
+                // Handle String responses (for ping) - try this first
+                if T.self == String.self {
+                    let result = String(data: responseBodyData, encoding: .utf8) ?? ""
+                    promise.succeed(result as! T)
+                    context.close(promise: nil)
+                    return
+                }
+                
+                // Handle empty responses
+                if responseBodyData.isEmpty {
+                    if T.self == Void.self {
+                        promise.succeed(() as! T)
+                    } else if T.self == String.self {
                         promise.succeed("OK" as! T)
                     } else {
                         promise.fail(DockerAPIError.missingBody)
                     }
+                    context.close(promise: nil)
+                    return
                 }
-                context.close(promise: nil)
-                return
-            }
 
-            do {
-                if let decodableType = T.self as? Decodable.Type {
-                    let decoded = try JSONDecoder().decode(decodableType, from: responseBodyData) as! T
-                    promise.succeed(decoded)
-                } else {
-                    // For non-decodable types like String (fallback)
+                do {
+                    if let decodableType = T.self as? Decodable.Type {
+                        let decoded = try JSONDecoder().decode(decodableType, from: responseBodyData) as! T
+                        promise.succeed(decoded)
+                    } else {
+                        // For non-decodable types like String (fallback)
+                        if T.self == String.self {
+                            let string = String(data: responseBodyData, encoding: .utf8) ?? ""
+                            promise.succeed(string as! T)
+                        } else {
+                            promise.fail(DockerAPIError.missingBody)
+                        }
+                    }
+                } catch {
+                    // If JSON decoding fails but we're expecting a String, try raw string
                     if T.self == String.self {
                         let string = String(data: responseBodyData, encoding: .utf8) ?? ""
                         promise.succeed(string as! T)
                     } else {
-                        promise.fail(DockerAPIError.missingBody)
+                        promise.fail(error)
                     }
                 }
-            } catch {
-                // If JSON decoding fails but we're expecting a String, try raw string
-                if T.self == String.self {
-                    let string = String(data: responseBodyData, encoding: .utf8) ?? ""
-                    promise.succeed(string as! T)
-                } else {
-                    promise.fail(error)
-                }
+            } else {
+                promise.fail(DockerAPIError.badResponse(status))
             }
+            
             context.close(promise: nil)
         }
     }

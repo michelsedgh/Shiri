@@ -17,6 +17,13 @@ class NetworkManager: ObservableObject {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { path in
             Task { @MainActor in
+                print("Network path updated. Available interfaces count: \(path.availableInterfaces.count)")
+                
+                // Log all interfaces first
+                for interface in path.availableInterfaces {
+                    print("Found interface: \(interface.name) (type: \(interface.type))")
+                }
+                
                 // Filter out duplicates by interface name to prevent ForEach ID conflicts
                 var uniqueInterfaces: [NWInterface] = []
                 var seenNames: Set<String> = []
@@ -25,14 +32,20 @@ class NetworkManager: ObservableObject {
                     if !seenNames.contains(interface.name) {
                         uniqueInterfaces.append(interface)
                         seenNames.insert(interface.name)
+                        print("Added unique interface: \(interface.name)")
+                    } else {
+                        print("Skipped duplicate interface: \(interface.name)")
                     }
                 }
                 
                 self.availableInterfaces = uniqueInterfaces
+                print("Final interface list: \(self.availableInterfaces.map { $0.name })")
                 monitor.cancel() // We only need the list once.
             }
         }
-        monitor.start(queue: .main)
+        let queue = DispatchQueue(label: "network-monitor")
+        monitor.start(queue: queue)
+        print("Started network monitor")
     }
     
     func startSpeakerDiscovery(on interface: NWInterface?) {
