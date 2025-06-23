@@ -114,19 +114,21 @@ class DockerManager: ObservableObject {
     }
     
     private func makeCreateConfig(for bridge: BridgeConfig, tempDir: String) -> DockerCreateContainerRequest {
+        // Use command-line arguments instead of environment variables
         let envVars = [
-            "AIRPLAY_NAME=\(bridge.airplayName)",
-            "AIRPLAY_BACKEND=pipe", // Deprecated name, but good for compatibility
-            "SPS_OUTPUT_BACKEND=pipe",
-            "SPS_PIPE_NAME=/tmp/shairport/audio",
-            "SPS_METADATA_ENABLED=yes",
-            "SPS_METADATA_PIPE_NAME=/tmp/shairport/metadata",
-            "SPS_ALSA_IGNORE_VOLUME=yes",
-            "SPS_VOLUME_RANGE_DB=\(bridge.volumeRangeDb)",
-            "SPS_LATENCY_OFFSET=\(bridge.latencyOffset)",
-            "SPS_SESSION_TIMEOUT=\(bridge.sessionTimeout)",
-            "SPS_INTERPOLATION=soxr",
-            "AIRPLAY_PORT=7000" // For AirPlay 2
+            "AIRPLAY_NAME=\(bridge.airplayName)"
+        ]
+        
+        // Custom command for shairport-sync with pipe backend
+        let cmd = [
+            "-a", bridge.name,               // Service name
+            "-o", "pipe",                    // Output backend: pipe
+            "-M",                            // Enable metadata
+            "--metadata-pipename=/tmp/shairport/metadata",  // Metadata pipe location
+            "-p", "5000",                    // AirPlay port
+            "-v",                            // Verbose logging for debugging
+            "--",                            // Separator for backend options
+            "/tmp/shairport/audio"           // Pipe backend option: just the pipe name
         ]
         
         let hostConfig = DockerCreateContainerRequest.HostConfig(
@@ -137,7 +139,8 @@ class DockerManager: ObservableObject {
         return DockerCreateContainerRequest(
             Image: "mikebrady/shairport-sync:latest",
             Env: envVars,
-            HostConfig: hostConfig
+            HostConfig: hostConfig,
+            Cmd: cmd  // Override the default command
         )
     }
 } 
