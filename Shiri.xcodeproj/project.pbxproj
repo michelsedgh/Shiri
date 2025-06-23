@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		D01E75F32E0A04BE00E4A95B /* NIO in Frameworks */ = {isa = PBXBuildFile; productRef = D01E75F22E0A04BE00E4A95B /* NIO */; };
+		D01E75F52E0A04BE00E4A95B /* NIOHTTP1 in Frameworks */ = {isa = PBXBuildFile; productRef = D01E75F42E0A04BE00E4A95B /* NIOHTTP1 */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		D01E75B52E0A02B000E4A95B /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +57,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D01E75F32E0A04BE00E4A95B /* NIO in Frameworks */,
+				D01E75F52E0A04BE00E4A95B /* NIOHTTP1 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +119,8 @@
 			);
 			name = Shiri;
 			packageProductDependencies = (
+				D01E75F22E0A04BE00E4A95B /* NIO */,
+				D01E75F42E0A04BE00E4A95B /* NIOHTTP1 */,
 			);
 			productName = Shiri;
 			productReference = D01E75A72E0A02AF00E4A95B /* Shiri.app */;
@@ -195,6 +204,9 @@
 			);
 			mainGroup = D01E759E2E0A02AF00E4A95B;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				D01E75F12E0A04BE00E4A95B /* XCRemoteSwiftPackageReference "swift-nio" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = D01E75A82E0A02AF00E4A95B /* Products */;
 			projectDirPath = "";
@@ -567,6 +579,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		D01E75F12E0A04BE00E4A95B /* XCRemoteSwiftPackageReference "swift-nio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.83.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		D01E75F22E0A04BE00E4A95B /* NIO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D01E75F12E0A04BE00E4A95B /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIO;
+		};
+		D01E75F42E0A04BE00E4A95B /* NIOHTTP1 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D01E75F12E0A04BE00E4A95B /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIOHTTP1;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = D01E759F2E0A02AF00E4A95B /* Project object */;
 }
