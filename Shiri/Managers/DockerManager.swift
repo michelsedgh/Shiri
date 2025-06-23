@@ -33,24 +33,53 @@ class DockerManager: ObservableObject {
     }
     
     func checkDockerStatus() async {
+        print("Checking Docker status...")
         do {
             let responseString = try await dockerAPI.ping().get()
-            self.status = (responseString == "OK") ? .running : .notRunning
+            print("Docker ping response: '\(responseString)'")
+            print("Response length: \(responseString.count)")
+            print("Response bytes: \(Array(responseString.utf8))")
+            
+            // Docker ping returns "OK" but sometimes with extra whitespace
+            let trimmedResponse = responseString.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("Trimmed response: '\(trimmedResponse)'")
+            
+            let isRunning = (trimmedResponse == "OK" || !trimmedResponse.isEmpty)
+            print("Setting status to: \(isRunning ? "running" : "notRunning")")
+            
+            self.status = isRunning ? .running : .notRunning
         } catch {
+            print("Docker ping failed: \(error)")
+            print("Error details: \(error.localizedDescription)")
             self.status = .notRunning
         }
-        print("Docker status: \(self.status)")
+        print("Docker status updated to: \(self.status)")
     }
     
     func start(bridge: BridgeConfig, bridgeManager: BridgeManager) async {
         print("Attempting to start bridge: \(bridge.name)")
         
-        let createConfig = makeCreateConfig(for: bridge)
+        // Use Documents directory instead of /tmp for better sandbox compatibility
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let tempDir = homeDir.appendingPathComponent("Documents/Shiri/\(bridge.containerName)").path
         
         do {
+            try FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true, attributes: nil)
+            print("Created temp directory: \(tempDir)")
+        } catch {
+            print("Failed to create temp directory \(tempDir): \(error.localizedDescription)")
+            self.containerStates[bridge.containerName] = .error("Failed to create directory: \(error.localizedDescription)")
+            return
+        }
+        
+        let createConfig = makeCreateConfig(for: bridge, tempDir: tempDir)
+        
+        do {
+            print("Creating container with config: \(createConfig)")
             let createResponse = try await dockerAPI.createContainer(name: bridge.containerName, config: createConfig).get()
             print("Container created with ID: \(createResponse.Id)")
             
+            print("Starting container: \(createResponse.Id)")
             try await dockerAPI.startContainer(id: createResponse.Id).get()
             
             print("Successfully started container for bridge: \(bridge.name)")
@@ -58,7 +87,8 @@ class DockerManager: ObservableObject {
             await audioPipelineManager.startPipeline(for: bridge, bridgeManager: bridgeManager)
             
         } catch {
-            print("Failed to start bridge: \(error.localizedDescription)")
+            print("Failed to start bridge: \(error)")
+            print("Error details: \(error.localizedDescription)")
             self.containerStates[bridge.containerName] = .error(error.localizedDescription)
         }
     }
@@ -84,7 +114,7 @@ class DockerManager: ObservableObject {
         }
     }
     
-    private func makeCreateConfig(for bridge: BridgeConfig) -> DockerCreateContainerRequest {
+    private func makeCreateConfig(for bridge: BridgeConfig, tempDir: String) -> DockerCreateContainerRequest {
         let envVars = [
             "AIRPLAY_NAME=\(bridge.airplayName)",
             "AIRPLAY_BACKEND=pipe", // Deprecated name, but good for compatibility
@@ -102,7 +132,7 @@ class DockerManager: ObservableObject {
         
         let hostConfig = DockerCreateContainerRequest.HostConfig(
             NetworkMode: "host",
-            Binds: ["/tmp/\(bridge.containerName):/tmp/shairport"]
+            Binds: ["\(tempDir):/tmp/shairport"]
         )
         
         return DockerCreateContainerRequest(

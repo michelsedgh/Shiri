@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Enable App Sandbox -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    
+    <!-- Network access for Docker API and AirPlay discovery -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    
+    <!-- Allow incoming connections for AirPlay -->
+    <key>com.apple.security.network.incoming-connections</key>
+    <true/>
+    
+    <!-- Allow access to Docker Desktop socket and temporary directories -->
+    <key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
+    <array>
+        <string>/var/run/docker.sock</string>
+        <string>$(HOME)/.docker/</string>
+        <string>/tmp/</string>
+        <string>/private/tmp/</string>
+        <string>/var/tmp/</string>
+    </array>
+    
+    <!-- Allow reading system network configuration -->
+    <key>com.apple.security.temporary-exception.files.absolute-path.read-only</key>
+    <array>
+        <string>/Library/Preferences/com.apple.networkd.plist</string>
+        <string>/System/Library/</string>
+    </array>
+    
+    <!-- Hardware access for audio -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.device.audio-output</key>
+    <true/>
+    
+    <!-- Allow mDNS/Bonjour for AirPlay discovery -->
+    <key>com.apple.security.network.multicast</key>
+    <true/>
+    
+    <!-- Disable library validation to allow NIO -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    
+    <!-- Allow file access for temp directories -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist> 

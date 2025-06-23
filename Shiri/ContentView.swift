@@ -9,9 +9,9 @@ struct ContentView: View {
     @EnvironmentObject private var audioPipelineManager: AudioPipelineManager
     @Environment(\.openWindow) private var openWindow
     
-    // Default interfaces. In a real app, these would be persisted.
-    @State private var inputInterface: NWInterface?
-    @State private var outputInterface: NWInterface?
+    // Use interface names as strings to avoid picker issues
+    @State private var inputInterfaceName: String = ""
+    @State private var outputInterfaceName: String = ""
 
     var body: some View {
         NavigationSplitView {
@@ -19,14 +19,16 @@ struct ContentView: View {
                 
                 Form {
                     Section(header: Text("Global Network Settings")) {
-                        Picker("Input (Receives AirPlay)", selection: $inputInterface) {
-                            ForEach(networkManager.availableInterfaces, id: \.self) { iface in
-                                Text(iface.name).tag(iface as NWInterface?)
+                        Picker("Input (Receives AirPlay)", selection: $inputInterfaceName) {
+                            Text("Auto").tag("")
+                            ForEach(networkManager.availableInterfaces, id: \.name) { iface in
+                                Text(iface.name).tag(iface.name)
                             }
                         }
-                        Picker("Output (Sends to Speakers)", selection: $outputInterface) {
-                            ForEach(networkManager.availableInterfaces, id: \.self) { iface in
-                                Text(iface.name).tag(iface as NWInterface?)
+                        Picker("Output (Sends to Speakers)", selection: $outputInterfaceName) {
+                            Text("Auto").tag("")
+                            ForEach(networkManager.availableInterfaces, id: \.name) { iface in
+                                Text(iface.name).tag(iface.name)
                             }
                         }
                     }
@@ -38,6 +40,12 @@ struct ContentView: View {
                 HStack {
                     DockerStatusView(status: dockerManager.status)
                     Spacer()
+                    Button("Refresh Docker") {
+                        Task {
+                            await dockerManager.checkDockerStatus()
+                        }
+                    }
+                    .font(.caption)
                 }
                 .padding(.horizontal)
                 
@@ -73,12 +81,25 @@ struct ContentView: View {
         }
         .onAppear {
             // Set default interfaces when the view appears
-            inputInterface = networkManager.availableInterfaces.first(where: { $0.name == "en0" })
-            outputInterface = networkManager.availableInterfaces.first(where: { $0.name == "en6" }) ?? networkManager.availableInterfaces.first
+            if networkManager.availableInterfaces.contains(where: { $0.name == "en0" }) {
+                inputInterfaceName = "en0"
+            } else {
+                inputInterfaceName = networkManager.availableInterfaces.first?.name ?? ""
+            }
+            
+            if let preferredInterface = networkManager.availableInterfaces.first(where: { $0.name == "en6" }) {
+                outputInterfaceName = preferredInterface.name
+            } else {
+                outputInterfaceName = networkManager.availableInterfaces.first?.name ?? ""
+            }
+            
+            print("Set interface selections - Input: \(inputInterfaceName), Output: \(outputInterfaceName)")
+            print("Available interfaces: \(networkManager.availableInterfaces.map { $0.name })")
         }
-        .onChange(of: outputInterface) { newInterface in
+        .onChange(of: outputInterfaceName) { newInterfaceName in
             // When the output interface changes, restart speaker discovery
-            networkManager.startSpeakerDiscovery(on: newInterface)
+            let selectedInterface = newInterfaceName.isEmpty ? nil : networkManager.availableInterfaces.first { $0.name == newInterfaceName }
+            networkManager.startSpeakerDiscovery(on: selectedInterface)
         }
         .frame(minWidth: 900, minHeight: 600)
     }
@@ -88,49 +109,76 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Supporting Views
+
 struct DockerStatusView: View {
     let status: DockerManager.Status
+    
+    var body: some View {
+        HStack {
+            Image(systemName: "externaldrive.connected.to.line.below")
+                .foregroundColor(statusColor)
+            Text("Docker: \(statusText)")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+    
+    private var statusColor: Color {
+        switch status {
+        case .running: return .green
+        case .notRunning: return .red
+        case .unknown: return .orange
+        }
+    }
+    
+    private var statusText: String {
+        switch status {
+        case .running: return "Running"
+        case .notRunning: return "Not Running"
+        case .unknown: return "Unknown"
+        }
+    }
+}
 
+struct BridgeStatusView: View {
+    let status: DockerManager.ContainerState
+    
     var body: some View {
         HStack {
             Image(systemName: statusIcon)
                 .foregroundColor(statusColor)
+                .font(.caption)
             Text(statusText)
+                .font(.caption2)
                 .foregroundColor(.secondary)
         }
-        .padding(.vertical, 8)
     }
-
-    private var statusIcon: String {
-        switch status {
-        case .unknown:
-            return "questionmark.circle"
-        case .running:
-            return "checkmark.circle.fill"
-        case .notRunning:
-            return "xmark.circle.fill"
-        }
-    }
-
+    
     private var statusColor: Color {
         switch status {
-        case .unknown:
-            return .yellow
-        case .running:
-            return .green
-        case .notRunning:
-            return .red
+        case .running: return .green
+        case .stopped: return .gray
+        case .error: return .red
+        case .unknown: return .orange
         }
     }
-
+    
+    private var statusIcon: String {
+        switch status {
+        case .running: return "play.circle.fill"
+        case .stopped: return "stop.circle"
+        case .error: return "exclamationmark.triangle.fill"
+        case .unknown: return "questionmark.circle"
+        }
+    }
+    
     private var statusText: String {
         switch status {
-        case .unknown:
-            return "Checking Docker status..."
-        case .running:
-            return "Docker is running"
-        case .notRunning:
-            return "Docker is not running"
+        case .running: return "Running"
+        case .stopped: return "Stopped"
+        case .error(let message): return "Error: \(message)"
+        case .unknown: return "Unknown"
         }
     }
 }
@@ -188,9 +236,11 @@ struct BridgeRowView: View {
                     await toggleBridgeState()
                 }
             }) {
-                Image(systemName: isRunning ? "stop.fill" : "play.fill")
+                Image(systemName: isRunning ? "stop.circle" : "play.circle")
+                    .foregroundColor(isRunning ? .red : .green)
+                    .font(.title2)
             }
-            .buttonStyle(BorderlessButtonStyle())
+            .buttonStyle(PlainButtonStyle())
         }
         .padding(.vertical, 4)
     }
@@ -203,48 +253,19 @@ struct BridgeRowView: View {
     }
     
     private var statusColor: Color {
-        isRunning ? .blue : .gray
+        switch dockerManager.containerStates[bridge.containerName] {
+        case .running: return .green
+        case .stopped: return .gray
+        case .error: return .red
+        case .unknown, .none: return .orange
+        }
     }
     
     private func toggleBridgeState() async {
         if isRunning {
             await dockerManager.stop(bridge: bridge)
         } else {
-            let pipeDir = "/tmp/\(bridge.containerName)"
-            try? FileManager.default.createDirectory(atPath: pipeDir, withIntermediateDirectories: true, attributes: nil)
             await dockerManager.start(bridge: bridge, bridgeManager: bridgeManager)
-        }
-    }
-}
-
-struct BridgeStatusView: View {
-    let status: DockerManager.ContainerState
-    
-    var body: some View {
-        Text(statusText)
-            .font(.caption)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(statusColor.opacity(0.2))
-            .foregroundColor(statusColor)
-            .cornerRadius(8)
-    }
-    
-    private var statusText: String {
-        switch status {
-        case .running: return "Running"
-        case .stopped: return "Stopped"
-        case .error(_): return "Error"
-        case .unknown: return "Unknown"
-        }
-    }
-    
-    private var statusColor: Color {
-        switch status {
-        case .running: return .green
-        case .stopped: return .gray
-        case .error: return .red
-        case .unknown: return .yellow
         }
     }
 }

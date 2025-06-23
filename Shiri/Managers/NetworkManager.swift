@@ -17,7 +17,18 @@ class NetworkManager: ObservableObject {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { path in
             Task { @MainActor in
-                self.availableInterfaces = path.availableInterfaces
+                // Filter out duplicates by interface name to prevent ForEach ID conflicts
+                var uniqueInterfaces: [NWInterface] = []
+                var seenNames: Set<String> = []
+                
+                for interface in path.availableInterfaces {
+                    if !seenNames.contains(interface.name) {
+                        uniqueInterfaces.append(interface)
+                        seenNames.insert(interface.name)
+                    }
+                }
+                
+                self.availableInterfaces = uniqueInterfaces
                 monitor.cancel() // We only need the list once.
             }
         }

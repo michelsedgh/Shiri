@@ -16,6 +16,12 @@ struct DockerCreateContainerRequest: Codable {
     }
 }
 
+extension DockerCreateContainerRequest: CustomStringConvertible {
+    var description: String {
+        return "DockerCreateContainerRequest(Image: \(Image), Env: \(Env), HostConfig: NetworkMode=\(self.HostConfig.NetworkMode), Binds=\(self.HostConfig.Binds))"
+    }
+}
+
 // MARK: - Create Container Response
 
 struct DockerCreateContainerResponse: Codable {
