@@ -126,8 +126,11 @@ func main() {
     top.Objects = append(top.Objects, widget.NewSeparator())
 
     // Left panel (rooms)
-    left := container.NewBorder(nil, nil, nil, nil,
-        container.NewVBox(widget.NewLabelWithStyle("Rooms", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), roomsList))
+    left := container.NewBorder(
+        container.NewVBox(widget.NewLabelWithStyle("Rooms", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})),
+        nil, nil, nil,
+        roomsList,
+    )
     left.Resize(fyne.NewSize(240, 600))
 
     // Right panel placeholder
