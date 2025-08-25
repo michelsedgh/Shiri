@@ -9,6 +9,7 @@ import (
     "fyne.io/fyne/v2"
     "fyne.io/fyne/v2/app"
     "fyne.io/fyne/v2/container"
+    "fyne.io/fyne/v2/data/binding"
     "fyne.io/fyne/v2/theme"
     "fyne.io/fyne/v2/widget"
 
@@ -49,15 +50,26 @@ func main() {
         nicsLabel.SetText(fmt.Sprintf("NICs: %d", len(ifs)))
     })
 
-    // Rooms list
-    roomsList := widget.NewList(
-        func() int { return len(appConfig.Rooms) },
+    // Rooms list (data-bound so it updates reliably on changes)
+    roomsData := binding.NewStringList()
+    syncRoomsBinding := func() {
+        names := make([]string, 0, len(appConfig.Rooms))
+        for _, r := range appConfig.Rooms {
+            names = append(names, r.Name)
+        }
+        _ = roomsData.Set(names)
+    }
+    roomsList := widget.NewListWithData(
+        roomsData,
         func() fyne.CanvasObject { return widget.NewLabel("room") },
-        func(i widget.ListItemID, o fyne.CanvasObject) {
-            l := o.(*widget.Label)
-            l.SetText(appConfig.Rooms[i].Name)
+        func(di binding.DataItem, o fyne.CanvasObject) {
+            s := di.(binding.String)
+            txt, _ := s.Get()
+            o.(*widget.Label).SetText(txt)
         },
     )
+    // initial populate
+    syncRoomsBinding()
 
     addRoomBtn := widget.NewButton("Add Room", func() {
         entry := widget.NewEntry()
@@ -79,6 +91,7 @@ func main() {
                         TargetDeviceIDs:       []string{},
                     })
                     _ = cfg.Save(appConfig)
+                    syncRoomsBinding()
                     roomsList.Refresh()
                     d.Close()
                 }),
