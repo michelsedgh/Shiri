@@ -61,12 +61,10 @@ func (b *Broadcaster) Subscribe() <-chan []byte {
 }
 
 // Unsubscribe removes a channel.
-func (b *Broadcaster) Unsubscribe(ch <-chan []byte) {
+func (b *Broadcaster) Unsubscribe(ch chan []byte) {
     b.mu.Lock()
-    if c, ok := ch.(chan []byte); ok {
-        delete(b.chans, c)
-        close(c)
-    }
+    delete(b.chans, ch)
+    close(ch)
     b.mu.Unlock()
 }
 

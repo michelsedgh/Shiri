@@ -39,7 +39,7 @@ func (h *HTTPStreamer) handleStream(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "hijack not supported", http.StatusInternalServerError)
         return
     }
-    conn, buf, err := hj.Hijack()
+    conn, _, err := hj.Hijack()
     if err != nil {
         return
     }
