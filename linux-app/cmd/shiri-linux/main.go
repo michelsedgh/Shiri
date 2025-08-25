@@ -83,6 +83,9 @@ func main() {
                 widget.NewButton("Create", func() {
                     name := entry.Text
                     if name == "" { return }
+                    // trim whitespace; avoid empty after trim
+                    if t := strings.TrimSpace(name); t != "" { name = t } else { return }
+                    // append and persist
                     appConfig.Rooms = append(appConfig.Rooms, cfg.RoomConfig{
                         Name:                  name,
                         AirplayName:           name,
@@ -90,9 +93,13 @@ func main() {
                         BindInterfaceSpeakers: "",
                         TargetDeviceIDs:       []string{},
                     })
-                    _ = cfg.Save(appConfig)
+                    if err := cfg.Save(appConfig); err != nil {
+                        fyne.CurrentApp().SendNotification(&fyne.Notification{Title: "Save Error", Content: err.Error()})
+                    }
+                    // refresh list and select the new room so it’s visible
                     syncRoomsBinding()
                     roomsList.Refresh()
+                    roomsList.Select(len(appConfig.Rooms)-1)
                     d.Close()
                 }),
             ),
