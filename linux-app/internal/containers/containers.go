@@ -47,11 +47,15 @@ func (m *Manager) RunShairportRoom(name, airplayName, volumeHost, networkName st
         args = append(args, "--network", networkName)
     }
     // Image and shairport args (enable verbose logs and basic stats for easier debugging)
-    shArgs := []string{"mikebrady/shairport-sync:latest", "-vv", "--statistics", "-a", airplayName, "-o", "pipe", "-M", "--metadata-pipename=/tmp/shairport/metadata", "--", "/tmp/shairport/audio"}
+    // Program options must appear BEFORE the "--" separator; backend-specific options follow it.
+    // Extra program options (e.g., "-p <port>") must be inserted before "--" to avoid being
+    // interpreted as pipe-backend arguments, which caused the "too many command-line arguments to pipe" error.
+    programArgs := []string{"mikebrady/shairport-sync:latest", "-vv", "--statistics", "-a", airplayName, "-o", "pipe", "-M", "--metadata-pipename=/tmp/shairport/metadata"}
     if len(extraArgs) > 0 {
-        shArgs = append(shArgs, extraArgs...)
+        programArgs = append(programArgs, extraArgs...)
     }
-    args = append(args, shArgs...)
+    backendArgs := []string{"--", "/tmp/shairport/audio"}
+    args = append(args, append(programArgs, backendArgs...)...)
     res := runner.Run(15*time.Second, bin, args...)
     if res.Err != nil {
         return "", fmt.Errorf("run failed: %v: %s", res.Err, string(res.Stderr))
