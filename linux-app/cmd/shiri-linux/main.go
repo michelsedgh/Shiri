@@ -262,18 +262,7 @@ func main() {
         os.Exit(0)
     })
 
-    // Accent color for the window (optional visual polish)
-    w.Canvas().SetOnTypedKey(func(ev *fyne.KeyEvent) {
-        _ = ev // reserved for future accelerators
-    })
-    w.Canvas().SetOnTypedRune(func(r rune) {})
-    w.Canvas().SetOnTypedShortcut(func(shortcut fyne.Shortcut) {})
-
-    // Minor background color tweak
-    w.SetPadded(true)
-    w.Canvas().SetScale(1.0)
-    w.Canvas().SetContent(container.NewMax(content))
-    w.Canvas().SetOnRemoved(func(o fyne.CanvasObject) {})
+    // Minor background tweaks (keep defaults to maximize compatibility)
     _ = color.RGBA{R: 0x22, G: 0x22, B: 0x22, A: 0xff}
 
     w.ShowAndRun()
