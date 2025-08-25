@@ -5,6 +5,7 @@ import (
     "image/color"
     "log"
     "os"
+    "strings"
 
     "fyne.io/fyne/v2"
     "fyne.io/fyne/v2/app"
