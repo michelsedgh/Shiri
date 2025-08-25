@@ -174,6 +174,20 @@ func main() {
             rightTitle.SetText("Room: "+r.Name)
             airNic.SetSelected(r.BindInterfaceAirplay)
             spkNic.SetSelected(r.BindInterfaceSpeakers)
+            // Update speakers list binding for newly selected room
+            speakerList.Refresh()
+            // Reflect running status of the selected room
+            if sup.IsRunning(roomID(r)) {
+                statusLbl.SetText("Running")
+            } else {
+                statusLbl.SetText("Idle")
+            }
+        } else {
+            rightTitle.SetText("Room Details")
+            airNic.SetSelected("")
+            spkNic.SetSelected("")
+            statusLbl.SetText("Idle")
+            speakerList.Refresh()
         }
     }
 

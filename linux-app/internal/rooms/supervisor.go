@@ -99,4 +99,12 @@ func (s *Supervisor) Logs(roomID string, tail int) (string, error) {
     return s.mgr.Logs(rp.ContainerName, tail)
 }
 
+// IsRunning reports whether a room pipeline is currently active.
+func (s *Supervisor) IsRunning(roomID string) bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    _, ok := s.procs[roomID]
+    return ok
+}
+
 
