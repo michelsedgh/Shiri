@@ -207,26 +207,28 @@ func main() {
     startBtn.OnTapped = func() {
         if selectedIdx < 0 { return }
         r := appConfig.Rooms[selectedIdx]
+        // Require a wired AirPlay NIC for macvlan; no host fallback to avoid port/IP conflicts
+        if r.BindInterfaceAirplay == "" {
+            statusLbl.SetText("Select AirPlay NIC")
+            return
+        }
+        if netsetup.IsWireless(r.BindInterfaceAirplay) {
+            statusLbl.SetText("AirPlay NIC can't be wireless")
+            return
+        }
         // Ensure macvlan network for AirPlay containers on selected NIC
         netName, err := netsetup.EnsureMacvlanNetwork(engine.Detect(), r.BindInterfaceAirplay)
         if err != nil {
-            // Fallbacks: if iface is wireless or creation failed, use host networking for reliability
-            if netsetup.IsWireless(r.BindInterfaceAirplay) {
-                netName = "host"
-            } else {
-                // As a last resort, still try host networking
-                netName = "host"
-            }
+            statusLbl.SetText("Macvlan error: "+err.Error())
+            return
         }
         // Bind HTTP streamer to speaker NIC IP; stable per-room port 8090 + index
         ip, ok := netifaces.FirstIPv4(r.BindInterfaceSpeakers)
         if !ok { statusLbl.SetText("Select Speakers NIC"); return }
         port := 8090 + selectedIdx
         httpBind := fmt.Sprintf("%s:%d", ip, port)
-        _ = netName // network selection used when starting the container
-        // Avoid RTSP port conflicts when using host networking by assigning a unique port per room.
+        // Use default RAOP port under macvlan; unique network per container avoids conflicts
         raopPort := 0
-        if netName == "host" { raopPort = 7000 + selectedIdx }
         if err := sup.StartRoom(roomID(r), r.AirplayName, netName, httpBind, raopPort); err != nil {
             statusLbl.SetText("Error: "+err.Error())
             return
