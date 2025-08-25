@@ -34,7 +34,15 @@ func (m *Manager) bin() string {
 // If networkName is non-empty, attaches container to that network.
 func (m *Manager) RunShairportRoom(name, airplayName, volumeHost, networkName string, extraArgs []string) (string, error) {
     bin := m.bin()
-    args := []string{"run", "-d", "--restart=unless-stopped", "--name", name, "-v", fmt.Sprintf("%s:/tmp/shairport", volumeHost)}
+    args := []string{
+        "run", "-d", "--restart=unless-stopped",
+        "--name", name,
+        // Capabilities improve timing (rtprio) and avoid permission errors in NQPTP/AP2
+        "--cap-add", "SYS_NICE",
+        "--cap-add", "NET_ADMIN",
+        "--cap-add", "SYS_RESOURCE",
+        "-v", fmt.Sprintf("%s:/tmp/shairport", volumeHost),
+    }
     if networkName != "" {
         args = append(args, "--network", networkName)
     }

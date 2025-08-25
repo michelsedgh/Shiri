@@ -7,6 +7,7 @@ import (
     "os"
     "path/filepath"
     "sync"
+    "strconv"
 
     "shiri-linux/internal/containers"
     "shiri-linux/internal/encode"
@@ -34,7 +35,8 @@ func NewSupervisor(kind engine.EngineKind) *Supervisor {
 }
 
 // StartRoom ensures FIFOs, starts container, and encoder.
-func (s *Supervisor) StartRoom(roomID, airplayName, networkName, httpBind string) error {
+// If raopPort > 0, it will be passed to shairport-sync with -p to set RTSP port.
+func (s *Supervisor) StartRoom(roomID, airplayName, networkName, httpBind string, raopPort int) error {
     s.mu.Lock()
     defer s.mu.Unlock()
     if _, ok := s.procs[roomID]; ok { return nil }
@@ -45,7 +47,11 @@ func (s *Supervisor) StartRoom(roomID, airplayName, networkName, httpBind string
 
     // Start container
     cname := "sps-" + roomID
-    if _, err := s.mgr.RunShairportRoom(cname, airplayName, base, networkName, nil); err != nil {
+    var extra []string
+    if raopPort > 0 {
+        extra = append(extra, "-p", strconv.Itoa(raopPort))
+    }
+    if _, err := s.mgr.RunShairportRoom(cname, airplayName, base, networkName, extra); err != nil {
         return fmt.Errorf("start shairport: %w", err)
     }
 

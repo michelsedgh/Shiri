@@ -2,6 +2,7 @@ package netifaces
 
 import (
     "net"
+    "strings"
 )
 
 // Interface describes a network interface with IPv4 addresses.
@@ -18,6 +19,14 @@ func List() []Interface {
         return out
     }
     for _, ni := range ifs {
+        // Filter to likely-physical interfaces only (eth*/en*/wl*) and exclude loopback
+        name := ni.Name
+        if name == "lo" {
+            continue
+        }
+        if !(strings.HasPrefix(name, "en") || strings.HasPrefix(name, "eth") || strings.HasPrefix(name, "wl")) {
+            continue
+        }
         addrs, _ := ni.Addrs()
         var v4s []string
         for _, a := range addrs {

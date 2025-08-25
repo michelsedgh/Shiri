@@ -186,7 +186,10 @@ func main() {
         port := 8090 + selectedIdx
         httpBind := fmt.Sprintf("%s:%d", ip, port)
         _ = netName // network selection used when starting the container
-        if err := sup.StartRoom(roomID(r), r.AirplayName, netName, httpBind); err != nil {
+        // Avoid RTSP port conflicts when using host networking by assigning a unique port per room.
+        raopPort := 0
+        if netName == "host" { raopPort = 7000 + selectedIdx }
+        if err := sup.StartRoom(roomID(r), r.AirplayName, netName, httpBind, raopPort); err != nil {
             statusLbl.SetText("Error: "+err.Error())
             return
         }
