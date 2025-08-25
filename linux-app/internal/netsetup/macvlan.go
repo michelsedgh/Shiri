@@ -53,16 +53,57 @@ func EnsureMacvlanNetwork(kind engine.EngineKind, parentIface string) (string, e
             return "", fmt.Errorf("podman network create failed: %v: %s", r.Err, string(r.Stderr))
         }
     } else {
+        // If a macvlan network already exists on the same subnet, reuse it to avoid
+        // "Pool overlaps" errors when the name differs.
+        if ifName, ok := findExistingDockerMacvlanBySubnet(bin, subnet, parentIface); ok {
+            return ifName, nil
+        }
         args := []string{"network", "create", "-d", "macvlan", "-o", "parent="+parentIface, "--subnet", subnet}
         if gw != "" {
             args = append(args, "--gateway", gw)
         }
         args = append(args, name)
         if r := runner.Run(10*time.Second, bin, args...); r.Err != nil {
+            // Attempt to reuse existing overlapping macvlan pool if present.
+            if strings.Contains(string(r.Stderr), "overlap") || strings.Contains(string(r.Stderr), "Pool overlaps") {
+                if ifName, ok := findExistingDockerMacvlanBySubnet(bin, subnet, parentIface); ok {
+                    return ifName, nil
+                }
+            }
             return "", fmt.Errorf("docker network create failed: %v: %s", r.Err, string(r.Stderr))
         }
     }
     return name, nil
+}
+
+// findExistingDockerMacvlanBySubnet scans docker networks and returns the first
+// macvlan network that matches the given subnet. If the network specifies a
+// parent and it matches parentIface (when provided), it is preferred.
+func findExistingDockerMacvlanBySubnet(bin, subnet, parentIface string) (string, bool) {
+    // List networks with their drivers
+    res := runner.Run(5*time.Second, bin, "network", "ls", "--format", "{{.Name}} {{.Driver}}")
+    if res.Err != nil { return "", false }
+    lines := strings.Split(strings.TrimSpace(string(res.Stdout)), "\n")
+    for _, ln := range lines {
+        f := strings.Fields(strings.TrimSpace(ln))
+        if len(f) < 2 { continue }
+        name, driver := f[0], f[1]
+        if driver != "macvlan" { continue }
+        // Inspect to get subnet and parent
+        insp := runner.Run(5*time.Second, bin, "network", "inspect", "-f", "{{ (index .IPAM.Config 0).Subnet }}|{{ index .Options \"parent\" }}", name)
+        if insp.Err != nil { continue }
+        parts := strings.Split(strings.TrimSpace(string(insp.Stdout)), "|")
+        gotSubnet := ""
+        gotParent := ""
+        if len(parts) > 0 { gotSubnet = strings.TrimSpace(parts[0]) }
+        if len(parts) > 1 { gotParent = strings.TrimSpace(parts[1]) }
+        if gotSubnet == subnet {
+            if parentIface == "" || gotParent == "" || gotParent == parentIface {
+                return name, true
+            }
+        }
+    }
+    return "", false
 }
 
 func firstIPv4(iface string) (*net.IPNet, error) {
