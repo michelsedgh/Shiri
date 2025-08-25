@@ -1,0 +1,17 @@
+[Unit]
+Description=Shiri Linux GUI (user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/shiri-linux
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+
+[Install]
+WantedBy=default.target
+
+
