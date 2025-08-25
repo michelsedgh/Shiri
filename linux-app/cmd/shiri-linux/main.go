@@ -171,13 +171,21 @@ func main() {
         r := appConfig.Rooms[selectedIdx]
         // Ensure macvlan network for AirPlay containers on selected NIC
         netName, err := netsetup.EnsureMacvlanNetwork(engine.Detect(), r.BindInterfaceAirplay)
-        if err != nil { statusLbl.SetText("Error: "+err.Error()); return }
+        if err != nil {
+            // Fallbacks: if iface is wireless or creation failed, use host networking for reliability
+            if netsetup.IsWireless(r.BindInterfaceAirplay) {
+                netName = "host"
+            } else {
+                // As a last resort, still try host networking
+                netName = "host"
+            }
+        }
         // Bind HTTP streamer to speaker NIC IP; stable per-room port 8090 + index
         ip, ok := netifaces.FirstIPv4(r.BindInterfaceSpeakers)
         if !ok { statusLbl.SetText("Select Speakers NIC"); return }
         port := 8090 + selectedIdx
         httpBind := fmt.Sprintf("%s:%d", ip, port)
-        _ = netName // currently attached at container run
+        _ = netName // network selection used when starting the container
         if err := sup.StartRoom(roomID(r), r.AirplayName, netName, httpBind); err != nil {
             statusLbl.SetText("Error: "+err.Error())
             return

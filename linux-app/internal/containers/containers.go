@@ -38,8 +38,8 @@ func (m *Manager) RunShairportRoom(name, airplayName, volumeHost, networkName st
     if networkName != "" {
         args = append(args, "--network", networkName)
     }
-    // Image and shairport args
-    shArgs := []string{"mikebrady/shairport-sync:latest", "-a", airplayName, "-o", "pipe", "-M", "--metadata-pipename=/tmp/shairport/metadata", "--", "/tmp/shairport/audio"}
+    // Image and shairport args (enable verbose logs and basic stats for easier debugging)
+    shArgs := []string{"mikebrady/shairport-sync:latest", "-vv", "--statistics", "-a", airplayName, "-o", "pipe", "-M", "--metadata-pipename=/tmp/shairport/metadata", "--", "/tmp/shairport/audio"}
     if len(extraArgs) > 0 {
         shArgs = append(shArgs, extraArgs...)
     }

@@ -3,6 +3,7 @@ package netsetup
 import (
     "fmt"
     "net"
+    "os"
     "strings"
     "time"
 
@@ -38,14 +39,25 @@ func EnsureMacvlanNetwork(kind engine.EngineKind, parentIface string) (string, e
         }
     }
 
+    // Try to determine gateway for the parent interface (optional but recommended)
+    gw := defaultGatewayForInterface(parentIface)
+
     // Create
     if kind == engine.EnginePodman {
-        args := []string{"network", "create", "--driver", "macvlan", "-o", "parent="+parentIface, "--subnet", subnet, name}
+        args := []string{"network", "create", "--driver", "macvlan", "-o", "parent="+parentIface, "--subnet", subnet}
+        if gw != "" {
+            args = append(args, "--gateway", gw)
+        }
+        args = append(args, name)
         if r := runner.Run(10*time.Second, bin, args...); r.Err != nil {
             return "", fmt.Errorf("podman network create failed: %v: %s", r.Err, string(r.Stderr))
         }
     } else {
-        args := []string{"network", "create", "-d", "macvlan", "-o", "parent="+parentIface, "--subnet", subnet, name}
+        args := []string{"network", "create", "-d", "macvlan", "-o", "parent="+parentIface, "--subnet", subnet}
+        if gw != "" {
+            args = append(args, "--gateway", gw)
+        }
+        args = append(args, name)
         if r := runner.Run(10*time.Second, bin, args...); r.Err != nil {
             return "", fmt.Errorf("docker network create failed: %v: %s", r.Err, string(r.Stderr))
         }
@@ -70,6 +82,36 @@ func cidrFromIPNet(ipnet *net.IPNet) string {
     masked := ipnet.IP.Mask(ipnet.Mask)
     ones, _ := ipnet.Mask.Size()
     return fmt.Sprintf("%s/%d", masked.String(), ones)
+}
+
+// defaultGatewayForInterface returns the default gateway IP for the given interface,
+// or an empty string if it can not be determined. It shells out to `ip route` to avoid
+// adding extra dependencies.
+func defaultGatewayForInterface(iface string) string {
+    r := runner.Run(2*time.Second, "ip", "route", "show", "dev", iface)
+    if r.Err != nil { return "" }
+    for _, ln := range strings.Split(string(r.Stdout), "\n") {
+        s := strings.TrimSpace(ln)
+        if strings.HasPrefix(s, "default ") {
+            f := strings.Fields(s)
+            for i := 0; i < len(f)-1; i++ {
+                if f[i] == "via" {
+                    return f[i+1]
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// IsWireless reports whether the interface is a Wi‑Fi interface.
+// On Linux, wireless interfaces have /sys/class/net/<iface>/wireless.
+func IsWireless(iface string) bool {
+    if iface == "" { return false }
+    if _, err := os.Stat("/sys/class/net/" + iface + "/wireless"); err == nil {
+        return true
+    }
+    return false
 }
 
 
