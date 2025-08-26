@@ -222,20 +222,18 @@ func main() {
             statusLbl.SetText("Error: "+err.Error())
             return
         }
-        // Auto-connect speakers for this room
-        // 1) UPnP renderers: entries that look like HTTP control URLs
-        streamURL := fmt.Sprintf("http://%s:%d/stream.mp3", ip, port)
+        // Auto-connect speakers for this room (RAOP targets only)
         var raopTargets []string
         for _, dev := range appConfig.Rooms[selectedIdx].TargetDeviceIDs {
+            if dev == "" { continue }
             if strings.HasPrefix(dev, "http://") || strings.HasPrefix(dev, "https://") {
-                _ = upnp.SetAVTransportURI(dev, streamURL, "")
-                _ = upnp.Play(dev)
-            } else if dev != "" {
-                // Treat as RAOP target (IP or IP:port)
-                raopTargets = append(raopTargets, dev)
+                // Skip HTTP (UPnP) entries
+                continue
             }
+            // Treat as RAOP target (IP or IP:port)
+            raopTargets = append(raopTargets, dev)
         }
-        // 2) RAOP senders: launch if any IP targets provided
+        // Launch RAOP senders if any IP targets provided
         if len(raopTargets) > 0 {
             // Bind RAOP to the speakers NIC IP (same IP used for HTTP streamer)
             if err := sup.StartRAOP(roomID(r), ip, raopTargets); err != nil {
