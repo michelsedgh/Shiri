@@ -6,6 +6,7 @@ import (
     "log"
     "os"
     "strings"
+    "time"
 
     "fyne.io/fyne/v2"
     "fyne.io/fyne/v2/app"
@@ -20,7 +21,6 @@ import (
     "shiri-linux/internal/netsetup"
     "shiri-linux/internal/rooms"
     "shiri-linux/internal/ssdp"
-    "shiri-linux/internal/upnp"
     "shiri-linux/internal/systemcheck"
 )
 
@@ -143,19 +143,8 @@ func main() {
     statusLbl := widget.NewLabel("Idle")
     speakerList := widget.NewList(func() int { if selectedIdx<0 { return 0 }; return len(appConfig.Rooms[selectedIdx].TargetDeviceIDs) }, func() fyne.CanvasObject { return widget.NewLabel("speaker") }, func(i widget.ListItemID, o fyne.CanvasObject) { if selectedIdx>=0 { o.(*widget.Label).SetText(appConfig.Rooms[selectedIdx].TargetDeviceIDs[i]) } })
     discoverBtn := widget.NewButton("Discover Speakers", nil)
-    resolveBtn := widget.NewButton("Resolve Control URLs", nil)
 
     sup := rooms.NewSupervisor(engine.Detect())
-    logsOut := widget.NewMultiLineEntry()
-    logsOut.SetPlaceHolder("Container logs will appear here…")
-    logsOut.Wrapping = fyne.TextWrapWord
-    logsBtn := widget.NewButton("Tail Logs", func() {
-        if selectedIdx < 0 { return }
-        r := appConfig.Rooms[selectedIdx]
-        txt, err := sup.Logs(roomID(r), 200)
-        if err != nil { logsOut.SetText("Error: "+err.Error()); return }
-        logsOut.SetText(txt)
-    })
 
     refreshNicOptions := func() {
         ifs := netifaces.List()
@@ -266,47 +255,27 @@ func main() {
         if selectedIdx < 0 { return }
         ip, ok := netifaces.FirstIPv4(appConfig.Rooms[selectedIdx].BindInterfaceSpeakers)
         if !ok { statusLbl.SetText("Select Speakers NIC first"); return }
-        // Discover generic UPnP renderers; users can copy their control URLs for now
-        devs, err := ssdp.Discover(ip, "urn:schemas-upnp-org:device:MediaRenderer:1", 2*1e9)
-        if err != nil { statusLbl.SetText("SSDP error: "+err.Error()); return }
-        // Replace device IDs with their LOCATIONs for quick prototyping
-        ids := make([]string, 0, len(devs))
-        for _, d := range devs { ids = append(ids, d.Location) }
+        // Discover RAOP (AirPlay) renderers on the selected NIC
+        devs, err := ssdp.DiscoverRAOP(ip, 3*time.Second)
+        if err != nil { statusLbl.SetText("mDNS error: "+err.Error()); return }
+        var ids []string
+        for _, d := range devs { ids = append(ids, d.Addr) }
         appConfig.Rooms[selectedIdx].TargetDeviceIDs = ids
         _ = cfg.Save(appConfig)
         speakerList.Refresh()
     }
-    resolveBtn.OnTapped = func() {
-        if selectedIdx < 0 { return }
-        var out []string
-        for _, loc := range appConfig.Rooms[selectedIdx].TargetDeviceIDs {
-            if ctrl, name, err := upnp.ResolveAVTransportControlURL(loc); err == nil {
-                out = append(out, ctrl)
-                log.Printf("%s -> %s", name, ctrl)
-            } else {
-                log.Printf("resolve failed for %s: %v", loc, err)
-            }
-        }
-        if len(out) > 0 {
-            appConfig.Rooms[selectedIdx].TargetDeviceIDs = out
-            _ = cfg.Save(appConfig)
-            speakerList.Refresh()
-        }
-    }
 
-    right := container.NewVBox(
+    // Right panel with speakers list filling vertical space; logs removed; UPnP label replaced
+    rightTop := container.NewVBox(
         rightTitle, widget.NewSeparator(),
         widget.NewLabel("AirPlay NIC"), airNic,
         widget.NewLabel("Speakers NIC"), spkNic,
         container.NewHBox(startBtn, stopBtn, statusLbl),
         widget.NewSeparator(),
-        widget.NewLabelWithStyle("Speakers (UPnP - prototype)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-        discoverBtn, resolveBtn,
-        speakerList,
-        widget.NewSeparator(),
-        widget.NewLabelWithStyle("Logs", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-        logsBtn, logsOut,
+        widget.NewLabelWithStyle("AirPlay Speakers", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+        discoverBtn,
     )
+    right := container.NewBorder(rightTop, nil, nil, nil, speakerList)
 
     // Split
     split := container.NewHSplit(left, right)
