@@ -22,6 +22,7 @@ func NewHTTPStreamer(addr string, input io.Reader) *HTTPStreamer {
     hs := &HTTPStreamer{conns: make(map[net.Conn]struct{}), inputR: input}
     mux := http.NewServeMux()
     mux.HandleFunc("/stream", hs.handleStream)
+    mux.HandleFunc("/stream.mp3", hs.handleStreamChunked)
     hs.srv = &http.Server{Addr: addr, Handler: mux}
     return hs
 }
@@ -69,6 +70,27 @@ func (h *HTTPStreamer) handleStream(w http.ResponseWriter, r *http.Request) {
             }
         }
     }()
+}
+
+// handleStreamChunked serves the stream using standard chunked transfer encoding
+// (no hijacking). This increases compatibility with some UPnP renderers.
+func (h *HTTPStreamer) handleStreamChunked(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "audio/mpeg")
+    // Let net/http choose chunked encoding automatically for HTTP/1.1
+    // by not setting Content-Length and not hijacking.
+    buf := make([]byte, 16384)
+    rd := bufio.NewReader(h.inputR)
+    for {
+        n, err := rd.Read(buf)
+        if n > 0 {
+            if _, werr := w.Write(buf[:n]); werr != nil { return }
+            if f, ok := w.(http.Flusher); ok { f.Flush() }
+        }
+        if err != nil {
+            if err != io.EOF { log.Printf("stream chunked read err: %v", err) }
+            return
+        }
+    }
 }
 
 
