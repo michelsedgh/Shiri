@@ -1,9 +1,12 @@
 package ssdp
 
 import (
+    "context"
     "net"
     "strings"
     "time"
+
+    "github.com/grandcat/zeroconf"
 )
 
 // Device represents a simple SSDP discovery result.
@@ -53,6 +56,54 @@ func Discover(bindIP string, st string, timeout time.Duration) ([]Device, error)
         out = append(out, dev)
     }
     return out, nil
+}
+
+// DiscoverRAOP discovers RAOP/AirPlay receivers (_raop._tcp / _airplay._tcp) via mDNS.
+// It binds the query to the provided interface IP so we only see devices on that LAN.
+func DiscoverRAOP(bindIP string, timeout time.Duration) ([]Device, error) {
+    // RAOP service carries the MAC and service name in instance; we mostly need IP:port
+    ctx, cancel := context.WithTimeout(context.Background(), timeout)
+    defer cancel()
+    // Limit to the interface
+    ifi, err := net.InterfaceByName(interfaceNameForIP(bindIP))
+    if err != nil { return nil, err }
+    r, err := zeroconf.NewResolver(nil)
+    if err != nil { return nil, err }
+    entries := make(chan *zeroconf.ServiceEntry)
+    var out []Device
+    go func() {
+        for e := range entries {
+            if len(e.AddrIPv4) > 0 {
+                out = append(out, Device{
+                    Addr: e.AddrIPv4[0].String(),
+                    ST:   "_raop._tcp",
+                    USN:  e.Instance,
+                    Location: e.Instance, // reuse for display
+                })
+            }
+        }
+    }()
+    // Browse RAOP; we could also browse _airplay._tcp for AP2 but RAOP is our sender path
+    if err := r.Browse(ctx, "_raop._tcp", "local.", entries, zeroconf.SelectIfaces([]net.Interface{*ifi})); err != nil {
+        close(entries)
+        return nil, err
+    }
+    <-ctx.Done()
+    close(entries)
+    return out, nil
+}
+
+func interfaceNameForIP(ip string) string {
+    ifaces, _ := net.Interfaces()
+    for _, ifi := range ifaces {
+        addrs, _ := ifi.Addrs()
+        for _, a := range addrs {
+            if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+                if ipn.IP.String() == ip { return ifi.Name }
+            }
+        }
+    }
+    return ""
 }
 
 
