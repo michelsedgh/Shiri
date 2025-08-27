@@ -80,11 +80,11 @@ func DiscoverRAOP(bindIP string, timeout time.Duration) ([]Device, error) {
     }()
     // Browse RAOP; we could also browse _airplay._tcp for AP2 but RAOP is our sender path
     if err := r.Browse(ctx, "_raop._tcp", "local.", entries); err != nil {
-        close(entries)
+        // Do not close(entries) here; nothing has been started yet, but avoid double-close patterns.
         return nil, err
     }
     <-ctx.Done()
-    close(entries)
+    // Allow the producer side to close the channel; avoid explicit close to prevent panic on double close
     return out, nil
 }
 

@@ -18,6 +18,7 @@ import (
     "shiri-linux/internal/engine"
     "shiri-linux/internal/fifo"
     "shiri-linux/internal/stream"
+    "shiri-linux/internal/raopbin"
 )
 
 // Supervisor manages per-room pipelines: containerized shairport -> ffmpeg -> HTTP
@@ -143,7 +144,12 @@ func (s *Supervisor) StartRAOP(roomID, bindIP string, targets []string) error {
 
     // Prepare a common NTP reference file for group start.
     ntpPath := filepath.Join(rp.FIFOBase, "ntp")
-    _ = exec.Command("raop_play", "-ntp", ntpPath).Run()
+    // Resolve RAOP binary (raop_play/clipraop/bundled)
+    raopPath, err := raopbin.Resolve()
+    if err != nil {
+        return fmt.Errorf("no RAOP binary: %w", err)
+    }
+    _ = exec.Command(raopPath, "-ntp", ntpPath).Run()
 
     var senders []*raopSender
     for _, t := range targets {
@@ -151,7 +157,7 @@ func (s *Supervisor) StartRAOP(roomID, bindIP string, targets []string) error {
         if err != nil { log.Printf("raop target skip %s: %v", t, err); continue }
         // Build command: raop_play -i <bindIP> -p <port> -nf <ntp-file> -w 1000 <host> -
         args := []string{"-i", bindIP, "-p", port, "-nf", ntpPath, "-w", "1000", host, "-"}
-        cmd := exec.Command("raop_play", args...)
+        cmd := exec.Command(raopPath, args...)
         stdin, err := cmd.StdinPipe()
         if err != nil { log.Printf("raop stdin: %v", err); continue }
         if err := cmd.Start(); err != nil { log.Printf("raop start: %v", err); _ = stdin.Close(); continue }
@@ -179,6 +185,11 @@ func (s *Supervisor) StartRAOP(roomID, bindIP string, targets []string) error {
 }
 
 func splitHostPortDefault(addr, defPort string) (host, port string, err error) {
+    // Accept legacy formats like "Name|IP" by taking the substring after the last '|'
+    addr = strings.TrimSpace(addr)
+    if idx := strings.LastIndex(addr, "|"); idx != -1 {
+        addr = strings.TrimSpace(addr[idx+1:])
+    }
     if strings.Contains(addr, ":") {
         h, p, e := net.SplitHostPort(addr)
         if e == nil { return h, p, nil }

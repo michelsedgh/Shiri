@@ -3,6 +3,7 @@ package systemcheck
 import (
     "fmt"
     "os/exec"
+    "shiri-linux/internal/raopbin"
 )
 
 type Result struct {
@@ -31,6 +32,14 @@ func Run() Result {
         }
     } else {
         details = append(details, "engine: docker found")
+    }
+
+    // Check for RAOP sender (raop_play/clipraop/bundled)
+    if p, err := raopbin.Resolve(); err != nil {
+        details = append(details, "raop sender: NOT FOUND (bundle clipraop or install raop_play)")
+        ok = false
+    } else {
+        details = append(details, "raop sender: ok ("+p+")")
     }
 
     details = append(details, fmt.Sprintf("permissions: ensure access to container socket (docker group or root)"))
