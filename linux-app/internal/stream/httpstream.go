@@ -2,7 +2,6 @@ package stream
 
 import (
     "bufio"
-    "io"
     "log"
     "net"
     "net/http"
@@ -14,12 +13,12 @@ type HTTPStreamer struct {
     mu      sync.Mutex
     conns   map[net.Conn]struct{}
     srv     *http.Server
-    inputR  io.Reader
+    src     *Broadcaster
 }
 
 // NewHTTPStreamer creates a streamer bound to host:port.
-func NewHTTPStreamer(addr string, input io.Reader) *HTTPStreamer {
-    hs := &HTTPStreamer{conns: make(map[net.Conn]struct{}), inputR: input}
+func NewHTTPStreamer(addr string, src *Broadcaster) *HTTPStreamer {
+    hs := &HTTPStreamer{conns: make(map[net.Conn]struct{}), src: src}
     mux := http.NewServeMux()
     mux.HandleFunc("/stream", hs.handleStream)
     mux.HandleFunc("/stream.mp3", hs.handleStreamChunked)
@@ -47,7 +46,7 @@ func (h *HTTPStreamer) handleStream(w http.ResponseWriter, r *http.Request) {
     h.mu.Lock()
     h.conns[conn] = struct{}{}
     h.mu.Unlock()
-    // Pump input when available (this simplistic version reads shared input)
+    // Pump from broadcaster subscription to the hijacked connection
     go func() {
         defer func() {
             h.mu.Lock()
@@ -55,19 +54,11 @@ func (h *HTTPStreamer) handleStream(w http.ResponseWriter, r *http.Request) {
             h.mu.Unlock()
             _ = conn.Close()
         }()
-        rd := bufio.NewReader(h.inputR)
         wr := bufio.NewWriter(conn)
-        buf := make([]byte, 16384)
-        for {
-            n, err := rd.Read(buf)
-            if n > 0 {
-                if _, werr := wr.Write(buf[:n]); werr != nil { return }
-                if err := wr.Flush(); err != nil { return }
-            }
-            if err != nil {
-                if err != io.EOF { log.Printf("stream read err: %v", err) }
-                return
-            }
+        ch := h.src.Subscribe()
+        for buf := range ch {
+            if _, werr := wr.Write(buf); werr != nil { return }
+            if err := wr.Flush(); err != nil { return }
         }
     }()
 }
@@ -78,18 +69,10 @@ func (h *HTTPStreamer) handleStreamChunked(w http.ResponseWriter, r *http.Reques
     w.Header().Set("Content-Type", "audio/mpeg")
     // Let net/http choose chunked encoding automatically for HTTP/1.1
     // by not setting Content-Length and not hijacking.
-    buf := make([]byte, 16384)
-    rd := bufio.NewReader(h.inputR)
-    for {
-        n, err := rd.Read(buf)
-        if n > 0 {
-            if _, werr := w.Write(buf[:n]); werr != nil { return }
-            if f, ok := w.(http.Flusher); ok { f.Flush() }
-        }
-        if err != nil {
-            if err != io.EOF { log.Printf("stream chunked read err: %v", err) }
-            return
-        }
+    ch := h.src.Subscribe()
+    for buf := range ch {
+        if _, werr := w.Write(buf); werr != nil { return }
+        if f, ok := w.(http.Flusher); ok { f.Flush() }
     }
 }
 

@@ -1,6 +1,7 @@
 package rooms
 
 import (
+    "bufio"
     "fmt"
     "io"
     "log"
@@ -34,13 +35,45 @@ type roomProc struct {
     Encoder       *encode.FFMpegEncoder
     HTTP          *stream.HTTPStreamer
     Broadcaster   *stream.Broadcaster
+    MP3Broadcaster *stream.Broadcaster
     RAOPS         []*raopSender
+    RAOPLogs      *raopLogBuffer
 }
 
 type raopSender struct {
     Target string
     Cmd    *exec.Cmd
     Stdin  io.WriteCloser
+}
+
+type raopLogBuffer struct {
+    mu    sync.Mutex
+    lines []string
+    max   int
+}
+
+func newRAOPLogBuffer(max int) *raopLogBuffer {
+    return &raopLogBuffer{max: max}
+}
+
+func (b *raopLogBuffer) appendLine(line string) {
+    b.mu.Lock()
+    if line == "" { b.mu.Unlock(); return }
+    b.lines = append(b.lines, line)
+    if len(b.lines) > b.max {
+        // drop oldest to keep at most max
+        b.lines = b.lines[len(b.lines)-b.max:]
+    }
+    b.mu.Unlock()
+}
+
+func (b *raopLogBuffer) tail(n int) string {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    if n <= 0 || n > len(b.lines) { n = len(b.lines) }
+    start := len(b.lines) - n
+    if start < 0 { start = 0 }
+    return strings.Join(b.lines[start:], "\n")
 }
 
 func NewSupervisor(kind engine.EngineKind) *Supervisor {
@@ -88,14 +121,18 @@ func (s *Supervisor) StartRoom(roomID, airplayName, networkName, httpBind string
         _ = enc.Stdin.Close()
     }()
 
+    // MP3 broadcaster for HTTP fan-out (fix concurrent reader issue)
+    mp3b := stream.NewBroadcaster()
+    go func() {
+        mp3b.Attach(enc.Stdout)
+    }()
     // Start HTTP streamer bound to selected NIC/port
-    httpIn := enc.Stdout
-    hs := stream.NewHTTPStreamer(httpBind, httpIn)
+    hs := stream.NewHTTPStreamer(httpBind, mp3b)
     go func() {
         if err := hs.Start(); err != nil { log.Printf("http streamer: %v", err) }
     }()
 
-    s.procs[roomID] = &roomProc{ContainerName: cname, FIFOBase: base, Encoder: enc, HTTP: hs, Broadcaster: b}
+    s.procs[roomID] = &roomProc{ContainerName: cname, FIFOBase: base, Encoder: enc, HTTP: hs, Broadcaster: b, MP3Broadcaster: mp3b, RAOPLogs: newRAOPLogBuffer(400)}
     return nil
 }
 
@@ -108,11 +145,7 @@ func (s *Supervisor) StopRoom(roomID string) error {
     if rp.Encoder != nil && rp.Encoder.Cmd != nil {
         _ = rp.Encoder.Cmd.Process.Kill()
     }
-    for _, r := range rp.RAOPS {
-        if r != nil && r.Cmd != nil && r.Cmd.Process != nil {
-            _ = r.Cmd.Process.Kill()
-        }
-    }
+    s.stopRAOPLocked(rp)
     delete(s.procs, roomID)
     return nil
 }
@@ -158,11 +191,16 @@ func (s *Supervisor) StartRAOP(roomID, bindIP string, targets []string) error {
         // Build command: raop_play -i <bindIP> -p <port> -nf <ntp-file> -w 1000 <host> -
         args := []string{"-i", bindIP, "-p", port, "-nf", ntpPath, "-w", "1000", host, "-"}
         cmd := exec.Command(raopPath, args...)
+        stdout, _ := cmd.StdoutPipe()
+        stderr, _ := cmd.StderrPipe()
         stdin, err := cmd.StdinPipe()
         if err != nil { log.Printf("raop stdin: %v", err); continue }
         if err := cmd.Start(); err != nil { log.Printf("raop start: %v", err); _ = stdin.Close(); continue }
         rs := &raopSender{Target: t, Cmd: cmd, Stdin: stdin}
         senders = append(senders, rs)
+        // Capture logs
+        go pipeLines(stdout, rp.RAOPLogs)
+        go pipeLines(stderr, rp.RAOPLogs)
         // Feed from broadcaster
         go func(w io.WriteCloser) {
             ch := rp.Broadcaster.Subscribe()
@@ -182,6 +220,44 @@ func (s *Supervisor) StartRAOP(roomID, bindIP string, targets []string) error {
     rp.RAOPS = append(rp.RAOPS, senders...)
     s.mu.Unlock()
     return nil
+}
+
+// StopRAOP terminates any RAOP sender processes for the room.
+func (s *Supervisor) StopRAOP(roomID string) error {
+    s.mu.Lock()
+    rp, ok := s.procs[roomID]
+    s.mu.Unlock()
+    if !ok { return fmt.Errorf("room not running") }
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.stopRAOPLocked(rp)
+    return nil
+}
+
+func (s *Supervisor) stopRAOPLocked(rp *roomProc) {
+    for _, r := range rp.RAOPS {
+        if r != nil && r.Cmd != nil && r.Cmd.Process != nil {
+            _ = r.Cmd.Process.Kill()
+        }
+    }
+    rp.RAOPS = nil
+}
+
+// RAOPLogs returns recent logs from RAOP senders for a room.
+func (s *Supervisor) RAOPLogs(roomID string, tail int) (string, error) {
+    s.mu.Lock()
+    rp, ok := s.procs[roomID]
+    s.mu.Unlock()
+    if !ok { return "", fmt.Errorf("room not running") }
+    return rp.RAOPLogs.tail(tail), nil
+}
+
+func pipeLines(r io.Reader, buf *raopLogBuffer) {
+    if r == nil || buf == nil { return }
+    br := bufio.NewScanner(r)
+    for br.Scan() {
+        buf.appendLine(br.Text())
+    }
 }
 
 func splitHostPortDefault(addr, defPort string) (host, port string, err error) {

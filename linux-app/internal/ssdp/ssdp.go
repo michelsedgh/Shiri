@@ -16,6 +16,8 @@ type Device struct {
     ST       string
     USN      string
     Addr     string
+    Port     int
+    Friendly string
 }
 
 // Discover sends M-SEARCH on the given interface IPv4 and returns responses.
@@ -74,7 +76,8 @@ func DiscoverRAOP(bindIP string, timeout time.Duration) ([]Device, error) {
             if len(e.AddrIPv4) > 0 {
                 ip := e.AddrIPv4[0]
                 if subnet != nil && !subnet.Contains(ip) { continue }
-                out = append(out, Device{Addr: ip.String(), ST: "_raop._tcp", USN: e.Instance, Location: e.Instance})
+                friendly := friendlyFromInstance(e.Instance)
+                out = append(out, Device{Addr: ip.String(), Port: e.Port, ST: "_raop._tcp", USN: e.Instance, Friendly: friendly, Location: e.Instance})
             }
         }
     }()
@@ -86,6 +89,14 @@ func DiscoverRAOP(bindIP string, timeout time.Duration) ([]Device, error) {
     <-ctx.Done()
     // Allow the producer side to close the channel; avoid explicit close to prevent panic on double close
     return out, nil
+}
+
+func friendlyFromInstance(instance string) string {
+    // RAOP instance is typically "<MAC>@<Device Name>"
+    if idx := strings.LastIndex(instance, "@"); idx != -1 && idx+1 < len(instance) {
+        return strings.TrimSpace(instance[idx+1:])
+    }
+    return instance
 }
 
 func interfaceNameForIP(ip string) string {

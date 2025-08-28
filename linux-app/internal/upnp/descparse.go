@@ -1,3 +1,4 @@
+// Package deprecated: UPnP control removed for RAOP-only build.
 package upnp
 
 import (

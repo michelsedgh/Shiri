@@ -68,4 +68,14 @@ func (b *Broadcaster) Unsubscribe(ch chan []byte) {
     b.mu.Unlock()
 }
 
+// Feed reads from r and writes to a writer function, useful for bridging to process stdin
+func (b *Broadcaster) Feed(write func([]byte) error) {
+    go func() {
+        ch := b.Subscribe()
+        for buf := range ch {
+            if err := write(buf); err != nil { return }
+        }
+    }()
+}
+
 

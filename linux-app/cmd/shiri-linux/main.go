@@ -12,6 +12,7 @@ import (
     "fyne.io/fyne/v2/app"
     "fyne.io/fyne/v2/container"
     "fyne.io/fyne/v2/data/binding"
+    "fyne.io/fyne/v2/dialog"
     "fyne.io/fyne/v2/theme"
     "fyne.io/fyne/v2/widget"
 
@@ -141,10 +142,33 @@ func main() {
     startBtn := widget.NewButton("Start", nil)
     stopBtn := widget.NewButton("Stop", nil)
     statusLbl := widget.NewLabel("Idle")
-    speakerList := widget.NewList(func() int { if selectedIdx<0 { return 0 }; return len(appConfig.Rooms[selectedIdx].TargetDeviceIDs) }, func() fyne.CanvasObject { return widget.NewLabel("speaker") }, func(i widget.ListItemID, o fyne.CanvasObject) { if selectedIdx>=0 { o.(*widget.Label).SetText(appConfig.Rooms[selectedIdx].TargetDeviceIDs[i]) } })
+    speakerList := widget.NewList(func() int { if selectedIdx<0 { return 0 }; return len(appConfig.Rooms[selectedIdx].TargetDeviceIDs) }, func() fyne.CanvasObject { return widget.NewLabel("speaker") }, func(i widget.ListItemID, o fyne.CanvasObject) {
+        if selectedIdx>=0 {
+            o.(*widget.Label).SetText(appConfig.Rooms[selectedIdx].TargetDeviceIDs[i])
+        }
+    })
     discoverBtn := widget.NewButton("Discover Speakers", nil)
+    startSpeakersBtn := widget.NewButton("Start Speakers", nil)
+    stopSpeakersBtn := widget.NewButton("Stop Speakers", nil)
+    viewRaopLogsBtn := widget.NewButton("Speakers Logs", nil)
+    viewLogsBtn := widget.NewButton("View Logs", nil)
+    nicWarningLbl := widget.NewLabel("")
 
     sup := rooms.NewSupervisor(engine.Detect())
+
+    var checkNicConflict func()
+    checkNicConflict = func() {
+        if selectedIdx < 0 || selectedIdx >= len(appConfig.Rooms) {
+            nicWarningLbl.SetText("")
+            return
+        }
+        r := appConfig.Rooms[selectedIdx]
+        if r.BindInterfaceAirplay != "" && r.BindInterfaceAirplay == r.BindInterfaceSpeakers {
+            nicWarningLbl.SetText("Warning: Using the same NIC for AirPlay and Speakers may cause conflicts.")
+        } else {
+            nicWarningLbl.SetText("")
+        }
+    }
 
     refreshNicOptions := func() {
         ifs := netifaces.List()
@@ -178,6 +202,7 @@ func main() {
             statusLbl.SetText("Idle")
             speakerList.Refresh()
         }
+        checkNicConflict()
     }
 
     airNic.OnChanged = func(s string) {
@@ -185,12 +210,35 @@ func main() {
             appConfig.Rooms[selectedIdx].BindInterfaceAirplay = s
             _ = cfg.Save(appConfig)
         }
+        checkNicConflict()
     }
     spkNic.OnChanged = func(s string) {
         if selectedIdx >= 0 {
             appConfig.Rooms[selectedIdx].BindInterfaceSpeakers = s
             _ = cfg.Save(appConfig)
         }
+        checkNicConflict()
+    }
+
+    viewLogsBtn.OnTapped = func() {
+        if selectedIdx < 0 || !sup.IsRunning(roomID(appConfig.Rooms[selectedIdx])) {
+            dialog.ShowInformation("Logs", "Room is not running.", w)
+            return
+        }
+        r := appConfig.Rooms[selectedIdx]
+        logs, err := sup.Logs(roomID(r), 200)
+        if err != nil {
+            dialog.ShowError(err, w)
+            return
+        }
+        logContent := widget.NewMultiLineEntry()
+        logContent.SetText(logs)
+        logContent.Wrapping = fyne.TextWrapOff
+        logContainer := container.NewScroll(logContent)
+        logContainer.SetMinSize(fyne.NewSize(780, 500))
+
+        d := dialog.NewCustom("Logs: "+r.Name, "Close", logContainer, w)
+        d.Show()
     }
 
     startBtn.OnTapped = func() {
@@ -222,24 +270,7 @@ func main() {
             statusLbl.SetText("Error: "+err.Error())
             return
         }
-        // Auto-connect speakers for this room (RAOP targets only)
-        var raopTargets []string
-        for _, dev := range appConfig.Rooms[selectedIdx].TargetDeviceIDs {
-            if dev == "" { continue }
-            if strings.HasPrefix(dev, "http://") || strings.HasPrefix(dev, "https://") {
-                // Skip HTTP (UPnP) entries
-                continue
-            }
-            // Treat as RAOP target (IP or IP:port)
-            raopTargets = append(raopTargets, dev)
-        }
-        // Launch RAOP senders if any IP targets provided
-        if len(raopTargets) > 0 {
-            // Bind RAOP to the speakers NIC IP (same IP used for HTTP streamer)
-            if err := sup.StartRAOP(roomID(r), ip, raopTargets); err != nil {
-                log.Printf("RAOP start failed: %v", err)
-            }
-        }
+        // We no longer auto-start RAOP here; use Start Speakers button
         statusLbl.SetText("Running")
     }
     stopBtn.OnTapped = func() {
@@ -257,10 +288,62 @@ func main() {
         devs, err := ssdp.DiscoverRAOP(ip, 3*time.Second)
         if err != nil { statusLbl.SetText("mDNS error: "+err.Error()); return }
         var ids []string
-        for _, d := range devs { ids = append(ids, d.Addr) }
+        for _, d := range devs {
+            label := d.Addr
+            if d.Port > 0 { label = fmt.Sprintf("%s:%d", d.Addr, d.Port) }
+            if d.Friendly != "" { label = d.Friendly + " | " + label }
+            ids = append(ids, label)
+        }
         appConfig.Rooms[selectedIdx].TargetDeviceIDs = ids
         _ = cfg.Save(appConfig)
         speakerList.Refresh()
+    }
+
+    startSpeakersBtn.OnTapped = func() {
+        if selectedIdx < 0 { return }
+        r := appConfig.Rooms[selectedIdx]
+        ip, ok := netifaces.FirstIPv4(r.BindInterfaceSpeakers)
+        if !ok { statusLbl.SetText("Select Speakers NIC"); return }
+        var raopTargets []string
+        for _, dev := range r.TargetDeviceIDs {
+            if dev == "" { continue }
+            // Accept labels like "Friendly | ip[:port]" by extracting after last '|'
+            t := dev
+            if idx := strings.LastIndex(t, "|"); idx != -1 {
+                t = strings.TrimSpace(t[idx+1:])
+            }
+            raopTargets = append(raopTargets, t)
+        }
+        if len(raopTargets) == 0 { statusLbl.SetText("No speakers selected"); return }
+        if err := sup.StartRAOP(roomID(r), ip, raopTargets); err != nil {
+            dialog.ShowError(err, w)
+            return
+        }
+        statusLbl.SetText("Running (Speakers)")
+    }
+
+    stopSpeakersBtn.OnTapped = func() {
+        if selectedIdx < 0 { return }
+        r := appConfig.Rooms[selectedIdx]
+        if err := sup.StopRAOP(roomID(r)); err != nil {
+            dialog.ShowError(err, w)
+            return
+        }
+        statusLbl.SetText("Running (Speakers stopped)")
+    }
+
+    viewRaopLogsBtn.OnTapped = func() {
+        if selectedIdx < 0 { return }
+        r := appConfig.Rooms[selectedIdx]
+        logs, err := sup.RAOPLogs(roomID(r), 300)
+        if err != nil { dialog.ShowError(err, w); return }
+        logContent := widget.NewMultiLineEntry()
+        logContent.SetText(logs)
+        logContent.Wrapping = fyne.TextWrapOff
+        logContainer := container.NewScroll(logContent)
+        logContainer.SetMinSize(fyne.NewSize(780, 500))
+        d := dialog.NewCustom("RAOP Logs: "+r.Name, "Close", logContainer, w)
+        d.Show()
     }
 
     // Right panel with speakers list filling vertical space; logs removed; UPnP label replaced
@@ -268,10 +351,11 @@ func main() {
         rightTitle, widget.NewSeparator(),
         widget.NewLabel("AirPlay NIC"), airNic,
         widget.NewLabel("Speakers NIC"), spkNic,
-        container.NewHBox(startBtn, stopBtn, statusLbl),
+        container.NewHBox(startBtn, stopBtn, statusLbl, viewLogsBtn),
+        nicWarningLbl,
         widget.NewSeparator(),
         widget.NewLabelWithStyle("AirPlay Speakers", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-        discoverBtn,
+        container.NewHBox(discoverBtn, startSpeakersBtn, stopSpeakersBtn, viewRaopLogsBtn),
     )
     right := container.NewBorder(rightTop, nil, nil, nil, speakerList)
 

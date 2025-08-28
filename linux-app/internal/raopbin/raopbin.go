@@ -30,17 +30,22 @@ func Resolve() (string, error) {
 	}
 	exeDir := filepath.Dir(exe)
 
-	// Only known bundled artifact we expect right now
-	bundledName := bundledFilename()
-	if bundledName == "" {
+	// Accept multiple bundled artifact names (to cover historical typo variants)
+	bundledNames := bundledFilenames()
+	if len(bundledNames) == 0 {
 		return "", errors.New("no supported RAOP binary for this platform")
 	}
 
-	candidates := []string{
-		filepath.Join(exeDir, bundledName),
-		filepath.Join(exeDir, "bin", bundledName),
-		filepath.Join(exeDir, "linux-app", bundledName),
-		filepath.Join(exeDir, "linux-app", "bin", bundledName),
+	var candidates []string
+	for _, bundledName := range bundledNames {
+		candidates = append(candidates,
+			filepath.Join(exeDir, bundledName),
+			filepath.Join(exeDir, "bin", bundledName),
+			filepath.Join(exeDir, "linux-app", bundledName),
+			filepath.Join(exeDir, "linux-app", "bin", bundledName),
+			filepath.Join(filepath.Dir(exeDir), bundledName),
+			filepath.Join(filepath.Dir(exeDir), "bin", bundledName),
+		)
 	}
 	for _, c := range candidates {
 		if st, err := os.Stat(c); err == nil && !st.IsDir() {
@@ -51,12 +56,12 @@ func Resolve() (string, error) {
 	return "", errors.New("RAOP sender binary not found (raop_play/clipraop)")
 }
 
-func bundledFilename() string {
+func bundledFilenames() []string {
 	if runtime.GOOS == "linux" && runtime.GOARCH == "arm64" {
-		return "clipraop-linux-aarch64"
+		return []string{"clipraop-linux-aarch64", "cliraop-linux-aarch64", "clipraop-linux-aarch64.", "cliraop-linux-aarch64."}
 	}
 	// Add more mappings as additional artifacts are bundled (e.g., amd64)
-	return ""
+	return nil
 }
 
 func ensureExec(path string) error {
