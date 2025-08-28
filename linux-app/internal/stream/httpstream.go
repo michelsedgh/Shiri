@@ -2,7 +2,6 @@ package stream
 
 import (
     "bufio"
-    "log"
     "net"
     "net/http"
     "sync"
