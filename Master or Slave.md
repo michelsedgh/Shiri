@@ -1,4 +1,0 @@
-Will we be the master or the slave?
-why not co-exist. steve wozniak said we have built these computers and machines and we are dependent on them, and now when they are so good, and have better intelligence and do all the jobs, who will be the master and who will be the slave? 
-In such world, I argue, there is no master or slave.
-If the machines take over completely, I think they will grow to help us and nurture us and raise us, the way we did for it. If AI takes over, I believe it will have to take care of us one way or another. We aren't its food or prey, but we are its parents, without us there would be no AI. Just like how we humans take care of our ancestry, museums, buildings and have nostalgia and take care of all old things, I believe the AI will realize the same thing, and without us, it would be a lonely place for the AI to be, and what would be the point? 

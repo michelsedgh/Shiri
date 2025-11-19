@@ -1,0 +1,17 @@
+# ninja log v5
+17	138	1763543951697441260	CMakeFiles/mdnssd.dir/third_party/mdnssd.c.o	126646c2d29f5291
+143	187	1763543951750728389	libmdnssd.a	de02e8a052377b3d
+18	672	1763544340255028212	CMakeFiles/shiri-bridge.dir/src/Shairport.cpp.o	1fc374ebd8a8a05
+20	640	1763543952201318196	CMakeFiles/shiri-bridge.dir/src/Discovery.cpp.o	e490a7d0f61b483f
+16	1038	1763544340620422724	CMakeFiles/shiri-bridge.dir/src/main.cpp.o	ee92ab2d8fba132
+1041	1222	1763544340809518010	shiri-bridge	a425b0cd46cf044c
+4	84	1763544631110615301	build.ninja	a59a2b3bbe2f4155
+18	171	1763544631303078864	CMakeFiles/mdnssd.dir/third_party/mdnssd.c.o	126646c2d29f5291
+180	240	1763544631377676703	libmdnssd.a	de02e8a052377b3d
+15	849	1763544631980261798	CMakeFiles/shiri-bridge.dir/src/Discovery.cpp.o	e490a7d0f61b483f
+17	860	1763544631980286257	CMakeFiles/shiri-bridge.dir/src/Shairport.cpp.o	1fc374ebd8a8a05
+21	1224	1763544632357283778	CMakeFiles/shiri-bridge.dir/src/main.cpp.o	ee92ab2d8fba132
+1228	1419	1763544632555321468	shiri-bridge	a425b0cd46cf044c
+19	729	1763544731368792486	CMakeFiles/shiri-bridge.dir/src/Shairport.cpp.o	1fc374ebd8a8a05
+18	1128	1763544731767063758	CMakeFiles/shiri-bridge.dir/src/main.cpp.o	ee92ab2d8fba132
+1131	1326	1763544731968782394	shiri-bridge	a425b0cd46cf044c

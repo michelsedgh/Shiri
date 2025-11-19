@@ -1,0 +1,4 @@
+/mnt/macos/Shiri/shiri-bridge/build/CMakeFiles/mdnssd.dir
+/mnt/macos/Shiri/shiri-bridge/build/CMakeFiles/shiri-bridge.dir
+/mnt/macos/Shiri/shiri-bridge/build/CMakeFiles/edit_cache.dir
+/mnt/macos/Shiri/shiri-bridge/build/CMakeFiles/rebuild_cache.dir
