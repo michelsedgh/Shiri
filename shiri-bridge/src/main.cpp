@@ -75,13 +75,12 @@ struct GroupInfo {
     std::vector<uint8_t> pendingBytes;
     std::thread streamerThread;
     bool streamerRunning = false;
-    bool prebufferFilled = false;
 };
 constexpr size_t kAudioBytesPerFrame = 4; // 16-bit stereo PCM
 constexpr size_t kFramesPerChunk = 352;   // RAOP default
 constexpr size_t kChunkBytes = kAudioBytesPerFrame * kFramesPerChunk;
-constexpr size_t kMaxQueuedChunks = 1024;      // ~8.0 seconds of audio buffering
-constexpr size_t kPrebufferChunks = 256;       // ~2.0 seconds initial buffer
+constexpr size_t kMaxQueuedChunks = 128;       // ~1.0 second of audio buffering (reduced)
+constexpr size_t kPrebufferChunks = 32;        // ~0.25 seconds initial buffer (reduced)
 
 std::map<std::string, SpeakerState> speakerStates;
 std::map<std::string, GroupInfo> groups;
@@ -114,7 +113,6 @@ void groupStreamerLoop(std::string groupName) {
         std::vector<uint8_t> chunk;
         std::vector<std::pair<std::string, RaopHostage*>> hostages;
         bool runningLocal = true;
-        bool waitingForPrebuffer = false;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             auto it = groups.find(groupName);
@@ -123,14 +121,9 @@ void groupStreamerLoop(std::string groupName) {
             }
             auto& group = it->second;
             auto& queue = group.chunkQueue;
-            if (!group.prebufferFilled) {
-                if (queue.size() >= kPrebufferChunks) {
-                    group.prebufferFilled = true;
-                } else {
-                    waitingForPrebuffer = true;
-                }
-            }
-            if (!waitingForPrebuffer && !queue.empty()) {
+
+            // Send audio immediately when available - RAOP protocol handles timing
+            if (!queue.empty()) {
                 chunk = std::move(queue.front());
                 queue.pop_front();
                 for (const auto& id : group.speakerIds) {

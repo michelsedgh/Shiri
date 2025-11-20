@@ -158,7 +158,7 @@ bool RaopHostage::attemptConnect(const struct in_addr& host,
               << ", et=" << (etPtr ? etPtr : "none") << ")\n";
 
     raop_ = raopcl_create(local_host, 0, 0, NULL, NULL,
-                          RAOP_ALAC, DEFAULT_FRAMES_PER_CHUNK, 88200,
+                          RAOP_ALAC, DEFAULT_FRAMES_PER_CHUNK, 22050,
                           cryptoMode, enableAuth, NULL, NULL,
                           const_cast<char*>(etPtr),
                           NULL,
