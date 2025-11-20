@@ -75,6 +75,7 @@ struct GroupInfo {
     std::vector<uint8_t> pendingBytes;
     std::thread streamerThread;
     bool streamerRunning = false;
+    uint64_t consecutiveSilenceChunks = 0;  // Track silence duration for robustness
 };
 constexpr size_t kAudioBytesPerFrame = 4; // 16-bit stereo PCM
 constexpr size_t kFramesPerChunk = 352;   // RAOP default
@@ -113,6 +114,7 @@ void groupStreamerLoop(std::string groupName) {
         std::vector<uint8_t> chunk;
         std::vector<std::pair<std::string, RaopHostage*>> hostages;
         bool runningLocal = true;
+        bool isSilenceChunk = false;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             auto it = groups.find(groupName);
@@ -126,6 +128,10 @@ void groupStreamerLoop(std::string groupName) {
             if (!queue.empty()) {
                 chunk = std::move(queue.front());
                 queue.pop_front();
+                // Log transition from silence to audio
+                if (group.consecutiveSilenceChunks > 0) {
+                    raopLog.add("Audio resumed after " + std::to_string(group.consecutiveSilenceChunks) + " silence chunks");
+                }
                 for (const auto& id : group.speakerIds) {
                     auto sit = speakerStates.find(id);
                     if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
@@ -133,7 +139,16 @@ void groupStreamerLoop(std::string groupName) {
                     }
                 }
             } else {
+                // Generate silence chunk to keep speakers alive during pauses
+                chunk.resize(kChunkBytes, 0); // Silent audio (all zeros)
+                isSilenceChunk = true;
                 runningLocal = group.streamerRunning;
+                for (const auto& id : group.speakerIds) {
+                    auto sit = speakerStates.find(id);
+                    if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
+                        hostages.emplace_back(id, sit->second.hostage.get());
+                    }
+                }
             }
         }
 
@@ -153,7 +168,7 @@ void groupStreamerLoop(std::string groupName) {
             }
         }
 
-        if (requeue) {
+        if (requeue && !isSilenceChunk) {  // Don't requeue silence chunks
             std::lock_guard<std::mutex> lock(stateMutex);
             auto it = groups.find(groupName);
             if (it != groups.end()) {
@@ -164,12 +179,55 @@ void groupStreamerLoop(std::string groupName) {
         }
 
         uint64_t chunkId = ++chunkCounter;
+
+        // Update silence tracking
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            auto it = groups.find(groupName);
+            if (it != groups.end()) {
+                if (isSilenceChunk) {
+                    it->second.consecutiveSilenceChunks++;
+                } else {
+                    it->second.consecutiveSilenceChunks = 0;
+                }
+            }
+        }
+
         for (const auto& [id, hostage] : hostages) {
             if (!hostage || !hostage->isConnected()) continue;
             if (!hostage->sendAudioChunk(chunk.data(), chunk.size())) {
-                raopLog.add("RAOP send failed: " + id);
-            } else if (chunkId <= 10 || chunkId % 500 == 0) {
+                raopLog.add("RAOP send failed: " + id + " - attempting reconnect");
+                // Attempt to reconnect the hostage
+                std::lock_guard<std::mutex> lock(stateMutex);
+                auto sit = speakerStates.find(id);
+                if (sit != speakerStates.end() && sit->second.hostage) {
+                    const auto& speaker = sit->second.info;
+                    if (!speaker.ip.empty() && speaker.port > 0) {
+                        sit->second.hostage->disconnect();
+                        if (sit->second.hostage->connect()) {
+                            raopLog.add("Reconnected hostage: " + id);
+                        } else {
+                            raopLog.add("Failed to reconnect hostage: " + id);
+                        }
+                    }
+                }
+            } else if (!isSilenceChunk && (chunkId <= 10 || chunkId % 500 == 0)) {
                 raopLog.add("Chunk #" + std::to_string(chunkId) + " sent to " + id);
+            } else if (isSilenceChunk && chunkId % 1000 == 0) {  // Less frequent logging for silence
+                raopLog.add("Silence chunk #" + std::to_string(chunkId) + " sent to " + id);
+            }
+        }
+
+        // Adaptive sleep timing based on silence duration
+        if (isSilenceChunk) {
+            // During long silence periods, use slightly longer sleep to reduce CPU usage
+            // but still maintain connection health
+            std::lock_guard<std::mutex> lock(stateMutex);
+            auto it = groups.find(groupName);
+            if (it != groups.end() && it->second.consecutiveSilenceChunks > 1000) {  // ~1 second of silence
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
@@ -585,6 +643,8 @@ bool createGroupFlow() {
                     queue.pop_front();
                 }
             }
+            // Reset silence counter when we receive real audio
+            groupIt->second.consecutiveSilenceChunks = 0;
         });
 
         process->start();
@@ -687,9 +747,24 @@ void inputLoop() {
         renderUI();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         
-        // Pulse hostages every 3 seconds (30 * 100ms)
+        // Pulse hostages with adaptive frequency based on silence duration
         pulseCounter++;
-        if (pulseCounter >= 30) {
+        bool shouldPulse = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            // Check if any group has been silent for a while
+            bool longSilence = false;
+            for (const auto& [name, group] : groups) {
+                if (group.consecutiveSilenceChunks > 500) {  // ~0.5 seconds of silence
+                    longSilence = true;
+                    break;
+                }
+            }
+            // Pulse every 3 seconds normally, every 1 second during long silence
+            shouldPulse = pulseCounter >= (longSilence ? 10 : 30);
+        }
+
+        if (shouldPulse) {
             pulseCounter = 0;
             std::lock_guard<std::mutex> lock(stateMutex);
             for (auto& [id, state] : speakerStates) {
