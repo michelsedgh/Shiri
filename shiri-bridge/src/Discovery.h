@@ -7,23 +7,16 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <map>
 
 #ifdef __APPLE__
 #include <dns_sd.h>
 #else
-extern "C" {
-#if defined(__has_include)
-#  if __has_include(<mdnssd/mdnssd.h>)
-#    include <mdnssd/mdnssd.h>
-#  elif __has_include("mdnssd.h")
-#    include "mdnssd.h"
-#  else
-#    error "mdnssd headers not found – install libmdns or vendor mdnssd.h"
-#  endif
-#else
-#  include <mdnssd/mdnssd.h>
-#endif
-}
+#include <avahi-client/client.h>
+#include <avahi-client/lookup.h>
+#include <avahi-common/simple-watch.h>
+#include <avahi-common/error.h>
+#include <avahi-common/address.h>
 #endif
 
 struct Speaker {
@@ -32,6 +25,10 @@ struct Speaker {
     int port = 0;
     std::string id;
     std::string hostname;
+    std::map<std::string, std::string> txtRecords;
+    std::string et;
+    bool requiresAuth = false;
+    bool passwordRequired = false;
 };
 
 class Discovery {
@@ -43,6 +40,7 @@ public:
 
     void start(Callback callback);
     void stop();
+    bool isRunning() const;
 
 private:
     void run();
@@ -78,19 +76,64 @@ private:
 
     void handleResolved(const std::string& fullname,
                         const std::string& hosttarget,
+                        const std::string& ip,
                         uint16_t port,
-                        const unsigned char* txtRecord,
-                        uint16_t txtLen);
+                        const std::map<std::string, std::string>& txtRecords);
 
     void removeService(const std::string& fullname);
     static std::string makeFullName(const std::string& serviceName,
                                     const std::string& regtype,
                                     const std::string& domain);
-    std::map<std::string, Speaker> speakers_;
 #else
-    mdnssd_handle_s* handle_;
+    AvahiSimplePoll* poll_;
+    AvahiClient* client_;
+    AvahiServiceBrowser* browser_;
+
+    static void clientCallback(AvahiClient* c, AvahiClientState state, void* userdata);
+    static void browseCallback(AvahiServiceBrowser* b,
+                               AvahiIfIndex interface,
+                               AvahiProtocol protocol,
+                               AvahiBrowserEvent event,
+                               const char* name,
+                               const char* type,
+                               const char* domain,
+                               AvahiLookupResultFlags flags,
+                               void* userdata);
+    static void resolveCallback(AvahiServiceResolver* r,
+                                AvahiIfIndex interface,
+                                AvahiProtocol protocol,
+                                AvahiResolverEvent event,
+                                const char* name,
+                                const char* type,
+                                const char* domain,
+                                const char* host_name,
+                                const AvahiAddress* address,
+                                uint16_t port,
+                                AvahiStringList* txt,
+                                AvahiLookupResultFlags flags,
+                                void* userdata);
+
+    void handleResolved(const std::string& fullname,
+                        const std::string& hosttarget,
+                        const std::string& ip,
+                        uint16_t port,
+                        const std::map<std::string, std::string>& txtRecords);
+    void removeService(const std::string& fullname);
+    static std::string makeFullName(const char* serviceName,
+                                    const char* regtype,
+                                    const char* domain);
+    void cleanupAvahi();
 #endif
 
+    static std::map<std::string, std::string> parseTxtRecord(const unsigned char* txtRecord,
+                                                             uint16_t txtLen);
+#ifndef __APPLE__
+    static std::map<std::string, std::string> parseTxtRecord(AvahiStringList* txt);
+#endif
+    static void applyTxtMetadata(Speaker& speaker,
+                                 const std::map<std::string, std::string>& txtRecords);
+
+    std::map<std::string, Speaker> speakers_;
     std::atomic<bool> running_;
     std::thread thread_;
     Callback callback_;

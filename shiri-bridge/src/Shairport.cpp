@@ -31,6 +31,10 @@ void Shairport::stop() {
     }
 }
 
+void Shairport::setCallback(AudioCallback callback) {
+    callback_ = std::move(callback);
+}
+
 uint64_t Shairport::bytesReceived() const {
     return bytesReceived_.load();
 }
@@ -44,7 +48,12 @@ int64_t Shairport::millisSinceLastChunk() const {
     if (last == 0) {
         return -1;
     }
-    return nowMillis() - last;
+    // To maintain const correctness we can't call the non-const nowMillis().
+    // But nowMillis() doesn't modify state, it just reads the clock.
+    // So let's manually get the time here or make nowMillis static/const.
+    using namespace std::chrono;
+    int64_t now = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    return now - last;
 }
 
 int64_t Shairport::nowMillis() {
@@ -107,13 +116,16 @@ void Shairport::run() {
         pipe_ = fdopen(pipefd[0], "r");
         
         // Read from pipe
-        std::vector<char> buffer(4096);
+        std::vector<uint8_t> buffer(4096);
         while (running_) {
             size_t n = fread(buffer.data(), 1, buffer.size(), pipe_);
             if (n == 0) break;
+
             // Process audio data
-            // For now, just drop it or log size
-            // std::cout << "Received " << n << " bytes from shairport" << std::endl;
+            if (callback_) {
+                callback_(buffer.data(), n);
+            }
+            
             bytesReceived_ += n;
             lastChunkBytes_.store(n, std::memory_order_relaxed);
             lastChunkMillis_.store(nowMillis(), std::memory_order_relaxed);

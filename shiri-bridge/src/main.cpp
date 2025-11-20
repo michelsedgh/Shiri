@@ -13,19 +13,57 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <deque>
 
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
 
+// --- Libraop Globals Definition ---
+extern "C" {
+#include "cross_log.h"
+#include "cross_net.h"
+#include "cross_ssl.h"
+}
+
+// These globals are required by libraop/cross_net linkage
+extern "C" {
+    log_level util_loglevel = lERROR; // Default to ERROR to keep TUI clean
+    log_level raop_loglevel = lWARN;
+    log_level main_log = lERROR;
+    log_level *loglevel = &main_log;
+}
+// ----------------------------------
+
 #include "Discovery.h"
 #include "Shairport.h"
+#include "RaopHostage.h"
+
+// Log window for debugging RAOP issues
+struct LogWindow {
+    std::deque<std::string> lines;
+    std::mutex mutex;
+    
+    void add(const std::string& msg) {
+        std::lock_guard<std::mutex> lock(mutex);
+        lines.push_back(msg);
+        if (lines.size() > 5) lines.pop_front(); // Keep last 5 messages
+    }
+    
+    std::vector<std::string> getRecent() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::vector<std::string>(lines.begin(), lines.end());
+    }
+};
+
+LogWindow raopLog;
 
 struct SpeakerState {
     Speaker info;
     bool connected = false;
     bool reserved = false;
+    std::unique_ptr<RaopHostage> hostage;
 };
 
 struct GroupInfo {
@@ -33,11 +71,23 @@ struct GroupInfo {
     int port = 0;
     std::vector<std::string> speakerIds;
     std::unique_ptr<Shairport> process;
+    std::deque<std::vector<uint8_t>> chunkQueue;
+    std::vector<uint8_t> pendingBytes;
+    std::thread streamerThread;
+    bool streamerRunning = false;
+    bool prebufferFilled = false;
 };
+constexpr size_t kAudioBytesPerFrame = 4; // 16-bit stereo PCM
+constexpr size_t kFramesPerChunk = 352;   // RAOP default
+constexpr size_t kChunkBytes = kAudioBytesPerFrame * kFramesPerChunk;
+constexpr size_t kMaxQueuedChunks = 1024;      // ~8.0 seconds of audio buffering
+constexpr size_t kPrebufferChunks = 256;       // ~2.0 seconds initial buffer
 
 std::map<std::string, SpeakerState> speakerStates;
 std::map<std::string, GroupInfo> groups;
 std::mutex stateMutex;
+std::atomic<uint64_t> chunkCounter{0};
+void groupStreamerLoop(std::string groupName);
 
 std::string statusMessage;
 std::mutex statusMutex;
@@ -59,11 +109,92 @@ void setStatusMessage(const std::string& message) {
     uiDirty = true;
 }
 
+void groupStreamerLoop(std::string groupName) {
+    while (true) {
+        std::vector<uint8_t> chunk;
+        std::vector<std::pair<std::string, RaopHostage*>> hostages;
+        bool runningLocal = true;
+        bool waitingForPrebuffer = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            auto it = groups.find(groupName);
+            if (it == groups.end() || !it->second.streamerRunning) {
+                break;
+            }
+            auto& group = it->second;
+            auto& queue = group.chunkQueue;
+            if (!group.prebufferFilled) {
+                if (queue.size() >= kPrebufferChunks) {
+                    group.prebufferFilled = true;
+                } else {
+                    waitingForPrebuffer = true;
+                }
+            }
+            if (!waitingForPrebuffer && !queue.empty()) {
+                chunk = std::move(queue.front());
+                queue.pop_front();
+                for (const auto& id : group.speakerIds) {
+                    auto sit = speakerStates.find(id);
+                    if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
+                        hostages.emplace_back(id, sit->second.hostage.get());
+                    }
+                }
+            } else {
+                runningLocal = group.streamerRunning;
+            }
+        }
+
+        if (chunk.empty()) {
+            if (!runningLocal) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        bool requeue = false;
+        for (const auto& [id, hostage] : hostages) {
+            if (!hostage || !hostage->isConnected()) continue;
+            if (!hostage->waitForFramesReady()) {
+                raopLog.add("Hostage not ready yet: " + id);
+                requeue = true;
+                break;
+            }
+        }
+
+        if (requeue) {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            auto it = groups.find(groupName);
+            if (it != groups.end()) {
+                it->second.chunkQueue.emplace_front(std::move(chunk));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        uint64_t chunkId = ++chunkCounter;
+        for (const auto& [id, hostage] : hostages) {
+            if (!hostage || !hostage->isConnected()) continue;
+            if (!hostage->sendAudioChunk(chunk.data(), chunk.size())) {
+                raopLog.add("RAOP send failed: " + id);
+            } else if (chunkId <= 10 || chunkId % 500 == 0) {
+                raopLog.add("Chunk #" + std::to_string(chunkId) + " sent to " + id);
+            }
+        }
+    }
+    raopLog.add("Streamer exited for group " + groupName);
+}
+
 void getTerminalSize(int& rows, int& cols) {
     struct winsize w { };
-    ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
-    rows = w.ws_row;
-    cols = w.ws_col;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1) {
+        // Fallback if ioctl fails
+        const char* env_cols = getenv("COLUMNS");
+        const char* env_lines = getenv("LINES");
+        cols = env_cols ? std::atoi(env_cols) : 80;
+        rows = env_lines ? std::atoi(env_lines) : 24;
+    } else {
+        rows = w.ws_row;
+        cols = w.ws_col;
+    }
 }
 
 void clearScreen() {
@@ -160,6 +291,7 @@ struct SpeakerSnapshot {
     int port = 0;
     bool connected = false;
     bool reserved = false;
+    bool hostage = false;
 };
 
 std::string formatBytes(uint64_t bytes) {
@@ -202,6 +334,7 @@ void renderUI() {
 
     std::vector<GroupSnapshot> groupData;
     std::vector<SpeakerSnapshot> speakerData;
+    auto recentLogs = raopLog.getRecent();
     {
         std::lock_guard<std::mutex> lock(stateMutex);
         for (const auto& [name, group] : groups) {
@@ -231,6 +364,7 @@ void renderUI() {
             snap.port = state.info.port;
             snap.connected = state.connected;
             snap.reserved = state.reserved;
+            snap.hostage = (state.hostage != nullptr && state.hostage->isConnected());
             speakerData.push_back(std::move(snap));
         }
     }
@@ -248,8 +382,9 @@ void renderUI() {
     for (int i = 0; i < cols; ++i) std::cout << '=';
 
     int panelWidth = cols - 4;
-    int groupPanelHeight = (rows - 10) / 2;
-    int speakerPanelHeight = rows - 10 - groupPanelHeight;
+    int groupPanelHeight = (rows - 13) / 2; // Reserve space for log
+    int speakerPanelHeight = rows - 13 - groupPanelHeight;
+    int logPanelHeight = 5;
 
     drawBox(4, 2, panelWidth, groupPanelHeight, "Groups");
     int groupY = 5;
@@ -296,11 +431,22 @@ void renderUI() {
             std::string badge = sp.connected ? (GREEN + "[ON]" + RESET)
                                              : (RED + "[OFF]" + RESET);
             std::cout << badge << ' ' << sp.name;
+            if (sp.hostage) {
+                std::cout << RED << " [HOSTAGE]" << RESET;
+            }
             setCursor(speakerY++, 6);
             std::cout << sp.ip << ':' << sp.port
                       << (sp.reserved ? "  (locked)" : "  (free)");
             speakerY++;
         }
+    }
+
+    int logPanelTop = speakerPanelTop + speakerPanelHeight + 1;
+    drawBox(logPanelTop, 2, panelWidth, logPanelHeight, "RAOP Logs");
+    int logY = logPanelTop + 1;
+    for (size_t i = 0; i < recentLogs.size() && logY < logPanelTop + logPanelHeight; ++i) {
+        setCursor(logY++, 4);
+        std::cout << recentLogs[i];
     }
 
     setCursor(rows - 3, 1);
@@ -410,9 +556,49 @@ bool createGroupFlow() {
         }
         info.port = port;
         info.speakerIds = chosenIds;
-        info.process = std::make_unique<Shairport>(name, info.port);
-        info.process->start();
+        
+        // Connect hostages for speakers in this group
+        for (const auto& id : chosenIds) {
+            auto it = speakerStates.find(id);
+            if (it != speakerStates.end() && !it->second.hostage) {
+                const auto& speaker = it->second.info;
+                if (!speaker.ip.empty() && speaker.ip != "0.0.0.0" && speaker.port > 0) {
+                    it->second.hostage = std::make_unique<RaopHostage>(
+                        speaker.ip, speaker.port, speaker.id, speaker.et, speaker.requiresAuth);
+                    if (it->second.hostage->connect()) {
+                        raopLog.add("Connected: " + speaker.id + " (group: " + name + ")");
+                    } else {
+                        raopLog.add("Failed to connect: " + speaker.id + " (group: " + name + ")");
+                    }
+                }
+            }
+        }
+
+        auto process = std::make_unique<Shairport>(name, info.port);
+        process->setCallback([groupName = name](const uint8_t* data, size_t size) {
+            if (size == 0) return;
+            std::lock_guard<std::mutex> lock(stateMutex);
+            auto groupIt = groups.find(groupName);
+            if (groupIt == groups.end()) return;
+            auto& pending = groupIt->second.pendingBytes;
+            auto& queue = groupIt->second.chunkQueue;
+            pending.insert(pending.end(), data, data + size);
+            while (pending.size() >= kChunkBytes) {
+                std::vector<uint8_t> chunk(kChunkBytes);
+                std::copy_n(pending.begin(), kChunkBytes, chunk.begin());
+                queue.emplace_back(std::move(chunk));
+                pending.erase(pending.begin(), pending.begin() + kChunkBytes);
+                if (queue.size() > kMaxQueuedChunks) {
+                    queue.pop_front();
+                }
+            }
+        });
+
+        process->start();
+        info.process = std::move(process);
+        info.streamerRunning = true;
         groups[name] = std::move(info);
+        groups[name].streamerThread = std::thread(groupStreamerLoop, name);
         for (const auto& id : chosenIds) {
             speakerStates[id].reserved = true;
         }
@@ -438,6 +624,9 @@ void deleteGroupFlow() {
         return;
     }
 
+    std::thread streamer;
+    std::unique_ptr<Shairport> processToStop;
+    std::vector<std::string> speakers;
     {
         std::lock_guard<std::mutex> lock(stateMutex);
         auto it = groups.find(name);
@@ -446,16 +635,39 @@ void deleteGroupFlow() {
             setNonCanonicalMode(true);
             return;
         }
+        it->second.streamerRunning = false;
+        if (it->second.streamerThread.joinable()) {
+            streamer = std::move(it->second.streamerThread);
+        }
         if (it->second.process) {
-            it->second.process->stop();
+            processToStop = std::move(it->second.process);
         }
-        for (const auto& id : it->second.speakerIds) {
-            auto sit = speakerStates.find(id);
-            if (sit != speakerStates.end()) {
-                sit->second.reserved = false;
+        speakers = it->second.speakerIds;
+    }
+
+    if (streamer.joinable()) {
+        streamer.join();
+    }
+    if (processToStop) {
+        processToStop->stop();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        auto it = groups.find(name);
+        if (it != groups.end()) {
+            for (const auto& id : speakers) {
+                auto sit = speakerStates.find(id);
+                if (sit != speakerStates.end()) {
+                    sit->second.reserved = false;
+                    if (sit->second.hostage) {
+                        sit->second.hostage.reset();
+                        raopLog.add("Disconnected (group deleted): " + id);
+                    }
+                }
             }
+            groups.erase(it);
         }
-        groups.erase(it);
     }
 
     setStatusMessage("Group '" + name + "' deleted.");
@@ -463,6 +675,7 @@ void deleteGroupFlow() {
 }
 
 void inputLoop() {
+    int pulseCounter = 0;
     while (running) {
         if (kbhit() > 0) {
             int ch = getch();
@@ -480,10 +693,50 @@ void inputLoop() {
         }
         renderUI();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Pulse hostages every 3 seconds (30 * 100ms)
+        pulseCounter++;
+        if (pulseCounter >= 30) {
+            pulseCounter = 0;
+            std::lock_guard<std::mutex> lock(stateMutex);
+            for (auto& [id, state] : speakerStates) {
+                if (state.hostage) {
+                    state.hostage->pulse();
+                    uiDirty = true; // Update UI to reflect potential connection status changes
+                }
+            }
+        }
     }
 }
 
+#include <signal.h>
+
+void signalHandler(int signum) {
+    std::cerr << "Caught signal " << signum << ", cleaning up..." << std::endl;
+    running = false;
+}
+
 int main() {
+    // Disable OpenSSL hardware acceleration capability detection on ARM to prevent SIGILL in VM
+    // This is a known issue when running Aarch64 code in some virtualized environments
+    setenv("OPENSSL_armcap", "0", 1);
+
+    signal(SIGSEGV, signalHandler);
+    signal(SIGILL, signalHandler);
+    signal(SIGINT, signalHandler);
+
+    // Initialize platform specifics for libraop
+    std::cerr << "Initializing platform..." << std::endl;
+    netsock_init();
+
+    // Initialize SSL/Crypto subsystem (Required for RAOP to work)
+    std::cerr << "Loading SSL libraries..." << std::endl;
+    if (!cross_ssl_load()) {
+         std::cerr << RED << "Fatal: Failed to load SSL libraries." << RESET << std::endl;
+         return 1;
+    }
+    std::cerr << "Platform initialization complete." << std::endl;
+
     setNonCanonicalMode(true);
     std::cout << "\033[?25l"; // hide cursor
 
@@ -498,14 +751,28 @@ int main() {
             state.connected = true;
             seen.push_back(speaker.id);
         }
-        // Mark speakers not in current snapshot as offline (they remain reserved if locked)
+        // Mark speakers not in current snapshot as offline
         for (auto& [id, state] : speakerStates) {
             if (std::find(seen.begin(), seen.end(), id) == seen.end()) {
                 state.connected = false;
+                // Disconnect hostage when speaker goes offline
+                if (state.hostage) {
+                    state.hostage.reset();
+                    raopLog.add("Disconnected (offline): " + id);
+                }
             }
         }
         uiDirty = true;
     });
+
+    // Check if discovery actually started
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (!discovery.isRunning()) {
+        setNonCanonicalMode(false);
+        std::cout << "\033[?25h";
+        std::cerr << RED << "Fatal: Discovery failed to start (mDNS init failed)." << RESET << std::endl;
+        return 1;
+    }
 
     setStatusMessage("Ready.");
     uiDirty = true;
@@ -515,6 +782,20 @@ int main() {
     running = false;
     discovery.stop();
 
+    std::vector<std::thread> streamerJoins;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        for (auto& [name, group] : groups) {
+            group.streamerRunning = false;
+            if (group.streamerThread.joinable()) {
+                streamerJoins.push_back(std::move(group.streamerThread));
+            }
+        }
+    }
+    for (auto& t : streamerJoins) {
+        if (t.joinable()) t.join();
+    }
+
     {
         std::lock_guard<std::mutex> lock(stateMutex);
         for (auto& [name, group] : groups) {
@@ -522,7 +803,15 @@ int main() {
                 group.process->stop();
             }
         }
+        // Release hostages
+        for (auto& [id, state] : speakerStates) {
+            state.hostage.reset();
+        }
     }
+    
+    // Cleanup platform
+    cross_ssl_free();
+    netsock_close();
 
     setNonCanonicalMode(false);
     std::cout << "\033[?25h"; // show cursor

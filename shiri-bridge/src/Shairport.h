@@ -1,26 +1,28 @@
 #pragma once
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
+
 #include <string>
+#include <atomic>
 #include <thread>
-#include <vector>
+#include <functional>
 
 class Shairport {
 public:
+    using AudioCallback = std::function<void(const uint8_t* data, size_t size)>;
+
     Shairport(const std::string& groupName, int port);
     ~Shairport();
 
     void start();
     void stop();
+    void setCallback(AudioCallback callback);
 
     uint64_t bytesReceived() const;
     uint64_t lastChunkBytes() const;
     int64_t millisSinceLastChunk() const;
 
 private:
-    static int64_t nowMillis();
     void run();
+    int64_t nowMillis();
 
     std::string groupName_;
     int port_;
@@ -28,7 +30,10 @@ private:
     std::thread thread_;
     FILE* pipe_;
     pid_t pid_;
+
     std::atomic<uint64_t> bytesReceived_{0};
     std::atomic<uint64_t> lastChunkBytes_{0};
     std::atomic<int64_t> lastChunkMillis_{0};
+
+    AudioCallback callback_;
 };
