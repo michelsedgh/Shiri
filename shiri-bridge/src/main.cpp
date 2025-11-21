@@ -81,8 +81,7 @@ struct GroupInfo {
 constexpr size_t kAudioBytesPerFrame = 4; // 16-bit stereo PCM
 constexpr size_t kFramesPerChunk = 352;   // RAOP default
 constexpr size_t kChunkBytes = kAudioBytesPerFrame * kFramesPerChunk;
-constexpr size_t kMaxQueuedChunks = 128;       // ~1.0 second of audio buffering (reduced)
-constexpr size_t kPrebufferChunks = 32;        // ~0.25 seconds initial buffer (reduced)
+constexpr size_t kMaxQueuedChunks = 16;        // ~0.14 seconds of headroom (minimize buffering)
 
 std::map<std::string, SpeakerState> speakerStates;
 std::map<std::string, GroupInfo> groups;
