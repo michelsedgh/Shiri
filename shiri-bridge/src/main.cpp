@@ -69,6 +69,7 @@ struct SpeakerState {
 struct GroupInfo {
     std::string name;
     int port = 0;
+    std::string parentInterface; // network interface used for this group's AirPlay 2 netns
     std::vector<std::string> speakerIds;
     std::unique_ptr<Shairport> process;
     std::deque<std::vector<uint8_t>> chunkQueue;
@@ -595,6 +596,55 @@ bool createGroupFlow() {
         return false;
     }
 
+    // Step 3: Choose parent network interface for this group's AirPlay 2 instance
+    std::vector<std::string> interfaces;
+    {
+        FILE* fp = popen("ip -o link show | awk -F': ' '($2!=\"lo\") {print $2}'", "r");
+        if (fp) {
+            char buf[256];
+            while (fgets(buf, sizeof(buf), fp)) {
+                std::string name(buf);
+                // strip trailing newline
+                if (!name.empty() && name.back() == '\n') name.pop_back();
+                if (!name.empty()) interfaces.push_back(name);
+            }
+            pclose(fp);
+        }
+    }
+
+    if (interfaces.empty()) {
+        setStatusMessage("No network interfaces available for AirPlay 2.");
+        setNonCanonicalMode(true);
+        return false;
+    }
+
+    std::cout << "Select parent network interface for AirPlay 2 instance:\n";
+    for (size_t i = 0; i < interfaces.size(); ++i) {
+        std::cout << "  [" << i << "] " << interfaces[i] << "\n";
+    }
+    std::cout << "> " << std::flush;
+
+    std::string ifaceChoiceLine;
+    std::getline(std::cin, ifaceChoiceLine);
+    if (ifaceChoiceLine.empty()) {
+        setStatusMessage("No interface selected.");
+        setNonCanonicalMode(true);
+        return false;
+    }
+    size_t ifaceIndex = static_cast<size_t>(-1);
+    try {
+        ifaceIndex = static_cast<size_t>(std::stoul(ifaceChoiceLine));
+    } catch (const std::exception&) {
+        ifaceIndex = static_cast<size_t>(-1);
+    }
+    if (ifaceIndex >= interfaces.size()) {
+        setStatusMessage("Invalid interface selection.");
+        setNonCanonicalMode(true);
+        return false;
+    }
+
+    std::string parentInterface = interfaces[ifaceIndex];
+
     {
         std::lock_guard<std::mutex> lock(stateMutex);
         GroupInfo info;
@@ -606,6 +656,7 @@ bool createGroupFlow() {
             return false;
         }
         info.port = port;
+        info.parentInterface = parentInterface;
         info.speakerIds = chosenIds;
         
         // Connect hostages for speakers in this group
@@ -625,7 +676,7 @@ bool createGroupFlow() {
             }
         }
 
-        auto process = std::make_unique<Shairport>(name, info.port);
+        auto process = std::make_unique<Shairport>(name, info.port, info.parentInterface);
         process->setCallback([groupName = name](const uint8_t* data, size_t size) {
             if (size == 0) return;
             std::lock_guard<std::mutex> lock(stateMutex);

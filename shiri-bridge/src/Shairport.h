@@ -9,7 +9,7 @@ class Shairport {
 public:
     using AudioCallback = std::function<void(const uint8_t* data, size_t size)>;
 
-    Shairport(const std::string& groupName, int port);
+    Shairport(const std::string& groupName, int port, const std::string& parentInterface);
     ~Shairport();
 
     void start();
@@ -26,6 +26,7 @@ private:
 
     std::string groupName_;
     int port_;
+    std::string parentInterface_;
     std::atomic<bool> running_;
     std::thread thread_;
     FILE* pipe_;
