@@ -32,6 +32,13 @@
 #define CLONE_NEWNS 0x00020000
 #endif
 
+#ifndef MS_REC
+#define MS_REC 16384
+#endif
+#ifndef MS_PRIVATE
+#define MS_PRIVATE (1 << 18)
+#endif
+
 extern "C" int setns(int fd, int nstype);
 extern "C" int unshare(int flags);
 
@@ -200,6 +207,11 @@ void Shairport::run() {
         // Create a private mount namespace for /run.
         if (unshare(CLONE_NEWNS) == -1) {
             perror("unshare(CLONE_NEWNS)");
+            _exit(1);
+        }
+
+        if (mount("none", "/run", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1) {
+            perror("mount --make-rprivate /run");
             _exit(1);
         }
 

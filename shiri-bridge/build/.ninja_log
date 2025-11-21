@@ -42,3 +42,6 @@
 297	6052	1763720624703985844	CMakeFiles/shiri-bridge.dir/src/RaopHostage.cpp.o	31f169b6da15a869
 321	13284	1763720784563905430	CMakeFiles/shiri-bridge.dir/src/main.cpp.o	d43534d81f74758e
 13289	13725	1763720785008501675	shiri-bridge	57e4a6711e0b394a
+291	5015	1763732990276960287	CMakeFiles/shiri-bridge.dir/src/Shairport.cpp.o	5ebe2580ac4d3e5d
+290	7986	1763732993246035906	CMakeFiles/shiri-bridge.dir/src/main.cpp.o	d43534d81f74758e
+7989	8392	1763732993650722137	shiri-bridge	57e4a6711e0b394a
