@@ -65,6 +65,7 @@ add_executable(shiri-bridge
     ${SRC_DIR}/Discovery.cpp
     ${SRC_DIR}/Shairport.cpp
     ${SRC_DIR}/RaopHostage.cpp
+    ${SRC_DIR}/Tui.cpp
 )
 
 # Include libraop headers and its dependencies (mdnssd)

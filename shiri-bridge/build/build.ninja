@@ -76,6 +76,14 @@ build CMakeFiles/shiri-bridge.dir/src/RaopHostage.cpp.o: CXX_COMPILER__shiri-bri
   OBJECT_DIR = CMakeFiles/shiri-bridge.dir
   OBJECT_FILE_DIR = CMakeFiles/shiri-bridge.dir/src
 
+build CMakeFiles/shiri-bridge.dir/src/Tui.cpp.o: CXX_COMPILER__shiri-bridge_ /mnt/macos/Shiri/shiri-bridge/src/Tui.cpp || cmake_object_order_depends_target_shiri-bridge
+  DEFINES = -DNDEBUG -D_GNU_SOURCE
+  DEP_FILE = CMakeFiles/shiri-bridge.dir/src/Tui.cpp.o.d
+  FLAGS = -std=c++20
+  INCLUDES = -I/mnt/macos/Shiri/shiri-bridge/src -I/mnt/macos/Shiri/shiri-bridge/third_party -I/mnt/macos/Shiri/shiri-bridge/../libraop/src -I/mnt/macos/Shiri/libraop/libopenssl/targets/linux/aarch64/include -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/addons -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/alac -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/faad -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/faac -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/flac -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/mad -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/ogg -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/opus -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/opusfile -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/opusenc -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/opusurl -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/shine -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/soxr -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/utf8 -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/vorbis -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/vorbisenc -I/mnt/macos/Shiri/libraop/libcodecs/targets/include/vorbisfile -I/mnt/macos/Shiri/libraop/libmdns/targets/include/mdnssvc -I/mnt/macos/Shiri/libraop/libmdns/targets/include/mdnssd -I/mnt/macos/Shiri/libraop/. -I/mnt/macos/Shiri/libraop/src -I/mnt/macos/Shiri/libraop/crosstools/src -I/mnt/macos/Shiri/libraop/dmap-parser
+  OBJECT_DIR = CMakeFiles/shiri-bridge.dir
+  OBJECT_FILE_DIR = CMakeFiles/shiri-bridge.dir/src
+
 
 # =============================================================================
 # Link build statements for EXECUTABLE target shiri-bridge
@@ -84,7 +92,7 @@ build CMakeFiles/shiri-bridge.dir/src/RaopHostage.cpp.o: CXX_COMPILER__shiri-bri
 #############################################
 # Link the executable shiri-bridge
 
-build shiri-bridge: CXX_EXECUTABLE_LINKER__shiri-bridge_ CMakeFiles/shiri-bridge.dir/src/main.cpp.o CMakeFiles/shiri-bridge.dir/src/Discovery.cpp.o CMakeFiles/shiri-bridge.dir/src/Shairport.cpp.o CMakeFiles/shiri-bridge.dir/src/RaopHostage.cpp.o | libraop/libraop_lib.a /mnt/macos/Shiri/libraop/libopenssl/targets/linux/aarch64/libopenssl.a /mnt/macos/Shiri/libraop/libcodecs/targets/linux/aarch64/libcodecs.a /mnt/macos/Shiri/libraop/libmdns/targets/linux/aarch64/libmdns.a || libraop/libraop_lib.a
+build shiri-bridge: CXX_EXECUTABLE_LINKER__shiri-bridge_ CMakeFiles/shiri-bridge.dir/src/main.cpp.o CMakeFiles/shiri-bridge.dir/src/Discovery.cpp.o CMakeFiles/shiri-bridge.dir/src/Shairport.cpp.o CMakeFiles/shiri-bridge.dir/src/RaopHostage.cpp.o CMakeFiles/shiri-bridge.dir/src/Tui.cpp.o | libraop/libraop_lib.a /mnt/macos/Shiri/libraop/libopenssl/targets/linux/aarch64/libopenssl.a /mnt/macos/Shiri/libraop/libcodecs/targets/linux/aarch64/libcodecs.a /mnt/macos/Shiri/libraop/libmdns/targets/linux/aarch64/libmdns.a || libraop/libraop_lib.a
   LINK_LIBRARIES = -lavahi-common  -lavahi-client  libraop/libraop_lib.a  -lpthread  /mnt/macos/Shiri/libraop/libopenssl/targets/linux/aarch64/libopenssl.a  /mnt/macos/Shiri/libraop/libcodecs/targets/linux/aarch64/libcodecs.a  /mnt/macos/Shiri/libraop/libmdns/targets/linux/aarch64/libmdns.a  -lstdc++  -lm  -lpthread  -ldl
   OBJECT_DIR = CMakeFiles/shiri-bridge.dir
   POST_BUILD = :

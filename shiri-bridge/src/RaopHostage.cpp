@@ -1,11 +1,13 @@
 #include "RaopHostage.h"
 // Include C++ standard headers BEFORE raop_client.h to prevent macro collisions (min/max)
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <memory>
 #include <cctype>
 #include <chrono>
 #include <thread>
+#include "Tui.h"
 
 extern "C" {
 #include "raop_client.h"
@@ -65,11 +67,13 @@ bool RaopHostage::connect() {
             return true;
         }
 
-        std::cerr << "[RaopHostage] RAOP connect failed for " << id_
-                  << " in auth mode " << (authFlag ? "ON" : "OFF") << std::endl;
+        std::ostringstream oss;
+        oss << "[RaopHostage] RAOP connect failed for " << id_
+            << " in auth mode " << (authFlag ? "ON" : "OFF");
+        Tui::AppendRaopLog(oss.str());
     }
 
-    std::cerr << "[RaopHostage] Exhausted all connection strategies for " << id_ << std::endl;
+    Tui::AppendRaopLog("[RaopHostage] Exhausted all connection strategies for " + id_);
     return false;
 }
 
@@ -152,10 +156,14 @@ bool RaopHostage::attemptConnect(const struct in_addr& host,
 
     const char* etPtr = etValue.empty() ? nullptr : etValue.c_str();
 
-    std::cerr << "[RaopHostage] Creating RAOP client for " << id_
-              << " (auth=" << (authFlag ? "ON" : "OFF")
-              << ", crypto=" << (cryptoMode == RAOP_RSA ? "RSA" : "CLEAR")
-              << ", et=" << (etPtr ? etPtr : "none") << ")\n";
+    {
+        std::ostringstream oss;
+        oss << "[RaopHostage] Creating RAOP client for " << id_
+            << " (auth=" << (authFlag ? "ON" : "OFF")
+            << ", crypto=" << (cryptoMode == RAOP_RSA ? "RSA" : "CLEAR")
+            << ", et=" << (etPtr ? etPtr : "none") << ")";
+        Tui::AppendRaopLog(oss.str());
+    }
 
     raop_ = raopcl_create(local_host, 0, 0, NULL, NULL,
                           RAOP_ALAC, DEFAULT_FRAMES_PER_CHUNK, 22050,
@@ -165,17 +173,25 @@ bool RaopHostage::attemptConnect(const struct in_addr& host,
                           44100, 16, 2, 0.0f);
 
     if (!raop_) {
-        std::cerr << "[RaopHostage] raopcl_create failed for " << id_ << std::endl;
+        Tui::AppendRaopLog("[RaopHostage] raopcl_create failed for " + id_);
         return false;
     }
 
-    std::cerr << "[RaopHostage] Attempting RAOP protocol connect to " << id_
-              << " at " << ip_ << ":" << port_
-              << " (auth=" << (authFlag ? "ON" : "OFF") << ")\n";
+    {
+        std::ostringstream oss;
+        oss << "[RaopHostage] Attempting RAOP protocol connect to " << id_
+            << " at " << ip_ << ":" << port_
+            << " (auth=" << (authFlag ? "ON" : "OFF") << ")";
+        Tui::AppendRaopLog(oss.str());
+    }
 
     if (!raopcl_connect(raop_, host, static_cast<uint16_t>(port_), true)) {
-        std::cerr << "[RaopHostage] RAOP protocol connect failed for " << id_
-                  << " (auth=" << (authFlag ? "ON" : "OFF") << ")\n";
+        {
+            std::ostringstream oss;
+            oss << "[RaopHostage] RAOP protocol connect failed for " << id_
+                << " (auth=" << (authFlag ? "ON" : "OFF") << ")";
+            Tui::AppendRaopLog(oss.str());
+        }
         raopcl_destroy(raop_);
         raop_ = nullptr;
         return false;
@@ -183,26 +199,29 @@ bool RaopHostage::attemptConnect(const struct in_addr& host,
 
     connected_ = true;
     lastAuthUsed_ = authFlag;
-    std::cerr << "[RaopHostage] RAOP connect succeeded for " << id_
-              << " (auth=" << (authFlag ? "ON" : "OFF") << ")\n";
+    {
+        std::ostringstream oss;
+        oss << "[RaopHostage] RAOP connect succeeded for " << id_
+            << " (auth=" << (authFlag ? "ON" : "OFF") << ")";
+        Tui::AppendRaopLog(oss.str());
+    }
     return true;
 }
 
 bool RaopHostage::ensureReachable(struct in_addr& host) {
     if (inet_aton(ip_.c_str(), &host) == 0) {
-        std::cerr << "Invalid IP: " << ip_ << std::endl;
+        Tui::AppendRaopLog("Invalid IP: " + ip_);
         return false;
     }
     if (host.s_addr == INADDR_ANY) {
-        std::cerr << "Skipping RAOP connect to INADDR_ANY for " << id_ << std::endl;
+        Tui::AppendRaopLog("Skipping RAOP connect to INADDR_ANY for " + id_);
         return false;
     }
 
-    std::cerr << "Testing TCP reachability for " << id_
-              << " at " << ip_ << ":" << port_ << std::endl;
+    Tui::AppendRaopLog("Testing TCP reachability for " + id_ + " at " + ip_ + ":" + std::to_string(port_));
     int test_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (test_sock < 0) {
-        std::cerr << "Failed to create test socket for " << id_ << std::endl;
+        Tui::AppendRaopLog("Failed to create test socket for " + id_);
         return false;
     }
 
@@ -219,12 +238,11 @@ bool RaopHostage::ensureReachable(struct in_addr& host) {
     close(test_sock);
 
     if (conn_result < 0) {
-        std::cerr << "Cannot reach " << id_ << " at " << ip_
-                  << ":" << port_ << " (network issue)" << std::endl;
+        Tui::AppendRaopLog("Cannot reach " + id_ + " at " + ip_ + ":" + std::to_string(port_) + " (network issue)");
         return false;
     }
 
-    std::cerr << "Reachability test passed for " << id_ << std::endl;
+    Tui::AppendRaopLog("Reachability test passed for " + id_);
     return true;
 }
 

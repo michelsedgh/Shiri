@@ -3,9 +3,11 @@
 #include <avahi-common/strlst.h>
 #endif
 #include "Discovery.h"
+#include "Tui.h"
 
 #include <chrono>
 #include <iostream>
+#include <sstream>
 #include <thread>
 #include <cstring>
 #include <cctype>
@@ -327,10 +329,15 @@ void Discovery::applyTxtMetadata(Speaker& speaker,
 
     speaker.requiresAuth = speaker.passwordRequired;
 
-    std::cerr << "[Discovery] Speaker '" << speaker.name << "' et="
-              << (speaker.et.empty() ? "n/a" : speaker.et)
-              << " auth_required=" << (speaker.requiresAuth ? "yes" : "no")
-              << std::endl;
+    {
+        std::ostringstream oss;
+        oss << "[Discovery] Speaker '" << speaker.name << "' et="
+            << (speaker.et.empty() ? "n/a" : speaker.et)
+            << " auth_required=" << (speaker.requiresAuth ? "yes" : "no")
+            << std::endl;
+        std::string line = oss.str();
+        Tui::AppendShairportLog(line);
+    }
 }
 
 std::string Discovery::makeFullName(const std::string& serviceName,
@@ -651,10 +658,15 @@ void Discovery::applyTxtMetadata(Speaker& speaker,
         speaker.requiresAuth = true;
     }
 
-    std::cerr << "[Discovery] Speaker '" << speaker.name << "' et="
-              << (speaker.et.empty() ? "n/a" : speaker.et)
-              << " auth_required=" << (speaker.requiresAuth ? "yes" : "no")
-              << std::endl;
+    {
+        std::ostringstream oss;
+        oss << "[Discovery] Speaker '" << speaker.name << "' et="
+            << (speaker.et.empty() ? "n/a" : speaker.et)
+            << " auth_required=" << (speaker.requiresAuth ? "yes" : "no")
+            << std::endl;
+        std::string line = oss.str();
+        Tui::AppendShairportLog(line);
+    }
 }
 
 void Discovery::notifyListeners() {

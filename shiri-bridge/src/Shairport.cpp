@@ -6,6 +6,7 @@
 // RAOP speakers as before.
 
 #include "Shairport.h"
+#include "Tui.h"
 
 #include <chrono>
 #include <iostream>
@@ -22,7 +23,6 @@
 
 // For setns / unshare / clone flags
 #include <sched.h>
-#include <errno.h>
 
 // Some toolchains may not expose these clone flags by default; define if missing.
 #ifndef CLONE_NEWNET
@@ -120,8 +120,7 @@ void Shairport::run() {
     auto runShell = [](const std::string& cmd) {
         int ret = system(cmd.c_str());
         if (ret != 0) {
-            std::cerr << "Shairport netns: command failed: " << cmd
-                      << " (exit=" << ret << ")" << std::endl;
+            Tui::AppendShairportLog("Shairport netns: command failed: " + cmd + " (exit=" + std::to_string(ret) + ")");
         }
         return ret;
     };
@@ -158,6 +157,7 @@ void Shairport::run() {
     int pipefd[2];
     if (pipe(pipefd) == -1) {
         perror("pipe");
+        Tui::AppendShairportLog("pipe failed for Shairport");
         cleanupNs();
         return;
     }
@@ -165,7 +165,7 @@ void Shairport::run() {
     pid_ = fork();
     if (pid_ == -1) {
         perror("fork");
-        cleanupNs();
+        Tui::AppendShairportLog("fork failed for Shairport");
         return;
     }
 
@@ -197,8 +197,10 @@ void Shairport::run() {
             _exit(1);
         }
 
-        // Acquire IP via DHCP inside the namespace.
-        std::string dhcpCmd = "dhclient -v " + mvName;
+        // Acquire IP via DHCP inside the namespace. dhclient is very verbose
+        // by default; redirect its stdout/stderr so it doesn't corrupt the
+        // TUI screen. We still treat a non-zero exit code as a hard error.
+        std::string dhcpCmd = "dhclient -v " + mvName + " >/dev/null 2>&1";
         if (system(dhcpCmd.c_str()) != 0) {
             std::cerr << "dhclient failed in netns" << std::endl;
             _exit(1);
@@ -270,6 +272,7 @@ void Shairport::run() {
 
         if (!found) {
             std::cerr << "Error: shairport-sync binary not found in expected locations." << std::endl;
+            Tui::AppendShairportLog("Error: shairport-sync binary not found in expected locations.");
             _exit(1);
         }
 
@@ -282,11 +285,14 @@ void Shairport::run() {
               (char*)nullptr);
 
         perror("execl shairport-sync");
+        Tui::AppendShairportLog("execl shairport-sync failed");
         _exit(1);
     } else {
         // Parent: read PCM from pipe and feed callback.
         close(pipefd[1]); // Close write end
         pipe_ = fdopen(pipefd[0], "r");
+
+        Tui::AppendShairportLog("[Shairport] Started for group '" + groupName_ + "' on port " + std::to_string(port_) + " with parent interface '" + parentInterface_ + "' (pid " + std::to_string(pid_) + ")");
 
         std::vector<uint8_t> buffer(4096);
         while (running_) {
