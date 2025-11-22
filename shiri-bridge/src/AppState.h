@@ -38,6 +38,7 @@ struct GroupInfo {
     std::thread streamerThread;                // Thread that pushes PCM to RAOP hostages
     bool streamerRunning = false;
     uint64_t consecutiveSilenceChunks = 0;     // How many consecutive silence chunks we have sent
+    bool paused = false;                       // RAOP pause state for this group
 };
 
 // Audio pipeline configuration shared between the shairport callback and the

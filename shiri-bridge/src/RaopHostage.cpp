@@ -97,6 +97,18 @@ void RaopHostage::pulse() {
     }
 }
 
+void RaopHostage::pause() {
+	if (connected_ && raop_) {
+		raopcl_pause(raop_);
+	}
+}
+
+void RaopHostage::flush() {
+	if (connected_ && raop_) {
+		raopcl_flush(raop_);
+	}
+}
+
 bool RaopHostage::isConnected() const {
     return connected_;
 }

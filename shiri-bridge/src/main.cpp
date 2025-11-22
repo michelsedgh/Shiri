@@ -58,8 +58,11 @@ void groupStreamerLoop(std::string groupName) {
     while (true) {
         std::vector<uint8_t> chunk;
         std::vector<std::pair<std::string, RaopHostage*>> hostages;
+        std::vector<RaopHostage*> hostagesToPause;
         bool runningLocal = true;
-        bool isSilenceChunk = false;
+        bool hasChunk = false;
+        bool shouldPause = false;
+        int64_t idleMs = -1;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             auto it = groups.find(groupName);
@@ -73,31 +76,49 @@ void groupStreamerLoop(std::string groupName) {
             if (!queue.empty()) {
                 chunk = std::move(queue.front());
                 queue.pop_front();
-                // Log transition from silence to audio
                 if (group.consecutiveSilenceChunks > 0) {
-                    Tui::AppendRaopLog("Audio resumed after " + std::to_string(group.consecutiveSilenceChunks) + " silence chunks");
+                    Tui::AppendRaopLog("Audio resumed after " + std::to_string(group.consecutiveSilenceChunks) + " idle iterations");
                 }
+                group.consecutiveSilenceChunks = 0;
+                group.paused = false;
                 for (const auto& id : group.speakerIds) {
                     auto sit = speakerStates.find(id);
                     if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
                         hostages.emplace_back(id, sit->second.hostage.get());
                     }
                 }
+                hasChunk = true;
             } else {
-                // Generate silence chunk to keep speakers alive during pauses
-                chunk.resize(kChunkBytes, 0); // Silent audio (all zeros)
-                isSilenceChunk = true;
                 runningLocal = group.streamerRunning;
-                for (const auto& id : group.speakerIds) {
-                    auto sit = speakerStates.find(id);
-                    if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
-                        hostages.emplace_back(id, sit->second.hostage.get());
+                group.consecutiveSilenceChunks++;
+
+                if (group.process) {
+                    idleMs = group.process->millisSinceLastChunk();
+                }
+
+                if (!group.paused && idleMs >= 1000) {
+                    group.paused = true;
+                    shouldPause = true;
+                    for (const auto& id : group.speakerIds) {
+                        auto sit = speakerStates.find(id);
+                        if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
+                            hostagesToPause.push_back(sit->second.hostage.get());
+                        }
                     }
                 }
             }
         }
 
-        if (chunk.empty()) {
+        if (shouldPause) {
+            Tui::AppendRaopLog("Pausing RAOP for group " + groupName + " after " + std::to_string(idleMs) + " ms idle");
+            for (auto* h : hostagesToPause) {
+                if (!h) continue;
+                h->pause();
+                h->flush();
+            }
+        }
+
+        if (!hasChunk) {
             if (!runningLocal) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
@@ -113,7 +134,7 @@ void groupStreamerLoop(std::string groupName) {
             }
         }
 
-        if (requeue && !isSilenceChunk) {  // Don't requeue silence chunks
+        if (requeue) {
             std::lock_guard<std::mutex> lock(stateMutex);
             auto it = groups.find(groupName);
             if (it != groups.end()) {
@@ -124,19 +145,6 @@ void groupStreamerLoop(std::string groupName) {
         }
 
         uint64_t chunkId = ++chunkCounter;
-
-        // Update silence tracking
-        {
-            std::lock_guard<std::mutex> lock(stateMutex);
-            auto it = groups.find(groupName);
-            if (it != groups.end()) {
-                if (isSilenceChunk) {
-                    it->second.consecutiveSilenceChunks++;
-                } else {
-                    it->second.consecutiveSilenceChunks = 0;
-                }
-            }
-        }
 
         for (const auto& [id, hostage] : hostages) {
             if (!hostage || !hostage->isConnected()) continue;
@@ -156,23 +164,8 @@ void groupStreamerLoop(std::string groupName) {
                         }
                     }
                 }
-            } else if (!isSilenceChunk && (chunkId <= 10 || chunkId % 500 == 0)) {
+            } else if (chunkId <= 10 || chunkId % 500 == 0) {
                 Tui::AppendRaopLog("Chunk #" + std::to_string(chunkId) + " sent to " + id);
-            } else if (isSilenceChunk && chunkId % 1000 == 0) {  // Less frequent logging for silence
-                Tui::AppendRaopLog("Silence chunk #" + std::to_string(chunkId) + " sent to " + id);
-            }
-        }
-
-        // Adaptive sleep timing based on silence duration
-        if (isSilenceChunk) {
-            // During long silence periods, use slightly longer sleep to reduce CPU usage
-            // but still maintain connection health
-            std::lock_guard<std::mutex> lock(stateMutex);
-            auto it = groups.find(groupName);
-            if (it != groups.end() && it->second.consecutiveSilenceChunks > 1000) {  // ~1 second of silence
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
@@ -216,6 +209,17 @@ int main() {
             auto& state = speakerStates[speaker.id];
             state.info = speaker;
             state.connected = true;
+            // Ensure reserved speakers have an active RAOP hostage when they come back online
+            if (state.reserved && !state.hostage && !speaker.ip.empty() && speaker.port > 0) {
+                state.hostage = std::make_unique<RaopHostage>(
+                    speaker.ip, speaker.port, speaker.id, speaker.et, speaker.requiresAuth);
+                if (state.hostage->connect()) {
+                    Tui::AppendRaopLog("Reconnected (rediscovered): " + speaker.id);
+                } else {
+                    Tui::AppendRaopLog("Failed to reconnect (rediscovered): " + speaker.id);
+                    state.hostage.reset();
+                }
+            }
             seen.push_back(speaker.id);
         }
         // Mark speakers not in current snapshot as offline

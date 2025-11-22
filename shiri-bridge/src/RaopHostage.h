@@ -22,6 +22,8 @@ public:
     void disconnect();
     void pulse();
     bool isConnected() const;
+    void pause();
+    void flush();
     
     // Audio pipeline
     bool acceptFrames();
