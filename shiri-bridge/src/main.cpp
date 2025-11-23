@@ -79,7 +79,7 @@ void groupStreamerLoop(std::string groupName) {
                 }
                 for (const auto& id : group.speakerIds) {
                     auto sit = speakerStates.find(id);
-                    if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
+                    if (sit != speakerStates.end() && sit->second.hostage) {
                         hostages.emplace_back(id, sit->second.hostage.get());
                     }
                 }
@@ -90,7 +90,7 @@ void groupStreamerLoop(std::string groupName) {
                 runningLocal = group.streamerRunning;
                 for (const auto& id : group.speakerIds) {
                     auto sit = speakerStates.find(id);
-                    if (sit != speakerStates.end() && sit->second.hostage && sit->second.hostage->isConnected()) {
+                    if (sit != speakerStates.end() && sit->second.hostage) {
                         hostages.emplace_back(id, sit->second.hostage.get());
                     }
                 }
@@ -104,23 +104,54 @@ void groupStreamerLoop(std::string groupName) {
         }
 
         bool requeue = false;
+        std::string blockedId;
         for (const auto& [id, hostage] : hostages) {
-            if (!hostage || !hostage->isConnected()) continue;
+            if (!hostage) continue;
+            if (!hostage->isConnected()) {
+                Tui::AppendRaopLog("Hostage disconnected before frames ready: " + id);
+                blockedId = id;
+                requeue = !isSilenceChunk;
+                break;
+            }
             if (!hostage->waitForFramesReady()) {
                 Tui::AppendRaopLog("Hostage not ready yet: " + id);
-                requeue = true;
+                blockedId = id;
+                requeue = !isSilenceChunk;
                 break;
             }
         }
 
-        if (requeue && !isSilenceChunk) {  // Don't requeue silence chunks
+        if (!blockedId.empty()) {
             std::lock_guard<std::mutex> lock(stateMutex);
-            auto it = groups.find(groupName);
-            if (it != groups.end()) {
-                it->second.chunkQueue.emplace_front(std::move(chunk));
+            auto sit = speakerStates.find(blockedId);
+            if (sit != speakerStates.end()) {
+                auto& state = sit->second;
+                state.notReadyStreak++;
+                if (state.notReadyStreak >= 1 && state.hostage) {
+                    state.reconnectAttempts++;
+                    const auto& speaker = state.info;
+                    if (!speaker.ip.empty() && speaker.port > 0) {
+                        Tui::AppendRaopLog("Hostage stuck not ready, reconnecting: " + blockedId);
+                        state.hostage->disconnect();
+                        if (state.hostage->connect()) {
+                            Tui::AppendRaopLog("Reconnected hostage after not-ready streak: " + blockedId);
+                            state.notReadyStreak = 0;
+                        } else {
+                            Tui::AppendRaopLog("Failed to reconnect hostage after not-ready streak: " + blockedId);
+                        }
+                    }
+                }
+                if (requeue) {
+                    auto git = groups.find(groupName);
+                    if (git != groups.end()) {
+                        git->second.chunkQueue.emplace_front(std::move(chunk));
+                    }
+                }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
+            if (requeue) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
         }
 
         uint64_t chunkId = ++chunkCounter;

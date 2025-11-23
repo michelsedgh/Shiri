@@ -25,6 +25,8 @@ struct SpeakerState {
     bool connected = false;
     bool reserved = false;
     std::unique_ptr<RaopHostage> hostage;
+    std::uint32_t notReadyStreak = 0;
+    std::uint32_t reconnectAttempts = 0;
 };
 
 struct GroupInfo {

@@ -26,7 +26,7 @@ public:
     // Audio pipeline
     bool acceptFrames();
     bool sendAudioChunk(const uint8_t* data, size_t size);
-    bool waitForFramesReady(int maxAttempts = 500, int delayMillis = 2);
+    bool waitForFramesReady(int maxAttempts = 200, int delayMillis = 1);
     
     const std::string& id() const { return id_; }
 
