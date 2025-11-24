@@ -47,7 +47,7 @@ struct GroupInfo {
 constexpr std::size_t kAudioBytesPerFrame = 4;        // 16-bit stereo PCM
 constexpr std::size_t kFramesPerChunk     = 352;      // RAOP default
 constexpr std::size_t kChunkBytes         = kAudioBytesPerFrame * kFramesPerChunk;
-constexpr std::size_t kMaxQueuedChunks    = 16;       // ~0.14 seconds of headroom
+constexpr std::size_t kMaxQueuedChunks    = 128;       // ~0.14 seconds of headroom
 
 // Global state containers. Defined in main.cpp and used by both the audio
 // pipeline and the TUI.
