@@ -176,6 +176,15 @@ void Shairport::run() {
         // the audio stream.
         close(pipefd[0]); // Close read end
 
+        // Ensure helper daemons (dbus-daemon, avahi-daemon, nqptp) do NOT inherit
+        // the shairport PCM pipe. Otherwise, even after shairport-sync exits and
+        // closes its stdout, the parent would never see EOF on the pipe because
+        // those daemons would still hold the write end open.
+        int flags = fcntl(pipefd[1], F_GETFD);
+        if (flags != -1) {
+            fcntl(pipefd[1], F_SETFD, flags | FD_CLOEXEC);
+        }
+
         // Join the network namespace via setns on /run/netns/<nsName>.
         std::string nsPath = "/run/netns/" + nsName;
         int nsFd = open(nsPath.c_str(), O_RDONLY);
@@ -251,6 +260,14 @@ void Shairport::run() {
             _exit(1);
         }
         close(pipefd[1]);
+
+        // Make sure stdout is NOT marked close-on-exec, otherwise the pipe would
+        // be closed when exec'ing shairport-sync and no audio would reach the
+        // parent process.
+        int outFlags = fcntl(STDOUT_FILENO, F_GETFD);
+        if (outFlags != -1) {
+            fcntl(STDOUT_FILENO, F_SETFD, outFlags & ~FD_CLOEXEC);
+        }
 
         // Path to shairport-sync (AirPlay 2 + pipe backend).
         std::vector<std::string> possiblePaths = {

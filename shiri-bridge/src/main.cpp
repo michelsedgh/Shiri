@@ -294,16 +294,22 @@ int main() {
         if (t.joinable()) t.join();
     }
 
+    std::vector<Shairport*> shairportsToStop;
     {
         std::lock_guard<std::mutex> lock(stateMutex);
         for (auto& [name, group] : groups) {
             if (group.process) {
-                group.process->stop();
+                shairportsToStop.push_back(group.process.get());
             }
         }
         // Release hostages
         for (auto& [id, state] : speakerStates) {
             state.hostage.reset();
+        }
+    }
+    for (auto* proc : shairportsToStop) {
+        if (proc) {
+            proc->stop();
         }
     }
     
