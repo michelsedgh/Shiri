@@ -1,0 +1,28 @@
+Format: 1.8
+Date: Mon, 24 Nov 2025 07:33:57 +0000
+Source: owntone
+Architecture: source
+Version: 29.0.138.gitbd5746c-1+bullseye
+Distribution: bullseye
+Urgency: medium
+Maintainer: Espen Jürgensen <espenjurgensen+raspbian@gmail.com>
+Changed-By:  <runner@runnervmg1sw1>
+Changes:
+ owntone (29.0.138.gitbd5746c-1+bullseye) bullseye; urgency=medium
+ .
+   * Dummy changelog @commit bd5746c83ea04fde10c5337d2c2bfd7fc75049af
+Checksums-Sha1:
+ 8638fc59ef0b50f9f399132ee04b9a0837d14f5b 1477 owntone_29.0.138.gitbd5746c-1+bullseye.dsc
+ babfbd5da82a652fba6fe71bd0fa03510c0c9f27 5869918 owntone_29.0.138.gitbd5746c.orig.tar.gz
+ a12d9021a5d0e8039931bd1a2c93c5b8aced4cda 2920 owntone_29.0.138.gitbd5746c-1+bullseye.debian.tar.xz
+ d43342f4cda91a548eaea4fd806947f18637cc39 13165 owntone_29.0.138.gitbd5746c-1+bullseye_arm64.buildinfo
+Checksums-Sha256:
+ 883a36792a88ff2892b9ed53342448aa413e3a824ceda352fefd1957ec797cc8 1477 owntone_29.0.138.gitbd5746c-1+bullseye.dsc
+ 8ec8dc8bbd204c07c7108021e34ca81d46431660fb71abf05937fc41ffd91dcf 5869918 owntone_29.0.138.gitbd5746c.orig.tar.gz
+ 09ea317623d07f8f2e19bc269daa14313cb1ad0771844d2bfb30b69315d06b96 2920 owntone_29.0.138.gitbd5746c-1+bullseye.debian.tar.xz
+ bf1adf12a3402a2e234b4d0131a6aaaa5140de91405be60d0a40af21d1aa4164 13165 owntone_29.0.138.gitbd5746c-1+bullseye_arm64.buildinfo
+Files:
+ 3d811e1115014ba64514e8cb4731f452 1477 sound optional owntone_29.0.138.gitbd5746c-1+bullseye.dsc
+ fbf0b3da2c8623bcc6717e94d4f2f840 5869918 sound optional owntone_29.0.138.gitbd5746c.orig.tar.gz
+ 166f9627d25fb46c7242c8038b7f367a 2920 sound optional owntone_29.0.138.gitbd5746c-1+bullseye.debian.tar.xz
+ d293d0233f0bf4d8cd4a6e5e7fae0231 13165 sound optional owntone_29.0.138.gitbd5746c-1+bullseye_arm64.buildinfo
