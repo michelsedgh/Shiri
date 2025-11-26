@@ -20,7 +20,11 @@ set -euo pipefail
 # Configuration
 #------------------------------------------------------------------------------
 BASE_DIR="/var/lib/shiri"
-GROUPS=("zone1" "zone2")
+
+# Each script instance runs ONE zone only - for full isolation
+# Generate unique zone ID so multiple instances don't conflict
+INSTANCE_ID="${RANDOM}${RANDOM}"
+GROUPS=("zone${INSTANCE_ID}")
 
 # OwnTone ports (same for all instances since each is in its own namespace)
 OWNTONE_LIB_PORT=3689
@@ -91,17 +95,15 @@ select_parent_interface() {
 }
 
 #------------------------------------------------------------------------------
-# Ask user for AirPlay names per group (what iOS/macOS will see)
+# Ask user for AirPlay name (what iOS/macOS will see)
 #------------------------------------------------------------------------------
 prompt_group_names() {
   GROUP_NAMES=()
-  for i in "${!GROUPS[@]}"; do
-    local id="${GROUPS[$i]}"
-    local default_name="Shiri $id"
-    read -rp "AirPlay name for $id [$default_name]: " name
-    name=${name:-$default_name}
-    GROUP_NAMES[$i]="$name"
-  done
+  local default_name="Shiri Zone"
+  read -rp "AirPlay receiver name [$default_name]: " name
+  name=${name:-$default_name}
+  GROUP_NAMES[0]="$name"
+  log "This zone will appear as '$name' on your devices"
 }
 
 #------------------------------------------------------------------------------
@@ -201,7 +203,14 @@ cleanup_previous_run() {
 setup_directories() {
   for grp in "${GROUPS[@]}"; do
     local grp_dir="$BASE_DIR/groups/$grp"
+    
+    # Create directories with proper permissions
     mkdir -p "$grp_dir"/{pipes,config,logs,state}
+    chmod 755 "$grp_dir" "$grp_dir"/{pipes,config,logs,state}
+    
+    # Clear ALL stale state files (IP files, leases, db, etc.)
+    rm -f "$grp_dir/state/"* 2>/dev/null || true
+    rm -f "$grp_dir/logs/"* 2>/dev/null || true
 
     local audio_pipe="$grp_dir/pipes/audio.pipe"
     local meta_pipe="$grp_dir/pipes/audio.pipe.metadata"
@@ -242,7 +251,8 @@ general =
   mdns_backend = "avahi";
   udp_port_base = 6001;
   udp_port_range = 100;
-  audio_backend_buffer_desired_length_in_seconds = 1.0;
+  audio_backend_buffer_desired_length_in_seconds = 0.5;
+  audio_backend_latency_offset_in_seconds = -3.0;  // Compensate for OwnTone's AirPlay buffer
   output_format = "S16_LE";  // PCM16 little-endian for OwnTone
   output_rate = 44100;
 };
@@ -351,7 +361,11 @@ ip link set lo up
 ip link set "$MV_IF" up
 
 echo "[shairport:$GRP] Running DHCP on $MV_IF ..."
-dhclient -v "$MV_IF" 2>&1 | head -20 || true
+# Use per-instance lease and PID files to avoid conflicts with other instances
+dhclient -v "$MV_IF" \
+  -lf "$GRP_DIR/state/shairport_dhclient.leases" \
+  -pf "$GRP_DIR/state/shairport_dhclient.pid" \
+  2>&1 | head -20 || true
 sleep 2
 
 # Get and save the IP address
@@ -359,16 +373,41 @@ MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1
 echo "$MY_IP" > "$GRP_DIR/state/shairport_ip.txt"
 echo "[shairport:$GRP] Got IP: $MY_IP"
 
-# Private /run for dbus/avahi/nqptp
+# Private /run and /tmp for complete isolation
 mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
 mkdir -p /run/dbus /run/avahi-daemon
 
 echo "[shairport:$GRP] Starting dbus..."
 dbus-daemon --system --fork --nopidfile
 sleep 1
 
+# Create per-instance avahi config to avoid mDNS conflicts
+cat > /tmp/avahi-daemon.conf <<AVAHI_EOF
+[server]
+host-name=$(hostname)-shairport-$GRP
+use-ipv4=yes
+use-ipv6=no
+allow-interfaces=$MV_IF
+deny-interfaces=lo
+ratelimit-interval-usec=1000000
+ratelimit-burst=1000
+
+[wide-area]
+enable-wide-area=no
+
+[publish]
+publish-hinfo=no
+publish-workstation=no
+
+[reflector]
+enable-reflector=no
+
+[rlimits]
+AVAHI_EOF
+
 echo "[shairport:$GRP] Starting avahi..."
-avahi-daemon --daemonize --no-chroot --no-drop-root --file /etc/avahi/avahi-daemon.conf --no-rlimits 2>/dev/null || true
+avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits 2>/dev/null || true
 sleep 1
 
 echo "[shairport:$GRP] Starting nqptp..."
@@ -426,7 +465,11 @@ ip link set lo up
 ip link set "$MV_IF" up
 
 echo "[owntone:$GRP] Running DHCP on $MV_IF ..."
-dhclient -v "$MV_IF" 2>&1 | head -20 || true
+# Use per-instance lease and PID files to avoid conflicts with other instances
+dhclient -v "$MV_IF" \
+  -lf "$GRP_DIR/state/dhclient.leases" \
+  -pf "$GRP_DIR/state/dhclient.pid" \
+  2>&1 | head -20 || true
 sleep 2
 
 # Get and save the IP address
@@ -434,16 +477,41 @@ MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1
 echo "$MY_IP" > "$GRP_DIR/state/owntone_ip.txt"
 echo "[owntone:$GRP] Got IP: $MY_IP"
 
-# Private /run for dbus/avahi (OwnTone needs avahi for speaker discovery)
+# Private /run and /tmp for complete isolation
 mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
 mkdir -p /run/dbus /run/avahi-daemon
 
 echo "[owntone:$GRP] Starting dbus..."
 dbus-daemon --system --fork --nopidfile
 sleep 1
 
+# Create per-instance avahi config to avoid mDNS conflicts
+cat > /tmp/avahi-daemon.conf <<AVAHI_EOF
+[server]
+host-name=$(hostname)-owntone-$GRP
+use-ipv4=yes
+use-ipv6=no
+allow-interfaces=$MV_IF
+deny-interfaces=lo
+ratelimit-interval-usec=1000000
+ratelimit-burst=1000
+
+[wide-area]
+enable-wide-area=no
+
+[publish]
+publish-hinfo=no
+publish-workstation=no
+
+[reflector]
+enable-reflector=no
+
+[rlimits]
+AVAHI_EOF
+
 echo "[owntone:$GRP] Starting avahi..."
-avahi-daemon --daemonize --no-chroot --no-drop-root --file /etc/avahi/avahi-daemon.conf --no-rlimits 2>/dev/null || true
+avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits 2>/dev/null || true
 sleep 1
 
 echo "[owntone:$GRP] Starting OwnTone..."
@@ -517,10 +585,15 @@ wait_for_owntone() {
   local url="http://$owntone_ip:3689/api/config"
 
   log "Waiting for OwnTone API at $owntone_ip:3689 ..."
-  for _ in {1..30}; do
-    if exec_in_owntone_netns "$grp" curl -s --connect-timeout 2 "$url" >/dev/null 2>&1; then
+  for i in {1..60}; do
+    # Try curl from inside the namespace (localhost should work since OwnTone binds to 0.0.0.0)
+    if exec_in_owntone_netns "$grp" curl -s --connect-timeout 2 "http://127.0.0.1:3689/api/config" >/dev/null 2>&1; then
       log "OwnTone $grp is ready at $owntone_ip"
       return 0
+    fi
+    # Show progress every 10 seconds
+    if (( i % 10 == 0 )); then
+      log "Still waiting for OwnTone API... ($i seconds)"
     fi
     sleep 1
   done
@@ -648,9 +721,7 @@ main() {
   select_parent_interface
   prompt_group_names
 
-  # Clean up any state from previous runs
-  cleanup_previous_run
-
+  log "Starting instance with groups: ${GROUPS[*]}"
   log "Setting up directories and FIFOs..."
   setup_directories
 
