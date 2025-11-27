@@ -262,9 +262,10 @@ general =
   mdns_backend = "avahi";
   udp_port_base = $port_base;
   udp_port_range = 100;
-  audio_backend_buffer_desired_length_in_seconds = 0.5;
-  audio_backend_latency_offset_in_seconds = -3.0;  // Compensate for OwnTone's AirPlay buffer
-  output_format = "S16_LE";  // PCM16 little-endian for OwnTone
+  // Low buffer to push audio to pipe immediately
+  audio_backend_buffer_desired_length_in_seconds = 0.15;
+  audio_backend_latency_offset_in_seconds = -3.0;
+  output_format = "S16_LE";
   output_rate = 44100;
   // Unique device identifiers - CRITICAL for AirPlay 2 multi-room
   device_id = "$unique_device_id";
@@ -438,8 +439,9 @@ echo "[shairport:$GRP] Starting nqptp..."
 nqptp &
 sleep 1
 
-echo "[shairport:$GRP] Starting shairport-sync..."
-exec shairport-sync -c "$GRP_DIR/config/shairport-sync.conf" --statistics
+echo "[shairport:$GRP] Starting shairport-sync with Real-Time priority..."
+# Use chrt (FIFO priority 50) to minimize scheduling jitter
+exec chrt -f 50 shairport-sync -c "$GRP_DIR/config/shairport-sync.conf" --statistics
 WRAPPER_EOF
   chmod +x "$wrapper"
 
@@ -539,8 +541,9 @@ echo "[owntone:$GRP] Starting avahi..."
 avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits 2>/dev/null || true
 sleep 1
 
-echo "[owntone:$GRP] Starting OwnTone..."
-exec owntone -f -c "$GRP_DIR/config/owntone.conf"
+echo "[owntone:$GRP] Starting OwnTone with Real-Time priority..."
+# Use chrt (FIFO priority 50) to minimize scheduling jitter
+exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
 WRAPPER_EOF
   chmod +x "$wrapper"
 
