@@ -24,7 +24,7 @@ BASE_DIR="/var/lib/shiri"
 # Each script instance runs ONE zone only - for full isolation
 # Generate unique zone ID so multiple instances don't conflict
 INSTANCE_ID="${RANDOM}${RANDOM}"
-GROUPS=("zone${INSTANCE_ID}")
+ZONES=("zone${INSTANCE_ID}")
 
 # OwnTone ports (same for all instances since each is in its own namespace)
 OWNTONE_LIB_PORT=3689
@@ -126,7 +126,7 @@ cleanup() {
   done
 
   # Also kill wrapper PIDs if still running
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     pid="${SHAIRPORT_PIDS[$grp]:-}"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       log "Stopping shairport-sync wrapper for $grp (pid $pid)"
@@ -201,7 +201,7 @@ cleanup_previous_run() {
 # Directory / FIFO setup
 #------------------------------------------------------------------------------
 setup_directories() {
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     local grp_dir="$BASE_DIR/groups/$grp"
     
     # Create directories with proper permissions
@@ -240,6 +240,17 @@ generate_shairport_config() {
   local grp_dir="$BASE_DIR/groups/$grp"
   local conf="$grp_dir/config/shairport-sync.conf"
   local display_name="${GROUP_NAMES[$idx]:-Shiri $grp}"
+  
+  # Generate unique identifiers for this instance
+  # Each instance MUST have unique: device_id, port bases, and MAC-like identifier
+  local instance_hash
+  instance_hash=$(echo -n "$grp" | md5sum | cut -c1-12)
+  local unique_device_id="${instance_hash}"
+  
+  # Generate unique port base from hash (not idx, which is always 0 in single-zone mode)
+  # Convert first 4 hex chars to decimal and use modulo to get a port offset
+  local hash_num=$((16#${instance_hash:0:4}))
+  local port_base=$((6001 + (hash_num % 500) * 10))
 
   cat > "$conf" <<EOF
 // shairport-sync.conf for $grp
@@ -249,12 +260,21 @@ general =
   interpolation = "basic";
   output_backend = "pipe";
   mdns_backend = "avahi";
-  udp_port_base = 6001;
+  udp_port_base = $port_base;
   udp_port_range = 100;
   audio_backend_buffer_desired_length_in_seconds = 0.5;
   audio_backend_latency_offset_in_seconds = -3.0;  // Compensate for OwnTone's AirPlay buffer
   output_format = "S16_LE";  // PCM16 little-endian for OwnTone
   output_rate = 44100;
+  // Unique device identifiers - CRITICAL for AirPlay 2 multi-room
+  device_id = "$unique_device_id";
+};
+
+// AirPlay 2 specific settings
+airplay =
+{
+  // Enable AirPlay 2 operation (requires nqptp running)
+  // Each instance has isolated nqptp in private /dev/shm
 };
 
 metadata =
@@ -281,6 +301,7 @@ generate_owntone_config() {
   local idx="$2"
   local grp_dir="$BASE_DIR/groups/$grp"
   local conf="$grp_dir/config/owntone.conf"
+  local display_name="${GROUP_NAMES[$idx]:-Shiri $grp}"
 
   cat > "$conf" <<EOF
 # OwnTone config for $grp (runs in network namespace)
@@ -289,7 +310,7 @@ general {
 	uid = "root"
 	db_path = "$grp_dir/state/songs3.db"
 	logfile = "$grp_dir/logs/owntone.log"
-	loglevel = debug
+	loglevel = log
 	admin_password = ""
 	websocket_port = 3688
 	cache_dir = "$grp_dir/state/cache"
@@ -299,7 +320,7 @@ general {
 }
 
 library {
-	name = "Shiri $grp"
+	name = "$display_name Library"
 	port = 3689
 	directories = { "$grp_dir/pipes" }
 	follow_symlinks = false
@@ -361,10 +382,10 @@ ip link set lo up
 ip link set "$MV_IF" up
 
 echo "[shairport:$GRP] Running DHCP on $MV_IF ..."
-# Use per-instance lease and PID files to avoid conflicts with other instances
+# Use per-instance lease and PID files in /run (tmpfs) to avoid AppArmor/permission issues
 dhclient -v "$MV_IF" \
-  -lf "$GRP_DIR/state/shairport_dhclient.leases" \
-  -pf "$GRP_DIR/state/shairport_dhclient.pid" \
+  -lf "/run/shairport_dhclient.leases" \
+  -pf "/run/shairport_dhclient.pid" \
   2>&1 | head -20 || true
 sleep 2
 
@@ -373,9 +394,11 @@ MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1
 echo "$MY_IP" > "$GRP_DIR/state/shairport_ip.txt"
 echo "[shairport:$GRP] Got IP: $MY_IP"
 
-# Private /run and /tmp for complete isolation
+# Private /run, /tmp, AND /dev/shm for complete isolation
+# CRITICAL: nqptp uses /dev/shm for shared memory - must be isolated!
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /dev/shm
 mkdir -p /run/dbus /run/avahi-daemon
 
 echo "[shairport:$GRP] Starting dbus..."
@@ -411,6 +434,7 @@ avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.con
 sleep 1
 
 echo "[shairport:$GRP] Starting nqptp..."
+# nqptp binds to ports 319/320 - in separate network namespaces with separate IPs, this is isolated
 nqptp &
 sleep 1
 
@@ -465,10 +489,10 @@ ip link set lo up
 ip link set "$MV_IF" up
 
 echo "[owntone:$GRP] Running DHCP on $MV_IF ..."
-# Use per-instance lease and PID files to avoid conflicts with other instances
+# Use per-instance lease and PID files in /run (tmpfs) to avoid AppArmor/permission issues
 dhclient -v "$MV_IF" \
-  -lf "$GRP_DIR/state/dhclient.leases" \
-  -pf "$GRP_DIR/state/dhclient.pid" \
+  -lf "/run/dhclient.leases" \
+  -pf "/run/dhclient.pid" \
   2>&1 | head -20 || true
 sleep 2
 
@@ -477,9 +501,10 @@ MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1
 echo "$MY_IP" > "$GRP_DIR/state/owntone_ip.txt"
 echo "[owntone:$GRP] Got IP: $MY_IP"
 
-# Private /run and /tmp for complete isolation
+# Private /run, /tmp, AND /dev/shm for complete isolation
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /dev/shm
 mkdir -p /run/dbus /run/avahi-daemon
 
 echo "[owntone:$GRP] Starting dbus..."
@@ -721,31 +746,31 @@ main() {
   select_parent_interface
   prompt_group_names
 
-  log "Starting instance with groups: ${GROUPS[*]}"
+  log "Starting instance with groups: ${ZONES[*]}"
   log "Setting up directories and FIFOs..."
   setup_directories
 
   log "Generating configs..."
-  for i in "${!GROUPS[@]}"; do
-    generate_shairport_config "${GROUPS[$i]}" "$i"
-    generate_owntone_config "${GROUPS[$i]}" "$i"
+  for i in "${!ZONES[@]}"; do
+    generate_shairport_config "${ZONES[$i]}" "$i"
+    generate_owntone_config "${ZONES[$i]}" "$i"
   done
 
   # Start OwnTone instances FIRST (each in its own namespace with its own IP)
   # This way OwnTone can discover and watch the pipes before shairport writes to them
   log "Starting OwnTone instances in separate namespaces..."
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     start_owntone_in_netns "$grp"
   done
 
   # Wait for OwnTone instances to be ready
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     wait_for_owntone "$grp" || true
   done
 
   # Trigger library rescan so OwnTone finds the pipes
   log "Triggering library rescan to discover pipes..."
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     trigger_library_rescan "$grp" || true
   done
   
@@ -757,18 +782,18 @@ main() {
   echo "========================================"
   echo "  Pipe Discovery Status"
   echo "========================================"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     verify_pipe_discovery "$grp" || true
   done
 
   # NOW start shairport-sync instances (each in its own namespace with its own IP)
   log "Starting shairport-sync instances in separate namespaces..."
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     start_shairport_in_netns "$grp"
   done
 
   # Wait for shairport-sync to get IPs
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     wait_for_shairport "$grp" || true
   done
 
@@ -777,7 +802,7 @@ main() {
   echo "========================================"
   echo "  Speaker Selection"
   echo "========================================"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     select_speaker_for_group "$grp"
   done
 
@@ -785,13 +810,13 @@ main() {
   log "Demo is running!"
   echo ""
   echo "IPs assigned:"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     echo "  - $grp shairport-sync: ${SHAIRPORT_IPS[$grp]:-unknown}"
     echo "  - $grp OwnTone:        ${OWNTONE_IPS[$grp]:-unknown}"
   done
   echo ""
   echo "You should now see these AirPlay endpoints on your iPhone:"
-  for i in "${!GROUPS[@]}"; do
+  for i in "${!ZONES[@]}"; do
     echo "  - ${GROUP_NAMES[$i]}"
   done
   echo ""
@@ -799,28 +824,28 @@ main() {
   echo "playback to the speaker you selected (pipe_autostart is enabled)."
   echo ""
   echo "OwnTone Web UIs (access from your browser):"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     echo "  - $grp: http://${OWNTONE_IPS[$grp]:-<ip>}:3689"
   done
   echo ""
   echo "TROUBLESHOOTING:"
   echo "  1. Check OwnTone wrapper logs:"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     echo "     cat $BASE_DIR/groups/$grp/logs/owntone_wrapper.log"
   done
   echo ""
   echo "  2. Check shairport-sync wrapper logs:"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     echo "     cat $BASE_DIR/groups/$grp/logs/shairport_wrapper.log"
   done
   echo ""
   echo "  3. Check OwnTone logs for 'pipe' messages:"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     echo "     grep -i pipe $BASE_DIR/groups/$grp/logs/owntone.log"
   done
   echo ""
   echo "  4. Check if pipes exist and are FIFOs:"
-  for grp in "${GROUPS[@]}"; do
+  for grp in "${ZONES[@]}"; do
     echo "     ls -la $BASE_DIR/groups/$grp/pipes/"
   done
   echo ""
