@@ -74,11 +74,79 @@ require_root() {
 
 check_deps() {
   local missing=()
-  for cmd in ip dhclient unshare dbus-daemon avahi-daemon shairport-sync nqptp owntone jq curl mkfifo python3; do
+  for cmd in ip dhclient unshare dbus-daemon avahi-daemon shairport-sync nqptp owntone jq curl mkfifo python3 arecord; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     die "Missing required commands: ${missing[*]}\nInstall them first (apt install iproute2 isc-dhcp-client util-linux dbus avahi-daemon shairport-sync owntone-server jq curl coreutils python3)."
+  fi
+}
+
+#------------------------------------------------------------------------------
+# Setup ALSA loopback for clock-synchronized multi-zone audio
+# Each zone gets a unique subdevice (0-15) to avoid conflicts
+#------------------------------------------------------------------------------
+LOOPBACK_LOCK_DIR="/var/lib/shiri/loopback"
+ALLOCATED_SUBDEVICE=""
+
+setup_alsa_loopback() {
+  # Load snd-aloop with 16 subdevices if not already loaded
+  if ! lsmod | grep -q snd_aloop; then
+    log "Loading snd-aloop kernel module with 16 subdevices..."
+    modprobe snd-aloop pcm_substreams=16 2>/dev/null || {
+      log "WARNING: Failed to load snd-aloop. Trying without options..."
+      modprobe snd-aloop 2>/dev/null || {
+        log "ERROR: Cannot load snd-aloop module. Install linux-modules-extra-$(uname -r)"
+        return 1
+      }
+    }
+    sleep 1
+  fi
+  
+  # Verify loopback card exists
+  if ! aplay -l 2>/dev/null | grep -q Loopback; then
+    log "ERROR: ALSA Loopback card not found after loading module"
+    return 1
+  fi
+  
+  log "ALSA Loopback ready"
+  return 0
+}
+
+# Allocate a unique loopback subdevice using file-based locking
+allocate_loopback_subdevice() {
+  mkdir -p "$LOOPBACK_LOCK_DIR"
+  
+  for i in {0..15}; do
+    local lock_file="$LOOPBACK_LOCK_DIR/subdev_$i.lock"
+    # Try to create lock file exclusively
+    if ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
+      ALLOCATED_SUBDEVICE="$i"
+      log "Allocated loopback subdevice $i"
+      return 0
+    fi
+    # Check if the PID in the lock file is still running
+    local pid
+    pid=$(cat "$lock_file" 2>/dev/null)
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      # Stale lock, remove and claim
+      rm -f "$lock_file"
+      if ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
+        ALLOCATED_SUBDEVICE="$i"
+        log "Allocated loopback subdevice $i (reclaimed from stale lock)"
+        return 0
+      fi
+    fi
+  done
+  
+  log "ERROR: No free loopback subdevices available (all 16 in use)"
+  return 1
+}
+
+release_loopback_subdevice() {
+  if [[ -n "$ALLOCATED_SUBDEVICE" ]]; then
+    rm -f "$LOOPBACK_LOCK_DIR/subdev_$ALLOCATED_SUBDEVICE.lock"
+    log "Released loopback subdevice $ALLOCATED_SUBDEVICE"
   fi
 }
 
@@ -120,6 +188,9 @@ prompt_group_names() {
 cleanup() {
   set +e
   log "Cleaning up..."
+  
+  # Release loopback subdevice
+  release_loopback_subdevice
 
   # Kill ALL processes in each namespace before deleting it
   for ns in "${NETNS_NAMES[@]}"; do
@@ -260,15 +331,36 @@ import sys
 import time
 import os
 import fcntl
+import threading
+import queue
 
 # Configuration
 BARRIER_FILE = "/var/lib/shiri/sync/barrier"
-PRE_BUFFER_SIZE = 256 * 1024  # ~1.5 seconds of audio (prevent blips)
+PRE_BUFFER_SIZE = 256 * 1024  # ~1.5 seconds of audio
 START_DELAY = 0.5             # Extra wait time after buffering
-VALID_WINDOW = 3.0            # Allow barrier to be valid for 3s (cover buffer time)
+VALID_WINDOW = 3.0            # Allow barrier to be valid for 3s
+
+# Thread-safe queue for buffering input while waiting
+input_queue = queue.Queue()
+input_active = True
 
 def get_time():
     return time.time()
+
+def reader_thread():
+    global input_active
+    try:
+        while True:
+            # Read in 64KB chunks
+            chunk = sys.stdin.buffer.read(65536)
+            if not chunk:
+                break
+            input_queue.put(chunk)
+    except Exception:
+        pass
+    finally:
+        input_active = False
+        input_queue.put(None) # Sentinel
 
 def main():
     # Ensure sync dir exists
@@ -277,33 +369,25 @@ def main():
     except OSError:
         pass
 
-    # 1. Read PRE-BUFFER to ensure stable start
-    # This effectively "records" ~1.5s of audio from the stream
-    try:
-        # Use read() not read(size) loop to ensure we get ENOUGH data
-        # But pipes might return partial data, so we need a loop
-        buffer_data = bytearray()
-        while len(buffer_data) < PRE_BUFFER_SIZE:
-            chunk = sys.stdin.buffer.read(PRE_BUFFER_SIZE - len(buffer_data))
-            if not chunk:
-                break
-            buffer_data.extend(chunk)
-            
-        if not buffer_data:
+    # Start background reader thread to prevent blocking stdin (arecord)
+    t = threading.Thread(target=reader_thread, daemon=True)
+    t.start()
+
+    # 1. Read PRE-BUFFER
+    buffer_data = bytearray()
+    while len(buffer_data) < PRE_BUFFER_SIZE:
+        chunk = input_queue.get()
+        if chunk is None: # EOF
             return
-    except KeyboardInterrupt:
-        return
+        buffer_data.extend(chunk)
 
     # 2. Coordinate via Barrier File
-    # Now that we have data, negotiate WHEN to release it
     arrival_time = get_time()
     barrier_time = 0.0
 
     with open(BARRIER_FILE, 'a+') as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX)
-            
-            # Read existing barrier
             f.seek(0)
             content = f.read().strip()
             
@@ -311,10 +395,6 @@ def main():
             if content:
                 try:
                     stored_time = float(content)
-                    # If barrier is in future OR recently past
-                    # Since we spent 1.5s reading, the barrier set by Zone A (who arrived 1.5s ago)
-                    # might be slightly in the past or near future.
-                    # We accept it if it's not TOO old (>3s ago)
                     if stored_time > (arrival_time - VALID_WINDOW):
                         barrier_time = stored_time
                         use_existing = True
@@ -322,37 +402,40 @@ def main():
                     pass
             
             if not use_existing:
-                # Create new barrier
-                # Target = Now + Delay
                 barrier_time = arrival_time + START_DELAY
                 f.seek(0)
                 f.truncate()
                 f.write(f"{barrier_time:.6f}")
                 f.flush()
-                
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
     # 3. Wait for Barrier
     now = get_time()
     wait_time = barrier_time - now
-    
-    # If we are early, wait.
     if wait_time > 0:
         time.sleep(wait_time)
     
     # 4. Stream Audio
     try:
-        # BLAST the pre-buffer (critical for OwnTone startup stability)
+        # BLAST the pre-buffer
         sys.stdout.buffer.write(buffer_data)
         sys.stdout.buffer.flush()
         
-        # Stream the rest in large chunks
+        # Stream the rest from queue
         while True:
-            chunk = sys.stdin.buffer.read(65536) # 64KB chunks
-            if not chunk:
+            try:
+                # Non-blocking get to drain queue efficiently
+                chunk = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                if not input_active:
+                    break
+                continue
+                
+            if chunk is None:
                 break
             sys.stdout.buffer.write(chunk)
+            
     except BrokenPipeError:
         pass
     except KeyboardInterrupt:
@@ -375,6 +458,10 @@ generate_shairport_config() {
   local conf="$grp_dir/config/shairport-sync.conf"
   local display_name="${GROUP_NAMES[$idx]:-Shiri $grp}"
   
+  # Use ALSA Loopback for perfect clock synchronization
+  # ALLOCATED_SUBDEVICE is unique across all script instances (0-15)
+  local alsa_device="hw:Loopback,0,$ALLOCATED_SUBDEVICE"
+  
   # Generate unique identifiers for this instance
   # Each instance MUST have unique: device_id, port bases, and MAC-like identifier
   local instance_hash
@@ -391,17 +478,23 @@ generate_shairport_config() {
 general =
 {
   name = "$display_name";
-  interpolation = "basic";
-  output_backend = "pipe";
+  interpolation = "soxr";  // High-quality resampling for sync
+  output_backend = "alsa"; // ALSA backend enables PTP clock sync
   mdns_backend = "avahi";
   udp_port_base = $port_base;
   udp_port_range = 100;
-  audio_backend_buffer_desired_length_in_seconds = 0.5;
-  audio_backend_latency_offset_in_seconds = -3.0;  // Compensate for OwnTone's AirPlay buffer
-  output_format = "S16_LE";  // PCM16 little-endian for OwnTone
+  // Explicitly match arecord -f cd format
+  output_format = "S16_LE";
   output_rate = 44100;
-  // Unique device identifiers - CRITICAL for AirPlay 2 multi-room
+  
+  audio_backend_latency_offset_in_seconds = -3.0;  // Compensate for OwnTone's AirPlay buffer
+  // Unique device identifiers
   device_id = "$unique_device_id";
+};
+
+alsa =
+{
+  output_device = "$alsa_device";
 };
 
 // AirPlay 2 specific settings
@@ -418,13 +511,8 @@ metadata =
   pipe_name = "$grp_dir/pipes/audio.pipe.metadata";
   pipe_timeout = 5000;
 };
-
-pipe =
-{
-  name = "$grp_dir/state/shairport.raw";  // Writes to raw pipe in state/ (OwnTone doesn't scan there)
-};
 EOF
-  log "Generated shairport-sync config for $grp"
+  log "Generated shairport-sync config for $grp (ALSA backend)"
 }
 
 #------------------------------------------------------------------------------
@@ -484,6 +572,7 @@ EOF
 #------------------------------------------------------------------------------
 start_shairport_in_netns() {
   local grp="$1"
+  local idx="$2"
   local grp_dir="$BASE_DIR/groups/$grp"
 
   local suffix
@@ -504,29 +593,33 @@ start_shairport_in_netns() {
 
   # Wrapper script for shairport-sync
   local wrapper="$grp_dir/config/shairport_wrapper.sh"
-  cat > "$wrapper" <<'WRAPPER_EOF'
+  # Calculate loopback capture device: Card Loopback (1), Subdevice matches ALLOCATED_SUBDEVICE
+  # Loopback 0 is Playback (used by shairport), Loopback 1 is Capture (used by arecord)
+  local capture_dev="hw:Loopback,1,$ALLOCATED_SUBDEVICE"
+
+  cat > "$wrapper" <<WRAPPER_EOF
 #!/usr/bin/env bash
 set -e
 
-MV_IF="$1"
-GRP_DIR="$2"
-GRP="$3"
+MV_IF="\$1"
+GRP_DIR="\$2"
+GRP="\$3"
 
 ip link set lo up
-ip link set "$MV_IF" up
+ip link set "\$MV_IF" up
 
-echo "[shairport:$GRP] Running DHCP on $MV_IF ..."
+echo "[shairport:\$GRP] Running DHCP on \$MV_IF ..."
 # Use per-instance lease and PID files in /run (tmpfs) to avoid AppArmor/permission issues
-dhclient -v "$MV_IF" \
-  -lf "/run/shairport_dhclient.leases" \
-  -pf "/run/shairport_dhclient.pid" \
+dhclient -v "\$MV_IF" \\
+  -lf "/run/shairport_dhclient.leases" \\
+  -pf "/run/shairport_dhclient.pid" \\
   2>&1 | head -20 || true
 sleep 2
 
 # Get and save the IP address
-MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-echo "$MY_IP" > "$GRP_DIR/state/shairport_ip.txt"
-echo "[shairport:$GRP] Got IP: $MY_IP"
+MY_IP=\$(ip -4 addr show "\$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+echo "\$MY_IP" > "\$GRP_DIR/state/shairport_ip.txt"
+echo "[shairport:\$GRP] Got IP: \$MY_IP"
 
 # Private /run, /tmp, AND /dev/shm for complete isolation
 # CRITICAL: nqptp uses /dev/shm for shared memory - must be isolated!
@@ -535,17 +628,17 @@ mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /dev/shm
 mkdir -p /run/dbus /run/avahi-daemon
 
-echo "[shairport:$GRP] Starting dbus..."
+echo "[shairport:\$GRP] Starting dbus..."
 dbus-daemon --system --fork --nopidfile
 sleep 1
 
 # Create per-instance avahi config to avoid mDNS conflicts
 cat > /tmp/avahi-daemon.conf <<AVAHI_EOF
 [server]
-host-name=$(hostname)-shairport-$GRP
+host-name=\$(hostname)-shairport-\$GRP
 use-ipv4=yes
 use-ipv6=no
-allow-interfaces=$MV_IF
+allow-interfaces=\$MV_IF
 deny-interfaces=lo
 ratelimit-interval-usec=1000000
 ratelimit-burst=1000
@@ -563,25 +656,30 @@ enable-reflector=no
 [rlimits]
 AVAHI_EOF
 
-echo "[shairport:$GRP] Starting avahi..."
+echo "[shairport:\$GRP] Starting avahi..."
 avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits 2>/dev/null || true
 sleep 1
 
-echo "[shairport:$GRP] Starting nqptp..."
+echo "[shairport:\$GRP] Starting nqptp..."
 # nqptp binds to ports 319/320 - in separate network namespaces with separate IPs, this is isolated
 nqptp &
 sleep 1
 
-echo "[shairport:$GRP] Starting clock-sync buffer..."
-# Clock-sync buffer reads from audio.pipe.raw (shairport output) and writes to audio.pipe (OwnTone input)
-# This aligns audio output to wall-clock time, ensuring all zones stay in sync
-"$GRP_DIR/config/clock_sync_buffer.py" < "$GRP_DIR/state/shairport.raw" > "$GRP_DIR/pipes/audio.pipe" &
-CLOCK_SYNC_PID=$!
-echo "$CLOCK_SYNC_PID" > "$GRP_DIR/state/clock_sync.pid"
+echo "[shairport:\$GRP] Starting sync pipeline..."
+# CHAIN: shairport (ALSA Loopback 0) -> arecord (ALSA Loopback 1) -> clock_sync_buffer -> audio.pipe -> OwnTone
+# This ensures shairport syncs to the system clock via ALSA PTP
 
-echo "[shairport:$GRP] Starting shairport-sync with Real-Time priority..."
+# 1. Start clock-sync buffer reading from arecord
+# arecord captures from the loopback device where shairport is writing
+arecord -D $capture_dev -f cd -c 2 -t raw 2>/dev/null | \\
+  "\$GRP_DIR/config/clock_sync_buffer.py" > "\$GRP_DIR/pipes/audio.pipe" &
+
+CLOCK_SYNC_PID=\$!
+echo "\$CLOCK_SYNC_PID" > "\$GRP_DIR/state/clock_sync.pid"
+
+echo "[shairport:\$GRP] Starting shairport-sync with Real-Time priority..."
 # Use chrt (FIFO priority 50) to minimize scheduling jitter
-exec chrt -f 50 shairport-sync -c "$GRP_DIR/config/shairport-sync.conf" --statistics
+exec chrt -f 50 shairport-sync -c "\$GRP_DIR/config/shairport-sync.conf" --statistics
 WRAPPER_EOF
   chmod +x "$wrapper"
 
@@ -886,6 +984,11 @@ select_speaker_for_group() {
 main() {
   require_root
   check_deps
+  
+  # Setup ALSA loopback for clock synchronization
+  setup_alsa_loopback || die "Failed to setup ALSA loopback"
+  allocate_loopback_subdevice || die "Failed to allocate loopback subdevice"
+  
   select_parent_interface
   prompt_group_names
 
@@ -932,8 +1035,8 @@ main() {
 
   # NOW start shairport-sync instances (each in its own namespace with its own IP)
   log "Starting shairport-sync instances in separate namespaces..."
-  for grp in "${ZONES[@]}"; do
-    start_shairport_in_netns "$grp"
+  for i in "${!ZONES[@]}"; do
+    start_shairport_in_netns "${ZONES[$i]}" "$i"
   done
 
   # Wait for shairport-sync to get IPs
