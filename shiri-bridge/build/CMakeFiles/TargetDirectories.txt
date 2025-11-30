@@ -1,7 +1,0 @@
-/mnt/macos/Shiri/shiri-bridge/build/CMakeFiles/shiri-bridge.dir
-/mnt/macos/Shiri/shiri-bridge/build/CMakeFiles/edit_cache.dir
-/mnt/macos/Shiri/shiri-bridge/build/CMakeFiles/rebuild_cache.dir
-/mnt/macos/Shiri/shiri-bridge/build/libraop/CMakeFiles/raop_lib.dir
-/mnt/macos/Shiri/shiri-bridge/build/libraop/CMakeFiles/raop_play-linux-aarch64.dir
-/mnt/macos/Shiri/shiri-bridge/build/libraop/CMakeFiles/edit_cache.dir
-/mnt/macos/Shiri/shiri-bridge/build/libraop/CMakeFiles/rebuild_cache.dir
