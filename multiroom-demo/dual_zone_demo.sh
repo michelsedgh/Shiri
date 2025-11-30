@@ -2,24 +2,26 @@
 ###############################################################################
 # dual_zone_demo.sh
 #
-# Proof-of-concept script that spins up TWO independent AirPlay 2 endpoints.
+# Proof-of-concept script that spins up independent AirPlay 2 endpoints.
 # Each zone runs in its own network namespace with macvlan, containing:
 #   - shairport-sync (AirPlay 2 receiver)
 #   - OwnTone (audio router to speakers)
 # This gives each zone its own IP, avoiding port conflicts.
 #
-# AUDIO FLOW (with clock-sync for multi-zone synchronization):
-#   shairport-sync → audio.pipe.raw → clock_sync_buffer → audio.pipe → OwnTone
+# AUDIO FLOW (using ALSA loopback for PTP synchronization):
+#   shairport-sync → ALSA Loopback → arecord → audio.pipe → OwnTone
 #
-# The clock_sync_buffer ensures audio output is aligned to wall-clock time.
-# When multiple zones are grouped (e.g., on iOS), they stay synchronized because:
-#   1. Both shairport-syncs receive NTP-synced audio from iOS
-#   2. Both clock_sync_buffers wait for the same wall-clock boundary
-#   3. Both start outputting at the same moment
+# Synchronization is handled by shairport-sync's native PTP clock sync:
+#   1. shairport-sync uses ALSA backend (not pipe) to enable PTP sync
+#   2. Each instance syncs to the system clock using PTP from iOS
+#   3. ALSA loopback captures the synced audio for OwnTone
 #
-# When zones play independently, the clock alignment has no negative effect.
+# For zones to stay synchronized when grouped on iOS:
+#   - Group all zones BEFORE starting playback
+#   - iOS will send the same audio stream to all grouped zones
 #
 # Target OS: Ubuntu (tested on 22.04+)
+# Requires: snd-aloop kernel module (modprobe snd-aloop pcm_substreams=16)
 # Must be run as root (sudo).
 ###############################################################################
 set -euo pipefail
@@ -292,16 +294,14 @@ setup_directories() {
     rm -f "$grp_dir/logs/"* 2>/dev/null || true
 
     local audio_pipe="$grp_dir/pipes/audio.pipe"       # OwnTone reads from this
-    local raw_pipe="$grp_dir/state/shairport.raw"        # shairport-sync writes here (outside pipes/ so OwnTone ignores it)
     local meta_pipe="$grp_dir/pipes/audio.pipe.metadata"
     local format_file="$grp_dir/pipes/audio.pipe.format"
 
     # Remove stale FIFOs (if exist) and recreate
-    rm -f "$audio_pipe" "$raw_pipe" "$meta_pipe" "$format_file"
+    rm -f "$audio_pipe" "$meta_pipe" "$format_file"
     mkfifo "$audio_pipe"
-    mkfifo "$raw_pipe"
     mkfifo "$meta_pipe"
-    chmod 666 "$audio_pipe" "$raw_pipe" "$meta_pipe"
+    chmod 666 "$audio_pipe" "$meta_pipe"
 
     # OwnTone REQUIRES a format file to know the pipe's audio format!
     # Format: <bits_per_sample>,<sample_rate>,<channels>
@@ -310,142 +310,6 @@ setup_directories() {
 
     log "Created directories and FIFOs for $grp"
   done
-  
-  # Create shared sync directory (used for clock-aligned output)
-  mkdir -p "$BASE_DIR/sync"
-  chmod 777 "$BASE_DIR/sync"
-}
-
-#------------------------------------------------------------------------------
-# Generate clock-sync buffer script
-# This ensures audio output is aligned to wall-clock time across all zones
-#------------------------------------------------------------------------------
-generate_clock_sync_buffer() {
-  local grp="$1"
-  local grp_dir="$BASE_DIR/groups/$grp"
-  local script="$grp_dir/config/clock_sync_buffer.py"
-  
-  cat > "$script" <<'CLOCK_SYNC_EOF'
-#!/usr/bin/env python3
-import sys
-import time
-import os
-import fcntl
-import threading
-import queue
-
-# Configuration
-BARRIER_FILE = "/var/lib/shiri/sync/barrier"
-PRE_BUFFER_SIZE = 256 * 1024  # ~1.5 seconds of audio
-START_DELAY = 0.5             # Extra wait time after buffering
-VALID_WINDOW = 3.0            # Allow barrier to be valid for 3s
-
-# Thread-safe queue for buffering input while waiting
-input_queue = queue.Queue()
-input_active = True
-
-def get_time():
-    return time.time()
-
-def reader_thread():
-    global input_active
-    try:
-        while True:
-            # Read in 64KB chunks
-            chunk = sys.stdin.buffer.read(65536)
-            if not chunk:
-                break
-            input_queue.put(chunk)
-    except Exception:
-        pass
-    finally:
-        input_active = False
-        input_queue.put(None) # Sentinel
-
-def main():
-    # Ensure sync dir exists
-    try:
-        os.makedirs(os.path.dirname(BARRIER_FILE), exist_ok=True)
-    except OSError:
-        pass
-
-    # Start background reader thread to prevent blocking stdin (arecord)
-    t = threading.Thread(target=reader_thread, daemon=True)
-    t.start()
-
-    # 1. Read PRE-BUFFER
-    buffer_data = bytearray()
-    while len(buffer_data) < PRE_BUFFER_SIZE:
-        chunk = input_queue.get()
-        if chunk is None: # EOF
-            return
-        buffer_data.extend(chunk)
-
-    # 2. Coordinate via Barrier File
-    arrival_time = get_time()
-    barrier_time = 0.0
-
-    with open(BARRIER_FILE, 'a+') as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            content = f.read().strip()
-            
-            use_existing = False
-            if content:
-                try:
-                    stored_time = float(content)
-                    if stored_time > (arrival_time - VALID_WINDOW):
-                        barrier_time = stored_time
-                        use_existing = True
-                except ValueError:
-                    pass
-            
-            if not use_existing:
-                barrier_time = arrival_time + START_DELAY
-                f.seek(0)
-                f.truncate()
-                f.write(f"{barrier_time:.6f}")
-                f.flush()
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-    # 3. Wait for Barrier
-    now = get_time()
-    wait_time = barrier_time - now
-    if wait_time > 0:
-        time.sleep(wait_time)
-    
-    # 4. Stream Audio
-    try:
-        # BLAST the pre-buffer
-        sys.stdout.buffer.write(buffer_data)
-        sys.stdout.buffer.flush()
-        
-        # Stream the rest from queue
-        while True:
-            try:
-                # Non-blocking get to drain queue efficiently
-                chunk = input_queue.get(timeout=0.1)
-            except queue.Empty:
-                if not input_active:
-                    break
-                continue
-                
-            if chunk is None:
-                break
-            sys.stdout.buffer.write(chunk)
-            
-    except BrokenPipeError:
-        pass
-    except KeyboardInterrupt:
-        pass
-
-if __name__ == "__main__":
-    main()
-CLOCK_SYNC_EOF
-  chmod +x "$script"
-  log "Generated clock-sync buffer script for $grp"
 }
 
 #------------------------------------------------------------------------------
@@ -665,17 +529,19 @@ echo "[shairport:\$GRP] Starting nqptp..."
 nqptp &
 sleep 1
 
-echo "[shairport:\$GRP] Starting sync pipeline..."
-# CHAIN: shairport (ALSA Loopback 0) -> arecord (ALSA Loopback 1) -> clock_sync_buffer -> audio.pipe -> OwnTone
-# This ensures shairport syncs to the system clock via ALSA PTP
+echo "[shairport:\$GRP] Starting audio capture pipeline..."
+# DIRECT PIPE: shairport (ALSA Loopback 0) -> arecord (ALSA Loopback 1) -> audio.pipe -> OwnTone
+# 
+# IMPORTANT: We removed clock_sync_buffer because shairport-sync with ALSA backend
+# already does PTP synchronization to the system clock. Adding our own re-timing
+# was BREAKING the sync.
+#
+# For zones to be synced, iOS must send them the same audio stream (same frame positions).
+# This happens when zones are properly grouped BEFORE playback starts.
 
-# 1. Start clock-sync buffer reading from arecord
-# arecord captures from the loopback device where shairport is writing
-arecord -D $capture_dev -f cd -c 2 -t raw 2>/dev/null | \\
-  "\$GRP_DIR/config/clock_sync_buffer.py" > "\$GRP_DIR/pipes/audio.pipe" &
-
-CLOCK_SYNC_PID=\$!
-echo "\$CLOCK_SYNC_PID" > "\$GRP_DIR/state/clock_sync.pid"
+arecord -D $capture_dev -f cd -c 2 -t raw 2>/dev/null > "\$GRP_DIR/pipes/audio.pipe" &
+ARECORD_PID=\$!
+echo "\$ARECORD_PID" > "\$GRP_DIR/state/arecord.pid"
 
 echo "[shairport:\$GRP] Starting shairport-sync with Real-Time priority..."
 # Use chrt (FIFO priority 50) to minimize scheduling jitter
@@ -1000,7 +866,6 @@ main() {
   for i in "${!ZONES[@]}"; do
     generate_shairport_config "${ZONES[$i]}" "$i"
     generate_owntone_config "${ZONES[$i]}" "$i"
-    generate_clock_sync_buffer "${ZONES[$i]}"
   done
 
   # Start OwnTone instances FIRST (each in its own namespace with its own IP)
