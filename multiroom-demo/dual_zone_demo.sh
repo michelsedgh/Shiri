@@ -37,7 +37,7 @@ INSTANCE_ID="${RANDOM}${RANDOM}"
 ZONES=("zone${INSTANCE_ID}")
 
 # OwnTone ports (same for all instances since each is in its own namespace)
-OWNTONE_LIB_PORT=3689
+ 
 
 # Parent interface for macvlan (set via CLI or interactive prompt)
 PARENT_IF=""
@@ -76,11 +76,11 @@ require_root() {
 
 check_deps() {
   local missing=()
-  for cmd in ip dhclient unshare dbus-daemon avahi-daemon shairport-sync nqptp owntone jq curl mkfifo python3 arecord; do
+  for cmd in ip dhclient unshare dbus-daemon avahi-daemon shairport-sync nqptp owntone jq curl mkfifo arecord; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
-    die "Missing required commands: ${missing[*]}\nInstall them first (apt install iproute2 isc-dhcp-client util-linux dbus avahi-daemon shairport-sync owntone-server jq curl coreutils python3)."
+    die "Missing required commands: ${missing[*]}\nInstall them first (apt install iproute2 isc-dhcp-client util-linux dbus avahi-daemon shairport-sync owntone-server jq curl coreutils)."
   fi
 }
 
@@ -194,15 +194,50 @@ cleanup() {
   # Release loopback subdevice
   release_loopback_subdevice
 
-  # Kill ALL processes in each namespace before deleting it
+  # STEP 1: Gracefully release DHCP leases and stop network services in each namespace
+  # This is CRITICAL - without releasing DHCP, the router thinks devices are still connected!
   for ns in "${NETNS_NAMES[@]}"; do
     if ip netns list 2>/dev/null | grep -qw "$ns"; then
-      log "Killing processes in netns $ns"
-      # Get all PIDs in the namespace and kill them
+      log "Releasing DHCP lease in netns $ns..."
+      
+      # Find the interface in the namespace (sp_* or ot_*)
+      local iface
+      iface=$(ip netns exec "$ns" ip -o link show 2>/dev/null | grep -oP '(sp_|ot_)\w+' | head -1)
+      
+      if [[ -n "$iface" ]]; then
+        # Release DHCP lease - this notifies the router to free the IP
+        ip netns exec "$ns" dhclient -r "$iface" 2>/dev/null || true
+        log "Released DHCP lease on $iface in $ns"
+      fi
+      
+      # Stop avahi-daemon gracefully (deregisters from mDNS/Bonjour)
+      ip netns exec "$ns" pkill -TERM avahi-daemon 2>/dev/null || true
+      
+      # Stop nqptp gracefully
+      ip netns exec "$ns" pkill -TERM nqptp 2>/dev/null || true
+      
+      # Stop shairport-sync gracefully (allows it to deregister from AirPlay)
+      ip netns exec "$ns" pkill -TERM shairport-sync 2>/dev/null || true
+      
+      # Stop owntone gracefully
+      ip netns exec "$ns" pkill -TERM owntone 2>/dev/null || true
+      
+      # Stop arecord
+      ip netns exec "$ns" pkill -TERM arecord 2>/dev/null || true
+    fi
+  done
+  
+  # Give services time to gracefully shutdown and deregister
+  sleep 2
+
+  # STEP 2: Force kill any remaining processes in each namespace
+  for ns in "${NETNS_NAMES[@]}"; do
+    if ip netns list 2>/dev/null | grep -qw "$ns"; then
+      log "Force killing remaining processes in netns $ns"
       for pid in $(ip netns pids "$ns" 2>/dev/null); do
         kill -9 "$pid" 2>/dev/null || true
       done
-      sleep 0.5
+      sleep 0.3
     fi
   done
 
@@ -222,7 +257,7 @@ cleanup() {
 
   sleep 1
 
-  # Tear down network namespaces
+  # STEP 3: Tear down network namespaces
   for ns in "${NETNS_NAMES[@]}"; do
     if ip netns list 2>/dev/null | grep -qw "$ns"; then
       log "Deleting netns $ns"
@@ -239,44 +274,6 @@ cleanup() {
   log "Cleanup complete."
 }
 trap cleanup EXIT INT TERM
-
-#------------------------------------------------------------------------------
-# Kill any lingering processes from previous runs
-#------------------------------------------------------------------------------
-cleanup_previous_run() {
-  log "Cleaning up any previous run state..."
-  
-  # Kill any existing owntone processes (including system-wide)
-  pkill -9 owntone 2>/dev/null || true
-  pkill -9 -f "owntone" 2>/dev/null || true
-  pkill -9 -f "shairport-sync.*shiri" 2>/dev/null || true
-  
-  # Delete any existing netns that match our patterns
-  for ns in $(ip netns list 2>/dev/null | grep -E "^(shairport_|owntone_|zone)" | awk '{print $1}'); do
-    log "Deleting old netns: $ns"
-    # Kill all processes in it first
-    for pid in $(ip netns pids "$ns" 2>/dev/null); do
-      kill -9 "$pid" 2>/dev/null || true
-    done
-    ip netns delete "$ns" 2>/dev/null || true
-  done
-  
-  # Remove old state files (IP files, etc.) - including old indexed groups (0, 1, etc.)
-  rm -f "$BASE_DIR"/groups/*/state/*.txt 2>/dev/null || true
-  rm -f "$BASE_DIR"/groups/*/state/*.db 2>/dev/null || true
-  rm -rf "$BASE_DIR"/groups/*/state/cache 2>/dev/null || true
-  rm -f "$BASE_DIR"/groups/*/logs/*.log 2>/dev/null || true
-  
-  # Also remove old index-based group directories if they exist
-  for old_grp in "$BASE_DIR"/groups/[0-9]*; do
-    if [[ -d "$old_grp" ]]; then
-      log "Removing old group directory: $old_grp"
-      rm -rf "$old_grp"
-    fi
-  done
-  
-  sleep 1
-}
 
 #------------------------------------------------------------------------------
 # Directory / FIFO setup
@@ -327,15 +324,14 @@ generate_shairport_config() {
   local alsa_device="hw:Loopback,0,$ALLOCATED_SUBDEVICE"
   
   # Generate unique identifiers for this instance
-  # Each instance MUST have unique: device_id, port bases, and MAC-like identifier
-  local instance_hash
-  instance_hash=$(echo -n "$grp" | md5sum | cut -c1-12)
-  local unique_device_id="${instance_hash}"
-  
-  # Generate unique port base from hash (not idx, which is always 0 in single-zone mode)
-  # Convert first 4 hex chars to decimal and use modulo to get a port offset
-  local hash_num=$((16#${instance_hash:0:4}))
-  local port_base=$((6001 + (hash_num % 500) * 10))
+  # CRITICAL FOR AIRPLAY 2 SYNC: Each instance MUST have:
+  #   - Unique airplay_device_id_offset (so iOS sees them as distinct devices)
+  #   - Unique port (to avoid any confusion)
+  # 
+  # Using ALLOCATED_SUBDEVICE (0-15) ensures uniqueness across all instances
+  local device_offset=$((ALLOCATED_SUBDEVICE + 1))  # 1-16 to avoid 0
+  local port=$((7000 + ALLOCATED_SUBDEVICE))  # 7000-7015
+  local udp_port_base=$((6001 + ALLOCATED_SUBDEVICE * 100))  # 6001, 6101, 6201, etc.
 
   cat > "$conf" <<EOF
 // shairport-sync.conf for $grp
@@ -345,20 +341,33 @@ general =
   interpolation = "soxr";  // High-quality resampling for sync
   output_backend = "alsa"; // ALSA backend enables PTP clock sync
   mdns_backend = "avahi";
-  udp_port_base = $port_base;
-  udp_port_range = 100;
-  // Explicitly match arecord -f cd format
-  output_format = "S16_LE";
-  output_rate = 44100;
   
-  audio_backend_latency_offset_in_seconds = -3.0;  // Compensate for OwnTone's AirPlay buffer
-  // Unique device identifiers
-  device_id = "$unique_device_id";
+  // CRITICAL FOR MULTI-INSTANCE SYNC:
+  // Each instance needs unique port and device ID offset
+  // so iOS properly identifies them as separate synchronized receivers
+  port = $port;  // Unique RTSP port per instance
+  udp_port_base = $udp_port_base;
+  udp_port_range = 100;
+  airplay_device_id_offset = $device_offset;  // Makes each instance have unique AirPlay ID
+  
+  // Tighter sync tolerances for multi-room
+  drift_tolerance_in_seconds = 0.001;  // Tighter than default 0.002
+  resync_threshold_in_seconds = 0.025;  // Faster resync when out of sync
+  resync_recovery_time_in_seconds = 0.050;  // Quick recovery
 };
 
 alsa =
 {
   output_device = "$alsa_device";
+  // Disable standby to prevent timing glitches on resume
+  disable_standby_mode = "always";
+};
+
+// Enable statistics for debugging sync issues
+diagnostics =
+{
+  statistics = "yes";
+  log_verbosity = 1;
 };
 
 // AirPlay 2 specific settings
@@ -436,7 +445,6 @@ EOF
 #------------------------------------------------------------------------------
 start_shairport_in_netns() {
   local grp="$1"
-  local idx="$2"
   local grp_dir="$BASE_DIR/groups/$grp"
 
   local suffix
@@ -714,7 +722,6 @@ wait_for_owntone() {
   fi
 
   local owntone_ip="${OWNTONE_IPS[$grp]}"
-  local url="http://$owntone_ip:3689/api/config"
 
   log "Waiting for OwnTone API at $owntone_ip:3689 ..."
   for i in {1..60}; do
@@ -901,7 +908,7 @@ main() {
   # NOW start shairport-sync instances (each in its own namespace with its own IP)
   log "Starting shairport-sync instances in separate namespaces..."
   for i in "${!ZONES[@]}"; do
-    start_shairport_in_netns "${ZONES[$i]}" "$i"
+    start_shairport_in_netns "${ZONES[$i]}"
   done
 
   # Wait for shairport-sync to get IPs
