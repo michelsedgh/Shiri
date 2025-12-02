@@ -3,22 +3,25 @@
 # dual_zone_demo.sh
 #
 # Proof-of-concept script that spins up independent AirPlay 2 endpoints.
-# Each zone runs in its own network namespace with macvlan, containing:
-#   - shairport-sync (AirPlay 2 receiver)
-#   - OwnTone (audio router to speakers)
-# This gives each zone its own IP, avoiding port conflicts.
 #
-# AUDIO FLOW (using ALSA loopback for PTP synchronization):
-#   shairport-sync → ALSA Loopback → arecord → audio.pipe → OwnTone
+# CRITICAL ARCHITECTURE FOR MULTI-ROOM SYNC:
+#   All shairport-sync instances run on the HOST (same IP) sharing ONE nqptp.
+#   This ensures all instances use the SAME PTP timing calculation.
+#   OwnTone runs in network namespaces (separate IPs) for speaker routing.
 #
-# Synchronization is handled by shairport-sync's native PTP clock sync:
-#   1. shairport-sync uses ALSA backend (not pipe) to enable PTP sync
-#   2. Each instance syncs to the system clock using PTP from iOS
-#   3. ALSA loopback captures the synced audio for OwnTone
+# Why this works:
+#   - nqptp receives PTP timing from iOS and calculates local_to_master_time_offset
+#   - All shairport-sync instances read from the SAME /dev/shm/nqptp
+#   - They all output audio at exactly the same time = PERFECT SYNC
+#   - OwnTone doesn't need PTP sync - it receives already-synchronized audio
 #
-# For zones to stay synchronized when grouped on iOS:
-#   - Group all zones BEFORE starting playback
-#   - iOS will send the same audio stream to all grouped zones
+# AUDIO FLOW:
+#   shairport-sync (HOST) → ALSA Loopback → arecord → audio.pipe → OwnTone (namespace)
+#
+# Each shairport-sync instance uses:
+#   - Different port (7000, 7001, etc.)
+#   - Different airplay_device_id_offset (1, 2, etc.)
+#   - Different ALSA loopback subdevice (0, 1, etc.)
 #
 # Target OS: Ubuntu (tested on 22.04+)
 # Requires: snd-aloop kernel module (modprobe snd-aloop pcm_substreams=16)
@@ -48,16 +51,31 @@ declare -A OWNTONE_PIDS
 declare -a NETNS_NAMES
 declare -a MACVLAN_IFS
 declare -a GROUP_NAMES
-declare -A SHAIRPORT_IPS  # IP address of each shairport-sync namespace
+declare -A SHAIRPORT_IPS  # IP address of each shairport-sync instance
 declare -A OWNTONE_IPS    # IP address of each OwnTone namespace
-declare -A SHAIRPORT_NETNS  # Namespace name per shairport instance
+declare -A SHAIRPORT_NETNS  # "HOST" for host-based, or namespace name
 declare -A OWNTONE_NETNS    # Namespace name per OwnTone instance
+
+# Host process tracking (for cleanup)
+HOST_NQPTP_PID=""
+declare -a HOST_SHAIRPORT_PIDS
+declare -a HOST_ARECORD_PIDS
 
 #------------------------------------------------------------------------------
 # Helpers
 #------------------------------------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
+
+# Forward declaration for cleanup - actual logic is later
+stop_host_nqptp() {
+  if [[ -n "$HOST_NQPTP_PID" ]]; then
+    log "Stopping host nqptp (pid $HOST_NQPTP_PID)"
+    kill -TERM "$HOST_NQPTP_PID" 2>/dev/null || true
+    sleep 1
+    kill -9 "$HOST_NQPTP_PID" 2>/dev/null || true
+  fi
+}
 
 exec_in_owntone_netns() {
   local grp="$1"
@@ -194,43 +212,64 @@ cleanup() {
   # Release loopback subdevice
   release_loopback_subdevice
 
-  # STEP 1: Gracefully release DHCP leases and stop network services in each namespace
-  # This is CRITICAL - without releasing DHCP, the router thinks devices are still connected!
+  # STEP 1: Stop HOST processes (shairport-sync, arecord, nqptp)
+  log "Stopping host shairport-sync instances..."
+  for pid in "${HOST_SHAIRPORT_PIDS[@]}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "Stopping shairport-sync (pid $pid)"
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  
+  log "Stopping host arecord instances..."
+  for pid in "${HOST_ARECORD_PIDS[@]}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "Stopping arecord (pid $pid)"
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  
+  # Stop host nqptp (only if we started it)
+  stop_host_nqptp
+
+  # STEP 2: Gracefully release DHCP leases and stop services in OwnTone namespaces
   for ns in "${NETNS_NAMES[@]}"; do
     if ip netns list 2>/dev/null | grep -qw "$ns"; then
       log "Releasing DHCP lease in netns $ns..."
       
-      # Find the interface in the namespace (sp_* or ot_*)
+      # Find the interface in the namespace (ot_*)
       local iface
-      iface=$(ip netns exec "$ns" ip -o link show 2>/dev/null | grep -oP '(sp_|ot_)\w+' | head -1)
+      iface=$(ip netns exec "$ns" ip -o link show 2>/dev/null | grep -oP 'ot_\w+' | head -1)
       
       if [[ -n "$iface" ]]; then
-        # Release DHCP lease - this notifies the router to free the IP
         ip netns exec "$ns" dhclient -r "$iface" 2>/dev/null || true
         log "Released DHCP lease on $iface in $ns"
       fi
       
-      # Stop avahi-daemon gracefully (deregisters from mDNS/Bonjour)
+      # Stop avahi-daemon gracefully
       ip netns exec "$ns" pkill -TERM avahi-daemon 2>/dev/null || true
-      
-      # Stop nqptp gracefully
-      ip netns exec "$ns" pkill -TERM nqptp 2>/dev/null || true
-      
-      # Stop shairport-sync gracefully (allows it to deregister from AirPlay)
-      ip netns exec "$ns" pkill -TERM shairport-sync 2>/dev/null || true
       
       # Stop owntone gracefully
       ip netns exec "$ns" pkill -TERM owntone 2>/dev/null || true
-      
-      # Stop arecord
-      ip netns exec "$ns" pkill -TERM arecord 2>/dev/null || true
     fi
   done
   
-  # Give services time to gracefully shutdown and deregister
+  # Give services time to gracefully shutdown
   sleep 2
 
-  # STEP 2: Force kill any remaining processes in each namespace
+  # STEP 3: Force kill remaining host processes
+  for pid in "${HOST_SHAIRPORT_PIDS[@]}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "${HOST_ARECORD_PIDS[@]}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+
+  # STEP 4: Force kill remaining namespace processes
   for ns in "${NETNS_NAMES[@]}"; do
     if ip netns list 2>/dev/null | grep -qw "$ns"; then
       log "Force killing remaining processes in netns $ns"
@@ -245,7 +284,7 @@ cleanup() {
   for grp in "${ZONES[@]}"; do
     pid="${SHAIRPORT_PIDS[$grp]:-}"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      log "Stopping shairport-sync wrapper for $grp (pid $pid)"
+      log "Stopping shairport-sync for $grp (pid $pid)"
       kill -9 "$pid" 2>/dev/null || true
     fi
     pid="${OWNTONE_PIDS[$grp]:-}"
@@ -257,7 +296,7 @@ cleanup() {
 
   sleep 1
 
-  # STEP 3: Tear down network namespaces
+  # STEP 5: Tear down network namespaces (OwnTone only now)
   for ns in "${NETNS_NAMES[@]}"; do
     if ip netns list 2>/dev/null | grep -qw "$ns"; then
       log "Deleting netns $ns"
@@ -441,126 +480,94 @@ EOF
 }
 
 #------------------------------------------------------------------------------
-# Start shairport-sync in its own netns
+# Host nqptp management - ONE instance shared by ALL shairport-sync
+# This is CRITICAL for multi-room sync - all instances must use same timing
 #------------------------------------------------------------------------------
-start_shairport_in_netns() {
+start_host_nqptp() {
+  # Check if nqptp is already running on the host
+  if pgrep -x nqptp >/dev/null 2>&1; then
+    HOST_NQPTP_PID=$(pgrep -x nqptp | head -1)
+    log "nqptp already running on host (pid $HOST_NQPTP_PID) - reusing for shared timing"
+    return 0
+  fi
+  
+  log "Starting shared nqptp on HOST (CRITICAL for multi-room sync)..."
+  # nqptp MUST run on host to:
+  # 1. Receive PTP timing packets from iOS on ports 319/320
+  # 2. Write timing data to /dev/shm/nqptp
+  # 3. All shairport-sync instances read the SAME timing = PERFECT SYNC
+  nqptp &
+  HOST_NQPTP_PID=$!
+  sleep 1
+  
+  if ! kill -0 "$HOST_NQPTP_PID" 2>/dev/null; then
+    die "Failed to start nqptp on host - check if ports 319/320 are available"
+  fi
+  
+  # Verify shared memory was created
+  if [[ ! -e /dev/shm/nqptp ]]; then
+    die "nqptp started but /dev/shm/nqptp not created"
+  fi
+  
+  log "Host nqptp started (pid $HOST_NQPTP_PID) - /dev/shm/nqptp ready for all instances"
+}
+
+#------------------------------------------------------------------------------
+# Start shairport-sync on HOST (NOT in namespace) for shared PTP timing
+# 
+# CRITICAL FOR MULTI-ROOM SYNC:
+#   All shairport-sync instances MUST share the same nqptp via /dev/shm/nqptp.
+#   Running in separate namespaces with private /dev/shm causes each instance 
+#   to have independent PTP calculations → DRIFT over time.
+#
+#   By running on HOST:
+#   - All instances share ONE nqptp = SAME local_to_master_time_offset
+#   - Different ports + airplay_device_id_offset = iOS sees separate devices
+#   - Audio flows through ALSA loopback to pipes → OwnTone in namespaces
+#------------------------------------------------------------------------------
+start_shairport_on_host() {
   local grp="$1"
   local grp_dir="$BASE_DIR/groups/$grp"
 
-  local suffix
-  suffix=$(date +%s%N | tail -c 9)
-  local ns_name="shairport_${grp}_${suffix}"
-  local mv_if="sp_${grp:0:3}${suffix:0:5}"
+  log "Starting shairport-sync on HOST for $grp (shared nqptp = perfect sync)"
 
-  NETNS_NAMES+=("$ns_name")
-  MACVLAN_IFS+=("$mv_if")
+  # Get host IP for display
+  local host_ip
+  host_ip=$(ip -4 addr show "$PARENT_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || echo "unknown")
+  echo "$host_ip" > "$grp_dir/state/shairport_ip.txt"
+  SHAIRPORT_IPS[$grp]="$host_ip"
+  SHAIRPORT_NETNS[$grp]="HOST"  # Mark as running on host
 
-  log "Creating shairport-sync netns $ns_name for $grp"
-
-  ip netns add "$ns_name"
-  ip link add "$mv_if" link "$PARENT_IF" type macvlan mode bridge
-  ip link set "$mv_if" netns "$ns_name"
-
-  SHAIRPORT_NETNS[$grp]="$ns_name"
-
-  # Wrapper script for shairport-sync
-  local wrapper="$grp_dir/config/shairport_wrapper.sh"
-  # Calculate loopback capture device: Card Loopback (1), Subdevice matches ALLOCATED_SUBDEVICE
-  # Loopback 0 is Playback (used by shairport), Loopback 1 is Capture (used by arecord)
+  # Loopback devices for this instance
+  local playback_dev="hw:Loopback,0,$ALLOCATED_SUBDEVICE"
   local capture_dev="hw:Loopback,1,$ALLOCATED_SUBDEVICE"
 
-  cat > "$wrapper" <<WRAPPER_EOF
-#!/usr/bin/env bash
-set -e
+  # Start arecord in background to capture from loopback and write to pipe
+  log "Starting arecord for $grp (loopback subdevice $ALLOCATED_SUBDEVICE)"
+  (
+    while true; do
+      # Clear stale data
+      timeout 0.1 arecord -D "$capture_dev" -f cd -c 2 -t raw -d 1 2>/dev/null >/dev/null || true
+      # Capture and pipe to OwnTone
+      arecord -D "$capture_dev" -f cd -c 2 -t raw --buffer-size=8192 2>/dev/null > "$grp_dir/pipes/audio.pipe"
+      log "arecord for $grp exited, restarting..."
+      sleep 0.5
+    done
+  ) &>"$grp_dir/logs/arecord.log" &
+  local arecord_pid=$!
+  HOST_ARECORD_PIDS+=("$arecord_pid")
+  echo "$arecord_pid" > "$grp_dir/state/arecord.pid"
+  log "Started arecord for $grp (pid $arecord_pid)"
 
-MV_IF="\$1"
-GRP_DIR="\$2"
-GRP="\$3"
-
-ip link set lo up
-ip link set "\$MV_IF" up
-
-echo "[shairport:\$GRP] Running DHCP on \$MV_IF ..."
-# Use per-instance lease and PID files in /run (tmpfs) to avoid AppArmor/permission issues
-dhclient -v "\$MV_IF" \\
-  -lf "/run/shairport_dhclient.leases" \\
-  -pf "/run/shairport_dhclient.pid" \\
-  2>&1 | head -20 || true
-sleep 2
-
-# Get and save the IP address
-MY_IP=\$(ip -4 addr show "\$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-echo "\$MY_IP" > "\$GRP_DIR/state/shairport_ip.txt"
-echo "[shairport:\$GRP] Got IP: \$MY_IP"
-
-# Private /run, /tmp, AND /dev/shm for complete isolation
-# CRITICAL: nqptp uses /dev/shm for shared memory - must be isolated!
-mount -t tmpfs tmpfs /run
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /dev/shm
-mkdir -p /run/dbus /run/avahi-daemon
-
-echo "[shairport:\$GRP] Starting dbus..."
-dbus-daemon --system --fork --nopidfile
-sleep 1
-
-# Create per-instance avahi config to avoid mDNS conflicts
-cat > /tmp/avahi-daemon.conf <<AVAHI_EOF
-[server]
-host-name=\$(hostname)-shairport-\$GRP
-use-ipv4=yes
-use-ipv6=no
-allow-interfaces=\$MV_IF
-deny-interfaces=lo
-ratelimit-interval-usec=1000000
-ratelimit-burst=1000
-
-[wide-area]
-enable-wide-area=no
-
-[publish]
-publish-hinfo=no
-publish-workstation=no
-
-[reflector]
-enable-reflector=no
-
-[rlimits]
-AVAHI_EOF
-
-echo "[shairport:\$GRP] Starting avahi..."
-avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits 2>/dev/null || true
-sleep 1
-
-echo "[shairport:\$GRP] Starting nqptp..."
-# nqptp binds to ports 319/320 - in separate network namespaces with separate IPs, this is isolated
-nqptp &
-sleep 1
-
-echo "[shairport:\$GRP] Starting audio capture pipeline..."
-# DIRECT PIPE: shairport (ALSA Loopback 0) -> arecord (ALSA Loopback 1) -> audio.pipe -> OwnTone
-# 
-# IMPORTANT: We removed clock_sync_buffer because shairport-sync with ALSA backend
-# already does PTP synchronization to the system clock. Adding our own re-timing
-# was BREAKING the sync.
-#
-# For zones to be synced, iOS must send them the same audio stream (same frame positions).
-# This happens when zones are properly grouped BEFORE playback starts.
-
-arecord -D $capture_dev -f cd -c 2 -t raw 2>/dev/null > "\$GRP_DIR/pipes/audio.pipe" &
-ARECORD_PID=\$!
-echo "\$ARECORD_PID" > "\$GRP_DIR/state/arecord.pid"
-
-echo "[shairport:\$GRP] Starting shairport-sync with Real-Time priority..."
-# Use chrt (FIFO priority 50) to minimize scheduling jitter
-exec chrt -f 50 shairport-sync -c "\$GRP_DIR/config/shairport-sync.conf" --statistics
-WRAPPER_EOF
-  chmod +x "$wrapper"
-
-  # Launch wrapper inside netns
-  ip netns exec "$ns_name" unshare -m bash "$wrapper" "$mv_if" "$grp_dir" "$grp" &>"$grp_dir/logs/shairport_wrapper.log" &
-  SHAIRPORT_PIDS[$grp]=$!
-  log "Started shairport-sync for $grp (pid ${SHAIRPORT_PIDS[$grp]})"
+  # Start shairport-sync on host with real-time priority
+  log "Starting shairport-sync for $grp on host..."
+  chrt -f 50 shairport-sync -c "$grp_dir/config/shairport-sync.conf" --statistics \
+    &>"$grp_dir/logs/shairport.log" &
+  local shairport_pid=$!
+  SHAIRPORT_PIDS[$grp]=$shairport_pid
+  HOST_SHAIRPORT_PIDS+=("$shairport_pid")
+  
+  log "Started shairport-sync for $grp (pid $shairport_pid) - using shared nqptp"
 }
 
 #------------------------------------------------------------------------------
@@ -862,6 +869,10 @@ main() {
   setup_alsa_loopback || die "Failed to setup ALSA loopback"
   allocate_loopback_subdevice || die "Failed to allocate loopback subdevice"
   
+  # Start nqptp on HOST FIRST - CRITICAL for multi-room sync
+  # All shairport-sync instances will share this ONE nqptp
+  start_host_nqptp
+  
   select_parent_interface
   prompt_group_names
 
@@ -905,16 +916,14 @@ main() {
     verify_pipe_discovery "$grp" || true
   done
 
-  # NOW start shairport-sync instances (each in its own namespace with its own IP)
-  log "Starting shairport-sync instances in separate namespaces..."
+  # NOW start shairport-sync instances ON HOST (sharing nqptp for perfect sync)
+  log "Starting shairport-sync instances on HOST (shared nqptp = perfect multi-room sync)..."
   for i in "${!ZONES[@]}"; do
-    start_shairport_in_netns "${ZONES[$i]}"
+    start_shairport_on_host "${ZONES[$i]}"
   done
 
-  # Wait for shairport-sync to get IPs
-  for grp in "${ZONES[@]}"; do
-    wait_for_shairport "$grp" || true
-  done
+  # Brief pause to let shairport-sync register with avahi
+  sleep 2
 
   # Let user select speakers
   echo ""
@@ -928,19 +937,39 @@ main() {
   echo ""
   log "Demo is running!"
   echo ""
+  echo "========================================"
+  echo "  SYNC ARCHITECTURE (Perfect Multi-Room)"
+  echo "========================================"
+  echo ""
+  echo "  nqptp (HOST):        PID $HOST_NQPTP_PID → /dev/shm/nqptp"
+  echo "  All shairport-sync:  Running on HOST, sharing nqptp timing"
+  echo ""
   echo "IPs assigned:"
   for grp in "${ZONES[@]}"; do
-    echo "  - $grp shairport-sync: ${SHAIRPORT_IPS[$grp]:-unknown}"
-    echo "  - $grp OwnTone:        ${OWNTONE_IPS[$grp]:-unknown}"
+    echo "  - $grp shairport-sync: ${SHAIRPORT_IPS[$grp]:-unknown} (HOST)"
+    echo "  - $grp OwnTone:        ${OWNTONE_IPS[$grp]:-unknown} (namespace)"
   done
   echo ""
-  echo "You should now see these AirPlay endpoints on your iPhone:"
+  echo "========================================"
+  echo "  AirPlay Endpoints"
+  echo "========================================"
+  echo ""
+  echo "You should see these AirPlay endpoints on your iPhone:"
   for i in "${!ZONES[@]}"; do
     echo "  - ${GROUP_NAMES[$i]}"
   done
   echo ""
-  echo "When you play audio to an AirPlay endpoint, OwnTone should auto-start"
-  echo "playback to the speaker you selected (pipe_autostart is enabled)."
+  echo "FOR SYNCHRONIZED PLAYBACK:"
+  echo "  1. Open Control Center on your iPhone"
+  echo "  2. Long-press the audio card (top-right)"
+  echo "  3. Tap the AirPlay icon"
+  echo "  4. Select your zone(s)"
+  echo "  5. Play music!"
+  echo ""
+  echo "  ✓ All zones now share ONE nqptp = PERFECT SYNC"
+  echo "  ✓ No more drift over time!"
+  echo ""
+  echo "When you play audio, OwnTone should auto-start playback to your speakers."
   echo ""
   echo "OwnTone Web UIs (access from your browser):"
   for grp in "${ZONES[@]}"; do
@@ -948,25 +977,31 @@ main() {
   done
   echo ""
   echo "TROUBLESHOOTING:"
-  echo "  1. Check OwnTone wrapper logs:"
+  echo "  1. Verify nqptp shared memory exists:"
+  echo "     ls -la /dev/shm/nqptp"
+  echo ""
+  echo "  2. Check shairport-sync logs:"
+  for grp in "${ZONES[@]}"; do
+    echo "     cat $BASE_DIR/groups/$grp/logs/shairport.log"
+  done
+  echo ""
+  echo "  3. Check OwnTone wrapper logs:"
   for grp in "${ZONES[@]}"; do
     echo "     cat $BASE_DIR/groups/$grp/logs/owntone_wrapper.log"
   done
   echo ""
-  echo "  2. Check shairport-sync wrapper logs:"
+  echo "  4. Check arecord logs:"
   for grp in "${ZONES[@]}"; do
-    echo "     cat $BASE_DIR/groups/$grp/logs/shairport_wrapper.log"
+    echo "     cat $BASE_DIR/groups/$grp/logs/arecord.log"
   done
   echo ""
-  echo "  3. Check OwnTone logs for 'pipe' messages:"
-  for grp in "${ZONES[@]}"; do
-    echo "     grep -i pipe $BASE_DIR/groups/$grp/logs/owntone.log"
-  done
-  echo ""
-  echo "  4. Check if pipes exist and are FIFOs:"
+  echo "  5. Check if pipes exist and are FIFOs:"
   for grp in "${ZONES[@]}"; do
     echo "     ls -la $BASE_DIR/groups/$grp/pipes/"
   done
+  echo ""
+  echo "  6. SYNC VERIFICATION - All instances should show same timing offset:"
+  echo "     grep 'offset' $BASE_DIR/groups/*/logs/shairport.log | tail -20"
   echo ""
   echo "Press Ctrl+C to stop the demo and clean up."
 
