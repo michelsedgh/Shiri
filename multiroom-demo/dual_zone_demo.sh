@@ -451,6 +451,12 @@ general =
   resync_threshold_in_seconds = 0.025;  // Faster resync when out of sync
   resync_recovery_time_in_seconds = 0.050;  // Quick recovery
   
+  // LYRICS/VIDEO SYNC FIX:
+  // Negative value = deliver audio EARLIER to compensate for buffer delays
+  // Adjust this if lyrics on iPhone are ahead/behind what you hear
+  // Try values from -0.2 to -0.8 if still out of sync
+  audio_backend_latency_offset_in_seconds = -2.3;
+  
   // INSTANT VOLUME CONTROL via OwnTone:
   // Keep shairport-sync at 100% volume (no delayed volume changes)
   // Volume changes are intercepted and applied instantly via OwnTone API
