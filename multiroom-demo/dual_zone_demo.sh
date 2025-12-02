@@ -372,6 +372,12 @@ generate_shairport_config() {
   local port=$((7000 + ALLOCATED_SUBDEVICE))  # 7000-7015
   local udp_port_base=$((6001 + ALLOCATED_SUBDEVICE * 100))  # 6001, 6101, 6201, etc.
 
+  # Volume bridge script path (for instant volume control via OwnTone)
+  local volume_bridge_script="$(dirname "$(readlink -f "$0")")/volume_bridge.sh"
+  
+  # Ensure volume bridge script is executable
+  chmod +x "$volume_bridge_script" 2>/dev/null || true
+
   # Create pipe reset script - CRITICAL FOR MULTI-ROOM SYNC
   # This script kills arecord and flushes the pipe to reset ALL buffer state
   # Without this, pipes accumulate different amounts of data = DRIFT
@@ -444,6 +450,15 @@ general =
   drift_tolerance_in_seconds = 0.001;  // Tighter than default 0.002
   resync_threshold_in_seconds = 0.025;  // Faster resync when out of sync
   resync_recovery_time_in_seconds = 0.050;  // Quick recovery
+  
+  // INSTANT VOLUME CONTROL via OwnTone:
+  // Keep shairport-sync at 100% volume (no delayed volume changes)
+  // Volume changes are intercepted and applied instantly via OwnTone API
+  ignore_volume_control = "yes";
+  
+  // Hook called when iOS sends volume change - passes volume to OwnTone
+  // NOTE: trailing space is REQUIRED so shairport appends volume as argument
+  run_this_when_volume_is_set = "$volume_bridge_script $grp_dir ";
 };
 
 alsa =
@@ -663,6 +678,9 @@ start_owntone_in_netns() {
   ip link set "$mv_if" netns "$ns_name"
 
   OWNTONE_NETNS[$grp]="$ns_name"
+  
+  # Save netns name so volume_bridge.sh can use it
+  echo "$ns_name" > "$grp_dir/state/owntone_netns.txt"
 
   # Ensure cache dir exists
   mkdir -p "$grp_dir/state/cache"
@@ -1015,6 +1033,15 @@ main() {
   echo "  nqptp (HOST):        PID $HOST_NQPTP_PID → /dev/shm/nqptp"
   echo "  All shairport-sync:  Running on HOST, sharing nqptp timing"
   echo ""
+  echo "========================================"
+  echo "  INSTANT VOLUME CONTROL"
+  echo "========================================"
+  echo ""
+  echo "  Volume changes from your phone are now INSTANT!"
+  echo "  - shairport-sync stays at 100% (no delayed volume)"
+  echo "  - volume_bridge.sh intercepts volume events"
+  echo "  - OwnTone applies volume to speakers immediately"
+  echo ""
   echo "IPs assigned:"
   for grp in "${ZONES[@]}"; do
     echo "  - $grp shairport-sync: ${SHAIRPORT_IPS[$grp]:-unknown} (HOST)"
@@ -1066,12 +1093,17 @@ main() {
     echo "     cat $BASE_DIR/groups/$grp/logs/arecord.log"
   done
   echo ""
-  echo "  5. Check if pipes exist and are FIFOs:"
+  echo "  5. Check volume bridge logs (instant volume):"
+  for grp in "${ZONES[@]}"; do
+    echo "     cat $BASE_DIR/groups/$grp/logs/volume_bridge.log"
+  done
+  echo ""
+  echo "  6. Check if pipes exist and are FIFOs:"
   for grp in "${ZONES[@]}"; do
     echo "     ls -la $BASE_DIR/groups/$grp/pipes/"
   done
   echo ""
-  echo "  6. SYNC VERIFICATION - All instances should show same timing offset:"
+  echo "  7. SYNC VERIFICATION - All instances should show same timing offset:"
   echo "     grep 'offset' $BASE_DIR/groups/*/logs/shairport.log | tail -20"
   echo ""
   echo "Press Ctrl+C to stop the demo and clean up."
