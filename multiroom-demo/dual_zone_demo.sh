@@ -372,6 +372,57 @@ generate_shairport_config() {
   local port=$((7000 + ALLOCATED_SUBDEVICE))  # 7000-7015
   local udp_port_base=$((6001 + ALLOCATED_SUBDEVICE * 100))  # 6001, 6101, 6201, etc.
 
+  # Create pipe reset script - CRITICAL FOR MULTI-ROOM SYNC
+  # This script kills arecord and flushes the pipe to reset ALL buffer state
+  # Without this, pipes accumulate different amounts of data = DRIFT
+  local flush_script="$grp_dir/config/reset_audio_pipe.sh"
+  cat > "$flush_script" <<FLUSH_EOF
+#!/bin/bash
+# Reset audio pipe completely for sync
+# Called by shairport-sync on play start/stop
+# This kills arecord, flushes the pipe, and lets arecord restart fresh
+
+PIPE="$grp_dir/pipes/audio.pipe"
+ARECORD_PID_FILE="$grp_dir/state/arecord.pid"
+LOG="$grp_dir/logs/sync_reset.log"
+TIMESTAMP=\$(date '+%H:%M:%S.%3N')
+
+echo "" >> "\$LOG"
+echo "[\$TIMESTAMP] ========== SYNC RESET TRIGGERED ==========" >> "\$LOG"
+echo "[\$TIMESTAMP] Called with args: \$@" >> "\$LOG"
+
+# Step 1: Kill arecord to stop writing to pipe
+if [[ -f "\$ARECORD_PID_FILE" ]]; then
+  ARECORD_PID=\$(cat "\$ARECORD_PID_FILE")
+  echo "[\$TIMESTAMP] Found arecord PID file: \$ARECORD_PID" >> "\$LOG"
+  if kill -0 "\$ARECORD_PID" 2>/dev/null; then
+    echo "[\$TIMESTAMP] Killing arecord (pid \$ARECORD_PID)" >> "\$LOG"
+    kill -TERM "\$ARECORD_PID" 2>/dev/null || true
+    sleep 0.1
+    echo "[\$TIMESTAMP] arecord killed" >> "\$LOG"
+  else
+    echo "[\$TIMESTAMP] arecord (pid \$ARECORD_PID) not running" >> "\$LOG"
+  fi
+else
+  echo "[\$TIMESTAMP] WARNING: arecord PID file not found!" >> "\$LOG"
+fi
+
+# Step 2: Drain any buffered data from the pipe
+if [[ -p "\$PIPE" ]]; then
+  BEFORE_SIZE=\$(timeout 0.1 stat -c%s "\$PIPE" 2>/dev/null || echo "unknown")
+  echo "[\$TIMESTAMP] Draining pipe (size before: \$BEFORE_SIZE)" >> "\$LOG"
+  # Non-blocking drain - read whatever is buffered
+  DRAINED=\$(timeout 0.3 dd if="\$PIPE" of=/dev/null bs=65536 iflag=nonblock 2>&1 | grep -oP '\d+ bytes' || echo "0 bytes")
+  echo "[\$TIMESTAMP] Drained: \$DRAINED" >> "\$LOG"
+else
+  echo "[\$TIMESTAMP] WARNING: Pipe \$PIPE is not a FIFO!" >> "\$LOG"
+fi
+
+echo "[\$TIMESTAMP] Reset complete - arecord will restart fresh" >> "\$LOG"
+echo "[\$TIMESTAMP] ==========================================" >> "\$LOG"
+FLUSH_EOF
+  chmod +x "$flush_script"
+
   cat > "$conf" <<EOF
 // shairport-sync.conf for $grp
 general =
@@ -402,6 +453,15 @@ alsa =
   disable_standby_mode = "always";
 };
 
+// CRITICAL: Session control hooks to flush pipes on play start/stop
+// This resets buffer state so all instances start synchronized
+sessioncontrol =
+{
+  run_this_before_play_begins = "$flush_script";
+  run_this_after_play_ends = "$flush_script";
+  wait_for_completion = "yes";  // Wait for flush to complete before continuing
+};
+
 // Enable statistics for debugging sync issues
 diagnostics =
 {
@@ -413,7 +473,6 @@ diagnostics =
 airplay =
 {
   // Enable AirPlay 2 operation (requires nqptp running)
-  // Each instance has isolated nqptp in private /dev/shm
 };
 
 metadata =
@@ -424,7 +483,7 @@ metadata =
   pipe_timeout = 5000;
 };
 EOF
-  log "Generated shairport-sync config for $grp (ALSA backend)"
+  log "Generated shairport-sync config for $grp (ALSA backend + pipe flush hooks)"
 }
 
 #------------------------------------------------------------------------------
@@ -542,22 +601,34 @@ start_shairport_on_host() {
   local playback_dev="hw:Loopback,0,$ALLOCATED_SUBDEVICE"
   local capture_dev="hw:Loopback,1,$ALLOCATED_SUBDEVICE"
 
-  # Start arecord in background to capture from loopback and write to pipe
-  log "Starting arecord for $grp (loopback subdevice $ALLOCATED_SUBDEVICE)"
+  # Start arecord supervisor in background
+  # Uses small buffer (2048 frames = ~46ms) to minimize latency/drift
+  # The supervisor loop auto-restarts arecord when killed by sync reset
+  log "Starting arecord supervisor for $grp (loopback subdevice $ALLOCATED_SUBDEVICE)"
   (
     while true; do
-      # Clear stale data
+      # Clear stale loopback data before each session
       timeout 0.1 arecord -D "$capture_dev" -f cd -c 2 -t raw -d 1 2>/dev/null >/dev/null || true
-      # Capture and pipe to OwnTone
-      arecord -D "$capture_dev" -f cd -c 2 -t raw --buffer-size=8192 2>/dev/null > "$grp_dir/pipes/audio.pipe"
-      log "arecord for $grp exited, restarting..."
-      sleep 0.5
+      
+      # Start arecord with small buffer for low latency
+      # --buffer-size=2048 = ~46ms buffer (was 8192 = ~185ms)
+      # This reduces the time window for drift accumulation
+      arecord -D "$capture_dev" -f cd -c 2 -t raw --buffer-size=2048 --period-size=512 2>/dev/null > "$grp_dir/pipes/audio.pipe" &
+      ARECORD_INNER_PID=\$!
+      
+      # Write the actual arecord PID (not supervisor PID) for sync reset script
+      echo "\$ARECORD_INNER_PID" > "$grp_dir/state/arecord.pid"
+      
+      # Wait for arecord to exit (killed by sync reset or pipe close)
+      wait \$ARECORD_INNER_PID 2>/dev/null || true
+      
+      echo "[\$(date '+%H:%M:%S')] arecord exited, restarting in 0.3s..." >&2
+      sleep 0.3
     done
   ) &>"$grp_dir/logs/arecord.log" &
-  local arecord_pid=$!
-  HOST_ARECORD_PIDS+=("$arecord_pid")
-  echo "$arecord_pid" > "$grp_dir/state/arecord.pid"
-  log "Started arecord for $grp (pid $arecord_pid)"
+  local supervisor_pid=$!
+  HOST_ARECORD_PIDS+=("$supervisor_pid")
+  log "Started arecord supervisor for $grp (supervisor pid $supervisor_pid)"
 
   # Start shairport-sync on host with real-time priority
   log "Starting shairport-sync for $grp on host..."
