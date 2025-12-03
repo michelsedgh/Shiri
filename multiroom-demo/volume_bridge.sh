@@ -36,6 +36,7 @@ AIRPLAY_VOL="$2"
 LOG="$GRP_DIR/logs/volume_bridge.log"
 OWNTONE_IP_FILE="$GRP_DIR/state/owntone_ip.txt"
 OWNTONE_NETNS_FILE="$GRP_DIR/state/owntone_netns.txt"
+LAST_VOL_FILE="$GRP_DIR/state/master_volume_last.txt"
 
 log() {
   echo "[$(date '+%H:%M:%S.%3N')] $*" >> "$LOG"
@@ -107,7 +108,9 @@ RESULT=$(run_curl -s --connect-timeout 2 -X PUT \
   "http://$OWNTONE_IP:3689/api/player/volume?volume=$OWNTONE_VOL" 2>&1)
 
 if [[ $? -eq 0 ]]; then
-  log "SUCCESS: Master volume set to $OWNTONE_VOL"
+  # Persist last known master volume for pause_bridge
+  echo "$OWNTONE_VOL" > "$LAST_VOL_FILE" 2>/dev/null || true
+  log "SUCCESS: Master volume set to $OWNTONE_VOL (persisted)"
 else
   log "ERROR: Failed to set master volume: $RESULT"
   exit 1

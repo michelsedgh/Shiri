@@ -60,6 +60,7 @@ declare -A OWNTONE_NETNS    # Namespace name per OwnTone instance
 HOST_NQPTP_PID=""
 declare -a HOST_SHAIRPORT_PIDS
 declare -a HOST_ARECORD_PIDS
+declare -a PAUSE_BRIDGE_PIDS
 
 #------------------------------------------------------------------------------
 # Helpers
@@ -229,6 +230,14 @@ cleanup() {
     fi
   done
   
+  log "Stopping pause bridge instances..."
+  for pid in "${PAUSE_BRIDGE_PIDS[@]}"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "Stopping pause_bridge (pid $pid)"
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  
   # Stop host nqptp (only if we started it)
   stop_host_nqptp
 
@@ -330,14 +339,16 @@ setup_directories() {
     rm -f "$grp_dir/logs/"* 2>/dev/null || true
 
     local audio_pipe="$grp_dir/pipes/audio.pipe"       # OwnTone reads from this
-    local meta_pipe="$grp_dir/pipes/audio.pipe.metadata"
+    local meta_pipe="$grp_dir/pipes/audio.pipe.metadata"  # OwnTone's optional metadata FIFO
+    local pause_meta_pipe="$grp_dir/pipes/pause_bridge.metadata"  # Dedicated metadata FIFO for pause_bridge/shairport
     local format_file="$grp_dir/pipes/audio.pipe.format"
 
     # Remove stale FIFOs (if exist) and recreate
-    rm -f "$audio_pipe" "$meta_pipe" "$format_file"
+    rm -f "$audio_pipe" "$meta_pipe" "$pause_meta_pipe" "$format_file"
     mkfifo "$audio_pipe"
     mkfifo "$meta_pipe"
-    chmod 666 "$audio_pipe" "$meta_pipe"
+    mkfifo "$pause_meta_pipe"
+    chmod 666 "$audio_pipe" "$meta_pipe" "$pause_meta_pipe"
 
     # OwnTone REQUIRES a format file to know the pipe's audio format!
     # Format: <bits_per_sample>,<sample_rate>,<channels>
@@ -500,7 +511,9 @@ metadata =
 {
   enabled = "yes";
   include_cover_art = "no";
-  pipe_name = "$grp_dir/pipes/audio.pipe.metadata";
+  // Use a dedicated metadata FIFO for pause_bridge to avoid sharing OwnTone's pipe metadata FIFO
+  // This prevents multiple readers on the same FIFO, which can corrupt XML items.
+  pipe_name = "$grp_dir/pipes/pause_bridge.metadata";
   pipe_timeout = 5000;
 };
 EOF
@@ -660,6 +673,28 @@ start_shairport_on_host() {
   HOST_SHAIRPORT_PIDS+=("$shairport_pid")
   
   log "Started shairport-sync for $grp (pid $shairport_pid) - using shared nqptp"
+}
+
+#------------------------------------------------------------------------------
+# Start pause bridge to instantly mute on pause (eliminates buffer delay)
+#------------------------------------------------------------------------------
+start_pause_bridge() {
+  local grp="$1"
+  local grp_dir="$BASE_DIR/groups/$grp"
+  
+  local pause_bridge_script="$(dirname "$(readlink -f "$0")")/pause_bridge.sh"
+  
+  if [[ ! -x "$pause_bridge_script" ]]; then
+    log "WARNING: pause_bridge.sh not found or not executable at $pause_bridge_script"
+    return 1
+  fi
+  
+  log "Starting pause bridge for $grp (instant mute on pause)..."
+  "$pause_bridge_script" "$grp_dir" &>"$grp_dir/logs/pause_bridge.log" &
+  local bridge_pid=$!
+  PAUSE_BRIDGE_PIDS+=("$bridge_pid")
+  
+  log "Started pause bridge for $grp (pid $bridge_pid)"
 }
 
 #------------------------------------------------------------------------------
@@ -1017,6 +1052,12 @@ main() {
     start_shairport_on_host "${ZONES[$i]}"
   done
 
+  # Start pause bridges (instant mute on pause to eliminate buffer delay)
+  log "Starting pause bridges for instant pause response..."
+  for grp in "${ZONES[@]}"; do
+    start_pause_bridge "$grp" || true
+  done
+
   # Brief pause to let shairport-sync register with avahi
   sleep 2
 
@@ -1040,13 +1081,18 @@ main() {
   echo "  All shairport-sync:  Running on HOST, sharing nqptp timing"
   echo ""
   echo "========================================"
-  echo "  INSTANT VOLUME CONTROL"
+  echo "  INSTANT VOLUME & PAUSE CONTROL"
   echo "========================================"
   echo ""
   echo "  Volume changes from your phone are now INSTANT!"
   echo "  - shairport-sync stays at 100% (no delayed volume)"
   echo "  - volume_bridge.sh intercepts volume events"
-  echo "  - OwnTone applies volume to speakers immediately"
+  echo "  - OwnTone master volume preserves speaker ratio"
+  echo ""
+  echo "  Pause/Stop is now INSTANT! (no more 2.5s buffer delay)"
+  echo "  - pause_bridge.sh monitors metadata for pfls/prsm events"
+  echo "  - Instantly mutes OwnTone when you pause"
+  echo "  - Restores volume after buffer clears"
   echo ""
   echo "IPs assigned:"
   for grp in "${ZONES[@]}"; do
@@ -1104,12 +1150,17 @@ main() {
     echo "     cat $BASE_DIR/groups/$grp/logs/volume_bridge.log"
   done
   echo ""
-  echo "  6. Check if pipes exist and are FIFOs:"
+  echo "  6. Check pause bridge logs (instant pause):"
+  for grp in "${ZONES[@]}"; do
+    echo "     cat $BASE_DIR/groups/$grp/logs/pause_bridge.log"
+  done
+  echo ""
+  echo "  7. Check if pipes exist and are FIFOs:"
   for grp in "${ZONES[@]}"; do
     echo "     ls -la $BASE_DIR/groups/$grp/pipes/"
   done
   echo ""
-  echo "  7. SYNC VERIFICATION - All instances should show same timing offset:"
+  echo "  8. SYNC VERIFICATION - All instances should show same timing offset:"
   echo "     grep 'offset' $BASE_DIR/groups/*/logs/shairport.log | tail -20"
   echo ""
   echo "Press Ctrl+C to stop the demo and clean up."
