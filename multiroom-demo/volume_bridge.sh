@@ -98,37 +98,19 @@ run_curl() {
   fi
 }
 
-# Get all enabled outputs and set volume on each
-OUTPUTS=$(run_curl -s --connect-timeout 2 "http://$OWNTONE_IP:3689/api/outputs" 2>/dev/null)
+# Set MASTER volume (preserves ratio between individual speakers)
+# Using /api/player/volume without output_id changes the master volume
+# This is different from setting individual output volumes which would break the ratio
+log "Setting OwnTone MASTER volume to $OWNTONE_VOL (preserves speaker ratio)"
 
-if [[ -z "$OUTPUTS" ]]; then
-  log "ERROR: Could not connect to OwnTone API at $OWNTONE_IP:3689"
+RESULT=$(run_curl -s --connect-timeout 2 -X PUT \
+  "http://$OWNTONE_IP:3689/api/player/volume?volume=$OWNTONE_VOL" 2>&1)
+
+if [[ $? -eq 0 ]]; then
+  log "SUCCESS: Master volume set to $OWNTONE_VOL"
+else
+  log "ERROR: Failed to set master volume: $RESULT"
   exit 1
 fi
-
-# Get IDs of selected (enabled) outputs
-SELECTED_IDS=$(echo "$OUTPUTS" | jq -r '.outputs[] | select(.selected == true) | .id' 2>/dev/null)
-
-if [[ -z "$SELECTED_IDS" ]]; then
-  log "WARNING: No speakers selected in OwnTone"
-  exit 0
-fi
-
-# Set volume on each selected output
-for OUTPUT_ID in $SELECTED_IDS; do
-  OUTPUT_NAME=$(echo "$OUTPUTS" | jq -r ".outputs[] | select(.id == \"$OUTPUT_ID\") | .name" 2>/dev/null)
-  log "Setting volume $OWNTONE_VOL on output '$OUTPUT_NAME' (id: $OUTPUT_ID)"
-  
-  RESULT=$(run_curl -s --connect-timeout 2 -X PUT \
-    "http://$OWNTONE_IP:3689/api/outputs/$OUTPUT_ID" \
-    -H "Content-Type: application/json" \
-    -d "{\"volume\": $OWNTONE_VOL}" 2>&1)
-  
-  if [[ $? -eq 0 ]]; then
-    log "SUCCESS: Volume set on '$OUTPUT_NAME'"
-  else
-    log "ERROR: Failed to set volume on '$OUTPUT_NAME': $RESULT"
-  fi
-done
 
 log "Volume bridge complete"
