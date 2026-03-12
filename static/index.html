@@ -48,12 +48,12 @@
         </section>
     </main>
 
-    <!-- Create Zone Dialog -->
-    <div id="create-dialog" class="dialog-overlay" style="display:none;">
+    <!-- Create / Edit Zone Dialog -->
+    <div id="zone-dialog" class="dialog-overlay" style="display:none;">
         <div class="dialog">
             <div class="dialog-header">
-                <h2>Create New Zone</h2>
-                <button class="btn btn-ghost dialog-close" onclick="App.hideCreateDialog()">✕</button>
+                <h2 id="zone-dialog-title">Create New Zone</h2>
+                <button class="btn btn-ghost dialog-close" onclick="App.hideZoneDialog()">✕</button>
             </div>
             <div class="dialog-body">
                 <div class="form-group">
@@ -76,8 +76,8 @@
                 </div>
             </div>
             <div class="dialog-footer">
-                <button class="btn btn-secondary" onclick="App.hideCreateDialog()">Cancel</button>
-                <button class="btn btn-primary" onclick="App.createZone()">Create Zone</button>
+                <button class="btn btn-secondary" onclick="App.hideZoneDialog()">Cancel</button>
+                <button id="btn-save-zone" class="btn btn-primary" onclick="App.saveZone()">Create Zone</button>
             </div>
         </div>
     </div>

@@ -13,6 +13,7 @@ const App = (() => {
     let activeLogType = 'shairport';
     let logAutoScroll = true;
     let volumeDebounceTimers = {};
+    let editingZoneId = null;
 
     // -------------------------------------------------------------------------
     // Initialization
@@ -168,60 +169,101 @@ const App = (() => {
             // Insert before the create card
             const createCard = document.getElementById('create-zone-card');
             createCard.parentNode.insertBefore(card, createCard);
+
+            // Build waveform bars
+            let waveformBars = '';
+            for (let i = 0; i < 16; i++) {
+                waveformBars += '<div class="waveform-bar"></div>';
+            }
+
+            card.innerHTML = `
+                <div class="zone-card-header">
+                    <div>
+                        <div class="zone-name" id="name-${zone.zone_id}"></div>
+                        <div class="zone-interface" id="iface-${zone.zone_id}"></div>
+                    </div>
+                    <span class="status-badge" id="badge-${zone.zone_id}"></span>
+                </div>
+                <div class="waveform">${waveformBars}</div>
+                <div class="zone-error" id="error-${zone.zone_id}" style="display:none;"></div>
+                <div class="zone-speakers-summary">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 6v12M6 12h12"/></svg>
+                    <span id="speakers-summary-${zone.zone_id}"></span>
+                </div>
+                <div class="zone-volume">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+                    <input type="range" min="0" max="100" value="50" class="volume-slider"
+                        id="vol-${zone.zone_id}"
+                        oninput="App.onCardVolumeInput('${zone.zone_id}', this.value)"
+                        onchange="App.onCardVolumeChange('${zone.zone_id}', this.value)">
+                    <span class="volume-val" id="vol-val-${zone.zone_id}">—</span>
+                </div>
+                <div class="zone-card-actions" id="actions-${zone.zone_id}"></div>
+            `;
         }
 
-        // Set status class
+        // --- UPDATE EXISTING ELEMENTS (Prevents jumping sliders!) ---
         card.className = `zone-card ${zone.status}`;
+        
+        document.getElementById(`name-${zone.zone_id}`).textContent = zone.config?.name || zone.zone_id;
+        document.getElementById(`iface-${zone.zone_id}`).textContent = '⌘ ' + (zone.config?.interface || '—');
 
-        // Build waveform bars
-        let waveformBars = '';
-        for (let i = 0; i < 16; i++) {
-            waveformBars += '<div class="waveform-bar"></div>';
+        const badge = document.getElementById(`badge-${zone.zone_id}`);
+        badge.className = `status-badge ${zone.status}`;
+        badge.textContent = zone.status;
+
+        const errorEl = document.getElementById(`error-${zone.zone_id}`);
+        if (zone.error_message) {
+            errorEl.textContent = zone.error_message;
+            errorEl.style.display = 'block';
+        } else {
+            errorEl.style.display = 'none';
+        }
+
+        const summary = document.getElementById(`speakers-summary-${zone.zone_id}`);
+        if (zone.status === 'running') {
+            if (summary.textContent === 'Start to see speakers' || !summary.textContent) {
+                summary.textContent = 'Click details to view speakers';
+            }
+        } else {
+            summary.textContent = 'Start to see speakers';
+        }
+
+        const volSlider = document.getElementById(`vol-${zone.zone_id}`);
+        if (zone.status !== 'running') {
+            volSlider.disabled = true;
+        } else {
+            volSlider.disabled = false;
         }
 
         const canStart = zone.status === 'stopped' || zone.status === 'error';
         const canStop = zone.status === 'running' || zone.status === 'starting';
-        const iface = zone.config?.interface || '—';
 
-        card.innerHTML = `
-            <div class="zone-card-header">
-                <div>
-                    <div class="zone-name">${escHtml(zone.config?.name || zone.zone_id)}</div>
-                    <div class="zone-interface">⌘ ${escHtml(iface)}</div>
-                </div>
-                <span class="status-badge ${zone.status}">${zone.status}</span>
-            </div>
-            <div class="waveform">${waveformBars}</div>
-            ${zone.error_message ? `<div class="zone-error">${escHtml(zone.error_message)}</div>` : ''}
-            <div class="zone-speakers-summary">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 6v12M6 12h12"/></svg>
-                <span id="speakers-summary-${zone.zone_id}">
-                    ${zone.status === 'running' ? 'Click for speakers' : 'Start to see speakers'}
-                </span>
-            </div>
-            <div class="zone-volume">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-                <input type="range" min="0" max="100" value="50" class="volume-slider"
-                    id="vol-${zone.zone_id}"
-                    oninput="App.onCardVolumeInput('${zone.zone_id}', this.value)"
-                    onchange="App.onCardVolumeChange('${zone.zone_id}', this.value)"
-                    ${zone.status !== 'running' ? 'disabled' : ''}>
-                <span class="volume-val" id="vol-val-${zone.zone_id}">—</span>
-            </div>
-            <div class="zone-card-actions">
-                ${canStart
-                    ? `<button class="btn btn-success btn-sm" onclick="App.startZone('${zone.zone_id}')">▶ Start</button>`
-                    : `<button class="btn btn-secondary btn-sm" onclick="App.stopZone('${zone.zone_id}')" ${!canStop ? 'disabled' : ''}>■ Stop</button>`
-                }
-                <button class="btn btn-secondary btn-sm" onclick="App.showDetail('${zone.zone_id}')">Details</button>
-                <button class="btn btn-danger btn-sm btn-icon" onclick="App.deleteZone('${zone.zone_id}')" title="Delete zone">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                </button>
-            </div>
+        const actionsEl = document.getElementById(`actions-${zone.zone_id}`);
+        
+        let startStopButton = '';
+        if (canStart) {
+            startStopButton = `<button class="btn btn-success btn-sm" onclick="App.startZone('${zone.zone_id}')">▶ Start</button>`;
+        } else {
+            const disabledAttr = !canStop ? 'disabled' : '';
+            startStopButton = `<button class="btn btn-secondary btn-sm" onclick="App.stopZone('${zone.zone_id}')" ${disabledAttr}>■ Stop</button>`;
+        }
+        
+        const editDisabled = !canStart ? 'disabled' : '';
+
+        actionsEl.innerHTML = `
+            ${startStopButton}
+            <button class="btn btn-secondary btn-sm" onclick="App.showDetail('${zone.zone_id}')">Details</button>
+            <button class="btn btn-secondary btn-sm btn-icon" onclick="App.editZone('${zone.zone_id}')" title="Edit zone settings" ${editDisabled}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+            </button>
+            <button class="btn btn-danger btn-sm btn-icon" onclick="App.deleteZone('${zone.zone_id}')" title="Delete zone">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+            </button>
         `;
 
-        // Fetch volume if running
-        if (zone.status === 'running') {
+        // Only fetch volume if the zone is running AND the user isn't actively sliding it!
+        if (zone.status === 'running' && document.activeElement !== volSlider) {
             fetchZoneVolume(zone.zone_id);
         }
     }
@@ -256,13 +298,30 @@ const App = (() => {
     }
 
     // -------------------------------------------------------------------------
-    // Create Zone Dialog
+    // Create & Edit Zone Dialog
     // -------------------------------------------------------------------------
 
-    async function showCreateDialog() {
-        document.getElementById('create-dialog').style.display = 'flex';
-        document.getElementById('zone-name').value = '';
-        document.getElementById('zone-autostart').checked = false;
+    async function showZoneDialog(zoneId = null) {
+        editingZoneId = zoneId;
+        const dialogTitle = document.getElementById('zone-dialog-title');
+        const saveBtn = document.getElementById('btn-save-zone');
+        const nameInput = document.getElementById('zone-name');
+        const autoStartInput = document.getElementById('zone-autostart');
+        
+        document.getElementById('zone-dialog').style.display = 'flex';
+
+        if (zoneId && zones[zoneId]) {
+            const zone = zones[zoneId];
+            dialogTitle.textContent = 'Edit Zone';
+            saveBtn.textContent = 'Save Changes';
+            nameInput.value = zone.config.name || '';
+            autoStartInput.checked = !!zone.config.auto_start;
+        } else {
+            dialogTitle.textContent = 'Create New Zone';
+            saveBtn.textContent = 'Create Zone';
+            nameInput.value = '';
+            autoStartInput.checked = false;
+        }
 
         // Load interfaces
         try {
@@ -276,16 +335,31 @@ const App = (() => {
             } else {
                 sel.innerHTML = '<option value="">No interfaces found</option>';
             }
+            
+            // Set current interface if editing
+            if (zoneId && zones[zoneId] && zones[zoneId].config.interface) {
+                sel.value = zones[zoneId].config.interface;
+            }
         } catch (e) {
             console.error('Failed to load interfaces:', e);
         }
     }
-
-    function hideCreateDialog() {
-        document.getElementById('create-dialog').style.display = 'none';
+    
+    // For backwards compatibility with the create card click
+    function showCreateDialog() {
+        showZoneDialog(null);
+    }
+    
+    function editZone(zoneId) {
+        showZoneDialog(zoneId);
     }
 
-    async function createZone() {
+    function hideZoneDialog() {
+        document.getElementById('zone-dialog').style.display = 'none';
+        editingZoneId = null;
+    }
+
+    async function saveZone() {
         const name = document.getElementById('zone-name').value.trim();
         const iface = document.getElementById('zone-interface').value;
         const autoStart = document.getElementById('zone-autostart').checked;
@@ -299,8 +373,15 @@ const App = (() => {
             return;
         }
 
-        await api('/zones', 'POST', { name, interface: iface, auto_start: autoStart });
-        hideCreateDialog();
+        const payload = { name, interface: iface, auto_start: autoStart };
+
+        if (editingZoneId) {
+            await api(`/zones/${editingZoneId}`, 'PUT', payload);
+        } else {
+            await api('/zones', 'POST', payload);
+        }
+        
+        hideZoneDialog();
         fetchZones();
     }
 
@@ -590,9 +671,11 @@ const App = (() => {
 
     return {
         init,
+        showZoneDialog,
         showCreateDialog,
-        hideCreateDialog,
-        createZone,
+        editZone,
+        hideZoneDialog,
+        saveZone,
         startZone,
         stopZone,
         deleteZone,

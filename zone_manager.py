@@ -284,6 +284,10 @@ class ZoneManager:
             self.stop_zone(zone_id)
         with self._lock:
             self.zones.pop(zone_id, None)
+        
+        # Prevent the background stop thread from emitting 'stopped' and reviving the zone on the UI
+        zone.on_status_change = None 
+        
         self.config_store.delete_zone(zone_id)
         if self.socketio:
             self.socketio.emit("zone_deleted", {"zone_id": zone_id})
