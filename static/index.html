@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shiri — Multiroom AirPlay Manager</title>
+    <meta name="description" content="Shiri multiroom AirPlay 2 zone management dashboard">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header id="app-header">
+        <div class="header-left">
+            <h1 class="logo">
+                <span class="logo-icon">🔊</span>
+                <span class="logo-text">Shiri</span>
+            </h1>
+            <div id="system-status" class="system-status">
+                <span class="status-dot offline"></span>
+                <span class="status-text">Connecting...</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <button id="btn-refresh-speakers" class="btn btn-ghost" title="Refresh all speakers">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            </button>
+            <button id="btn-settings" class="btn btn-ghost" title="Settings">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main id="main-content">
+        <!-- Zone Grid -->
+        <section id="zone-grid" class="zone-grid">
+            <!-- Zone cards rendered by app.js -->
+            <!-- Create Zone Card (always last) -->
+            <div id="create-zone-card" class="zone-card create-card" onclick="App.showCreateDialog()">
+                <div class="create-card-inner">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    <span class="create-label">Create Zone</span>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Create Zone Dialog -->
+    <div id="create-dialog" class="dialog-overlay" style="display:none;">
+        <div class="dialog">
+            <div class="dialog-header">
+                <h2>Create New Zone</h2>
+                <button class="btn btn-ghost dialog-close" onclick="App.hideCreateDialog()">✕</button>
+            </div>
+            <div class="dialog-body">
+                <div class="form-group">
+                    <label for="zone-name">AirPlay Name</label>
+                    <input type="text" id="zone-name" placeholder="e.g. Living Room" autocomplete="off">
+                    <span class="form-hint">This is how the zone will appear on your iPhone/Mac</span>
+                </div>
+                <div class="form-group">
+                    <label for="zone-interface">Network Interface</label>
+                    <select id="zone-interface">
+                        <option value="">Loading interfaces...</option>
+                    </select>
+                    <span class="form-hint">Physical NIC for macvlan (speaker network)</span>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="zone-autostart">
+                        <span>Auto-start on daemon launch</span>
+                    </label>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-secondary" onclick="App.hideCreateDialog()">Cancel</button>
+                <button class="btn btn-primary" onclick="App.createZone()">Create Zone</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Zone Detail / Log Panel (slide-out) -->
+    <div id="detail-panel" class="detail-panel" style="display:none;">
+        <div class="detail-panel-inner">
+            <div class="detail-header">
+                <div>
+                    <h2 id="detail-zone-name">Zone Name</h2>
+                    <span id="detail-zone-status" class="status-badge stopped">stopped</span>
+                </div>
+                <button class="btn btn-ghost" onclick="App.hideDetailPanel()">✕</button>
+            </div>
+
+            <!-- Tabs -->
+            <div class="detail-tabs">
+                <button class="tab active" data-tab="speakers" onclick="App.switchDetailTab('speakers')">Speakers</button>
+                <button class="tab" data-tab="logs" onclick="App.switchDetailTab('logs')">Logs</button>
+                <button class="tab" data-tab="config" onclick="App.switchDetailTab('config')">Config</button>
+            </div>
+
+            <!-- Speakers Tab -->
+            <div id="tab-speakers" class="tab-content active">
+                <div class="volume-master">
+                    <label>Master Volume</label>
+                    <div class="volume-row">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/></svg>
+                        <input type="range" id="master-volume" min="0" max="100" value="50" class="volume-slider">
+                        <span id="master-volume-val" class="volume-val">50</span>
+                    </div>
+                </div>
+                <div id="speaker-list" class="speaker-list">
+                    <div class="empty-state">Start zone to discover speakers</div>
+                </div>
+            </div>
+
+            <!-- Logs Tab -->
+            <div id="tab-logs" class="tab-content" style="display:none;">
+                <div class="log-tabs">
+                    <button class="log-tab active" data-logtype="shairport" onclick="App.switchLogType('shairport')">Shairport</button>
+                    <button class="log-tab" data-logtype="owntone" onclick="App.switchLogType('owntone')">OwnTone</button>
+                    <button class="log-tab" data-logtype="owntone_wrapper" onclick="App.switchLogType('owntone_wrapper')">Wrapper</button>
+                    <button class="log-tab" data-logtype="arecord" onclick="App.switchLogType('arecord')">Arecord</button>
+                    <button class="log-tab" data-logtype="pause_bridge" onclick="App.switchLogType('pause_bridge')">Pause</button>
+                    <button class="log-tab" data-logtype="volume_bridge" onclick="App.switchLogType('volume_bridge')">Volume</button>
+                    <button class="log-tab" data-logtype="sync_reset" onclick="App.switchLogType('sync_reset')">Sync</button>
+                </div>
+                <div id="log-viewer" class="log-viewer">
+                    <div class="log-empty">Select a zone and log type to view logs</div>
+                </div>
+            </div>
+
+            <!-- Config Tab -->
+            <div id="tab-config" class="tab-content" style="display:none;">
+                <div class="config-info">
+                    <div class="config-row">
+                        <span class="config-label">Zone ID</span>
+                        <span id="config-zone-id" class="config-value">—</span>
+                    </div>
+                    <div class="config-row">
+                        <span class="config-label">Shairport IP</span>
+                        <span id="config-shairport-ip" class="config-value">—</span>
+                    </div>
+                    <div class="config-row">
+                        <span class="config-label">OwnTone IP</span>
+                        <span id="config-owntone-ip" class="config-value">—</span>
+                    </div>
+                    <div class="config-row">
+                        <span class="config-label">Namespace</span>
+                        <span id="config-netns" class="config-value">—</span>
+                    </div>
+                    <div class="config-row">
+                        <span class="config-label">Loopback Subdev</span>
+                        <span id="config-subdev" class="config-value">—</span>
+                    </div>
+                    <div class="config-row">
+                        <span class="config-label">Interface</span>
+                        <span id="config-interface" class="config-value">—</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Panel -->
+    <div id="settings-panel" class="dialog-overlay" style="display:none;">
+        <div class="dialog dialog-wide">
+            <div class="dialog-header">
+                <h2>System Settings</h2>
+                <button class="btn btn-ghost dialog-close" onclick="App.hideSettings()">✕</button>
+            </div>
+            <div class="dialog-body">
+                <h3>System Diagnostics</h3>
+                <div id="diagnostics" class="diagnostics">
+                    <div class="diag-row">
+                        <span>nqptp</span>
+                        <span id="diag-nqptp" class="diag-status">checking...</span>
+                    </div>
+                    <div class="diag-row">
+                        <span>ALSA Loopback</span>
+                        <span id="diag-alsa" class="diag-status">checking...</span>
+                    </div>
+                    <div class="diag-row">
+                        <span>Running Zones</span>
+                        <span id="diag-zones" class="diag-status">—</span>
+                    </div>
+                </div>
+                <h3>Network Interfaces</h3>
+                <div id="interface-list" class="interface-list">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+    <script src="/app.js"></script>
+</body>
+</html>
