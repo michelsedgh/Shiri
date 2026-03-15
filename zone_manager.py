@@ -1110,6 +1110,15 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
         with open(relay_script, "w") as f:
             f.write(textwrap.dedent("""\
                 #!/usr/bin/env python3
+                \"\"\"
+                Metadata relay with timing cache.
+                
+                OwnTone only opens audio.pipe.metadata AFTER playback starts,
+                but Shairport sends prgr (progress/timing) metadata BEFORE audio.
+                This causes a race condition where initial timing info is lost.
+                
+                Fix: Cache the last prgr item and replay it when OwnTone connects.
+                \"\"\"
                 import datetime
                 import errno
                 import os
@@ -1119,6 +1128,9 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
                 source_path, pause_path, owntone_path = sys.argv[1:4]
                 outputs = [pause_path, owntone_path]
                 writers = {path: None for path in outputs}
+                
+                # Cache for timing-critical metadata (prgr = 70726772 hex)
+                cached_prgr = {path: None for path in outputs}
 
                 def log(message):
                     ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1134,6 +1146,10 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
                         pass
                     writers[path] = None
 
+                def is_prgr_item(item):
+                    # prgr code in hex is 70726772
+                    return "<code>70726772</code>" in item
+
                 def get_writer(path):
                     fd = writers.get(path)
                     if fd is not None:
@@ -1146,15 +1162,32 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
                         raise
                     writers[path] = fd
                     log(f"Connected output: {path}")
+                    # On new connection, replay cached prgr if we have one
+                    prgr = cached_prgr.get(path)
+                    if prgr:
+                        try:
+                            os.write(fd, prgr.encode("utf-8"))
+                            log(f"Replayed cached prgr to {path}")
+                        except OSError:
+                            pass
                     return fd
 
                 def fanout(payload):
                     data = payload.encode("utf-8")
+                    is_prgr = is_prgr_item(payload)
+                    
                     for path in outputs:
-                        fd = writers.get(path)
+                        # Cache prgr items for replay on late connections
+                        if is_prgr:
+                            cached_prgr[path] = payload
+                        
+                        was_disconnected = writers.get(path) is None
                         try:
                             fd = get_writer(path)
                             if fd is None:
+                                continue
+                            # Don't double-send prgr if we just replayed it on connect
+                            if is_prgr and was_disconnected:
                                 continue
                             os.write(fd, data)
                         except OSError as exc:
