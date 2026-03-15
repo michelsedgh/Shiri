@@ -108,16 +108,6 @@ set_volume() {
   run_curl -s --connect-timeout 2 -X PUT "http://$OWNTONE_IP:3689/api/player/volume?volume=$vol" >/dev/null 2>&1
 }
 
-# Stop OwnTone playback (clears buffer)
-stop_playback() {
-  run_curl -s --connect-timeout 2 -X PUT "http://$OWNTONE_IP:3689/api/player/stop" >/dev/null 2>&1
-}
-
-# Pause OwnTone playback
-pause_playback() {
-  run_curl -s --connect-timeout 2 -X PUT "http://$OWNTONE_IP:3689/api/player/pause" >/dev/null 2>&1
-}
-
 # Cancel any pending restore
 cancel_restore() {
   if [[ -n "$RESTORE_PID" ]] && kill -0 "$RESTORE_PID" 2>/dev/null; then
@@ -141,20 +131,14 @@ do_mute() {
     log "Saved volume: $current_vol"
   fi
   
-  log "MUTING + STOPPING instantly (pause detected)"
+  log "MUTING instantly (pause detected)"
   set_volume 0
   
-  # CRITICAL FIX: Also stop OwnTone playback to clear buffer
-  # This prevents the 0.1s audio blip after pause
-  stop_playback
-  log "OwnTone playback stopped (buffer cleared)"
-  
   # Schedule restore after buffer clears
-  # (volume only - playback will resume via pipe when shairport sends audio)
   (
     sleep "$BUFFER_DELAY_SECS"
     
-    # Only restore volume if we have a saved value
+    # Only restore if still muted and not playing
     local saved_vol
     if [[ -f "$SAVED_VOLUME_FILE" ]]; then
       saved_vol=$(cat "$SAVED_VOLUME_FILE")
@@ -164,7 +148,7 @@ do_mute() {
     fi
   ) &
   RESTORE_PID=$!
-  log "Scheduled volume restore in ${BUFFER_DELAY_SECS}s (pid $RESTORE_PID)"
+  log "Scheduled restore in ${BUFFER_DELAY_SECS}s (pid $RESTORE_PID)"
 }
 
 # Handle resume - cancel restore, audio will naturally start
@@ -246,9 +230,16 @@ while true; do
         log ">>> PFLS (flush/pause) detected!"
       fi
       
-      # Resume - code 7072736d
+      # Resume - code 7072736d (prsm = buffer resume) OR 70726573 (pres = iOS resume)
+      # iOS sends 'pres' when user resumes, shairport sends 'prsm' after buffering
       if [[ "$line" == *"<code>7072736d</code>"* ]]; then
-        log ">>> PRSM (resume) detected!"
+        log ">>> PRSM (buffer resume) detected!"
+        do_resume
+      fi
+      
+      # iOS playback resume - code 70726573 (pres)
+      if [[ "$line" == *"<code>70726573</code>"* ]]; then
+        log ">>> PRES (iOS resume) detected!"
         do_resume
       fi
       

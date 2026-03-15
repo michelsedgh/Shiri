@@ -424,10 +424,18 @@ else
   echo "[\$TIMESTAMP] WARNING: arecord PID file not found!" >> "\$LOG"
 fi
 
-# Step 2: Drain any buffered data from the pipe
+# Step 2: Drain the ALSA loopback buffer (CRITICAL for reconnection sync)
+# This prevents accumulated audio from causing timing drift
+LOOPBACK_DEV="hw:Loopback,1,$ALLOCATED_SUBDEVICE"
+echo "[\$TIMESTAMP] Draining ALSA loopback buffer..." >> "\$LOG"
+for i in 1 2 3; do
+  timeout 0.2 arecord -D "\$LOOPBACK_DEV" -f cd -c 2 -t raw -d 1 2>/dev/null >/dev/null || true
+done
+echo "[\$TIMESTAMP] ALSA loopback drained (3 passes)" >> "\$LOG"
+
+# Step 3: Drain any buffered data from the pipe
 if [[ -p "\$PIPE" ]]; then
-  BEFORE_SIZE=\$(timeout 0.1 stat -c%s "\$PIPE" 2>/dev/null || echo "unknown")
-  echo "[\$TIMESTAMP] Draining pipe (size before: \$BEFORE_SIZE)" >> "\$LOG"
+  echo "[\$TIMESTAMP] Draining pipe..." >> "\$LOG"
   # Non-blocking drain - read whatever is buffered
   DRAINED=\$(timeout 0.3 dd if="\$PIPE" of=/dev/null bs=65536 iflag=nonblock 2>&1 | grep -oP '\d+ bytes' || echo "0 bytes")
   echo "[\$TIMESTAMP] Drained: \$DRAINED" >> "\$LOG"
