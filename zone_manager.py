@@ -28,6 +28,11 @@ LOOPBACK_LOCK_DIR = os.path.join(BASE_DIR, "loopback")
 # Path to the existing scripts (relative to where the daemon runs)
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "multiroom-demo")
 
+# Default latency offset for timeline/lyrics sync
+# Negative = audio delivered EARLIER to compensate for pipeline buffer delay
+# Tune this if lyrics on iPhone are ahead/behind speaker audio
+DEFAULT_LATENCY_OFFSET = -2.3
+
 
 class Zone:
     """
@@ -103,6 +108,7 @@ class Zone:
             "owntone_ip": self.owntone_ip,
             "netns_name": self.netns_name,
             "allocated_subdevice": self.allocated_subdevice,
+            "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
         }
 
 
@@ -647,6 +653,11 @@ class ZoneManager:
         volume_bridge_script = os.path.join(SCRIPT_DIR, "volume_bridge.sh")
         os.chmod(volume_bridge_script, 0o755)
 
+        # Get latency offset from zone config, or use default
+        # This can be tuned per-zone if needed
+        latency_offset = zone.config.get("latency_offset", DEFAULT_LATENCY_OFFSET)
+        log.info("Using latency offset: %s seconds for %s", latency_offset, zone.zone_id)
+
         # Create pipe reset script — CRITICAL FOR MULTI-ROOM SYNC
         # Same as the flush script in dual_zone_demo.sh
         flush_script = os.path.join(grp_dir, "config", "reset_audio_pipe.sh")
@@ -720,7 +731,10 @@ class ZoneManager:
                   resync_recovery_time_in_seconds = 0.050;
 
                   // LYRICS/VIDEO SYNC FIX:
-                  audio_backend_latency_offset_in_seconds = -2.3;
+                  // Negative = deliver audio EARLIER to compensate for buffer delays
+                  // If lyrics are AHEAD of speaker: make more negative (e.g. -2.5)
+                  // If speaker is AHEAD of lyrics: make less negative (e.g. -2.0)
+                  audio_backend_latency_offset_in_seconds = {latency_offset};
 
                   // INSTANT VOLUME CONTROL via OwnTone:
                   ignore_volume_control = "yes";
@@ -761,8 +775,16 @@ class ZoneManager:
                   pipe_timeout = 5000;
                 }};
             """))
-        log.info("Generated shairport-sync config for %s (ALSA backend + pipe flush hooks)",
-                  zone.zone_id)
+        log.info("Generated shairport-sync config for %s at %s", zone.zone_id, conf_path)
+        log.info("  -> latency_offset=%s, port=%d, alsa_device=%s", latency_offset, port, alsa_device)
+        
+        # Verify config was written correctly by reading it back
+        with open(conf_path, "r") as f:
+            config_content = f.read()
+            if "audio_backend_latency_offset_in_seconds" in config_content:
+                log.info("  -> Config verification: latency offset line found ✓")
+            else:
+                log.error("  -> Config verification FAILED: latency offset NOT in config!")
 
     def _generate_owntone_config(self, zone):
         """

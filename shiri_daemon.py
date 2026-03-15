@@ -228,6 +228,57 @@ def set_speaker_volume(zone_id, speaker_id):
     return jsonify({"ok": True, "volume": volume})
 
 # ---------------------------------------------------------------------------
+# Sync/Latency API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/zones/<zone_id>/latency")
+def get_latency(zone_id):
+    """Get current latency offset for a zone."""
+    zone = zone_manager.get_zone(zone_id)
+    if not zone:
+        return jsonify({"error": "Zone not found"}), 404
+    from zone_manager import DEFAULT_LATENCY_OFFSET
+    offset = zone.config.get("latency_offset", DEFAULT_LATENCY_OFFSET)
+    return jsonify({"latency_offset": offset, "default": DEFAULT_LATENCY_OFFSET})
+
+
+@app.route("/api/zones/<zone_id>/latency", methods=["PUT"])
+def set_latency(zone_id):
+    """
+    Set latency offset for timeline/lyrics sync.
+    Negative = audio delivered EARLIER (use if lyrics are ahead of speaker).
+    Requires zone restart to take effect.
+    """
+    zone = zone_manager.get_zone(zone_id)
+    if not zone:
+        return jsonify({"error": "Zone not found"}), 404
+
+    data = request.get_json() or {}
+    offset = data.get("latency_offset")
+    
+    if offset is None:
+        return jsonify({"error": "latency_offset is required"}), 400
+    
+    try:
+        offset = float(offset)
+    except (ValueError, TypeError):
+        return jsonify({"error": "latency_offset must be a number"}), 400
+    
+    # Sanity check: offset should typically be between -5 and +1
+    if offset < -10 or offset > 5:
+        return jsonify({"error": "latency_offset should be between -10 and +5 seconds"}), 400
+    
+    zone.config["latency_offset"] = offset
+    config_store.save_zone(zone_id, zone.config)
+    
+    log.info("Set latency_offset=%s for %s (restart zone to apply)", offset, zone_id)
+    return jsonify({
+        "ok": True,
+        "latency_offset": offset,
+        "note": "Restart zone to apply new latency offset"
+    })
+
+# ---------------------------------------------------------------------------
 # Player status API
 # ---------------------------------------------------------------------------
 
