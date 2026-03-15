@@ -230,16 +230,9 @@ while true; do
         log ">>> PFLS (flush/pause) detected!"
       fi
       
-      # Resume - code 7072736d (prsm = buffer resume) OR 70726573 (pres = iOS resume)
-      # iOS sends 'pres' when user resumes, shairport sends 'prsm' after buffering
+      # Resume - code 7072736d
       if [[ "$line" == *"<code>7072736d</code>"* ]]; then
-        log ">>> PRSM (buffer resume) detected!"
-        do_resume
-      fi
-      
-      # iOS playback resume - code 70726573 (pres)
-      if [[ "$line" == *"<code>70726573</code>"* ]]; then
-        log ">>> PRES (iOS resume) detected!"
+        log ">>> PRSM (resume) detected!"
         do_resume
       fi
       
