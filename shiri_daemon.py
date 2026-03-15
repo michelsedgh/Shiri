@@ -88,16 +88,25 @@ def create_zone():
     data = request.get_json() or {}
     name = data.get("name", "").strip()
     interface = data.get("interface", "").strip()
+    latency_offset = data.get("latency_offset")
 
     if not name:
         return jsonify({"error": "Zone name is required"}), 400
     if not interface:
         return jsonify({"error": "Network interface is required"}), 400
+    if latency_offset is not None:
+        try:
+            latency_offset = float(latency_offset)
+        except (ValueError, TypeError):
+            return jsonify({"error": "latency_offset must be a number"}), 400
+        if latency_offset < -10 or latency_offset > 5:
+            return jsonify({"error": "latency_offset should be between -10 and +5 seconds"}), 400
 
     zone = zone_manager.create_zone(
         name=name,
         interface=interface,
         auto_start=data.get("auto_start", False),
+        latency_offset=latency_offset,
     )
     return jsonify(zone.to_dict()), 201
 

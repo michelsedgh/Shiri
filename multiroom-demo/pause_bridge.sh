@@ -229,6 +229,7 @@ while true; do
       # Flush (pause/stop) - code 70666c73 (log only)
       if [[ "$line" == *"<code>70666c73</code>"* ]]; then
         log ">>> PFLS (flush/pause) detected!"
+        do_mute
       fi
       
       # Resume - code 7072736d

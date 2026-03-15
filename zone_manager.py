@@ -263,7 +263,7 @@ class ZoneManager:
     # Zone CRUD
     # -------------------------------------------------------------------------
 
-    def create_zone(self, name, interface, auto_start=False):
+    def create_zone(self, name, interface, auto_start=False, latency_offset=None):
         """Create a new zone (does not start it)."""
         zone_id = f"zone_{uuid.uuid4().hex[:8]}"
         config = {
@@ -272,6 +272,8 @@ class ZoneManager:
             "auto_start": auto_start,
             "speakers": [],
         }
+        if latency_offset is not None:
+            config["latency_offset"] = latency_offset
         zone = Zone(zone_id, config, on_status_change=self._emit_zone_status)
         with self._lock:
             self.zones[zone_id] = zone
@@ -710,22 +712,8 @@ class ZoneManager:
                 PIPE="{grp_dir}/pipes/audio.pipe"
                 ARECORD_PID_FILE="{grp_dir}/state/arecord.pid"
                 LOG="{grp_dir}/logs/sync_reset.log"
-                DEBOUNCE_FILE="{grp_dir}/state/reset_debounce.ts"
-                DEBOUNCE_MS=200  # Ignore calls within 200ms of each other
                 
                 TIMESTAMP=$(date '+%H:%M:%S.%3N')
-                NOW_MS=$(date +%s%3N)
-
-                # Debounce: skip if called too recently
-                if [[ -f "$DEBOUNCE_FILE" ]]; then
-                  LAST_MS=$(cat "$DEBOUNCE_FILE" 2>/dev/null || echo "0")
-                  DIFF=$((NOW_MS - LAST_MS))
-                  if [[ $DIFF -lt $DEBOUNCE_MS ]]; then
-                    echo "[$TIMESTAMP] Debounced (only ${{DIFF}}ms since last call)" >> "$LOG"
-                    exit 0
-                  fi
-                fi
-                echo "$NOW_MS" > "$DEBOUNCE_FILE"
 
                 echo "" >> "$LOG"
                 echo "[$TIMESTAMP] ========== SYNC RESET TRIGGERED ==========" >> "$LOG"
