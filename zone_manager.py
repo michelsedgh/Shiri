@@ -671,7 +671,15 @@ class ZoneManager:
                 PIPE="{grp_dir}/pipes/audio.pipe"
                 ARECORD_PID_FILE="{grp_dir}/state/arecord.pid"
                 LOG="{grp_dir}/logs/sync_reset.log"
+                LOCK_FILE="{grp_dir}/state/reset.lock"
                 TIMESTAMP=$(date '+%H:%M:%S.%3N')
+
+                # Use flock to prevent concurrent resets (critical for reconnection)
+                exec 200>"$LOCK_FILE"
+                flock -n 200 || {{
+                  echo "[$TIMESTAMP] Reset already in progress, skipping" >> "$LOG"
+                  exit 0
+                }}
 
                 echo "" >> "$LOG"
                 echo "[$TIMESTAMP] ========== SYNC RESET TRIGGERED ==========" >> "$LOG"
@@ -684,7 +692,11 @@ class ZoneManager:
                   if kill -0 "$ARECORD_PID" 2>/dev/null; then
                     echo "[$TIMESTAMP] Killing arecord (pid $ARECORD_PID)" >> "$LOG"
                     kill -TERM "$ARECORD_PID" 2>/dev/null || true
-                    sleep 0.1
+                    # Wait for arecord to actually die (up to 0.5s)
+                    for i in 1 2 3 4 5; do
+                      kill -0 "$ARECORD_PID" 2>/dev/null || break
+                      sleep 0.1
+                    done
                     echo "[$TIMESTAMP] arecord killed" >> "$LOG"
                   else
                     echo "[$TIMESTAMP] arecord (pid $ARECORD_PID) not running" >> "$LOG"
@@ -695,16 +707,21 @@ class ZoneManager:
 
                 # Step 2: Drain any buffered data from the pipe
                 if [[ -p "$PIPE" ]]; then
-                  BEFORE_SIZE=$(timeout 0.1 stat -c%s "$PIPE" 2>/dev/null || echo "unknown")
-                  echo "[$TIMESTAMP] Draining pipe (size before: $BEFORE_SIZE)" >> "$LOG"
-                  DRAINED=$(timeout 0.3 dd if="$PIPE" of=/dev/null bs=65536 iflag=nonblock 2>&1 | grep -oP '\\d+ bytes' || echo "0 bytes")
-                  echo "[$TIMESTAMP] Drained: $DRAINED" >> "$LOG"
+                  echo "[$TIMESTAMP] Draining pipe..." >> "$LOG"
+                  # Multiple drain passes to ensure pipe is empty
+                  for pass in 1 2; do
+                    DRAINED=$(timeout 0.2 dd if="$PIPE" of=/dev/null bs=65536 iflag=nonblock 2>&1 | grep -oP '\\d+ bytes' || echo "0 bytes")
+                    echo "[$TIMESTAMP] Pass $pass drained: $DRAINED" >> "$LOG"
+                  done
                 else
                   echo "[$TIMESTAMP] WARNING: Pipe $PIPE is not a FIFO!" >> "$LOG"
                 fi
 
                 echo "[$TIMESTAMP] Reset complete - arecord will restart fresh" >> "$LOG"
                 echo "[$TIMESTAMP] ==========================================" >> "$LOG"
+
+                # Release lock
+                flock -u 200
             """))
         os.chmod(flush_script, 0o755)
 
