@@ -38,7 +38,7 @@ SAVED_VOLUME_FILE="$GRP_DIR/state/saved_volume.txt"
 LAST_VOL_FILE="$GRP_DIR/state/master_volume_last.txt"  # Written by volume_bridge.sh
 
 # Buffer delay - how long to stay muted after pause
-BUFFER_DELAY_SECS=2.5
+BUFFER_DELAY_SECS=3
 
 # PID of the delayed restore job (to cancel if needed)
 RESTORE_PID=""

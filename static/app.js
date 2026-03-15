@@ -307,8 +307,16 @@ const App = (() => {
         const saveBtn = document.getElementById('btn-save-zone');
         const nameInput = document.getElementById('zone-name');
         const autoStartInput = document.getElementById('zone-autostart');
+        const latencyGroup = document.getElementById('latency-group');
+        const latencySlider = document.getElementById('zone-latency');
+        const latencyVal = document.getElementById('zone-latency-val');
         
         document.getElementById('zone-dialog').style.display = 'flex';
+
+        // Setup latency slider input handler
+        latencySlider.oninput = () => {
+            latencyVal.textContent = parseFloat(latencySlider.value).toFixed(1);
+        };
 
         if (zoneId && zones[zoneId]) {
             const zone = zones[zoneId];
@@ -316,11 +324,22 @@ const App = (() => {
             saveBtn.textContent = 'Save Changes';
             nameInput.value = zone.config.name || '';
             autoStartInput.checked = !!zone.config.auto_start;
+            
+            // Show latency slider when editing
+            latencyGroup.style.display = 'block';
+            const latency = zone.latency_offset ?? zone.config.latency_offset ?? -2.3;
+            latencySlider.value = latency;
+            latencyVal.textContent = parseFloat(latency).toFixed(1);
         } else {
             dialogTitle.textContent = 'Create New Zone';
             saveBtn.textContent = 'Create Zone';
             nameInput.value = '';
             autoStartInput.checked = false;
+            
+            // Hide latency slider for new zones (use default)
+            latencyGroup.style.display = 'none';
+            latencySlider.value = -2.3;
+            latencyVal.textContent = '-2.3';
         }
 
         // Load interfaces
@@ -363,6 +382,7 @@ const App = (() => {
         const name = document.getElementById('zone-name').value.trim();
         const iface = document.getElementById('zone-interface').value;
         const autoStart = document.getElementById('zone-autostart').checked;
+        const latencyOffset = parseFloat(document.getElementById('zone-latency').value);
 
         if (!name) {
             alert('Please enter a zone name');
@@ -374,8 +394,10 @@ const App = (() => {
         }
 
         const payload = { name, interface: iface, auto_start: autoStart };
-
+        
+        // Include latency_offset when editing existing zones
         if (editingZoneId) {
+            payload.latency_offset = latencyOffset;
             await api(`/zones/${editingZoneId}`, 'PUT', payload);
         } else {
             await api('/zones', 'POST', payload);
@@ -420,11 +442,21 @@ const App = (() => {
 
         // Config tab
         document.getElementById('config-zone-id').textContent = zone.zone_id;
+        document.getElementById('config-latency').textContent = (zone.latency_offset ?? zone.config?.latency_offset ?? -2.3) + 's';
         document.getElementById('config-shairport-ip').textContent = zone.shairport_ip || '—';
         document.getElementById('config-owntone-ip').textContent = zone.owntone_ip || '—';
         document.getElementById('config-netns').textContent = zone.netns_name || '—';
         document.getElementById('config-subdev').textContent = zone.allocated_subdevice ?? '—';
         document.getElementById('config-interface').textContent = zone.config?.interface || '—';
+        
+        // OwnTone link
+        const owntoneLink = document.getElementById('owntone-link');
+        if (zone.owntone_ip && zone.status === 'running') {
+            owntoneLink.href = `http://${zone.owntone_ip}:3689`;
+            owntoneLink.style.display = 'inline-flex';
+        } else {
+            owntoneLink.style.display = 'none';
+        }
     }
 
     function hideDetailPanel() {

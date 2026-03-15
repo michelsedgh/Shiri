@@ -281,18 +281,28 @@ class ZoneManager:
         return zone
 
     def delete_zone(self, zone_id):
-        """Stop and remove a zone."""
+        """Stop and remove a zone. Waits for zone to actually stop before deleting."""
         with self._lock:
             zone = self.zones.get(zone_id)
             if not zone:
                 return False
+        
+        # Stop the zone and wait for it to actually stop
         if zone.status in (Zone.STATUS_RUNNING, Zone.STATUS_STARTING):
             self.stop_zone(zone_id)
-        with self._lock:
-            self.zones.pop(zone_id, None)
+            # Wait for zone to stop (up to 15 seconds)
+            for _ in range(150):
+                if zone.status == Zone.STATUS_STOPPED:
+                    break
+                time.sleep(0.1)
+            else:
+                log.warning("Zone %s did not stop in time, proceeding with deletion", zone_id)
         
         # Prevent the background stop thread from emitting 'stopped' and reviving the zone on the UI
         zone.on_status_change = None 
+        
+        with self._lock:
+            self.zones.pop(zone_id, None)
         
         self.config_store.delete_zone(zone_id)
         if self.socketio:
@@ -416,11 +426,29 @@ class ZoneManager:
             # Brief pause for avahi registration
             time.sleep(2)
 
-            # Restore saved speaker selections
-            if zone.owntone_api and zone.config.get("speakers"):
+            # Restore saved speaker selections (by name, since IDs can change)
+            if zone.owntone_api and zone.config.get("speaker_names"):
+                try:
+                    all_speakers = zone.owntone_api.get_outputs()
+                    saved_names = zone.config["speaker_names"]
+                    matching_ids = [
+                        str(sp["id"]) for sp in all_speakers 
+                        if sp["name"] in saved_names
+                    ]
+                    if matching_ids:
+                        zone.owntone_api.set_outputs(matching_ids)
+                        log.info("Restored speakers for %s by name: %s -> %s",
+                                  zone.zone_id, saved_names, matching_ids)
+                    else:
+                        log.warning("No matching speakers found for %s (saved: %s)",
+                                    zone.zone_id, saved_names)
+                except Exception as e:
+                    log.warning("Could not restore speakers: %s", e)
+            elif zone.owntone_api and zone.config.get("speakers"):
+                # Fallback to old ID-based restoration
                 try:
                     zone.owntone_api.set_outputs(zone.config["speakers"])
-                    log.info("Restored speakers for %s: %s",
+                    log.info("Restored speakers for %s by ID: %s",
                               zone.zone_id, zone.config["speakers"])
                 except Exception as e:
                     log.warning("Could not restore speakers: %s", e)

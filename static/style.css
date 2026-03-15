@@ -685,6 +685,21 @@ body::before {
     height: 16px;
 }
 
+.latency-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.latency-row .volume-slider {
+    flex: 1;
+}
+
+.latency-row .volume-val {
+    min-width: 45px;
+    text-align: right;
+}
+
 /* ==========================================================================
    Detail Panel (slide-out)
    ========================================================================== */
