@@ -494,6 +494,68 @@ body::before {
     font-variant-numeric: tabular-nums;
 }
 
+/* Latency slider in dialog */
+.latency-slider-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.latency-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    height: 6px;
+    background: var(--bg-input);
+    border-radius: 3px;
+    outline: none;
+}
+
+.latency-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent-1);
+    cursor: pointer;
+    transition: transform 0.15s;
+}
+
+.latency-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.15);
+}
+
+.latency-slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent-1);
+    cursor: pointer;
+    border: none;
+}
+
+.latency-val {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-accent);
+    min-width: 45px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* OwnTone link */
+.owntone-link {
+    color: var(--text-accent);
+    text-decoration: none;
+    font-weight: 500;
+    transition: color 0.2s, opacity 0.2s;
+}
+
+.owntone-link:hover {
+    color: var(--accent-1);
+    text-decoration: underline;
+}
+
 /* Card actions */
 .zone-card-actions {
     display: flex;
@@ -683,21 +745,6 @@ body::before {
     accent-color: var(--accent-1);
     width: 16px;
     height: 16px;
-}
-
-.latency-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.latency-row .volume-slider {
-    flex: 1;
-}
-
-.latency-row .volume-val {
-    min-width: 45px;
-    text-align: right;
 }
 
 /* ==========================================================================

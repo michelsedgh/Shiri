@@ -168,11 +168,19 @@ def set_speakers(zone_id):
     speaker_ids = data.get("speaker_ids", [])
     zone.owntone_api.set_outputs(speaker_ids)
 
-    # Save speaker selection by NAME (IDs can change between restarts)
-    all_speakers = zone.owntone_api.get_outputs()
-    selected_names = [sp["name"] for sp in all_speakers if str(sp["id"]) in [str(sid) for sid in speaker_ids]]
-    zone.config["speakers"] = speaker_ids  # Keep IDs for immediate use
-    zone.config["speaker_names"] = selected_names  # Save names for restoration
+    # Get current outputs to save names for reliable restoration
+    outputs = zone.owntone_api.get_outputs()
+    selected_speakers = []
+    for out in outputs:
+        if str(out.get("id")) in [str(sid) for sid in speaker_ids]:
+            selected_speakers.append({
+                "id": out.get("id"),
+                "name": out.get("name", "Unknown")
+            })
+    
+    # Save speaker selection with names for restoration
+    zone.config["speakers"] = speaker_ids  # Keep IDs for backwards compat
+    zone.config["speaker_names"] = selected_speakers  # Save names for reliable restore
     config_store.save_zone(zone_id, zone.config)
 
     return jsonify({"ok": True})

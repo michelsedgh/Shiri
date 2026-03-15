@@ -281,22 +281,22 @@ class ZoneManager:
         return zone
 
     def delete_zone(self, zone_id):
-        """Stop and remove a zone. Waits for zone to actually stop before deleting."""
+        """Stop and remove a zone. Waits for stop to complete before deleting."""
         with self._lock:
             zone = self.zones.get(zone_id)
             if not zone:
                 return False
         
-        # Stop the zone and wait for it to actually stop
-        if zone.status in (Zone.STATUS_RUNNING, Zone.STATUS_STARTING):
+        # If zone is running, stop it and wait for completion
+        if zone.status in (Zone.STATUS_RUNNING, Zone.STATUS_STARTING, Zone.STATUS_STOPPING):
             self.stop_zone(zone_id)
-            # Wait for zone to stop (up to 15 seconds)
-            for _ in range(150):
+            # Wait for zone to actually stop (up to 30 seconds)
+            for _ in range(60):
                 if zone.status == Zone.STATUS_STOPPED:
                     break
-                time.sleep(0.1)
+                time.sleep(0.5)
             else:
-                log.warning("Zone %s did not stop in time, proceeding with deletion", zone_id)
+                log.warning("Zone %s did not stop in time, deleting anyway", zone_id)
         
         # Prevent the background stop thread from emitting 'stopped' and reviving the zone on the UI
         zone.on_status_change = None 
@@ -426,30 +426,41 @@ class ZoneManager:
             # Brief pause for avahi registration
             time.sleep(2)
 
-            # Restore saved speaker selections (by name, since IDs can change)
-            if zone.owntone_api and zone.config.get("speaker_names"):
+            # Restore saved speaker selections (with retry and name-based matching)
+            if zone.owntone_api and (zone.config.get("speakers") or zone.config.get("speaker_names")):
                 try:
-                    all_speakers = zone.owntone_api.get_outputs()
-                    saved_names = zone.config["speaker_names"]
-                    matching_ids = [
-                        str(sp["id"]) for sp in all_speakers 
-                        if sp["name"] in saved_names
-                    ]
-                    if matching_ids:
-                        zone.owntone_api.set_outputs(matching_ids)
-                        log.info("Restored speakers for %s by name: %s -> %s",
-                                  zone.zone_id, saved_names, matching_ids)
+                    # Wait a bit for OwnTone to discover speakers
+                    time.sleep(2)
+                    
+                    available_outputs = zone.owntone_api.get_outputs()
+                    available_by_name = {o.get("name"): o.get("id") for o in available_outputs}
+                    available_by_id = {str(o.get("id")): o.get("id") for o in available_outputs}
+                    
+                    # Try to match by name first (more reliable), then fall back to ID
+                    speaker_names = zone.config.get("speaker_names", [])
+                    speaker_ids = zone.config.get("speakers", [])
+                    
+                    matched_ids = []
+                    for saved in speaker_names:
+                        name = saved.get("name")
+                        if name and name in available_by_name:
+                            matched_ids.append(available_by_name[name])
+                            log.info("Matched speaker by name: %s -> %s", name, available_by_name[name])
+                    
+                    # Fall back to ID matching for any not matched by name
+                    if not matched_ids and speaker_ids:
+                        for sid in speaker_ids:
+                            if str(sid) in available_by_id:
+                                matched_ids.append(available_by_id[str(sid)])
+                                log.info("Matched speaker by ID: %s", sid)
+                    
+                    if matched_ids:
+                        zone.owntone_api.set_outputs(matched_ids)
+                        log.info("Restored %d speakers for %s", len(matched_ids), zone.zone_id)
                     else:
-                        log.warning("No matching speakers found for %s (saved: %s)",
-                                    zone.zone_id, saved_names)
-                except Exception as e:
-                    log.warning("Could not restore speakers: %s", e)
-            elif zone.owntone_api and zone.config.get("speakers"):
-                # Fallback to old ID-based restoration
-                try:
-                    zone.owntone_api.set_outputs(zone.config["speakers"])
-                    log.info("Restored speakers for %s by ID: %s",
-                              zone.zone_id, zone.config["speakers"])
+                        log.warning("No saved speakers found in available outputs for %s", zone.zone_id)
+                        log.debug("Available: %s, Saved names: %s, Saved IDs: %s",
+                                  list(available_by_name.keys()), speaker_names, speaker_ids)
                 except Exception as e:
                     log.warning("Could not restore speakers: %s", e)
 
@@ -699,7 +710,22 @@ class ZoneManager:
                 PIPE="{grp_dir}/pipes/audio.pipe"
                 ARECORD_PID_FILE="{grp_dir}/state/arecord.pid"
                 LOG="{grp_dir}/logs/sync_reset.log"
+                DEBOUNCE_FILE="{grp_dir}/state/reset_debounce.ts"
+                DEBOUNCE_MS=200  # Ignore calls within 200ms of each other
+                
                 TIMESTAMP=$(date '+%H:%M:%S.%3N')
+                NOW_MS=$(date +%s%3N)
+
+                # Debounce: skip if called too recently
+                if [[ -f "$DEBOUNCE_FILE" ]]; then
+                  LAST_MS=$(cat "$DEBOUNCE_FILE" 2>/dev/null || echo "0")
+                  DIFF=$((NOW_MS - LAST_MS))
+                  if [[ $DIFF -lt $DEBOUNCE_MS ]]; then
+                    echo "[$TIMESTAMP] Debounced (only ${{DIFF}}ms since last call)" >> "$LOG"
+                    exit 0
+                  fi
+                fi
+                echo "$NOW_MS" > "$DEBOUNCE_FILE"
 
                 echo "" >> "$LOG"
                 echo "[$TIMESTAMP] ========== SYNC RESET TRIGGERED ==========" >> "$LOG"
@@ -852,7 +878,9 @@ class ZoneManager:
                 }}
 
                 audio {{
-                \ttype = "disabled"
+                \ttype = "alsa"
+                \tcard = "default"
+                \tnickname = "Local Output"
                 }}
 
                 mpd {{
