@@ -66,6 +66,7 @@ class Zone:
         self.allocated_subdevice = None
         self.shairport_pid = None
         self.arecord_supervisor_pid = None
+        self.metadata_relay_pid = None
         self.pause_bridge_pid = None
         self.owntone_pid = None
         self.nqptp_pid = None  # Shared, tracked by ZoneManager
@@ -419,11 +420,9 @@ class ZoneManager:
             if zone._stop_event.is_set():
                 return
 
-            # Step 6: Start shairport-sync on HOST (shared nqptp)
-            self._start_shairport_on_host(zone)
-
-            # Step 7: Start pause bridge
+            self._start_metadata_relay(zone)
             self._start_pause_bridge(zone)
+            self._start_shairport_on_host(zone)
 
             # Brief pause for avahi registration
             time.sleep(2)
@@ -533,8 +532,10 @@ class ZoneManager:
         # 2. Stop HOST processes
         _kill_pid(zone.shairport_pid, f"shairport-sync ({zone.zone_id})")
         _kill_pid(zone.arecord_supervisor_pid, f"arecord supervisor ({zone.zone_id})")
+        _kill_pid(zone.metadata_relay_pid, f"metadata relay ({zone.zone_id})")
         zone.shairport_pid = None
         zone.arecord_supervisor_pid = None
+        zone.metadata_relay_pid = None
 
         # 3. Stop pause bridge
         _kill_pid(zone.pause_bridge_pid, f"pause_bridge ({zone.zone_id})")
@@ -660,16 +661,17 @@ class ZoneManager:
         audio_pipe = os.path.join(grp_dir, "pipes", "audio.pipe")
         meta_pipe = os.path.join(grp_dir, "pipes", "audio.pipe.metadata")
         pause_meta_pipe = os.path.join(grp_dir, "pipes", "pause_bridge.metadata")
+        shairport_meta_pipe = os.path.join(grp_dir, "pipes", "shairport.metadata")
         format_file = os.path.join(grp_dir, "pipes", "audio.pipe.format")
 
-        for pipe in [audio_pipe, meta_pipe, pause_meta_pipe, format_file]:
+        for pipe in [audio_pipe, meta_pipe, pause_meta_pipe, shairport_meta_pipe, format_file]:
             try:
                 os.remove(pipe)
             except FileNotFoundError:
                 pass
 
-        for pipe in [audio_pipe, meta_pipe, pause_meta_pipe]:
-            os.mkfifo(pipe)
+        for pipe in [audio_pipe, meta_pipe, pause_meta_pipe, shairport_meta_pipe]:
+            os.mkfifo(pipe, 0o666)
             os.chmod(pipe, 0o666)
 
         # Format file — OwnTone REQUIRES this to know the pipe's audio format
@@ -813,7 +815,7 @@ class ZoneManager:
                 {{
                   enabled = "yes";
                   include_cover_art = "no";
-                  pipe_name = "{grp_dir}/pipes/pause_bridge.metadata";
+                  pipe_name = "{grp_dir}/pipes/shairport.metadata";
                   pipe_timeout = 5000;
                 }};
             """))
@@ -1100,7 +1102,109 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
             )
         zone.shairport_pid = proc.pid
         log.info("Started shairport-sync for %s (pid %d) — using shared nqptp",
-                  zone.zone_id, proc.pid)
+                 zone.zone_id, proc.pid)
+
+    def _start_metadata_relay(self, zone):
+        grp_dir = zone.grp_dir
+        relay_script = os.path.join(grp_dir, "config", "metadata_relay.py")
+        with open(relay_script, "w") as f:
+            f.write(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import datetime
+                import errno
+                import os
+                import sys
+                import time
+
+                source_path, pause_path, owntone_path = sys.argv[1:4]
+                outputs = [pause_path, owntone_path]
+                writers = {path: None for path in outputs}
+
+                def log(message):
+                    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    print(f"[{ts}] {message}", flush=True)
+
+                def close_writer(path):
+                    fd = writers.get(path)
+                    if fd is None:
+                        return
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    writers[path] = None
+
+                def get_writer(path):
+                    fd = writers.get(path)
+                    if fd is not None:
+                        return fd
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                    except OSError as exc:
+                        if exc.errno in (errno.ENXIO, errno.ENOENT):
+                            return None
+                        raise
+                    writers[path] = fd
+                    log(f"Connected output: {path}")
+                    return fd
+
+                def fanout(payload):
+                    data = payload.encode("utf-8")
+                    for path in outputs:
+                        fd = writers.get(path)
+                        try:
+                            fd = get_writer(path)
+                            if fd is None:
+                                continue
+                            os.write(fd, data)
+                        except OSError as exc:
+                            close_writer(path)
+                            if exc.errno not in (errno.EPIPE, errno.ENXIO, errno.ENOENT):
+                                log(f"Write error on {path}: {exc}")
+
+                log(f"Relay source: {source_path}")
+                log(f"Relay outputs: {pause_path}, {owntone_path}")
+
+                buffer = ""
+                while True:
+                    try:
+                        with open(source_path, "r", encoding="utf-8", errors="ignore") as source:
+                            log("Source connected")
+                            while True:
+                                chunk = source.read(4096)
+                                if not chunk:
+                                    log("Source disconnected")
+                                    break
+                                buffer += chunk
+                                while True:
+                                    end = buffer.find("</item>")
+                                    if end == -1:
+                                        if len(buffer) > 1048576:
+                                            log("Discarding oversized partial metadata buffer")
+                                            buffer = ""
+                                        break
+                                    item = buffer[:end + len("</item>")]
+                                    buffer = buffer[end + len("</item>"):]
+                                    fanout(item)
+                    except FileNotFoundError:
+                        time.sleep(0.2)
+                    except Exception as exc:
+                        log(f"Relay error: {exc}")
+                        time.sleep(0.5)
+            """))
+        os.chmod(relay_script, 0o755)
+
+        source_pipe = os.path.join(grp_dir, "pipes", "shairport.metadata")
+        pause_pipe = os.path.join(grp_dir, "pipes", "pause_bridge.metadata")
+        owntone_pipe = os.path.join(grp_dir, "pipes", "audio.pipe.metadata")
+        log_path = os.path.join(grp_dir, "logs", "metadata_relay.log")
+        with open(log_path, "w") as log_file:
+            proc = subprocess.Popen(
+                ["python3", relay_script, source_pipe, pause_pipe, owntone_pipe],
+                stdout=log_file, stderr=subprocess.STDOUT
+            )
+        zone.metadata_relay_pid = proc.pid
+        log.info("Started metadata relay for %s (pid %d)", zone.zone_id, proc.pid)
 
     def _start_pause_bridge(self, zone):
         """
