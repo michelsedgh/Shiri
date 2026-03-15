@@ -1181,13 +1181,9 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
                         if is_prgr:
                             cached_prgr[path] = payload
                         
-                        was_disconnected = writers.get(path) is None
                         try:
                             fd = get_writer(path)
                             if fd is None:
-                                continue
-                            # Don't double-send prgr if we just replayed it on connect
-                            if is_prgr and was_disconnected:
                                 continue
                             os.write(fd, data)
                         except OSError as exc:
@@ -1199,10 +1195,28 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
                 log(f"Relay outputs: {pause_path}, {owntone_path}")
 
                 buffer = ""
+                # Synthetic pfls item to flush OwnTone buffers on new session
+                # pfls code = 70666c73, ssnc type = 73736e63
+                SYNTHETIC_PFLS = '<item><type>73736e63</type><code>70666c73</code><length>0</length></item>'
+                
                 while True:
                     try:
                         with open(source_path, "r", encoding="utf-8", errors="ignore") as source:
-                            log("Source connected")
+                            log("Source connected (new session) - clearing prgr cache")
+                            # CRITICAL: Clear cache on new session to avoid replaying stale timing
+                            for p in outputs:
+                                cached_prgr[p] = None
+                            
+                            # Send synthetic pfls to OwnTone to flush stale buffers
+                            # This fixes the ~0.5s drift on reconnect
+                            owntone_fd = get_writer(owntone_path)
+                            if owntone_fd:
+                                try:
+                                    os.write(owntone_fd, SYNTHETIC_PFLS.encode("utf-8"))
+                                    log("Sent synthetic pfls to OwnTone (flush stale buffers)")
+                                except OSError:
+                                    close_writer(owntone_path)
+                            
                             while True:
                                 chunk = source.read(4096)
                                 if not chunk:
