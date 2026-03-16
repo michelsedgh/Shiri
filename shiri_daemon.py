@@ -122,10 +122,13 @@ def get_zone(zone_id):
 @app.route("/api/zones/<zone_id>", methods=["PUT"])
 def update_zone(zone_id):
     data = request.get_json() or {}
-    zone = zone_manager.update_zone_config(zone_id, data)
+    # Allow updating running zones - they will be restarted automatically
+    zone, restarted = zone_manager.update_zone_config(zone_id, data, restart_if_running=True)
     if not zone:
-        return jsonify({"error": "Zone not found or currently running"}), 400
-    return jsonify(zone.to_dict())
+        return jsonify({"error": "Zone not found"}), 400
+    result = zone.to_dict()
+    result["restarted"] = restarted
+    return jsonify(result)
 
 
 @app.route("/api/zones/<zone_id>", methods=["DELETE"])

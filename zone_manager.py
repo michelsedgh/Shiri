@@ -313,18 +313,40 @@ class ZoneManager:
         log.info("Deleted zone %s", zone_id)
         return True
 
-    def update_zone_config(self, zone_id, updates):
-        """Update zone config (name, interface, etc.). Zone must be stopped."""
+    def update_zone_config(self, zone_id, updates, restart_if_running=False):
+        """Update zone config (name, interface, etc.). 
+        If restart_if_running=True and zone is running, it will be restarted."""
         with self._lock:
             zone = self.zones.get(zone_id)
             if not zone:
-                return None
-            if zone.status != Zone.STATUS_STOPPED:
-                return None
+                return None, False
+            
+            was_running = zone.status == Zone.STATUS_RUNNING
+            
+            if was_running and not restart_if_running:
+                return None, False
+            
             zone.config.update(updates)
+        
         self.config_store.save_zone(zone_id, zone.config)
         self._emit_zone_status(zone)
-        return zone
+        
+        # If zone was running, restart it to apply changes
+        needs_restart = was_running and restart_if_running
+        if needs_restart:
+            log.info("Restarting zone %s to apply config changes", zone_id)
+            self.stop_zone(zone_id)
+            # Start in background after stop completes
+            def restart_after_stop():
+                for _ in range(60):  # Wait up to 30 seconds
+                    if zone.status == Zone.STATUS_STOPPED:
+                        self.start_zone(zone_id)
+                        return
+                    time.sleep(0.5)
+                log.warning("Zone %s did not stop in time for restart", zone_id)
+            threading.Thread(target=restart_after_stop, daemon=True).start()
+        
+        return zone, needs_restart
 
     def get_zone(self, zone_id):
         with self._lock:
@@ -1208,13 +1230,14 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
                     return fd
 
                 def fanout(payload):
-                    data = payload.encode("utf-8")
+                    # Add newline so pause_bridge.sh can read line-by-line
+                    data = (payload + "\\n").encode("utf-8")
                     is_prgr = is_prgr_item(payload)
                     
                     for path in outputs:
                         # Cache prgr items for replay on late connections
                         if is_prgr:
-                            cached_prgr[path] = payload
+                            cached_prgr[path] = payload + "\\n"
                         
                         try:
                             fd = get_writer(path)

@@ -64,12 +64,34 @@ const App = (() => {
         });
 
         socket.on('zone_status', (data) => {
+            const prevStatus = zones[data.zone_id]?.status;
             zones[data.zone_id] = data;
             renderZoneCard(data);
 
             // Update detail panel if open for this zone
             if (activeDetailZone === data.zone_id) {
                 updateDetailPanel(data);
+                
+                // When zone transitions to running, load speakers and start polling
+                if (data.status === 'running' && prevStatus !== 'running') {
+                    loadSpeakers(data.zone_id);
+                    loadMasterVolume(data.zone_id);
+                    
+                    // Start periodic sync if not already running
+                    if (!volumePollInterval) {
+                        volumePollInterval = setInterval(() => {
+                            if (activeDetailZone && zones[activeDetailZone]?.status === 'running') {
+                                loadMasterVolume(activeDetailZone);
+                                loadSpeakers(activeDetailZone);
+                            }
+                        }, 3000);
+                    }
+                }
+                
+                // When zone stops, clear polling
+                if (data.status === 'stopped' && prevStatus === 'running') {
+                    stopVolumePoll();
+                }
             }
         });
 
@@ -266,12 +288,10 @@ const App = (() => {
             startStopButton = `<button class="btn btn-secondary btn-sm" onclick="App.stopZone('${zone.zone_id}')" ${disabledAttr}>■ Stop</button>`;
         }
         
-        const editDisabled = !canStart ? 'disabled' : '';
-
         actionsEl.innerHTML = `
             ${startStopButton}
             <button class="btn btn-secondary btn-sm" onclick="App.showDetail('${zone.zone_id}')">Details</button>
-            <button class="btn btn-secondary btn-sm btn-icon" onclick="App.editZone('${zone.zone_id}')" title="Edit zone settings" ${editDisabled}>
+            <button class="btn btn-secondary btn-sm btn-icon" onclick="App.editZone('${zone.zone_id}')" title="Edit zone settings">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
             </button>
             <button class="btn btn-danger btn-sm btn-icon" onclick="App.deleteZone('${zone.zone_id}')" title="Delete zone">
@@ -408,13 +428,30 @@ const App = (() => {
         const payload = { name, interface: iface, auto_start: autoStart, latency_offset: latencyOffset };
 
         if (editingZoneId) {
-            await api(`/zones/${editingZoneId}`, 'PUT', payload);
+            const result = await api(`/zones/${editingZoneId}`, 'PUT', payload);
+            if (result.restarted) {
+                showToast('Zone restarting to apply changes...');
+            }
         } else {
             await api('/zones', 'POST', payload);
         }
         
         hideZoneDialog();
         fetchZones();
+    }
+    
+    function showToast(message) {
+        // Create toast element if it doesn't exist
+        let toast = document.getElementById('toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'toast';
+            toast.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:12px 24px;border-radius:8px;z-index:10000;opacity:0;transition:opacity 0.3s;';
+            document.body.appendChild(toast);
+        }
+        toast.textContent = message;
+        toast.style.opacity = '1';
+        setTimeout(() => { toast.style.opacity = '0'; }, 3000);
     }
 
     // -------------------------------------------------------------------------
