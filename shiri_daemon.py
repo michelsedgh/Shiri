@@ -209,6 +209,25 @@ def toggle_speaker(zone_id, speaker_id):
     else:
         zone.owntone_api.disable_output(speaker_id)
 
+    # CRITICAL: Save current speaker selection to config for persistence
+    # Without this, speaker selections are lost on zone restart!
+    try:
+        outputs = zone.owntone_api.get_outputs()
+        selected_speakers = []
+        selected_ids = []
+        for out in outputs:
+            if out.get("selected"):
+                selected_ids.append(out.get("id"))
+                selected_speakers.append({
+                    "id": out.get("id"),
+                    "name": out.get("name", "Unknown")
+                })
+        zone.config["speakers"] = selected_ids
+        zone.config["speaker_names"] = selected_speakers
+        config_store.save_zone(zone_id, zone.config)
+    except Exception as e:
+        log.warning("Failed to save speaker selection: %s", e)
+
     return jsonify({"ok": True})
 
 # ---------------------------------------------------------------------------
