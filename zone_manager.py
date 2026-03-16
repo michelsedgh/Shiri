@@ -427,43 +427,57 @@ class ZoneManager:
             # Brief pause for avahi registration
             time.sleep(2)
 
-            # Restore saved speaker selections (with retry and name-based matching)
+            # Restore saved speaker selections with retry loop
+            # AirPlay speaker discovery via mDNS can take 5-15 seconds
             if zone.owntone_api and (zone.config.get("speakers") or zone.config.get("speaker_names")):
-                try:
-                    # Wait a bit for OwnTone to discover speakers
-                    time.sleep(2)
-                    
-                    available_outputs = zone.owntone_api.get_outputs()
-                    available_by_name = {o.get("name"): o.get("id") for o in available_outputs}
-                    available_by_id = {str(o.get("id")): o.get("id") for o in available_outputs}
-                    
-                    # Try to match by name first (more reliable), then fall back to ID
-                    speaker_names = zone.config.get("speaker_names", [])
-                    speaker_ids = zone.config.get("speakers", [])
-                    
-                    matched_ids = []
-                    for saved in speaker_names:
-                        name = saved.get("name")
-                        if name and name in available_by_name:
-                            matched_ids.append(available_by_name[name])
-                            log.info("Matched speaker by name: %s -> %s", name, available_by_name[name])
-                    
-                    # Fall back to ID matching for any not matched by name
-                    if not matched_ids and speaker_ids:
-                        for sid in speaker_ids:
-                            if str(sid) in available_by_id:
-                                matched_ids.append(available_by_id[str(sid)])
-                                log.info("Matched speaker by ID: %s", sid)
-                    
-                    if matched_ids:
-                        zone.owntone_api.set_outputs(matched_ids)
-                        log.info("Restored %d speakers for %s", len(matched_ids), zone.zone_id)
-                    else:
-                        log.warning("No saved speakers found in available outputs for %s", zone.zone_id)
-                        log.debug("Available: %s, Saved names: %s, Saved IDs: %s",
-                                  list(available_by_name.keys()), speaker_names, speaker_ids)
-                except Exception as e:
-                    log.warning("Could not restore speakers: %s", e)
+                speaker_names = zone.config.get("speaker_names", [])
+                speaker_ids = zone.config.get("speakers", [])
+                saved_names = [s.get("name") for s in speaker_names if s.get("name")]
+                
+                log.info("Waiting for speakers to appear: %s", saved_names or speaker_ids)
+                
+                # Retry up to 10 times (20 seconds total) for speakers to be discovered
+                for attempt in range(10):
+                    try:
+                        time.sleep(2)
+                        available_outputs = zone.owntone_api.get_outputs()
+                        available_by_name = {o.get("name"): o.get("id") for o in available_outputs}
+                        available_by_id = {str(o.get("id")): o.get("id") for o in available_outputs}
+                        
+                        # Try to match by name first (more reliable)
+                        matched_ids = []
+                        for saved in speaker_names:
+                            name = saved.get("name")
+                            if name and name in available_by_name:
+                                matched_ids.append(available_by_name[name])
+                                log.info("Matched speaker by name: %s -> %s", name, available_by_name[name])
+                        
+                        # Fall back to ID matching
+                        if not matched_ids and speaker_ids:
+                            for sid in speaker_ids:
+                                if str(sid) in available_by_id:
+                                    matched_ids.append(available_by_id[str(sid)])
+                                    log.info("Matched speaker by ID: %s", sid)
+                        
+                        if matched_ids:
+                            zone.owntone_api.set_outputs(matched_ids)
+                            log.info("Restored %d speakers for %s (attempt %d)", 
+                                     len(matched_ids), zone.zone_id, attempt + 1)
+                            break
+                        else:
+                            # Check if we found ANY of the saved speakers
+                            found_any = any(name in available_by_name for name in saved_names)
+                            if not found_any and attempt < 9:
+                                log.debug("Speakers not yet discovered (attempt %d), available: %s",
+                                          attempt + 1, list(available_by_name.keys()))
+                                continue
+                            log.warning("Could not find saved speakers for %s. Available: %s, Wanted: %s",
+                                        zone.zone_id, list(available_by_name.keys()), saved_names or speaker_ids)
+                            break
+                    except Exception as e:
+                        log.warning("Speaker restore attempt %d failed: %s", attempt + 1, e)
+                        if attempt >= 9:
+                            log.error("Gave up restoring speakers after 10 attempts")
 
             zone._set_status(Zone.STATUS_RUNNING)
             log.info("Zone %s is RUNNING! AirPlay name: '%s'",
