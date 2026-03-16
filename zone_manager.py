@@ -442,7 +442,8 @@ class ZoneManager:
             if zone._stop_event.is_set():
                 return
 
-            self._start_metadata_relay(zone)
+            # Note: metadata_relay disabled - shairport writes directly to pause_bridge.metadata
+            # which pause_bridge.sh reads. OwnTone metadata (for lyrics) not currently supported.
             self._start_pause_bridge(zone)
             self._start_shairport_on_host(zone)
 
@@ -872,7 +873,7 @@ class ZoneManager:
                 {{
                   enabled = "yes";
                   include_cover_art = "no";
-                  pipe_name = "{grp_dir}/pipes/shairport.metadata";
+                  pipe_name = "{grp_dir}/pipes/pause_bridge.metadata";
                   pipe_timeout = 5000;
                 }};
             """))
@@ -1038,12 +1039,13 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
 
         # Launch wrapper inside netns — same command as demo.sh
         log_path = os.path.join(grp_dir, "logs", "owntone_wrapper.log")
-        with open(log_path, "w") as log_file:
-            proc = subprocess.Popen(
-                ["ip", "netns", "exec", ns_name, "unshare", "-m",
-                 "bash", wrapper_path, mv_if, grp_dir, zone.zone_id],
-                stdout=log_file, stderr=subprocess.STDOUT
-            )
+        # Don't use context manager - file must stay open for subprocess lifetime
+        log_file = open(log_path, "w")
+        proc = subprocess.Popen(
+            ["ip", "netns", "exec", ns_name, "unshare", "-m",
+             "bash", wrapper_path, mv_if, grp_dir, zone.zone_id],
+            stdout=log_file, stderr=subprocess.STDOUT
+        )
         zone.owntone_pid = proc.pid
         log.info("Started OwnTone for %s (pid %d)", zone.zone_id, proc.pid)
 
@@ -1140,20 +1142,22 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
         os.chmod(arecord_supervisor_script, 0o755)
 
         log_path = os.path.join(grp_dir, "logs", "arecord.log")
-        with open(log_path, "w") as log_file:
-            proc = subprocess.Popen(
-                ["bash", arecord_supervisor_script],
-                stdout=log_file, stderr=subprocess.STDOUT
-            )
+        # Don't use context manager - file must stay open for subprocess lifetime
+        log_file = open(log_path, "w")
+        proc = subprocess.Popen(
+            ["bash", arecord_supervisor_script],
+            stdout=log_file, stderr=subprocess.STDOUT
+        )
         zone.arecord_supervisor_pid = proc.pid
         log.info("Started arecord supervisor for %s (pid %d)", zone.zone_id, proc.pid)
 
         # Start shairport-sync on host with real-time priority — same as demo.sh
         shairport_log = os.path.join(grp_dir, "logs", "shairport.log")
-        with open(shairport_log, "w") as log_file:
-            proc = subprocess.Popen(
-                ["chrt", "-f", "50", "shairport-sync",
-                 "-c", os.path.join(grp_dir, "config", "shairport-sync.conf"),
+        # Don't use context manager - file must stay open for subprocess lifetime
+        log_file = open(shairport_log, "w")
+        proc = subprocess.Popen(
+            ["chrt", "-f", "50", "shairport-sync",
+             "-c", os.path.join(grp_dir, "config", "shairport-sync.conf"),
                  "--statistics"],
                 stdout=log_file, stderr=subprocess.STDOUT
             )
@@ -1309,11 +1313,12 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
 
         os.chmod(pause_bridge_script, 0o755)
         log_path = os.path.join(zone.grp_dir, "logs", "pause_bridge.log")
-        with open(log_path, "w") as log_file:
-            proc = subprocess.Popen(
-                [pause_bridge_script, zone.grp_dir],
-                stdout=log_file, stderr=subprocess.STDOUT
-            )
+        # Don't use context manager - file must stay open for subprocess lifetime
+        log_file = open(log_path, "w")
+        proc = subprocess.Popen(
+            [pause_bridge_script, zone.grp_dir],
+            stdout=log_file, stderr=subprocess.STDOUT
+        )
         zone.pause_bridge_pid = proc.pid
         log.info("Started pause bridge for %s (pid %d)", zone.zone_id, proc.pid)
 
