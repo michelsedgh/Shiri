@@ -702,21 +702,18 @@ class ZoneManager:
         log.info("Using latency offset: %s seconds for %s", latency_offset, zone.zone_id)
 
         # Create pipe reset script — CRITICAL FOR MULTI-ROOM SYNC
-        # Same as the flush script in dual_zone_demo.sh
+        # EXACTLY matches dual_zone_demo.sh - don't change timing!
         flush_script = os.path.join(grp_dir, "config", "reset_audio_pipe.sh")
         with open(flush_script, "w") as f:
             f.write(textwrap.dedent(f"""\
                 #!/bin/bash
                 # Reset audio pipe completely for sync
                 # Called by shairport-sync on play start/stop
-                # CRITICAL: Must wait for arecord to restart before returning!
-                # If we return too early, Shairport starts playing but arecord isn't
-                # reading yet, causing ~0.5s of audio to buffer in loopback = DRIFT
+                # This kills arecord, flushes the pipe, and lets arecord restart fresh
 
                 PIPE="{grp_dir}/pipes/audio.pipe"
                 ARECORD_PID_FILE="{grp_dir}/state/arecord.pid"
                 LOG="{grp_dir}/logs/sync_reset.log"
-                
                 TIMESTAMP=$(date '+%H:%M:%S.%3N')
 
                 echo "" >> "$LOG"
@@ -724,38 +721,32 @@ class ZoneManager:
                 echo "[$TIMESTAMP] Called with args: $@" >> "$LOG"
 
                 # Step 1: Kill arecord to stop writing to pipe
-                OLD_PID=""
                 if [[ -f "$ARECORD_PID_FILE" ]]; then
-                  OLD_PID=$(cat "$ARECORD_PID_FILE")
-                  echo "[$TIMESTAMP] Found arecord PID file: $OLD_PID" >> "$LOG"
-                  if kill -0 "$OLD_PID" 2>/dev/null; then
-                    echo "[$TIMESTAMP] Killing arecord (pid $OLD_PID)" >> "$LOG"
-                    kill -TERM "$OLD_PID" 2>/dev/null || true
+                  ARECORD_PID=$(cat "$ARECORD_PID_FILE")
+                  echo "[$TIMESTAMP] Found arecord PID file: $ARECORD_PID" >> "$LOG"
+                  if kill -0 "$ARECORD_PID" 2>/dev/null; then
+                    echo "[$TIMESTAMP] Killing arecord (pid $ARECORD_PID)" >> "$LOG"
+                    kill -TERM "$ARECORD_PID" 2>/dev/null || true
+                    sleep 0.1
+                    echo "[$TIMESTAMP] arecord killed" >> "$LOG"
                   else
-                    echo "[$TIMESTAMP] arecord (pid $OLD_PID) not running" >> "$LOG"
+                    echo "[$TIMESTAMP] arecord (pid $ARECORD_PID) not running" >> "$LOG"
                   fi
                 else
                   echo "[$TIMESTAMP] WARNING: arecord PID file not found!" >> "$LOG"
                 fi
 
-                # Step 2: Wait for arecord supervisor to restart arecord with NEW PID
-                # This is critical - we must not return until arecord is reading from loopback
-                echo "[$TIMESTAMP] Waiting for arecord to restart..." >> "$LOG"
-                for i in {{1..20}}; do
-                  sleep 0.05
-                  if [[ -f "$ARECORD_PID_FILE" ]]; then
-                    NEW_PID=$(cat "$ARECORD_PID_FILE")
-                    if [[ "$NEW_PID" != "$OLD_PID" ]] && [[ -n "$NEW_PID" ]] && kill -0 "$NEW_PID" 2>/dev/null; then
-                      echo "[$TIMESTAMP] arecord restarted with new PID: $NEW_PID (took ${{i}}x50ms)" >> "$LOG"
-                      break
-                    fi
-                  fi
-                done
+                # Step 2: Drain any buffered data from the pipe
+                if [[ -p "$PIPE" ]]; then
+                  BEFORE_SIZE=$(timeout 0.1 stat -c%s "$PIPE" 2>/dev/null || echo "unknown")
+                  echo "[$TIMESTAMP] Draining pipe (size before: $BEFORE_SIZE)" >> "$LOG"
+                  DRAINED=$(timeout 0.3 dd if="$PIPE" of=/dev/null bs=65536 iflag=nonblock 2>&1 | grep -oP '\\d+ bytes' || echo "0 bytes")
+                  echo "[$TIMESTAMP] Drained: $DRAINED" >> "$LOG"
+                else
+                  echo "[$TIMESTAMP] WARNING: Pipe $PIPE is not a FIFO!" >> "$LOG"
+                fi
 
-                # Step 3: Small extra delay for arecord to fully initialize
-                sleep 0.05
-
-                echo "[$TIMESTAMP] Reset complete - arecord ready" >> "$LOG"
+                echo "[$TIMESTAMP] Reset complete - arecord will restart fresh" >> "$LOG"
                 echo "[$TIMESTAMP] ==========================================" >> "$LOG"
             """))
         os.chmod(flush_script, 0o755)
@@ -805,7 +796,8 @@ class ZoneManager:
                 sessioncontrol =
                 {{
                   run_this_before_play_begins = "{flush_script}";
-                  run_this_after_play_ends = "{flush_script}";
+                  // REMOVED: run_this_after_play_ends - causes double-reset race on reconnect
+                  // Only resetting on play_begin is sufficient for sync
                   wait_for_completion = "yes";
                 }};
 
@@ -1084,8 +1076,8 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
                   # Wait for arecord to exit (killed by sync reset or pipe close)
                   wait $ARECORD_INNER_PID 2>/dev/null || true
 
-                  echo "[$(date '+%H:%M:%S')] arecord exited, restarting..." >&2
-                  sleep 0.05
+                  echo "[$(date '+%H:%M:%S')] arecord exited, restarting in 0.3s..." >&2
+                  sleep 0.3
                 done
             """))
         os.chmod(arecord_supervisor_script, 0o755)
