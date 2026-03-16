@@ -702,25 +702,50 @@ class ZoneManager:
         log.info("Using latency offset: %s seconds for %s", latency_offset, zone.zone_id)
 
         # Create pipe reset script — CRITICAL FOR MULTI-ROOM SYNC
-        # EXACTLY matches dual_zone_demo.sh - don't change timing!
+        # This script:
+        # 1. Stops OwnTone playback (flushes its internal buffers)
+        # 2. Kills arecord
+        # 3. Drains the audio pipe
+        # This ensures NO accumulated buffer state between sessions
         flush_script = os.path.join(grp_dir, "config", "reset_audio_pipe.sh")
         with open(flush_script, "w") as f:
             f.write(textwrap.dedent(f"""\
                 #!/bin/bash
-                # Reset audio pipe completely for sync
-                # Called by shairport-sync on play start/stop
-                # This kills arecord, flushes the pipe, and lets arecord restart fresh
+                # Reset audio pipeline completely for sync
+                # Called by shairport-sync BEFORE play begins
+                # CRITICAL: Must flush OwnTone buffers to prevent cumulative drift!
 
                 PIPE="{grp_dir}/pipes/audio.pipe"
                 ARECORD_PID_FILE="{grp_dir}/state/arecord.pid"
+                OWNTONE_IP_FILE="{grp_dir}/state/owntone_ip.txt"
+                OWNTONE_NETNS_FILE="{grp_dir}/state/owntone_netns.txt"
                 LOG="{grp_dir}/logs/sync_reset.log"
                 TIMESTAMP=$(date '+%H:%M:%S.%3N')
 
                 echo "" >> "$LOG"
                 echo "[$TIMESTAMP] ========== SYNC RESET TRIGGERED ==========" >> "$LOG"
-                echo "[$TIMESTAMP] Called with args: $@" >> "$LOG"
 
-                # Step 1: Kill arecord to stop writing to pipe
+                # Step 1: STOP OwnTone playback to flush its internal buffers
+                # This is CRITICAL - without this, OwnTone accumulates delay each reconnect
+                if [[ -f "$OWNTONE_IP_FILE" ]]; then
+                  OWNTONE_IP=$(cat "$OWNTONE_IP_FILE")
+                  OWNTONE_NETNS=""
+                  if [[ -f "$OWNTONE_NETNS_FILE" ]]; then
+                    OWNTONE_NETNS=$(cat "$OWNTONE_NETNS_FILE")
+                  fi
+                  
+                  echo "[$TIMESTAMP] Stopping OwnTone playback (flush buffers)" >> "$LOG"
+                  if [[ -n "$OWNTONE_NETNS" ]]; then
+                    ip netns exec "$OWNTONE_NETNS" curl -s -X PUT "http://$OWNTONE_IP:3689/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
+                  else
+                    curl -s -X PUT "http://$OWNTONE_IP:3689/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
+                  fi
+                  echo "[$TIMESTAMP] OwnTone stopped" >> "$LOG"
+                else
+                  echo "[$TIMESTAMP] WARNING: OwnTone IP not found, cannot flush" >> "$LOG"
+                fi
+
+                # Step 2: Kill arecord to stop writing to pipe
                 if [[ -f "$ARECORD_PID_FILE" ]]; then
                   ARECORD_PID=$(cat "$ARECORD_PID_FILE")
                   echo "[$TIMESTAMP] Found arecord PID file: $ARECORD_PID" >> "$LOG"
@@ -736,17 +761,13 @@ class ZoneManager:
                   echo "[$TIMESTAMP] WARNING: arecord PID file not found!" >> "$LOG"
                 fi
 
-                # Step 2: Drain any buffered data from the pipe
+                # Step 3: Drain any buffered data from the pipe
                 if [[ -p "$PIPE" ]]; then
-                  BEFORE_SIZE=$(timeout 0.1 stat -c%s "$PIPE" 2>/dev/null || echo "unknown")
-                  echo "[$TIMESTAMP] Draining pipe (size before: $BEFORE_SIZE)" >> "$LOG"
-                  DRAINED=$(timeout 0.3 dd if="$PIPE" of=/dev/null bs=65536 iflag=nonblock 2>&1 | grep -oP '\\d+ bytes' || echo "0 bytes")
-                  echo "[$TIMESTAMP] Drained: $DRAINED" >> "$LOG"
-                else
-                  echo "[$TIMESTAMP] WARNING: Pipe $PIPE is not a FIFO!" >> "$LOG"
+                  DRAINED=$(timeout 0.2 dd if="$PIPE" of=/dev/null bs=65536 iflag=nonblock 2>&1 | grep -oP '\\d+ bytes' || echo "0 bytes")
+                  echo "[$TIMESTAMP] Drained pipe: $DRAINED" >> "$LOG"
                 fi
 
-                echo "[$TIMESTAMP] Reset complete - arecord will restart fresh" >> "$LOG"
+                echo "[$TIMESTAMP] Reset complete - pipeline flushed" >> "$LOG"
                 echo "[$TIMESTAMP] ==========================================" >> "$LOG"
             """))
         os.chmod(flush_script, 0o755)
