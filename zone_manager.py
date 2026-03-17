@@ -739,32 +739,18 @@ class ZoneManager:
         log.info("Using latency offset: %s seconds for %s", latency_offset, zone.zone_id)
 
         # Create pipe reset script — CRITICAL FOR MULTI-ROOM SYNC
-        # 
-        # FIX FOR ZONE COUPLING BUG:
-        # When iOS reorganizes AirPlay 2 groups (add/remove speaker), it triggers
-        # run_this_before_play_begins on ALL speakers - including ones already playing.
-        # 
-        # If we reset a zone that's already playing:
-        # - Stopping OwnTone causes audio dropout
-        # - Killing arecord causes 0.1s gap while supervisor restarts
-        # 
-        # SOLUTION: Check if OwnTone is already playing ("play" state)
-        # - If PLAYING: Skip entire reset (GROUP TRANSITION - audio already flowing)
-        # - If NOT PLAYING: Do full reset (FRESH SESSION - need to flush stale state)
-        # 
-        # This is safe because:
-        # - The zone that STAYS in the group continues uninterrupted
-        # - The zone that gets DISCONNECTED will be in "stop" state when it reconnects,
-        #   so it WILL get the full reset on its next connection
+        # This script:
+        # 1. Stops OwnTone playback (flushes its internal buffers)
+        # 2. Kills arecord
+        # 3. Drains the audio pipe
+        # This ensures NO accumulated buffer state between sessions
         flush_script = os.path.join(grp_dir, "config", "reset_audio_pipe.sh")
         with open(flush_script, "w") as f:
             f.write(textwrap.dedent(f"""\
                 #!/bin/bash
-                # Reset audio pipeline for sync
+                # Reset audio pipeline completely for sync
                 # Called by shairport-sync BEFORE play begins
-                #
-                # SMART RESET: Skip entirely if already playing (group transition).
-                # Full reset only for fresh sessions (zone was not playing).
+                # CRITICAL: Must flush OwnTone buffers to prevent cumulative drift!
 
                 PIPE="{grp_dir}/pipes/audio.pipe"
                 ARECORD_PID_FILE="{grp_dir}/state/arecord.pid"
@@ -776,7 +762,6 @@ class ZoneManager:
                 echo "" >> "$LOG"
                 echo "[$TIMESTAMP] ========== SYNC RESET TRIGGERED ==========" >> "$LOG"
 
-                # Helper function to run curl in netns if needed
                 run_curl() {{
                   if [[ -n "$OWNTONE_NETNS" ]] && ip netns list 2>/dev/null | grep -qw "$OWNTONE_NETNS"; then
                     ip netns exec "$OWNTONE_NETNS" curl "$@"
@@ -785,7 +770,6 @@ class ZoneManager:
                   fi
                 }}
 
-                # Read OwnTone connection info
                 OWNTONE_IP=""
                 OWNTONE_NETNS=""
                 if [[ -f "$OWNTONE_IP_FILE" ]]; then
@@ -795,41 +779,40 @@ class ZoneManager:
                   OWNTONE_NETNS=$(cat "$OWNTONE_NETNS_FILE")
                 fi
 
-                # Check if OwnTone is currently playing
-                # If yes, this is a GROUP TRANSITION - skip entire reset
-                # If no, this is a FRESH SESSION - do full reset
                 if [[ -n "$OWNTONE_IP" ]]; then
                   PLAYER_STATE=$(run_curl -s --connect-timeout 1 "http://$OWNTONE_IP:3689/api/player" 2>/dev/null | grep -o '"state":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
                   echo "[$TIMESTAMP] OwnTone player state: $PLAYER_STATE" >> "$LOG"
-                  
                   if [[ "$PLAYER_STATE" == "play" ]]; then
-                    echo "[$TIMESTAMP] GROUP TRANSITION - already playing, skipping entire reset" >> "$LOG"
-                    echo "[$TIMESTAMP] (Audio continues uninterrupted)" >> "$LOG"
+                    echo "[$TIMESTAMP] Already playing, skipping reset" >> "$LOG"
                     echo "[$TIMESTAMP] ==========================================" >> "$LOG"
                     exit 0
                   fi
                 fi
 
-                # --- FRESH SESSION: Full reset needed ---
-                echo "[$TIMESTAMP] FRESH SESSION - performing full pipeline reset" >> "$LOG"
-
-                # Step 1: Stop OwnTone playback to flush its internal buffers
+                # Step 1: STOP OwnTone playback to flush its internal buffers
+                # This is CRITICAL - without this, OwnTone accumulates delay each reconnect
                 if [[ -n "$OWNTONE_IP" ]]; then
-                  echo "[$TIMESTAMP] Stopping OwnTone playback" >> "$LOG"
+                  echo "[$TIMESTAMP] Stopping OwnTone playback (flush buffers)" >> "$LOG"
                   run_curl -s -X PUT "http://$OWNTONE_IP:3689/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
+                  echo "[$TIMESTAMP] OwnTone stopped" >> "$LOG"
+                else
+                  echo "[$TIMESTAMP] WARNING: OwnTone IP not found, cannot flush" >> "$LOG"
                 fi
 
                 # Step 2: Kill arecord to stop writing to pipe
                 if [[ -f "$ARECORD_PID_FILE" ]]; then
                   ARECORD_PID=$(cat "$ARECORD_PID_FILE")
-                  echo "[$TIMESTAMP] Found arecord PID: $ARECORD_PID" >> "$LOG"
+                  echo "[$TIMESTAMP] Found arecord PID file: $ARECORD_PID" >> "$LOG"
                   if kill -0 "$ARECORD_PID" 2>/dev/null; then
-                    echo "[$TIMESTAMP] Killing arecord" >> "$LOG"
+                    echo "[$TIMESTAMP] Killing arecord (pid $ARECORD_PID)" >> "$LOG"
                     kill -TERM "$ARECORD_PID" 2>/dev/null || true
                     sleep 0.1
+                    echo "[$TIMESTAMP] arecord killed" >> "$LOG"
+                  else
+                    echo "[$TIMESTAMP] arecord (pid $ARECORD_PID) not running" >> "$LOG"
                   fi
                 else
-                  echo "[$TIMESTAMP] No arecord PID file" >> "$LOG"
+                  echo "[$TIMESTAMP] WARNING: arecord PID file not found!" >> "$LOG"
                 fi
 
                 # Step 3: Drain any buffered data from the pipe
@@ -838,7 +821,7 @@ class ZoneManager:
                   echo "[$TIMESTAMP] Drained pipe: $DRAINED" >> "$LOG"
                 fi
 
-                echo "[$TIMESTAMP] Full reset complete" >> "$LOG"
+                echo "[$TIMESTAMP] Reset complete - pipeline flushed" >> "$LOG"
                 echo "[$TIMESTAMP] ==========================================" >> "$LOG"
             """))
         os.chmod(flush_script, 0o755)
