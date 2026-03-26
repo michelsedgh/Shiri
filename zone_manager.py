@@ -1017,7 +1017,7 @@ sleep 1
 # Each zone gets its own PTP timing — one zone's disconnect
 # cannot corrupt another zone's clock
 echo "[zone:$GRP] Starting per-zone nqptp (isolated PTP timing)..."
-nqptp &
+setsid nqptp &
 NQPTP_PID=$!
 echo "$NQPTP_PID" > "$GRP_DIR/state/nqptp.pid"
 sleep 1
@@ -1035,14 +1035,41 @@ echo "[zone:$GRP] nqptp ready (pid $NQPTP_PID, private /dev/shm/nqptp)"
 # Start shairport-sync (uses this zone's private /dev/shm/nqptp for PTP)
 # Writes to ALSA loopback on host (ALSA is kernel-level, works across namespaces)
 echo "[zone:$GRP] Starting shairport-sync..."
-chrt -f 50 shairport-sync -c "$GRP_DIR/config/shairport-sync.conf" --statistics &>"$GRP_DIR/logs/shairport.log" &
+setsid chrt -f 50 shairport-sync -c "$GRP_DIR/config/shairport-sync.conf" --statistics &>"$GRP_DIR/logs/shairport.log" &
 SHAIRPORT_PID=$!
 echo "$SHAIRPORT_PID" > "$GRP_DIR/state/shairport.pid"
 sleep 1
 echo "[zone:$GRP] shairport-sync started (pid $SHAIRPORT_PID)"
 
+# Start OwnTone in background (NOT exec — keeps wrapper as supervisor)
 echo "[zone:$GRP] Starting OwnTone with Real-Time priority..."
-exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
+chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf" &
+OWNTONE_PID=$!
+echo "$OWNTONE_PID" > "$GRP_DIR/state/owntone.pid"
+echo "[zone:$GRP] OwnTone started (pid $OWNTONE_PID)"
+
+# ---- Process supervisor loop ----
+# Monitor all three critical processes. If any dies, kill the rest and exit.
+# The Shiri daemon will detect our exit via the wrapper PID.
+cleanup() {
+  echo "[zone:$GRP] Supervisor cleaning up all processes..."
+  kill "$NQPTP_PID" "$SHAIRPORT_PID" "$OWNTONE_PID" 2>/dev/null
+  sleep 1
+  kill -9 "$NQPTP_PID" "$SHAIRPORT_PID" "$OWNTONE_PID" 2>/dev/null
+}
+trap cleanup EXIT
+
+while true; do
+  sleep 5
+  for label_pid in "nqptp:$NQPTP_PID" "shairport-sync:$SHAIRPORT_PID" "owntone:$OWNTONE_PID"; do
+    label="${label_pid%%:*}"
+    pid="${label_pid##*:}"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[zone:$GRP] FATAL: $label (pid $pid) died! Shutting down zone." >&2
+      exit 1
+    fi
+  done
+done
 """)
         os.chmod(wrapper_path, 0o755)
 
