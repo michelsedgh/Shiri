@@ -3,7 +3,8 @@ zone_manager.py — Core zone lifecycle management for Shiri.
 
 Translates dual_zone_demo.sh into Python, calling the SAME system commands.
 All the intricate audio pipeline logic (ALSA loopback, arecord supervisor,
-netns+macvlan, PTP sync via shared nqptp) is preserved exactly.
+netns+macvlan) is preserved. PTP sync uses per-zone nqptp in isolated netns
+so one zone's disconnect cannot poison another zone's PTP clock.
 
 The existing pause_bridge.sh and volume_bridge.sh scripts are launched
 as subprocesses — they are NOT reimplemented.
@@ -69,7 +70,7 @@ class Zone:
         self.metadata_relay_pid = None
         self.pause_bridge_pid = None
         self.owntone_pid = None
-        self.nqptp_pid = None  # Shared, tracked by ZoneManager
+        self.nqptp_pid = None  # Per-zone, runs inside netns
         self.netns_name = None
         self.macvlan_if = None
         self.shairport_ip = None
@@ -190,36 +191,20 @@ class ZoneManager:
 
     def start_host_nqptp(self):
         """
-        Same as start_host_nqptp() in dual_zone_demo.sh.
-        ONE shared nqptp instance for ALL zones — CRITICAL for multi-room sync.
+        Previously started a shared host nqptp for all zones.
+        Now each zone runs its own nqptp inside its netns with private /dev/shm.
+        This isolates PTP timing so one zone's disconnect can't poison another's clock.
+        
+        If a stale host nqptp is running, kill it to free ports 319/320 for per-zone instances.
         """
-        # Check if already running
         result = _run(["pgrep", "-x", "nqptp"])
         if result.returncode == 0 and result.stdout.strip():
-            self._host_nqptp_pid = int(result.stdout.strip().split()[0])
-            log.info("nqptp already running (pid %d) — reusing for shared timing",
-                      self._host_nqptp_pid)
-            return True
-
-        log.info("Starting shared nqptp on HOST (CRITICAL for multi-room sync)...")
-        proc = subprocess.Popen(["nqptp"], stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
-        self._host_nqptp_pid = proc.pid
-        time.sleep(1)
-
-        # Verify it started
-        try:
-            os.kill(proc.pid, 0)
-        except ProcessLookupError:
-            log.error("Failed to start nqptp — check if ports 319/320 are available")
-            return False
-
-        # Verify shared memory
-        if not os.path.exists("/dev/shm/nqptp"):
-            log.error("nqptp started but /dev/shm/nqptp not created")
-            return False
-
-        log.info("Host nqptp started (pid %d) — /dev/shm/nqptp ready", proc.pid)
+            for pid_str in result.stdout.strip().split():
+                pid = int(pid_str)
+                log.info("Killing stale host nqptp (pid %d) — now per-zone in netns", pid)
+                _kill_pid(pid, "stale host nqptp")
+        self._host_nqptp_pid = None
+        log.info("nqptp is now per-zone (each zone runs its own in isolated netns)")
         return True
 
     def get_network_interfaces(self):
@@ -242,17 +227,8 @@ class ZoneManager:
 
     def get_system_status(self):
         """Return system-level health info."""
-        nqptp_running = False
-        if self._host_nqptp_pid:
-            try:
-                os.kill(self._host_nqptp_pid, 0)
-                nqptp_running = True
-            except ProcessLookupError:
-                pass
-
         return {
-            "nqptp_running": nqptp_running,
-            "nqptp_pid": self._host_nqptp_pid,
+            "nqptp_mode": "per-zone",
             "alsa_ready": self._alsa_ready,
             "interfaces": self.get_network_interfaces(),
             "zone_count": len(self.zones),
@@ -386,14 +362,14 @@ class ZoneManager:
 
     def _start_zone_thread(self, zone):
         """
-        Full zone startup sequence. Same order as dual_zone_demo.sh main():
+        Full zone startup sequence:
         1. Allocate loopback subdevice
         2. Setup directories & FIFOs
         3. Generate configs
-        4. Start OwnTone in netns
+        4. Start zone in netns (nqptp + shairport-sync + OwnTone)
         5. Wait for OwnTone, rescan library, verify pipe
-        6. Start shairport-sync on host
-        7. Start pause bridge
+        6. Start arecord supervisor on host
+        7. Start pause bridge on host
         """
         try:
             if not zone.interface:
@@ -445,7 +421,24 @@ class ZoneManager:
             # Note: metadata_relay disabled - shairport writes directly to pause_bridge.metadata
             # which pause_bridge.sh reads. OwnTone metadata (for lyrics) not currently supported.
             self._start_pause_bridge(zone)
-            self._start_shairport_on_host(zone)
+            self._start_arecord_supervisor(zone)
+
+            # shairport-sync now runs inside the netns wrapper (with per-zone nqptp)
+            # Read its PID from the file the wrapper wrote
+            shairport_pid_file = os.path.join(zone.grp_dir, "state", "shairport.pid")
+            for _ in range(10):
+                if os.path.exists(shairport_pid_file):
+                    with open(shairport_pid_file) as f:
+                        pid_str = f.read().strip()
+                    if pid_str:
+                        zone.shairport_pid = int(pid_str)
+                        log.info("shairport-sync for %s running in netns (pid %d)",
+                                 zone.zone_id, zone.shairport_pid)
+                        break
+                time.sleep(1)
+
+            # shairport_ip = macvlan IP (same as OwnTone, both in the netns)
+            zone.shairport_ip = zone.owntone_ip
 
             # Brief pause for avahi registration
             time.sleep(2)
@@ -544,14 +537,12 @@ class ZoneManager:
 
     def _cleanup_zone(self, zone):
         """
-        Same as cleanup() in dual_zone_demo.sh:
+        Zone cleanup sequence:
         1. Release loopback subdevice
-        2. Stop HOST processes (shairport-sync, arecord)
-        3. Stop pause bridge
-        4. Release DHCP leases in namespace
-        5. Stop services in namespace
-        6. Force kill remaining
-        7. Tear down netns + macvlan
+        2. Stop HOST processes (arecord, pause_bridge)
+        3. Stop NETNS processes (nqptp, shairport-sync, owntone, avahi)
+        4. Force kill remaining netns processes
+        5. Tear down netns + macvlan
         """
         log.info("Cleaning up zone %s...", zone.zone_id)
 
@@ -566,19 +557,17 @@ class ZoneManager:
                 pass
             zone.allocated_subdevice = None
 
-        # 2. Stop HOST processes
-        _kill_pid(zone.shairport_pid, f"shairport-sync ({zone.zone_id})")
+        # 2. Stop HOST processes (arecord + pause_bridge remain on host)
+        # shairport-sync is now in the netns — killed in step 3
         _kill_pid(zone.arecord_supervisor_pid, f"arecord supervisor ({zone.zone_id})")
         _kill_pid(zone.metadata_relay_pid, f"metadata relay ({zone.zone_id})")
+        _kill_pid(zone.pause_bridge_pid, f"pause_bridge ({zone.zone_id})")
         zone.shairport_pid = None
         zone.arecord_supervisor_pid = None
         zone.metadata_relay_pid = None
-
-        # 3. Stop pause bridge
-        _kill_pid(zone.pause_bridge_pid, f"pause_bridge ({zone.zone_id})")
         zone.pause_bridge_pid = None
 
-        # 4-5. Cleanup in OwnTone namespace
+        # 3. Cleanup in zone namespace (nqptp + shairport-sync + owntone + avahi)
         ns = zone.netns_name
         if ns:
             # Check if namespace still exists
@@ -597,7 +586,9 @@ class ZoneManager:
                     _run(["ip", "netns", "exec", ns, "dhclient", "-r", iface_match])
                     log.info("Released DHCP lease on %s in %s", iface_match, ns)
 
-                # Stop services
+                # Gracefully stop all services in the namespace
+                _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "shairport-sync"])
+                _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "nqptp"])
                 _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "avahi-daemon"])
                 _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "owntone"])
 
@@ -754,8 +745,6 @@ class ZoneManager:
 
                 PIPE="{grp_dir}/pipes/audio.pipe"
                 ARECORD_PID_FILE="{grp_dir}/state/arecord.pid"
-                OWNTONE_IP_FILE="{grp_dir}/state/owntone_ip.txt"
-                OWNTONE_NETNS_FILE="{grp_dir}/state/owntone_netns.txt"
                 LOG="{grp_dir}/logs/sync_reset.log"
                 TIMESTAMP=$(date '+%H:%M:%S.%3N')
 
@@ -764,23 +753,10 @@ class ZoneManager:
 
                 # Step 1: STOP OwnTone playback to flush its internal buffers
                 # This is CRITICAL - without this, OwnTone accumulates delay each reconnect
-                if [[ -f "$OWNTONE_IP_FILE" ]]; then
-                  OWNTONE_IP=$(cat "$OWNTONE_IP_FILE")
-                  OWNTONE_NETNS=""
-                  if [[ -f "$OWNTONE_NETNS_FILE" ]]; then
-                    OWNTONE_NETNS=$(cat "$OWNTONE_NETNS_FILE")
-                  fi
-                  
-                  echo "[$TIMESTAMP] Stopping OwnTone playback (flush buffers)" >> "$LOG"
-                  if [[ -n "$OWNTONE_NETNS" ]]; then
-                    ip netns exec "$OWNTONE_NETNS" curl -s -X PUT "http://$OWNTONE_IP:3689/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
-                  else
-                    curl -s -X PUT "http://$OWNTONE_IP:3689/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
-                  fi
-                  echo "[$TIMESTAMP] OwnTone stopped" >> "$LOG"
-                else
-                  echo "[$TIMESTAMP] WARNING: OwnTone IP not found, cannot flush" >> "$LOG"
-                fi
+                # NOTE: shairport-sync now runs IN the netns, so curl reaches OwnTone directly
+                echo "[$TIMESTAMP] Stopping OwnTone playback (flush buffers)" >> "$LOG"
+                curl -s -X PUT "http://127.0.0.1:3689/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
+                echo "[$TIMESTAMP] OwnTone stopped" >> "$LOG"
 
                 # Step 2: Kill arecord to stop writing to pipe
                 if [[ -f "$ARECORD_PID_FILE" ]]; then
@@ -847,6 +823,7 @@ class ZoneManager:
                 alsa =
                 {{
                   output_device = "{alsa_device}";
+                  output_format = "S16";
                   disable_standby_mode = "always";
                 }};
 
@@ -862,7 +839,7 @@ class ZoneManager:
                 diagnostics =
                 {{
                   statistics = "yes";
-                  log_verbosity = 1;
+                  log_verbosity = 3;
                 }};
 
                 airplay =
@@ -944,8 +921,9 @@ class ZoneManager:
 
     def _start_owntone_in_netns(self, zone):
         """
-        Same as start_owntone_in_netns() in dual_zone_demo.sh.
-        Creates netns + macvlan, runs the wrapper script inside.
+        Creates netns + macvlan, runs the zone wrapper script inside.
+        The wrapper starts nqptp + shairport-sync + OwnTone, all with
+        private /dev/shm for PTP isolation between zones.
         """
         grp_dir = zone.grp_dir
         iface = zone.interface
@@ -968,9 +946,9 @@ class ZoneManager:
         with open(os.path.join(grp_dir, "state", "owntone_netns.txt"), "w") as f:
             f.write(ns_name)
 
-        # Create the wrapper script — VERBATIM from dual_zone_demo.sh
-        # NOTE: Written as raw string to avoid heredoc indentation issues
-        wrapper_path = os.path.join(grp_dir, "config", "owntone_wrapper.sh")
+        # Create zone wrapper — starts nqptp + shairport-sync + OwnTone in netns
+        # Each zone gets its own nqptp with private /dev/shm for PTP isolation
+        wrapper_path = os.path.join(grp_dir, "config", "zone_wrapper.sh")
         with open(wrapper_path, "w") as f:
             f.write("""#!/usr/bin/env bash
 set -e
@@ -982,7 +960,7 @@ GRP="$3"
 ip link set lo up
 ip link set "$MV_IF" up
 
-echo "[owntone:$GRP] Running DHCP on $MV_IF ..."
+echo "[zone:$GRP] Running DHCP on $MV_IF ..."
 dhclient -v "$MV_IF" \\
   -lf "/run/dhclient.leases" \\
   -pf "/run/dhclient.pid" \\
@@ -992,24 +970,27 @@ sleep 2
 # Get and save the IP address
 MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | head -1)
 echo "$MY_IP" > "$GRP_DIR/state/owntone_ip.txt"
-echo "[owntone:$GRP] Got IP: $MY_IP"
+echo "$MY_IP" > "$GRP_DIR/state/shairport_ip.txt"
+echo "[zone:$GRP] Got IP: $MY_IP"
 
-# Private /run, /tmp, AND /dev/shm for complete isolation
+# Private /run, /tmp, AND /dev/shm for COMPLETE PTP ISOLATION
+# CRITICAL: Private /dev/shm gives each zone its own /dev/shm/nqptp
+# This prevents one zone's teardown from poisoning another zone's PTP timing
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /dev/shm
 mkdir -p /run/dbus /run/avahi-daemon
 
-echo "[owntone:$GRP] Starting dbus..."
+echo "[zone:$GRP] Starting dbus..."
 dbus-daemon --system --fork --nopidfile
 sleep 1
 
 # Create per-instance avahi config to avoid mDNS conflicts
 cat > /tmp/avahi-daemon.conf <<AVAHI_EOF
 [server]
-host-name=$(hostname)-owntone-$GRP
+host-name=$(hostname)-shiri-$GRP
 use-ipv4=yes
-use-ipv6=no
+use-ipv6=yes
 allow-interfaces=$MV_IF
 deny-interfaces=lo
 ratelimit-interval-usec=1000000
@@ -1028,11 +1009,39 @@ enable-reflector=no
 [rlimits]
 AVAHI_EOF
 
-echo "[owntone:$GRP] Starting avahi..."
+echo "[zone:$GRP] Starting avahi..."
 avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits 2>/dev/null || true
 sleep 1
 
-echo "[owntone:$GRP] Starting OwnTone with Real-Time priority..."
+# Start per-zone nqptp with ISOLATED /dev/shm/nqptp
+# Each zone gets its own PTP timing — one zone's disconnect
+# cannot corrupt another zone's clock
+echo "[zone:$GRP] Starting per-zone nqptp (isolated PTP timing)..."
+nqptp &
+NQPTP_PID=$!
+echo "$NQPTP_PID" > "$GRP_DIR/state/nqptp.pid"
+sleep 1
+
+if ! kill -0 "$NQPTP_PID" 2>/dev/null; then
+  echo "[zone:$GRP] FATAL: nqptp failed to start" >&2
+  exit 1
+fi
+if [[ ! -e /dev/shm/nqptp ]]; then
+  echo "[zone:$GRP] FATAL: /dev/shm/nqptp not created" >&2
+  exit 1
+fi
+echo "[zone:$GRP] nqptp ready (pid $NQPTP_PID, private /dev/shm/nqptp)"
+
+# Start shairport-sync (uses this zone's private /dev/shm/nqptp for PTP)
+# Writes to ALSA loopback on host (ALSA is kernel-level, works across namespaces)
+echo "[zone:$GRP] Starting shairport-sync..."
+chrt -f 50 shairport-sync -c "$GRP_DIR/config/shairport-sync.conf" --statistics &>"$GRP_DIR/logs/shairport.log" &
+SHAIRPORT_PID=$!
+echo "$SHAIRPORT_PID" > "$GRP_DIR/state/shairport.pid"
+sleep 1
+echo "[zone:$GRP] shairport-sync started (pid $SHAIRPORT_PID)"
+
+echo "[zone:$GRP] Starting OwnTone with Real-Time priority..."
 exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
 """)
         os.chmod(wrapper_path, 0o755)
@@ -1091,28 +1100,15 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
         log.warning("OwnTone %s API did not become ready in time", zone.zone_id)
         return False
 
-    def _start_shairport_on_host(self, zone):
+    def _start_arecord_supervisor(self, zone):
         """
-        Same as start_shairport_on_host() in dual_zone_demo.sh.
-        Starts arecord supervisor + shairport-sync on host with RT priority.
+        Start the arecord supervisor on the HOST.
+        arecord captures from ALSA loopback and pipes to OwnTone's audio.pipe.
+        Runs on host because ALSA loopback is a kernel device accessible from anywhere.
+        shairport-sync now starts inside the netns wrapper (not here).
         """
         grp_dir = zone.grp_dir
         subdev = zone.allocated_subdevice
-
-        # Get host IP from parent interface
-        result = _run(["ip", "-4", "addr", "show", zone.interface])
-        host_ip = "unknown"
-        for line in (result.stdout or "").splitlines():
-            if "inet " in line:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    host_ip = parts[1].split("/")[0]
-                    break
-
-        with open(os.path.join(grp_dir, "state", "shairport_ip.txt"), "w") as f:
-            f.write(host_ip)
-        zone.shairport_ip = host_ip
-
         capture_dev = f"hw:Loopback,1,{subdev}"
 
         # Start arecord supervisor — SAME bash loop as dual_zone_demo.sh
@@ -1150,20 +1146,6 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
         )
         zone.arecord_supervisor_pid = proc.pid
         log.info("Started arecord supervisor for %s (pid %d)", zone.zone_id, proc.pid)
-
-        # Start shairport-sync on host with real-time priority — same as demo.sh
-        shairport_log = os.path.join(grp_dir, "logs", "shairport.log")
-        # Don't use context manager - file must stay open for subprocess lifetime
-        log_file = open(shairport_log, "w")
-        proc = subprocess.Popen(
-            ["chrt", "-f", "50", "shairport-sync",
-             "-c", os.path.join(grp_dir, "config", "shairport-sync.conf"),
-                 "--statistics"],
-                stdout=log_file, stderr=subprocess.STDOUT
-            )
-        zone.shairport_pid = proc.pid
-        log.info("Started shairport-sync for %s (pid %d) — using shared nqptp",
-                 zone.zone_id, proc.pid)
 
     def _start_metadata_relay(self, zone):
         grp_dir = zone.grp_dir
@@ -1323,6 +1305,90 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
         log.info("Started pause bridge for %s (pid %d)", zone.zone_id, proc.pid)
 
     # -------------------------------------------------------------------------
+    # Diagnostic monitoring for AirPlay disconnect debugging
+    # -------------------------------------------------------------------------
+
+    def start_diagnostic_monitor(self):
+        """Start background thread that polls OwnTone player state for all running zones."""
+        self._diag_stop = threading.Event()
+        self._diag_last_state = {}  # zone_id -> last known state dict
+        t = threading.Thread(target=self._diagnostic_monitor_loop, daemon=True,
+                             name="diag-monitor")
+        t.start()
+        log.info("[DIAG] Diagnostic monitor started — polling OwnTone player state every 2s")
+
+    def _diagnostic_monitor_loop(self):
+        """Poll each running zone's OwnTone player status and log changes."""
+        diag = logging.getLogger("shiri.diag")
+        diag.setLevel(logging.DEBUG)
+
+        while not self._diag_stop.is_set():
+            for zone_id, zone in list(self.zones.items()):
+                if zone.status != Zone.STATUS_RUNNING or not zone.owntone_api:
+                    continue
+                try:
+                    player = zone.owntone_api.get_player_status()
+                    if not player:
+                        prev = self._diag_last_state.get(zone_id, {})
+                        if prev:
+                            diag.warning("[DIAG][%s] OwnTone API returned None (was: state=%s)",
+                                         zone.display_name, prev.get("state"))
+                        self._diag_last_state[zone_id] = {}
+                        continue
+
+                    state = player.get("state", "unknown")
+                    volume = player.get("volume", -1)
+                    item_id = player.get("item_id", 0)
+
+                    prev = self._diag_last_state.get(zone_id, {})
+                    prev_state = prev.get("state")
+                    prev_volume = prev.get("volume", -1)
+                    prev_item = prev.get("item_id", 0)
+
+                    # Log any change in state, volume, or track
+                    if state != prev_state:
+                        diag.info("[DIAG][%s] PLAYER STATE CHANGED: %s -> %s (vol=%s, item=%s)",
+                                  zone.display_name, prev_state, state, volume, item_id)
+                    if volume != prev_volume and prev_volume != -1:
+                        diag.info("[DIAG][%s] VOLUME CHANGED: %s -> %s (state=%s)",
+                                  zone.display_name, prev_volume, volume, state)
+                    if item_id != prev_item and prev_item != 0:
+                        diag.info("[DIAG][%s] ITEM CHANGED: %s -> %s (state=%s)",
+                                  zone.display_name, prev_item, item_id, state)
+
+                    self._diag_last_state[zone_id] = {
+                        "state": state, "volume": volume, "item_id": item_id
+                    }
+
+                    # Check process liveness
+                    for label, pid in [("shairport-sync", zone.shairport_pid),
+                                       ("arecord-supervisor", zone.arecord_supervisor_pid),
+                                       ("pause-bridge", zone.pause_bridge_pid)]:
+                        if pid is None:
+                            continue
+                        alive_key = f"{zone_id}_{label}_alive"
+                        try:
+                            os.kill(pid, 0)
+                            was_dead = self._diag_last_state.get(alive_key) == False
+                            if was_dead:
+                                diag.info("[DIAG][%s] %s (pid %d) is ALIVE again", zone.display_name, label, pid)
+                            self._diag_last_state[alive_key] = True
+                        except ProcessLookupError:
+                            was_alive = self._diag_last_state.get(alive_key, True)
+                            if was_alive:
+                                diag.error("[DIAG][%s] %s (pid %d) DIED!", zone.display_name, label, pid)
+                            self._diag_last_state[alive_key] = False
+
+                except Exception as e:
+                    diag.warning("[DIAG][%s] Poll error: %s", zone.display_name, e)
+
+            self._diag_stop.wait(2)
+
+    def stop_diagnostic_monitor(self):
+        if hasattr(self, '_diag_stop'):
+            self._diag_stop.set()
+
+    # -------------------------------------------------------------------------
     # Event emission
     # -------------------------------------------------------------------------
 
@@ -1338,6 +1404,7 @@ exec chrt -f 50 owntone -f -c "$GRP_DIR/config/owntone.conf"
     def shutdown(self):
         """Stop all zones gracefully."""
         log.info("Shutting down all zones...")
+        self.stop_diagnostic_monitor()
         for zone_id in list(self.zones.keys()):
             zone = self.zones[zone_id]
             if zone.status in (Zone.STATUS_RUNNING, Zone.STATUS_STARTING):

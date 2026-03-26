@@ -386,9 +386,8 @@ def startup():
     if not zone_manager.setup_alsa_loopback():
         log.error("Failed to setup ALSA loopback — some features may not work")
 
-    # Start shared nqptp
-    if not zone_manager.start_host_nqptp():
-        log.error("Failed to start nqptp — AirPlay 2 sync will not work")
+    # Clean up any stale host nqptp (each zone now runs its own in netns)
+    zone_manager.start_host_nqptp()
 
     # Load saved zones from config
     zone_manager.load_saved_zones()
@@ -398,6 +397,9 @@ def startup():
         if zone.config.get("auto_start", False):
             log.info("Auto-starting zone: %s", zone.display_name)
             zone_manager.start_zone(zone.zone_id)
+
+    # Start diagnostic monitor for AirPlay disconnect debugging
+    zone_manager.start_diagnostic_monitor()
 
     log.info("Shiri daemon ready — UI at http://0.0.0.0:8080")
 
