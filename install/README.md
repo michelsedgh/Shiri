@@ -1,0 +1,77 @@
+# Shiri — Multiroom AirPlay Manager
+
+Shiri creates isolated AirPlay 2 zones using Linux network namespaces, ALSA loopback devices, and OwnTone. Each zone gets its own shairport-sync, OwnTone, and nqptp instance running in a dedicated network namespace with full PTP timing isolation.
+
+## Requirements
+
+- **Linux** (Ubuntu 22.04+ recommended) — uses kernel features not available on macOS
+- **Root access** — required for network namespaces, ALSA loopback, and macvlan
+- **Python 3.8+**
+- System dependencies: `nqptp`, `shairport-sync` (AirPlay 2 build), `owntone`
+
+### Running on macOS
+
+Since Shiri requires Linux kernel features, you must use a Linux VM:
+
+1. **Multipass** (quickest): `brew install --cask multipass`
+2. **UTM / VirtualBox** with **Bridged Networking** (required for AirPlay device discovery)
+
+Bridged networking is essential — your phone needs to see the AirPlay devices on the same network.
+
+## Installation
+
+### 1. Install system dependencies
+
+```bash
+sudo ./install.sh
+```
+
+This installs `nqptp`, `shairport-sync` (with AirPlay 2 + pipe support), and `owntone`.
+
+### 2. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Run Shiri
+
+```bash
+sudo python3 app.py
+```
+
+The web UI will be available at **http://\<your-ip\>:8080**
+
+## Project Structure
+
+```
+app.py               Entry point — Flask app, startup, shutdown
+routes.py            REST API endpoints + SocketIO handlers
+zone_manager.py      Zone model + ZoneManager (lifecycle, CRUD, networking)
+config_builder.py    Reads templates, substitutes variables, writes configs
+owntone_api.py       OwnTone REST API client
+config_store.py      Persistent JSON config storage
+log_streamer.py      Real-time log file tailing via SocketIO
+
+templates/           Config/script templates (native format, %%PLACEHOLDER%% syntax)
+  shairport_sync.conf    Shairport-sync config template
+  owntone.conf           OwnTone config template
+  reset_audio_pipe.sh    Audio pipeline flush script template
+  arecord_supervisor.sh  ALSA capture supervisor template
+
+scripts/             Runtime shell scripts
+  zone_wrapper.sh        Zone process supervisor (runs in netns)
+  pause_bridge.sh        Shairport→OwnTone play/pause bridge
+  volume_bridge.sh       Shairport→OwnTone volume bridge
+
+static/              Web UI frontend
+  index.html, app.js, style.css
+```
+
+## Troubleshooting
+
+- **"Missing required commands"**: Run `sudo ./install.sh` to install dependencies
+- **"modprobe: FATAL: Module snd-aloop not found"**: Install kernel modules:
+  `sudo apt install linux-modules-extra-$(uname -r)`
+- **Can't see AirPlay devices**: Verify your VM uses **Bridged Networking** and is on the same network as your phone
+- **Firewall blocking mDNS**: Check that Avahi/mDNS traffic (port 5353) is allowed

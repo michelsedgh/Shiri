@@ -1,7 +1,7 @@
 /**
  * app.js — Shiri Dashboard Frontend
  *
- * Communicates with shiri_daemon.py via REST API + SocketIO.
+ * Communicates with app.py via REST API + SocketIO.
  * Manages zone cards, speaker lists, volume sliders, and live logs.
  */
 
