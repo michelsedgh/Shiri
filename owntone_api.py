@@ -137,6 +137,10 @@ class OwnToneAPI:
         """
         return self._api(f"/api/player/volume?volume={int(volume)}", method="PUT")
 
+    def play(self):
+        """Ask OwnTone to play the current pipe/queue."""
+        return self._api("/api/player/play", method="PUT")
+
     # -- Library --
     # Same as trigger_library_rescan() in dual_zone_demo.sh
 

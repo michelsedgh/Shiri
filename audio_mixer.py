@@ -10,6 +10,7 @@ without stopping the live stream.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
@@ -102,7 +103,12 @@ class AudioMixer:
         if self._pipe_fd is not None:
             return
         log.info("Opening OwnTone pipe for mixed audio: %s", self.pipe_path)
-        self._pipe_fd = os.open(self.pipe_path, os.O_WRONLY)
+        try:
+            self._pipe_fd = os.open(self.pipe_path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                log.warning("OwnTone is not reading the audio pipe yet")
+            raise
 
     def _close_pipe(self) -> None:
         if self._pipe_fd is None:
@@ -180,6 +186,7 @@ class AudioMixer:
             live += b"\x00" * (CHUNK_BYTES - len(live))
 
         clip = self._active_clip
+        clip_position = clip.position if clip is not None else None
         if clip is not None:
             tts = clip.next_chunk(CHUNK_BYTES)
             target_duck = clip.duck_gain
@@ -191,7 +198,11 @@ class AudioMixer:
 
         self._duck_level = self._next_duck_level(target_duck)
         mixed = mix_pcm16(live, tts, music_gain=self._duck_level, tts_gain=tts_gain)
-        os.write(self._pipe_fd, mixed)
+        if not self._write_pipe(mixed):
+            if clip is not None and clip_position is not None:
+                clip.position = clip_position
+            time.sleep(CHUNK_SECONDS)
+            return
         if generated_silence:
             time.sleep(max(0.0, CHUNK_SECONDS - (time.monotonic() - started_at)))
 
@@ -212,6 +223,13 @@ class AudioMixer:
         if not data:
             return None
         return data
+
+    def _write_pipe(self, data: bytes) -> bool:
+        try:
+            os.write(self._pipe_fd, data)
+            return True
+        except BlockingIOError:
+            return False
 
     def _load_clip_if_needed(self) -> None:
         if self._active_clip is not None:

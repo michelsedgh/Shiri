@@ -455,6 +455,11 @@ class ZoneManager:
             return None, "Zone must be running before TTS can be queued"
         if not audio_bytes:
             return None, "No audio payload provided"
+        if zone.owntone_api:
+            try:
+                zone.owntone_api.play()
+            except Exception as e:
+                log.debug("Could not nudge OwnTone play state before TTS: %s", e)
 
         fmt = (audio_format or "wav").lower().strip(".")
         if fmt not in {"wav", "wave"}:
