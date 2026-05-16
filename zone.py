@@ -25,6 +25,7 @@ from zone_lifecycle import (
     start_zone_thread,
     stop_zone_thread,
     cleanup_zone,
+    cleanup_stale_runtime,
 )
 
 log = logging.getLogger("shiri.zone")
@@ -169,15 +170,26 @@ class ZoneManager:
         
         If a stale host nqptp is running, kill it to free ports 319/320 for per-zone instances.
         """
+        host_netns = os.stat("/proc/self/ns/net").st_ino
         result = _run(["pgrep", "-x", "nqptp"])
         if result.returncode == 0 and result.stdout.strip():
             for pid_str in result.stdout.strip().split():
                 pid = int(pid_str)
+                try:
+                    pid_netns = os.stat(f"/proc/{pid}/ns/net").st_ino
+                except OSError:
+                    continue
+                if pid_netns != host_netns:
+                    continue
                 log.info("Killing stale host nqptp (pid %d) — now per-zone in netns", pid)
                 _kill_pid(pid, "stale host nqptp")
         self._host_nqptp_pid = None
         log.info("nqptp is now per-zone (each zone runs its own in isolated netns)")
         return True
+
+    def cleanup_stale_runtime(self):
+        """Remove stale Shiri namespaces/processes left by an unclean daemon exit."""
+        cleanup_stale_runtime()
 
     def get_network_interfaces(self):
         """

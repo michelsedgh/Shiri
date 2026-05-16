@@ -10,6 +10,7 @@ Translates dual_zone_demo.sh into Python, calling the SAME system commands.
 """
 
 import logging
+import glob
 import os
 import signal
 import subprocess
@@ -17,6 +18,7 @@ import time
 
 from owntone_api import OwnToneAPI
 from config import (
+    BASE_DIR,
     SCRIPT_DIR,
     setup_directories,
     allocate_loopback_subdevice,
@@ -37,7 +39,13 @@ log = logging.getLogger("shiri.zone")
 def _run(cmd, check=False, **kwargs):
     """Run a command, log it, return CompletedProcess."""
     log.debug("Running: %s", " ".join(cmd) if isinstance(cmd, list) else cmd)
-    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    if check and result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        detail = stderr or stdout or f"exit code {result.returncode}"
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}: {detail}")
+    return result
 
 
 def _kill_pid(pid, label="process"):
@@ -55,6 +63,306 @@ def _kill_pid(pid, label="process"):
         log.info("Sent SIGKILL to %s (pid %d)", label, pid)
     except ProcessLookupError:
         pass
+
+
+def _terminate_pid(pid, label="process", timeout=5):
+    """Gracefully terminate a PID, allowing a longer cleanup window."""
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        log.info("Sent SIGTERM to %s (pid %d)", label, pid)
+    except ProcessLookupError:
+        return
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+        log.info("Sent SIGKILL to %s (pid %d)", label, pid)
+    except ProcessLookupError:
+        pass
+
+
+def _read_text(path):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _read_pid(path):
+    value = _read_text(path)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _pid_command(pid):
+    if pid is None:
+        return ""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _kill_pid_if_command(pid, needle, label):
+    cmdline = _pid_command(pid)
+    if cmdline and needle in cmdline:
+        _kill_pid(pid, label)
+
+
+def _state_path(grp_dir, filename):
+    return os.path.join(grp_dir, "state", filename)
+
+
+def _dhclient_paths(grp_dir):
+    return (
+        _state_path(grp_dir, "dhclient.leases"),
+        _state_path(grp_dir, "dhclient.pid"),
+    )
+
+
+def _netns_list_output():
+    result = _run(["ip", "netns", "list"])
+    return result.stdout or ""
+
+
+def _netns_exists(ns):
+    if not ns:
+        return False
+    for line in _netns_list_output().splitlines():
+        parts = line.split()
+        if parts and parts[0] == ns:
+            return True
+    return False
+
+
+def _netns_exec(ns, args, **kwargs):
+    return _run(["ip", "netns", "exec", ns] + args, **kwargs)
+
+
+def _find_macvlan_in_netns(ns, preferred=None):
+    """Return the zone macvlan interface inside a namespace."""
+    if not _netns_exists(ns):
+        return None
+
+    if preferred:
+        result = _netns_exec(ns, ["ip", "link", "show", preferred])
+        if result.returncode == 0:
+            return preferred
+
+    result = _netns_exec(ns, ["ip", "-o", "link", "show"])
+    for line in (result.stdout or "").splitlines():
+        parts = line.split(": ")
+        if len(parts) < 2:
+            continue
+        iface = parts[1].split("@")[0]
+        if iface.startswith("ot_"):
+            return iface
+    return None
+
+
+def _release_dhcp_lease(grp_dir, ns, iface):
+    """Release the DHCP lease using the same per-zone files used at acquire."""
+    if not ns or not iface or not _netns_exists(ns):
+        return
+
+    lease_file, pid_file = _dhclient_paths(grp_dir)
+    released = False
+    if os.path.exists(lease_file) or os.path.exists(pid_file):
+        result = _netns_exec(ns, [
+            "dhclient", "-r",
+            "-lf", lease_file,
+            "-pf", pid_file,
+            iface,
+        ])
+        released = result.returncode == 0
+        if result.returncode != 0:
+            log.warning("DHCP release using zone files failed for %s/%s: %s",
+                        ns, iface, (result.stderr or result.stdout or "").strip())
+
+    # Fallback for older runs that used dhclient defaults.
+    if not released:
+        legacy_result = _netns_exec(ns, [
+            "dhclient", "-r",
+            "-lf", "/run/dhclient.leases",
+            "-pf", "/run/dhclient.pid",
+            iface,
+        ])
+        released = legacy_result.returncode == 0
+
+    if not released:
+        _netns_exec(ns, ["dhclient", "-r", iface])
+
+    _netns_exec(ns, ["pkill", "-TERM", "dhclient"])
+    log.info("Released DHCP lease on %s in %s", iface, ns)
+
+
+def _terminate_namespace_services(ns):
+    if not ns or not _netns_exists(ns):
+        return
+    for name in ["shairport-sync", "nqptp", "avahi-daemon", "owntone", "dbus-daemon"]:
+        _netns_exec(ns, ["pkill", "-TERM", name])
+
+
+def _kill_namespace_pids(ns):
+    if not ns or not _netns_exists(ns):
+        return
+    result = _run(["ip", "netns", "pids", ns])
+    for pid_str in (result.stdout or "").split():
+        try:
+            os.kill(int(pid_str), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+
+
+def _delete_netns(ns):
+    if not ns or not _netns_exists(ns):
+        return
+    last_result = None
+    for _ in range(5):
+        last_result = _run(["ip", "netns", "delete", ns])
+        if last_result.returncode == 0:
+            log.info("Deleted netns %s", ns)
+            return
+        time.sleep(0.2)
+    log.warning("Failed to delete netns %s: %s", ns,
+                (last_result.stderr or last_result.stdout or "").strip())
+
+
+def _delete_host_link(iface):
+    if not iface:
+        return
+    result = _run(["ip", "link", "show", iface])
+    if result.returncode == 0:
+        result = _run(["ip", "link", "delete", iface])
+        if result.returncode == 0:
+            log.info("Deleted host link %s", iface)
+        else:
+            log.warning("Failed to delete host link %s: %s", iface,
+                        (result.stderr or result.stdout or "").strip())
+
+
+def _clear_runtime_state(grp_dir):
+    for filename in [
+        "arecord.pid",
+        "dhclient.leases",
+        "dhclient.pid",
+        "dhclient_lease_path.txt",
+        "dhclient_pid_path.txt",
+        "macvlan_if.txt",
+        "macvlan_mac.txt",
+        "nqptp.pid",
+        "owntone.pid",
+        "owntone_ip.txt",
+        "owntone_netns.txt",
+        "shairport.pid",
+        "shairport_ip.txt",
+    ]:
+        try:
+            os.remove(_state_path(grp_dir, filename))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.debug("Could not remove runtime state %s: %s", filename, e)
+
+
+def _kill_orphaned_host_processes():
+    result = _run(["ps", "-eo", "pid=,ppid=,args="])
+    for line in (result.stdout or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_str, ppid_str, args = parts
+        if ppid_str != "1" or "/var/lib/shiri/groups/" not in args:
+            continue
+        if "arecord_supervisor.sh" in args:
+            _kill_pid(int(pid_str), "orphaned arecord supervisor")
+        elif "pause_bridge.sh" in args:
+            _kill_pid(int(pid_str), "orphaned pause bridge")
+
+
+def _zone_id_from_netns(ns):
+    if not ns.startswith("owntone_"):
+        return None
+    body = ns[len("owntone_"):]
+    if "_" not in body:
+        return body
+    return body.rsplit("_", 1)[0]
+
+
+def cleanup_stale_runtime():
+    """Reap Shiri netns/macvlan leftovers from a previous daemon run."""
+    log.info("Checking for stale Shiri runtime state...")
+
+    stale_namespaces = set()
+    stale_group_dirs = set()
+    for line in _netns_list_output().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        ns = parts[0]
+        if ns.startswith("owntone_"):
+            stale_namespaces.add(ns)
+
+    for path in glob.glob(os.path.join(BASE_DIR, "groups", "*", "state", "owntone_netns.txt")):
+        ns = _read_text(path)
+        if ns.startswith("owntone_"):
+            stale_namespaces.add(ns)
+            stale_group_dirs.add(os.path.dirname(os.path.dirname(path)))
+
+    for ns in sorted(stale_namespaces):
+        zone_id = _zone_id_from_netns(ns)
+        grp_dir = os.path.join(BASE_DIR, "groups", zone_id) if zone_id else BASE_DIR
+        if zone_id:
+            stale_group_dirs.add(grp_dir)
+        if not _netns_exists(ns):
+            continue
+
+        log.info("Cleaning stale namespace %s", ns)
+        iface = _find_macvlan_in_netns(ns)
+        if zone_id:
+            _release_dhcp_lease(grp_dir, ns, iface)
+        elif iface:
+            _netns_exec(ns, ["dhclient", "-r", iface])
+        _terminate_namespace_services(ns)
+        time.sleep(1)
+        _kill_namespace_pids(ns)
+        _delete_netns(ns)
+
+    for grp_dir in stale_group_dirs:
+        _kill_pid_if_command(
+            _read_pid(_state_path(grp_dir, "arecord.pid")),
+            "arecord",
+            "stale arecord",
+        )
+    _kill_orphaned_host_processes()
+    for grp_dir in stale_group_dirs:
+        _clear_runtime_state(grp_dir)
+
+    result = _run(["ip", "-o", "link", "show"])
+    for line in (result.stdout or "").splitlines():
+        parts = line.split(": ")
+        if len(parts) < 2:
+            continue
+        iface = parts[1].split("@")[0]
+        if iface.startswith("ot_"):
+            _delete_host_link(iface)
+
+    log.info("Stale Shiri runtime cleanup complete")
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +447,7 @@ def _launch_netns(zone):
 def _wait_and_verify(zone):
     """Step 5: Wait for OwnTone to be ready, rescan library, verify pipe."""
     if not _wait_for_owntone(zone):
-        log.warning("OwnTone not ready for %s, continuing anyway", zone.zone_id)
+        raise RuntimeError(f"OwnTone did not become ready for {zone.zone_id}")
 
     # Trigger library rescan so OwnTone finds the pipes
     if zone.owntone_api:
@@ -265,78 +573,57 @@ def stop_zone_thread(zone, cleanup_fn):
 def cleanup_zone(zone):
     """
     Zone cleanup sequence:
-    1. Release loopback subdevice
-    2. Stop HOST processes (arecord, pause_bridge)
-    3. Stop NETNS processes (nqptp, shairport-sync, owntone, avahi)
+    1. Stop HOST processes (arecord, pause_bridge)
+    2. Release the zone DHCP lease while the macvlan is still alive
+    3. Stop NETNS processes (nqptp, shairport-sync, owntone, avahi, dbus)
     4. Force kill remaining netns processes
     5. Tear down netns + macvlan
+    6. Release loopback subdevice after all users are gone
     """
     log.info("Cleaning up zone %s...", zone.zone_id)
 
-    # 1. Release loopback subdevice
-    release_loopback_subdevice(zone.allocated_subdevice)
-    zone.allocated_subdevice = None
+    grp_dir = zone.grp_dir
+    ns = zone.netns_name or _read_text(_state_path(grp_dir, "owntone_netns.txt"))
+    macvlan_if = zone.macvlan_if or _read_text(_state_path(grp_dir, "macvlan_if.txt"))
+    if ns and _netns_exists(ns):
+        macvlan_if = _find_macvlan_in_netns(ns, macvlan_if) or macvlan_if
 
-    # 2. Stop HOST processes (arecord + pause_bridge remain on host)
-    # shairport-sync is now in the netns — killed in step 3
+    # 1. Stop HOST processes (arecord + pause_bridge remain on host).
+    # shairport-sync is in the netns and is killed below.
     _kill_pid(zone.arecord_supervisor_pid, f"arecord supervisor ({zone.zone_id})")
+    _kill_pid(_read_pid(_state_path(grp_dir, "arecord.pid")), f"arecord ({zone.zone_id})")
     _kill_pid(zone.metadata_relay_pid, f"metadata relay ({zone.zone_id})")
     _kill_pid(zone.pause_bridge_pid, f"pause_bridge ({zone.zone_id})")
+
     zone.shairport_pid = None
     zone.arecord_supervisor_pid = None
     zone.metadata_relay_pid = None
     zone.pause_bridge_pid = None
 
-    # 3. Cleanup in zone namespace (nqptp + shairport-sync + owntone + avahi)
-    ns = zone.netns_name
-    if ns:
-        # Check if namespace still exists
-        result = _run(["ip", "netns", "list"])
-        if ns in (result.stdout or ""):
-            # Release DHCP lease (same as demo cleanup)
-            result = _run(["ip", "netns", "exec", ns, "ip", "-o", "link", "show"])
-            iface_match = None
-            for line in (result.stdout or "").splitlines():
-                if "ot_" in line:
-                    parts = line.split(": ")
-                    if len(parts) >= 2:
-                        iface_match = parts[1].split("@")[0]
-                        break
-            if iface_match:
-                _run(["ip", "netns", "exec", ns, "dhclient", "-r", iface_match])
-                log.info("Released DHCP lease on %s in %s", iface_match, ns)
+    # Let the wrapper run its trap first; it owns the private mount namespace
+    # where dhclient keeps its lease/pid files.
+    _terminate_pid(zone.owntone_pid, f"zone wrapper ({zone.zone_id})", timeout=5)
 
-            # Gracefully stop all services in the namespace
-            _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "shairport-sync"])
-            _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "nqptp"])
-            _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "avahi-daemon"])
-            _run(["ip", "netns", "exec", ns, "pkill", "-TERM", "owntone"])
-
-    # Give services time to shut down
-    time.sleep(2)
+    # 2-3. Release the DHCP lease and stop services while the namespace exists.
+    if ns and _netns_exists(ns):
+        _release_dhcp_lease(grp_dir, ns, macvlan_if)
+        _terminate_namespace_services(ns)
+        time.sleep(2)
 
     # 4. Force kill remaining namespace processes
-    if ns:
-        result = _run(["ip", "netns", "list"])
-        if ns in (result.stdout or ""):
-            result = _run(["ip", "netns", "pids", ns])
-            for pid_str in (result.stdout or "").split():
-                try:
-                    os.kill(int(pid_str), signal.SIGKILL)
-                except (ProcessLookupError, ValueError):
-                    pass
-            time.sleep(0.3)
+    _kill_namespace_pids(ns)
+    time.sleep(0.3)
 
-            # Delete namespace
-            _run(["ip", "netns", "delete", ns])
-            log.info("Deleted netns %s", ns)
+    # 5. Delete namespace. A macvlan inside the namespace usually disappears
+    # with it; the host-link fallback handles failed/partial starts.
+    _delete_netns(ns)
+    _delete_host_link(macvlan_if)
 
-    # Delete macvlan interface
-    if zone.macvlan_if:
-        result = _run(["ip", "link", "show", zone.macvlan_if])
-        if result.returncode == 0:
-            _run(["ip", "link", "delete", zone.macvlan_if])
-            log.info("Deleted macvlan %s", zone.macvlan_if)
+    # 6. Release loopback subdevice only after all processes that could touch it
+    # have been stopped.
+    release_loopback_subdevice(zone.allocated_subdevice)
+    zone.allocated_subdevice = None
+    _clear_runtime_state(grp_dir)
 
     # Reset state
     zone.netns_name = None
@@ -344,6 +631,8 @@ def cleanup_zone(zone):
     zone.shairport_ip = None
     zone.owntone_ip = None
     zone.owntone_api = None
+    zone.owntone_pid = None
+    zone.nqptp_pid = None
 
     log.info("Zone %s cleanup complete", zone.zone_id)
 
@@ -370,14 +659,17 @@ def _start_owntone_in_netns(zone):
 
     log.info("Creating OwnTone netns %s for %s", ns_name, zone.zone_id)
 
-    # Create namespace and macvlan — same commands as demo.sh
-    _run(["ip", "netns", "add", ns_name])
-    _run(["ip", "link", "add", mv_if, "link", iface, "type", "macvlan", "mode", "bridge"])
-    _run(["ip", "link", "set", mv_if, "netns", ns_name])
+    # Create namespace and macvlan.
+    _run(["ip", "netns", "add", ns_name], check=True)
+    _run(["ip", "link", "add", mv_if, "link", iface, "type", "macvlan", "mode", "bridge"],
+         check=True)
+    _run(["ip", "link", "set", mv_if, "netns", ns_name], check=True)
 
     # Save netns name so volume_bridge.sh can use it
     with open(os.path.join(grp_dir, "state", "owntone_netns.txt"), "w") as f:
         f.write(ns_name)
+    with open(os.path.join(grp_dir, "state", "macvlan_if.txt"), "w") as f:
+        f.write(mv_if)
 
     # Use the static zone wrapper script (no longer generated per-zone)
     wrapper_path = get_zone_wrapper_path()

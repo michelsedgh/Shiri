@@ -1,33 +1,75 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
 MV_IF="$1"
 GRP_DIR="$2"
 GRP="$3"
 
+STATE_DIR="$GRP_DIR/state"
+DHCLIENT_LEASE="/run/dhclient-$GRP.leases"
+DHCLIENT_PID="/run/dhclient-$GRP.pid"
+NQPTP_PID=""
+SHAIRPORT_PID=""
+OWNTONE_PID=""
+
+cleanup() {
+  trap - EXIT INT TERM HUP
+  echo "[zone:$GRP] Supervisor cleaning up all processes..."
+
+  if [[ -n "${DHCLIENT_LEASE:-}" && -n "${DHCLIENT_PID:-}" ]]; then
+    dhclient -r -lf "$DHCLIENT_LEASE" -pf "$DHCLIENT_PID" "$MV_IF" >/dev/null 2>&1 || true
+  fi
+
+  for pid in "${OWNTONE_PID:-}" "${SHAIRPORT_PID:-}" "${NQPTP_PID:-}"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+
+  sleep 1
+
+  for pid in "${OWNTONE_PID:-}" "${SHAIRPORT_PID:-}" "${NQPTP_PID:-}"; do
+    if [[ -n "$pid" ]]; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+}
+trap cleanup EXIT INT TERM HUP
+
 ip link set lo up
 ip link set "$MV_IF" up
 
-echo "[zone:$GRP] Running DHCP on $MV_IF ..."
-dhclient -v "$MV_IF" \
-  -lf "/run/dhclient.leases" \
-  -pf "/run/dhclient.pid" \
-  2>&1 | head -20 || true
-sleep 2
-
-# Get and save the IP address
-MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-echo "$MY_IP" > "$GRP_DIR/state/owntone_ip.txt"
-echo "$MY_IP" > "$GRP_DIR/state/shairport_ip.txt"
-echo "[zone:$GRP] Got IP: $MY_IP"
-
 # Private /run, /tmp, AND /dev/shm for COMPLETE PTP ISOLATION
 # CRITICAL: Private /dev/shm gives each zone its own /dev/shm/nqptp
-# This prevents one zone's teardown from poisoning another zone's PTP timing
+# This prevents one zone's teardown from poisoning another zone's PTP timing.
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /dev/shm
 mkdir -p /run/dbus /run/avahi-daemon
+echo "$DHCLIENT_LEASE" > "$STATE_DIR/dhclient_lease_path.txt"
+echo "$DHCLIENT_PID" > "$STATE_DIR/dhclient_pid_path.txt"
+
+echo "[zone:$GRP] Running DHCP on $MV_IF ..."
+rm -f "$DHCLIENT_LEASE" "$DHCLIENT_PID"
+if ! timeout 45 dhclient -1 -v \
+  -lf "$DHCLIENT_LEASE" \
+  -pf "$DHCLIENT_PID" \
+  "$MV_IF"; then
+  echo "[zone:$GRP] FATAL: DHCP failed on $MV_IF" >&2
+  exit 1
+fi
+sleep 2
+
+# Get and save the IP address
+MY_IP=$(ip -4 addr show "$MV_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+if [[ -z "$MY_IP" ]]; then
+  echo "[zone:$GRP] FATAL: $MV_IF has no IPv4 address after DHCP" >&2
+  exit 1
+fi
+echo "$MY_IP" > "$GRP_DIR/state/owntone_ip.txt"
+echo "$MY_IP" > "$GRP_DIR/state/shairport_ip.txt"
+cat "/sys/class/net/$MV_IF/address" > "$GRP_DIR/state/macvlan_mac.txt"
+echo "[zone:$GRP] Got IP: $MY_IP"
 
 echo "[zone:$GRP] Starting dbus..."
 dbus-daemon --system --fork --nopidfile
@@ -99,13 +141,6 @@ echo "[zone:$GRP] OwnTone started (pid $OWNTONE_PID)"
 # ---- Process supervisor loop ----
 # Monitor all three critical processes. If any dies, kill the rest and exit.
 # The Shiri daemon will detect our exit via the wrapper PID.
-cleanup() {
-  echo "[zone:$GRP] Supervisor cleaning up all processes..."
-  kill "$NQPTP_PID" "$SHAIRPORT_PID" "$OWNTONE_PID" 2>/dev/null
-  sleep 1
-  kill -9 "$NQPTP_PID" "$SHAIRPORT_PID" "$OWNTONE_PID" 2>/dev/null
-}
-trap cleanup EXIT
 
 while true; do
   sleep 5

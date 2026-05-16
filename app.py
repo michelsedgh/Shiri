@@ -378,6 +378,9 @@ def startup():
     if not zone_manager.setup_alsa_loopback():
         log.error("Failed to setup ALSA loopback — some features may not work")
 
+    # Reap namespaces/macvlans/leases left by an unclean previous daemon exit.
+    zone_manager.cleanup_stale_runtime()
+
     # Clean up any stale host nqptp (each zone now runs its own in netns)
     zone_manager.start_host_nqptp()
 

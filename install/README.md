@@ -46,12 +46,10 @@ The web UI will be available at **http://\<your-ip\>:8080**
 
 ```
 app.py               Entry point — Flask app, startup, shutdown
-routes.py            REST API endpoints + SocketIO handlers
-zone_manager.py      Zone model + ZoneManager (lifecycle, CRUD, networking)
-config_builder.py    Reads templates, substitutes variables, writes configs
-owntone_api.py       OwnTone REST API client
-config_store.py      Persistent JSON config storage
-log_streamer.py      Real-time log file tailing via SocketIO
+zone.py              Zone model + ZoneManager API facade
+zone_lifecycle.py    Start/stop, namespace, macvlan, DHCP, and process cleanup
+config.py            Persistent JSON config plus template/config generation
+owntone_api.py       OwnTone REST API client, executed through the zone netns
 
 templates/           Config/script templates (native format, %%PLACEHOLDER%% syntax)
   shairport_sync.conf    Shairport-sync config template

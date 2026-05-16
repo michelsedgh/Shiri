@@ -180,10 +180,11 @@ const App = (() => {
     function updateSystemInfo(data) {
         const dot = document.querySelector('#system-status .status-dot');
         const text = document.querySelector('#system-status .status-text');
-        if (data.nqptp_running && data.alsa_ready) {
+        const nqptpReady = data.nqptp_running || data.nqptp_mode === 'per-zone';
+        if (nqptpReady && data.alsa_ready) {
             dot.className = 'status-dot online';
             text.textContent = `${data.running_zones}/${data.zone_count} zones active`;
-        } else if (!data.nqptp_running) {
+        } else if (!nqptpReady) {
             dot.className = 'status-dot offline';
             text.textContent = 'nqptp not running';
         } else {

@@ -18,6 +18,7 @@ log = logging.getLogger("shiri.config")
 BASE_DIR = "/var/lib/shiri"
 LOOPBACK_LOCK_DIR = os.path.join(BASE_DIR, "loopback")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+_LOOPBACK_ALLOC_LOCK = threading.Lock()
 
 # Resolve paths relative to this file's location
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -171,48 +172,60 @@ def allocate_loopback_subdevice():
     Same as allocate_loopback_subdevice() in dual_zone_demo.sh.
     File-based locking in /var/lib/shiri/loopback/.
     """
-    os.makedirs(LOOPBACK_LOCK_DIR, exist_ok=True)
-    my_pid = str(os.getpid())
+    with _LOOPBACK_ALLOC_LOCK:
+        os.makedirs(LOOPBACK_LOCK_DIR, exist_ok=True)
+        my_pid = str(os.getpid())
 
-    for i in range(16):
-        lock_file = os.path.join(LOOPBACK_LOCK_DIR, f"subdev_{i}.lock")
-        try:
-            # Try exclusive create (same as set -o noclobber in bash)
-            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, my_pid.encode())
-            os.close(fd)
-            log.info("Allocated loopback subdevice %d", i)
-            return i
-        except FileExistsError:
-            # Check if stale
+        for i in range(16):
+            lock_file = os.path.join(LOOPBACK_LOCK_DIR, f"subdev_{i}.lock")
             try:
-                with open(lock_file, "r") as f:
-                    pid = f.read().strip()
-                if pid and not os.path.exists(f"/proc/{pid}"):
-                    # Stale lock, remove and claim
-                    os.remove(lock_file)
-                    fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    os.write(fd, my_pid.encode())
-                    os.close(fd)
-                    log.info("Allocated loopback subdevice %d (reclaimed stale)", i)
-                    return i
-            except (IOError, FileExistsError):
-                continue
+                # Try exclusive create (same as set -o noclobber in bash)
+                fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, my_pid.encode())
+                os.close(fd)
+                log.info("Allocated loopback subdevice %d", i)
+                return i
+            except FileExistsError:
+                try:
+                    with open(lock_file, "r") as f:
+                        pid = f.read().strip()
+                    if not _lock_owner_is_live_shiri(pid):
+                        os.remove(lock_file)
+                        fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        os.write(fd, my_pid.encode())
+                        os.close(fd)
+                        log.info("Allocated loopback subdevice %d (reclaimed stale)", i)
+                        return i
+                except (IOError, FileExistsError):
+                    continue
 
     log.error("No free loopback subdevices available (all 16 in use)")
     return None
+
+
+def _lock_owner_is_live_shiri(pid):
+    """Return True only when a loopback lock belongs to a live Shiri daemon."""
+    if not pid or not pid.isdigit():
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return False
+    return "python" in cmdline and "app.py" in cmdline
 
 
 def release_loopback_subdevice(subdevice):
     """Release a previously allocated loopback subdevice."""
     if subdevice is None:
         return
-    lock_file = os.path.join(LOOPBACK_LOCK_DIR, f"subdev_{subdevice}.lock")
-    try:
-        os.remove(lock_file)
-        log.info("Released loopback subdevice %d", subdevice)
-    except FileNotFoundError:
-        pass
+    with _LOOPBACK_ALLOC_LOCK:
+        lock_file = os.path.join(LOOPBACK_LOCK_DIR, f"subdev_{subdevice}.lock")
+        try:
+            os.remove(lock_file)
+            log.info("Released loopback subdevice %d", subdevice)
+        except FileNotFoundError:
+            pass
 
 
 # ===========================================================================
