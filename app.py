@@ -11,18 +11,22 @@ Run with: sudo python3 app.py
 import logging
 import os
 import base64
+import json
 import signal
 import sys
 import threading
 import time
 import uuid
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from config import ConfigStore
-from zone import ZoneManager
+from zone import ZoneManager, _slugify_room_id
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -54,6 +58,17 @@ zone_manager = ZoneManager(config_store, socketio)
 # ---------------------------------------------------------------------------
 LOG_DIR = "/var/lib/shiri/groups"
 LOG_TYPES = ["shairport", "owntone", "owntone_wrapper", "arecord", "pause_bridge", "volume_bridge", "sync_reset"]
+LOG_FILTERS = {
+    "all": LOG_TYPES,
+    "tts": ["arecord"],
+    "speaker": ["owntone", "owntone_wrapper"],
+    "volume": ["volume_bridge", "owntone"],
+    "airplay": ["shairport"],
+    "owntone": ["owntone", "owntone_wrapper"],
+    "errors": LOG_TYPES,
+}
+DEFAULT_LIONOS_BASE_URL = os.environ.get("SHIRI_LIONOS_BASE_URL", "http://192.168.1.198:7001")
+LIONOS_TIMEOUT_SECONDS = float(os.environ.get("SHIRI_LIONOS_TIMEOUT", "1.5"))
 _watched_zones = set()
 _log_positions = {}
 _log_lock = threading.Lock()
@@ -93,11 +108,17 @@ def _log_watcher_loop():
                             f.seek(pos)
                             new_data = f.read()
                             _log_positions[path] = f.tell()
+                        zone = zone_manager.get_zone(zone_id)
                         for line in new_data.splitlines():
                             if line.strip():
                                 socketio.emit("zone_log", {
                                     "zone_id": zone_id,
+                                    "zone_name": zone.display_name if zone else zone_id,
+                                    "room_id": zone.room_id if zone else None,
+                                    "room_name": zone.room_name if zone else None,
                                     "log_type": log_type,
+                                    "category": _log_category(log_type, line),
+                                    "severity": _log_severity(line),
                                     "line": line,
                                     "timestamp": time.time(),
                                 })
@@ -114,6 +135,302 @@ def start_log_watch(zone_id):
 def stop_log_watch(zone_id):
     with _log_lock:
         _watched_zones.discard(zone_id)
+
+# ---------------------------------------------------------------------------
+# LionOS state + dashboard aggregation
+# ---------------------------------------------------------------------------
+
+def _settings():
+    settings = config_store.get_settings()
+    settings.setdefault("default_interface", "")
+    settings.setdefault("lionos_base_url", DEFAULT_LIONOS_BASE_URL)
+    return settings
+
+
+def _public_settings(settings=None):
+    settings = settings or _settings()
+    return {
+        "default_interface": settings.get("default_interface", ""),
+        "lionos_base_url": settings.get("lionos_base_url") or DEFAULT_LIONOS_BASE_URL,
+    }
+
+
+def _fetch_lionos_state():
+    settings = _settings()
+    base_url = (settings.get("lionos_base_url") or DEFAULT_LIONOS_BASE_URL).rstrip("/")
+    url = urljoin(f"{base_url}/", "api/state")
+    started_at = time.time()
+    try:
+        req = Request(url, headers={"Accept": "application/json", "User-Agent": "Shiri/room-console"})
+        with urlopen(req, timeout=LIONOS_TIMEOUT_SECONDS) as resp:
+            body = resp.read()
+        state = json.loads(body.decode("utf-8"))
+        fetched_at = time.time()
+        cache = {
+            "base_url": base_url,
+            "fetched_at": fetched_at,
+            "state": state,
+        }
+        try:
+            config_store.update_settings({"lionos_state_cache": cache})
+        except OSError as exc:
+            log.debug("Could not persist LionOS state cache: %s", exc)
+        return {
+            "online": True,
+            "base_url": base_url,
+            "state": state,
+            "cached": False,
+            "fetched_at": fetched_at,
+            "latency_ms": round((fetched_at - started_at) * 1000),
+            "error": None,
+        }
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        cache = settings.get("lionos_state_cache")
+        cached_state = cache.get("state") if isinstance(cache, dict) else None
+        return {
+            "online": False,
+            "base_url": base_url,
+            "state": cached_state if isinstance(cached_state, dict) else None,
+            "cached": isinstance(cached_state, dict),
+            "fetched_at": cache.get("fetched_at") if isinstance(cache, dict) else None,
+            "latency_ms": None,
+            "error": str(exc),
+        }
+
+
+def _member_names(state):
+    members = state.get("members", []) if isinstance(state, dict) else []
+    names = {}
+    for member in members if isinstance(members, list) else []:
+        if isinstance(member, dict) and member.get("id"):
+            names[str(member["id"])] = member.get("name") or str(member["id"])
+    return names
+
+
+def _zone_bound_to_room(room_id):
+    normalized = _slugify_room_id(room_id)
+    for zone in zone_manager.list_zones():
+        if _slugify_room_id(zone.room_id) == normalized:
+            return zone
+    return None
+
+
+def _zone_summary(zone):
+    speakers = []
+    try:
+        speakers = zone_manager._known_speakers(zone)
+    except Exception as exc:
+        log.debug("Could not summarize speakers for %s: %s", zone.zone_id, exc)
+
+    volume = None
+    volume_error = None
+    player = None
+    player_error = None
+    if zone.status == zone.STATUS_RUNNING:
+        volume, volume_error = zone_manager.get_volume(zone.zone_id)
+        player, player_error = zone_manager.get_player_status(zone.zone_id)
+
+    policy = zone_manager.get_tts_policy(zone.zone_id)[0] or {}
+    return {
+        "zone_id": zone.zone_id,
+        "zone_name": zone.display_name,
+        "status": zone.status,
+        "error_message": zone.error_message,
+        "room_id": zone.room_id,
+        "room_name": zone.room_name,
+        "default_room": bool(zone.config.get("default_room", False)),
+        "interface": zone.interface,
+        "auto_start": bool(zone.config.get("auto_start", False)),
+        "latency_offset": zone.config.get("latency_offset"),
+        "shairport_ip": zone.shairport_ip,
+        "owntone_ip": zone.owntone_ip,
+        "netns_name": zone.netns_name,
+        "allocated_subdevice": zone.allocated_subdevice,
+        "volume": volume,
+        "volume_error": volume_error,
+        "player": player or {},
+        "player_error": player_error,
+        "speakers": speakers,
+        "tts_policy": policy.get("policy"),
+        "tts_effective": policy.get("effective"),
+        "can_start": zone.status in {zone.STATUS_STOPPED, zone.STATUS_ERROR},
+        "can_stop": zone.status in {zone.STATUS_RUNNING, zone.STATUS_STARTING},
+    }
+
+
+def _room_activity(state, room_id):
+    if not isinstance(state, dict):
+        return {
+            "presence": [],
+            "presence_names": [],
+            "primary_member_id": None,
+            "activities": [],
+            "devices": [],
+            "agent_sessions": [],
+        }
+    names = _member_names(state)
+    presence_by_room = state.get("presence_by_room") if isinstance(state.get("presence_by_room"), dict) else {}
+    primary_by_room = state.get("primary_by_room") if isinstance(state.get("primary_by_room"), dict) else {}
+    presence = [str(item) for item in presence_by_room.get(room_id, [])]
+    activities = [
+        item for item in state.get("activities", [])
+        if isinstance(item, dict) and item.get("room_id") == room_id
+    ]
+    devices = [
+        item for item in state.get("devices", [])
+        if isinstance(item, dict) and item.get("room_id") == room_id
+    ]
+    sessions = [
+        item for item in state.get("agent_sessions", [])
+        if isinstance(item, dict) and item.get("room_id") == room_id
+    ]
+    return {
+        "presence": presence,
+        "presence_names": [names.get(member_id, member_id) for member_id in presence],
+        "primary_member_id": primary_by_room.get(room_id),
+        "activities": activities,
+        "devices": devices,
+        "agent_sessions": sessions,
+    }
+
+
+def _room_entry(room_id, room_name, *, source, lionos_room=None, lionos_state=None):
+    zone = _zone_bound_to_room(room_id)
+    activity = _room_activity(lionos_state, room_id)
+    return {
+        "room_id": room_id,
+        "room_name": room_name,
+        "source": source,
+        "lionos_room": lionos_room or None,
+        "presence": activity["presence"],
+        "presence_names": activity["presence_names"],
+        "primary_member_id": activity["primary_member_id"],
+        "activities": activity["activities"],
+        "devices": activity["devices"],
+        "agent_sessions": activity["agent_sessions"],
+        "binding": _zone_summary(zone) if zone else None,
+        "bound": zone is not None,
+    }
+
+
+def _dashboard_payload():
+    lionos = _fetch_lionos_state()
+    lionos_state = lionos.get("state") or {}
+    lionos_rooms = lionos_state.get("rooms", []) if isinstance(lionos_state, dict) else []
+    rooms = []
+    seen_room_ids = set()
+
+    if isinstance(lionos_rooms, list):
+        for room in lionos_rooms:
+            if not isinstance(room, dict) or not room.get("id"):
+                continue
+            room_id = str(room["id"])
+            seen_room_ids.add(_slugify_room_id(room_id))
+            rooms.append(_room_entry(
+                room_id,
+                room.get("name") or room_id,
+                source="lionos",
+                lionos_room=room,
+                lionos_state=lionos_state,
+            ))
+
+    for zone in zone_manager.list_zones():
+        normalized = _slugify_room_id(zone.room_id)
+        if normalized in seen_room_ids:
+            continue
+        seen_room_ids.add(normalized)
+        rooms.append(_room_entry(
+            zone.room_id,
+            zone.room_name,
+            source="shiri",
+            lionos_room=None,
+            lionos_state=lionos_state,
+        ))
+
+    rooms.sort(key=lambda item: (item["source"] != "lionos", item["room_name"].lower()))
+    zones = [_zone_summary(zone) for zone in zone_manager.list_zones()]
+    default_room = next((room for room in rooms if (room.get("binding") or {}).get("default_room")), None)
+    return {
+        "system": zone_manager.get_system_status(),
+        "lionos": {k: v for k, v in lionos.items() if k != "state"},
+        "settings": _public_settings(),
+        "rooms": rooms,
+        "zones": zones,
+        "default_room_id": default_room.get("room_id") if default_room else None,
+        "log_types": LOG_TYPES,
+        "log_filters": sorted(LOG_FILTERS.keys()),
+        "generated_at": time.time(),
+    }
+
+
+def _parse_volume(value):
+    try:
+        parsed = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return min(max(parsed, 0), 100)
+
+
+def _log_severity(line):
+    text = line.lower()
+    if any(token in text for token in ("error", "failed", "failure", "died", "exception", "fatal")):
+        return "error"
+    if any(token in text for token in ("warn", "retry", "timeout", "closed")):
+        return "warning"
+    return "info"
+
+
+def _log_category(log_type, line):
+    if log_type == "arecord" or "tts" in line.lower():
+        return "tts"
+    if log_type == "shairport":
+        return "airplay"
+    if log_type in {"owntone", "owntone_wrapper"}:
+        return "owntone"
+    if log_type == "volume_bridge":
+        return "volume"
+    return "system"
+
+
+def _logs_for_query(zone_id=None, room_id=None, log_filter="all", lines=200):
+    log_filter = (log_filter or "all").lower()
+    selected_types = LOG_FILTERS.get(log_filter, LOG_TYPES if log_filter == "all" else [log_filter])
+    if selected_types == ["all"]:
+        selected_types = LOG_TYPES
+
+    zones = []
+    if zone_id:
+        zone = zone_manager.get_zone(zone_id)
+        if zone:
+            zones = [zone]
+    elif room_id:
+        zone = _zone_bound_to_room(room_id)
+        if zone:
+            zones = [zone]
+    else:
+        zones = zone_manager.list_zones()
+
+    entries = []
+    for zone in zones:
+        for log_type in selected_types:
+            if log_type not in LOG_TYPES:
+                continue
+            for line in _read_log_tail(zone.zone_id, log_type, lines):
+                severity = _log_severity(line)
+                if log_filter == "errors" and severity == "info":
+                    continue
+                entries.append({
+                    "zone_id": zone.zone_id,
+                    "zone_name": zone.display_name,
+                    "room_id": zone.room_id,
+                    "room_name": zone.room_name,
+                    "log_type": log_type,
+                    "category": _log_category(log_type, line),
+                    "severity": severity,
+                    "line": line,
+                    "timestamp": None,
+                })
+    return entries[-lines:]
 
 
 threading.Thread(target=_log_watcher_loop, daemon=True, name="log-watcher").start()
@@ -141,6 +458,40 @@ def system_status():
 @app.route("/api/system/interfaces")
 def system_interfaces():
     return jsonify({"interfaces": zone_manager.get_network_interfaces()})
+
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    return jsonify({"settings": _public_settings()})
+
+@app.route("/api/settings", methods=["PUT"])
+def update_settings():
+    data = request.get_json() or {}
+    updates = {}
+    if "lionos_base_url" in data:
+        base_url = str(data.get("lionos_base_url") or "").strip().rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            return jsonify({"error": "lionos_base_url must start with http:// or https://"}), 400
+        updates["lionos_base_url"] = base_url
+    if "default_interface" in data:
+        updates["default_interface"] = str(data.get("default_interface") or "").strip()
+    if updates:
+        config_store.update_settings(updates)
+    return jsonify({"settings": _public_settings()})
+
+@app.route("/api/lionos/status")
+def lionos_status():
+    state = _fetch_lionos_state()
+    return jsonify({k: v for k, v in state.items() if k != "state"})
+
+@app.route("/api/lionos/state")
+def lionos_state():
+    state = _fetch_lionos_state()
+    status = {k: v for k, v in state.items() if k != "state"}
+    return jsonify({"lionos": status, "state": state.get("state")})
+
+@app.route("/api/dashboard")
+def dashboard():
+    return jsonify(_dashboard_payload())
 
 # ---------------------------------------------------------------------------
 # Zone CRUD API
@@ -232,6 +583,31 @@ def stop_zone(zone_id):
 def list_rooms():
     return jsonify({"rooms": zone_manager.list_rooms()})
 
+@app.route("/api/rooms/<room_id>/binding", methods=["PUT"])
+def set_room_binding(room_id):
+    data = request.get_json() or {}
+    zone_id = (data.get("zone_id") or "").strip()
+    if not zone_id:
+        return jsonify({"error": "zone_id is required"}), 400
+    room_name = data.get("room_name")
+    if not room_name:
+        lionos = _fetch_lionos_state()
+        state = lionos.get("state") or {}
+        rooms = state.get("rooms", []) if isinstance(state, dict) else []
+        for room in rooms if isinstance(rooms, list) else []:
+            if isinstance(room, dict) and room.get("id") == room_id:
+                room_name = room.get("name")
+                break
+    zone, error = zone_manager.set_zone_room(
+        zone_id,
+        room_id,
+        room_name=room_name or room_id,
+        default_room=bool(data.get("default_room", False)),
+    )
+    if error:
+        return jsonify({"error": error}), 404
+    return jsonify({"room": _room_entry(zone.room_id, zone.room_name, source="shiri")})
+
 @app.route("/api/zones/<zone_id>/room", methods=["PUT"])
 def set_zone_room(zone_id):
     data = request.get_json() or {}
@@ -247,6 +623,30 @@ def set_zone_room(zone_id):
     if error:
         return jsonify({"error": error}), 404
     return jsonify(zone.to_dict())
+
+@app.route("/api/rooms/<room_id>/volume")
+def get_room_volume(room_id):
+    zone = _zone_bound_to_room(room_id)
+    if not zone:
+        return jsonify({"error": "No Shiri zone bound to this room"}), 404
+    volume, error = zone_manager.get_volume(zone.zone_id)
+    if error:
+        return jsonify({"error": error, "zone_id": zone.zone_id}), 400
+    return jsonify({"room_id": zone.room_id, "zone_id": zone.zone_id, "volume": volume})
+
+@app.route("/api/rooms/<room_id>/volume", methods=["PUT"])
+def set_room_volume(room_id):
+    data = request.get_json() or {}
+    volume = _parse_volume(data.get("volume"))
+    if volume is None:
+        return jsonify({"error": "volume must be a number from 0 to 100"}), 400
+    zone = _zone_bound_to_room(room_id)
+    if not zone:
+        return jsonify({"error": "No Shiri zone bound to this room"}), 404
+    ok, error = zone_manager.set_volume(zone.zone_id, volume)
+    if error:
+        return jsonify({"error": error, "zone_id": zone.zone_id}), 400
+    return jsonify({"ok": bool(ok), "room_id": zone.room_id, "zone_id": zone.zone_id, "volume": volume})
 
 @app.route("/api/zones/<zone_id>/tts-policy")
 def get_tts_policy(zone_id):
@@ -506,6 +906,25 @@ def get_logs(zone_id, log_type):
     log_lines = _read_log_tail(zone_id, log_type, lines)
     return jsonify({"lines": log_lines, "log_type": log_type})
 
+@app.route("/api/logs")
+def get_combined_logs():
+    try:
+        lines = int(request.args.get("lines", 200))
+    except (TypeError, ValueError):
+        lines = 200
+    lines = min(max(lines, 1), 1000)
+    entries = _logs_for_query(
+        zone_id=request.args.get("zone_id"),
+        room_id=request.args.get("room_id"),
+        log_filter=request.args.get("type", "all"),
+        lines=lines,
+    )
+    return jsonify({
+        "entries": entries,
+        "lines": [entry["line"] for entry in entries],
+        "log_type": request.args.get("type", "all"),
+    })
+
 # ---------------------------------------------------------------------------
 # SocketIO events
 # ---------------------------------------------------------------------------
@@ -519,14 +938,22 @@ def handle_connect():
 
 @socketio.on("subscribe_logs")
 def handle_subscribe_logs(data):
+    data = data or {}
     zone_id = data.get("zone_id")
-    if zone_id:
+    if data.get("all") or zone_id in {"*", "all"}:
+        for zone in zone_manager.list_zones():
+            start_log_watch(zone.zone_id)
+    elif zone_id:
         start_log_watch(zone_id)
 
 @socketio.on("unsubscribe_logs")
 def handle_unsubscribe_logs(data):
+    data = data or {}
     zone_id = data.get("zone_id")
-    if zone_id:
+    if data.get("all") or zone_id in {"*", "all"}:
+        for zone in zone_manager.list_zones():
+            stop_log_watch(zone.zone_id)
+    elif zone_id:
         stop_log_watch(zone_id)
 
 # ---------------------------------------------------------------------------

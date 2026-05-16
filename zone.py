@@ -313,7 +313,11 @@ class ZoneManager:
         Same as select_parent_interface() listing logic in dual_zone_demo.sh.
         Returns list of interface names (excluding lo).
         """
-        result = _run(["ip", "-o", "link", "show"])
+        try:
+            result = _run(["ip", "-o", "link", "show"])
+        except OSError as exc:
+            log.warning("Could not list network interfaces: %s", exc)
+            return []
         if result.returncode != 0:
             return []
         interfaces = []
