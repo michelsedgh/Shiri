@@ -936,6 +936,121 @@ body::before {
 }
 
 /* ==========================================================================
+   TTS Settings
+   ========================================================================== */
+
+.tts-panel {
+    display: grid;
+    gap: 14px;
+}
+
+.tts-row {
+    display: grid;
+    grid-template-columns: 120px minmax(0, 1fr) 46px;
+    align-items: center;
+    gap: 12px;
+}
+
+.tts-mode-row {
+    grid-template-columns: 120px minmax(0, 1fr);
+}
+
+.tts-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.segmented-control {
+    display: inline-flex;
+    width: fit-content;
+    padding: 3px;
+    gap: 3px;
+    background: var(--bg-input);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-sm);
+}
+
+.segment {
+    min-width: 76px;
+    padding: 6px 12px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.segment.active {
+    background: var(--accent-glow);
+    color: var(--text-accent);
+}
+
+.tts-effective {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--bg-glass);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-md);
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.tts-effective strong {
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+}
+
+.tts-speaker-settings {
+    display: grid;
+    gap: 8px;
+}
+
+.tts-speaker-item {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    background: var(--bg-glass);
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-md);
+}
+
+.tts-speaker-item.selected {
+    border-color: var(--border-accent);
+}
+
+.tts-speaker-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.tts-speaker-controls {
+    display: grid;
+    gap: 8px;
+}
+
+.tts-speaker-controls .tts-row {
+    grid-template-columns: 120px minmax(0, 1fr) 46px;
+}
+
+.tts-actions {
+    display: flex;
+    justify-content: flex-end;
+}
+
+/* ==========================================================================
    Log Viewer
    ========================================================================== */
 

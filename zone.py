@@ -33,6 +33,13 @@ from zone_lifecycle import (
 
 log = logging.getLogger("shiri.zone")
 
+DEFAULT_TTS_LEVEL_PCT = 100
+DEFAULT_REDUCTION_PCT = 72
+MIN_TTS_LEVEL_PCT = 5
+MAX_TTS_LEVEL_PCT = 200
+MIN_REDUCTION_PCT = 0
+MAX_REDUCTION_PCT = 95
+
 
 def _slugify_room_id(value):
     """Return a stable LionOS-style room id."""
@@ -57,6 +64,77 @@ def _gain_from_volume(volume_pct):
         return None
     # LionOS defaults to 60%; map that to unity gain and cap the top end.
     return min(max(pct / 60.0, 0.05), 1.6)
+
+
+def _clamp_int(value, minimum, maximum, default):
+    try:
+        parsed = int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, minimum), maximum)
+
+
+def _level_settings(raw=None, fallback=None):
+    fallback = fallback or {}
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "tts_level_pct": _clamp_int(
+            raw.get("tts_level_pct", raw.get("tts_level", fallback.get("tts_level_pct"))),
+            MIN_TTS_LEVEL_PCT,
+            MAX_TTS_LEVEL_PCT,
+            fallback.get("tts_level_pct", DEFAULT_TTS_LEVEL_PCT),
+        ),
+        "reduction_pct": _clamp_int(
+            raw.get("reduction_pct", raw.get("music_reduction_pct", fallback.get("reduction_pct"))),
+            MIN_REDUCTION_PCT,
+            MAX_REDUCTION_PCT,
+            fallback.get("reduction_pct", DEFAULT_REDUCTION_PCT),
+        ),
+    }
+
+
+def _normalize_tts_policy(raw=None):
+    raw = raw if isinstance(raw, dict) else {}
+    room = _level_settings(raw.get("room", raw))
+    speakers = {}
+    raw_speakers = raw.get("speakers", {})
+    if isinstance(raw_speakers, dict):
+        for speaker_id, settings in raw_speakers.items():
+            if not speaker_id:
+                continue
+            normalized = _level_settings(settings, fallback=room)
+            if isinstance(settings, dict) and settings.get("name"):
+                normalized["name"] = str(settings.get("name"))
+            speakers[str(speaker_id)] = normalized
+    mode = str(raw.get("mode", "room")).lower()
+    if mode not in {"room", "speaker"}:
+        mode = "room"
+    return {
+        "mode": mode,
+        "room": room,
+        "speakers": speakers,
+    }
+
+
+def _settings_to_mix(settings):
+    tts_level_pct = _clamp_int(
+        settings.get("tts_level_pct"),
+        MIN_TTS_LEVEL_PCT,
+        MAX_TTS_LEVEL_PCT,
+        DEFAULT_TTS_LEVEL_PCT,
+    )
+    reduction_pct = _clamp_int(
+        settings.get("reduction_pct"),
+        MIN_REDUCTION_PCT,
+        MAX_REDUCTION_PCT,
+        DEFAULT_REDUCTION_PCT,
+    )
+    return {
+        "tts_gain": tts_level_pct / 100.0,
+        "duck_gain": 1.0 - (reduction_pct / 100.0),
+        "tts_level_pct": tts_level_pct,
+        "reduction_pct": reduction_pct,
+    }
 
 
 class Zone:
@@ -145,6 +223,7 @@ class Zone:
             "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
             "room_id": self.room_id,
             "room_name": self.room_name,
+            "tts_policy": _normalize_tts_policy(self.config.get("tts_policy")),
         }
 
 
@@ -273,6 +352,7 @@ class ZoneManager:
             "speakers": [],
             "room_id": _slugify_room_id(room_id or name),
             "room_name": room_name or name,
+            "tts_policy": _normalize_tts_policy(),
         }
         if default_room:
             config["default_room"] = True
@@ -334,6 +414,8 @@ class ZoneManager:
                 sanitized["room_id"] = _slugify_room_id(sanitized.get("room_id"))
             if "room_name" in sanitized and not sanitized.get("room_name"):
                 sanitized["room_name"] = sanitized.get("name") or zone.display_name
+            if "tts_policy" in sanitized:
+                sanitized["tts_policy"] = _normalize_tts_policy(sanitized.get("tts_policy"))
             zone.config.update(sanitized)
         
         self.config_store.save_zone(zone_id, zone.config)
@@ -389,6 +471,7 @@ class ZoneManager:
                 "status": zone.status,
                 "default_room": bool(zone.config.get("default_room", False)),
                 "speakers": zone.config.get("speaker_names", []),
+                "tts_policy": _normalize_tts_policy(zone.config.get("tts_policy")),
             })
         return rooms
 
@@ -404,6 +487,47 @@ class ZoneManager:
         self.config_store.save_zone(zone_id, zone.config)
         self._emit_zone_status(zone)
         return zone, None
+
+    def get_tts_policy(self, zone_id):
+        """Return persisted TTS policy and currently known speakers."""
+        zone = self.get_zone(zone_id)
+        if not zone:
+            return None, "Zone not found"
+        policy = _normalize_tts_policy(zone.config.get("tts_policy"))
+        speakers = self._known_speakers(zone)
+        return {
+            "zone_id": zone.zone_id,
+            "room_id": zone.room_id,
+            "room_name": zone.room_name,
+            "policy": policy,
+            "effective": self._effective_tts_mix(zone, policy=policy),
+            "speakers": speakers,
+        }, None
+
+    def set_tts_policy(self, zone_id, policy_updates):
+        """Persist room/per-speaker TTS level and reduction settings."""
+        zone = self.get_zone(zone_id)
+        if not zone:
+            return None, "Zone not found"
+        current = _normalize_tts_policy(zone.config.get("tts_policy"))
+        incoming = policy_updates if isinstance(policy_updates, dict) else {}
+        merged = {
+            "mode": incoming.get("mode", current["mode"]),
+            "room": incoming.get("room", current["room"]),
+            "speakers": incoming.get("speakers", current["speakers"]),
+        }
+        policy = _normalize_tts_policy(merged)
+        zone.config["tts_policy"] = policy
+        self.config_store.save_zone(zone_id, zone.config)
+        self._emit_zone_status(zone)
+        return {
+            "zone_id": zone.zone_id,
+            "room_id": zone.room_id,
+            "room_name": zone.room_name,
+            "policy": policy,
+            "effective": self._effective_tts_mix(zone, policy=policy),
+            "speakers": self._known_speakers(zone),
+        }, None
 
     def resolve_zone_for_room(self, room_id=None, require_running=True):
         """
@@ -446,7 +570,8 @@ class ZoneManager:
     # -------------------------------------------------------------------------
 
     def enqueue_tts(self, zone_id, audio_bytes, *, request_id=None, audio_format="wav",
-                    duck_gain=None, tts_gain=None, volume_pct=None, text=None):
+                    duck_gain=None, tts_gain=None, volume_pct=None, text=None,
+                    speaker_id=None, speaker_name=None):
         """Queue a TTS WAV for the zone mixer. Returns (payload, error)."""
         zone = self.get_zone(zone_id)
         if not zone:
@@ -473,6 +598,18 @@ class ZoneManager:
         meta_path = queue_dir / f"{prefix}.json"
         tmp_meta_path = queue_dir / f"{prefix}.json.tmp"
 
+        effective = self._effective_tts_mix(
+            zone,
+            speaker_id=speaker_id,
+            speaker_name=speaker_name,
+        )
+        if duck_gain is None:
+            duck_gain = effective["duck_gain"]
+        if tts_gain is None:
+            tts_gain = _gain_from_volume(volume_pct)
+        if tts_gain is None:
+            tts_gain = effective["tts_gain"]
+
         audio_path.write_bytes(audio_bytes)
         meta = {
             "request_id": safe_id,
@@ -481,8 +618,11 @@ class ZoneManager:
             "room_id": zone.room_id,
             "zone_id": zone.zone_id,
             "text": text,
+            "speaker_id": speaker_id,
+            "speaker_name": speaker_name,
             "duck_gain": duck_gain,
-            "tts_gain": tts_gain if tts_gain is not None else _gain_from_volume(volume_pct),
+            "tts_gain": tts_gain,
+            "effective_policy": effective,
             "queued_at": time.time(),
         }
         tmp_meta_path.write_text(json.dumps(meta, indent=2))
@@ -495,8 +635,85 @@ class ZoneManager:
             "room_id": zone.room_id,
             "room_name": zone.room_name,
             "zone_id": zone.zone_id,
+            "effective_policy": effective,
             "queued_bytes": len(audio_bytes),
         }, None
+
+    def _known_speakers(self, zone):
+        outputs = []
+        if zone.owntone_api:
+            try:
+                outputs = zone.owntone_api.get_outputs()
+            except Exception as e:
+                log.debug("Could not read outputs for TTS policy: %s", e)
+        if outputs:
+            return outputs
+        speakers = zone.config.get("speaker_names", [])
+        if speakers:
+            return [
+                {
+                    "id": item.get("id"),
+                    "name": item.get("name", "Unknown"),
+                    "selected": True,
+                }
+                for item in speakers
+            ]
+        return [
+            {"id": sid, "name": str(sid), "selected": True}
+            for sid in zone.config.get("speakers", [])
+        ]
+
+    def _selected_speaker_refs(self, zone):
+        speakers = self._known_speakers(zone)
+        selected = [sp for sp in speakers if sp.get("selected")]
+        if selected:
+            return selected
+        return speakers
+
+    def _effective_tts_mix(self, zone, *, speaker_id=None, speaker_name=None, policy=None):
+        policy = policy or _normalize_tts_policy(zone.config.get("tts_policy"))
+        room_settings = policy["room"]
+        settings = room_settings
+        source = "room"
+        source_speakers = []
+
+        if policy["mode"] == "speaker":
+            refs = [{"id": speaker_id, "name": speaker_name}] if speaker_id else self._selected_speaker_refs(zone)
+            matched = []
+            for ref in refs:
+                override = self._speaker_tts_override(policy, ref.get("id"), ref.get("name"))
+                if override:
+                    matched.append(override)
+                    source_speakers.append({
+                        "id": str(ref.get("id") or ""),
+                        "name": ref.get("name"),
+                    })
+            if matched:
+                settings = {
+                    "tts_level_pct": max(s["tts_level_pct"] for s in matched),
+                    "reduction_pct": max(s["reduction_pct"] for s in matched),
+                }
+                source = "speaker"
+
+        mix = _settings_to_mix(settings)
+        mix.update({
+            "mode": policy["mode"],
+            "source": source,
+            "speaker_ids": [sp["id"] for sp in source_speakers if sp.get("id")],
+        })
+        return mix
+
+    def _speaker_tts_override(self, policy, speaker_id, speaker_name=None):
+        overrides = policy.get("speakers", {})
+        if speaker_id is not None:
+            direct = overrides.get(str(speaker_id))
+            if direct:
+                return direct
+        if speaker_name:
+            for settings in overrides.values():
+                if settings.get("name") == speaker_name:
+                    return settings
+        return None
 
     # -------------------------------------------------------------------------
     # Speaker management (consolidated from routes + startup restore)

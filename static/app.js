@@ -15,6 +15,8 @@ const App = (() => {
     let volumeDebounceTimers = {};
     let editingZoneId = null;
     let volumePollInterval = null;
+    let activeTtsPolicy = null;
+    let activeTtsSpeakers = [];
 
     // -------------------------------------------------------------------------
     // Initialization
@@ -76,6 +78,7 @@ const App = (() => {
                 if (data.status === 'running' && prevStatus !== 'running') {
                     loadSpeakers(data.zone_id);
                     loadMasterVolume(data.zone_id);
+                    loadTtsPolicy(data.zone_id);
                     
                     // Start periodic sync if not already running
                     if (!volumePollInterval) {
@@ -490,6 +493,7 @@ const App = (() => {
 
         updateDetailPanel(zone);
         switchDetailTab('speakers');
+        loadTtsPolicy(zoneId);
 
         // Subscribe to logs
         if (socket) {
@@ -569,12 +573,16 @@ const App = (() => {
 
         // Show/hide tab content
         document.getElementById('tab-speakers').style.display = tabName === 'speakers' ? 'block' : 'none';
+        document.getElementById('tab-tts').style.display = tabName === 'tts' ? 'block' : 'none';
         document.getElementById('tab-logs').style.display = tabName === 'logs' ? 'block' : 'none';
         document.getElementById('tab-config').style.display = tabName === 'config' ? 'block' : 'none';
 
         // Load logs when switching to logs tab
         if (tabName === 'logs' && activeDetailZone) {
             loadLogs(activeDetailZone, activeLogType);
+        }
+        if (tabName === 'tts' && activeDetailZone) {
+            loadTtsPolicy(activeDetailZone);
         }
     }
 
@@ -635,6 +643,157 @@ const App = (() => {
 
     async function setSpeakerVolume(zoneId, speakerId, volume) {
         await api(`/zones/${zoneId}/speakers/${speakerId}/volume`, 'PUT', { volume: parseInt(volume) });
+    }
+
+    // -------------------------------------------------------------------------
+    // TTS Levels
+    // -------------------------------------------------------------------------
+
+    async function loadTtsPolicy(zoneId) {
+        try {
+            const data = await api(`/zones/${zoneId}/tts-policy`);
+            if (data.error) throw new Error(data.error);
+            activeTtsPolicy = data.policy || defaultTtsPolicy();
+            activeTtsSpeakers = data.speakers || [];
+            renderTtsPolicy(data);
+        } catch (e) {
+            const container = document.getElementById('tts-speaker-settings');
+            if (container) container.innerHTML = '<div class="empty-state">Error loading TTS levels</div>';
+        }
+    }
+
+    function defaultTtsPolicy() {
+        return {
+            mode: 'room',
+            room: { tts_level_pct: 100, reduction_pct: 72 },
+            speakers: {},
+        };
+    }
+
+    function renderTtsPolicy(data) {
+        const policy = data.policy || defaultTtsPolicy();
+        activeTtsPolicy = policy;
+        activeTtsSpeakers = data.speakers || activeTtsSpeakers || [];
+
+        const roomLevel = document.getElementById('tts-room-level');
+        const roomReduction = document.getElementById('tts-room-reduction');
+        if (!roomLevel || !roomReduction) return;
+
+        roomLevel.value = policy.room?.tts_level_pct ?? 100;
+        roomReduction.value = policy.room?.reduction_pct ?? 72;
+        onTtsRoomInput();
+        setTtsPolicyMode(policy.mode || 'room', { rerender: false });
+
+        const effective = data.effective || {};
+        const effectiveText = document.getElementById('tts-effective-text');
+        if (effectiveText) {
+            effectiveText.textContent = `${effective.tts_level_pct ?? roomLevel.value}% / ${effective.reduction_pct ?? roomReduction.value}%`;
+        }
+
+        renderTtsSpeakerSettings(policy);
+    }
+
+    function renderTtsSpeakerSettings(policy) {
+        const container = document.getElementById('tts-speaker-settings');
+        if (!container) return;
+        container.style.display = (policy.mode || 'room') === 'speaker' ? 'grid' : 'none';
+
+        if (!activeTtsSpeakers.length) {
+            container.innerHTML = '<div class="empty-state">No speakers discovered yet.</div>';
+            return;
+        }
+
+        const room = policy.room || { tts_level_pct: 100, reduction_pct: 72 };
+        const overrides = policy.speakers || {};
+        container.innerHTML = activeTtsSpeakers.map(sp => {
+            const sid = String(sp.id ?? '');
+            const settings = overrides[sid] || room;
+            const selected = !!sp.selected;
+            return `
+                <div class="tts-speaker-item ${selected ? 'selected' : ''}" data-speaker-id="${escHtml(sid)}">
+                    <div class="tts-speaker-title">
+                        <span>${escHtml(sp.name || sid || 'Speaker')}</span>
+                        <span class="speaker-type">${selected ? 'selected' : 'available'}</span>
+                    </div>
+                    <div class="tts-speaker-controls">
+                        <div class="tts-row">
+                            <label class="tts-label">TTS Level</label>
+                            <input type="range" min="5" max="200" step="1" value="${settings.tts_level_pct ?? room.tts_level_pct}" class="volume-slider" data-field="tts_level_pct" oninput="App.onTtsSpeakerInput(this)">
+                            <span class="volume-val">${settings.tts_level_pct ?? room.tts_level_pct}</span>
+                        </div>
+                        <div class="tts-row">
+                            <label class="tts-label">Music Reduction</label>
+                            <input type="range" min="0" max="95" step="1" value="${settings.reduction_pct ?? room.reduction_pct}" class="volume-slider" data-field="reduction_pct" oninput="App.onTtsSpeakerInput(this)">
+                            <span class="volume-val">${settings.reduction_pct ?? room.reduction_pct}</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function setTtsPolicyMode(mode, opts = {}) {
+        if (!activeTtsPolicy) activeTtsPolicy = defaultTtsPolicy();
+        activeTtsPolicy.mode = mode === 'speaker' ? 'speaker' : 'room';
+        document.getElementById('tts-mode-room')?.classList.toggle('active', activeTtsPolicy.mode === 'room');
+        document.getElementById('tts-mode-speaker')?.classList.toggle('active', activeTtsPolicy.mode === 'speaker');
+        if (opts.rerender !== false) {
+            renderTtsSpeakerSettings(activeTtsPolicy);
+        }
+    }
+
+    function onTtsRoomInput() {
+        const level = document.getElementById('tts-room-level');
+        const reduction = document.getElementById('tts-room-reduction');
+        const levelVal = document.getElementById('tts-room-level-val');
+        const reductionVal = document.getElementById('tts-room-reduction-val');
+        if (levelVal && level) levelVal.textContent = level.value;
+        if (reductionVal && reduction) reductionVal.textContent = reduction.value;
+        if (activeTtsPolicy && level && reduction) {
+            activeTtsPolicy.room = {
+                tts_level_pct: parseInt(level.value),
+                reduction_pct: parseInt(reduction.value),
+            };
+        }
+    }
+
+    function onTtsSpeakerInput(input) {
+        if (input?.nextElementSibling) {
+            input.nextElementSibling.textContent = input.value;
+        }
+    }
+
+    async function saveTtsPolicy() {
+        if (!activeDetailZone) return;
+        if (!activeTtsPolicy) activeTtsPolicy = defaultTtsPolicy();
+        onTtsRoomInput();
+
+        const speakers = {};
+        document.querySelectorAll('.tts-speaker-item').forEach(item => {
+            const speakerId = item.dataset.speakerId;
+            if (!speakerId) return;
+            const speaker = activeTtsSpeakers.find(sp => String(sp.id ?? '') === speakerId) || {};
+            const level = item.querySelector('[data-field="tts_level_pct"]');
+            const reduction = item.querySelector('[data-field="reduction_pct"]');
+            speakers[speakerId] = {
+                name: speaker.name || speakerId,
+                tts_level_pct: parseInt(level?.value || activeTtsPolicy.room.tts_level_pct || 100),
+                reduction_pct: parseInt(reduction?.value || activeTtsPolicy.room.reduction_pct || 72),
+            };
+        });
+
+        const result = await api(`/zones/${activeDetailZone}/tts-policy`, 'PUT', {
+            mode: activeTtsPolicy.mode,
+            room: activeTtsPolicy.room,
+            speakers,
+        });
+        if (result.error) {
+            alert(result.error);
+            return;
+        }
+        renderTtsPolicy(result);
+        showToast('TTS levels saved');
+        fetchZones();
     }
 
     async function refreshAllSpeakers() {
@@ -811,6 +970,10 @@ const App = (() => {
         switchLogType,
         toggleSpeaker,
         setSpeakerVolume,
+        setTtsPolicyMode,
+        onTtsRoomInput,
+        onTtsSpeakerInput,
+        saveTtsPolicy,
         showSettings: showSettings,
         hideSettings,
         onCardVolumeInput,

@@ -248,6 +248,42 @@ def set_zone_room(zone_id):
         return jsonify({"error": error}), 404
     return jsonify(zone.to_dict())
 
+@app.route("/api/zones/<zone_id>/tts-policy")
+def get_tts_policy(zone_id):
+    result, error = zone_manager.get_tts_policy(zone_id)
+    if error:
+        return jsonify({"error": error}), 404
+    return jsonify(result)
+
+@app.route("/api/zones/<zone_id>/tts-policy", methods=["PUT"])
+def set_tts_policy(zone_id):
+    data = request.get_json() or {}
+    result, error = zone_manager.set_tts_policy(zone_id, data)
+    if error:
+        return jsonify({"error": error}), 404
+    return jsonify(result)
+
+@app.route("/api/rooms/<room_id>/tts-policy")
+def get_room_tts_policy(room_id):
+    zone, error = zone_manager.resolve_zone_for_room(room_id, require_running=False)
+    if error:
+        return jsonify({"error": error}), 404
+    result, error = zone_manager.get_tts_policy(zone.zone_id)
+    if error:
+        return jsonify({"error": error}), 404
+    return jsonify(result)
+
+@app.route("/api/rooms/<room_id>/tts-policy", methods=["PUT"])
+def set_room_tts_policy(room_id):
+    zone, error = zone_manager.resolve_zone_for_room(room_id, require_running=False)
+    if error:
+        return jsonify({"error": error}), 404
+    data = request.get_json() or {}
+    result, error = zone_manager.set_tts_policy(zone.zone_id, data)
+    if error:
+        return jsonify({"error": error}), 404
+    return jsonify(result)
+
 # ---------------------------------------------------------------------------
 # TTS routing API
 # ---------------------------------------------------------------------------
@@ -343,6 +379,8 @@ def _extract_tts_payload(default_room_id=None):
         "volume_pct": data.get("volume_pct"),
         "text": data.get("text"),
         "room_id": data.get("room_id") or default_room_id,
+        "speaker_id": data.get("speaker_id"),
+        "speaker_name": data.get("speaker_name"),
     }, None
 
 

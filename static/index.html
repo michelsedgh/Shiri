@@ -120,6 +120,7 @@
             <!-- Tabs -->
             <div class="detail-tabs">
                 <button class="tab active" data-tab="speakers" onclick="App.switchDetailTab('speakers')">Speakers</button>
+                <button class="tab" data-tab="tts" onclick="App.switchDetailTab('tts')">TTS</button>
                 <button class="tab" data-tab="logs" onclick="App.switchDetailTab('logs')">Logs</button>
                 <button class="tab" data-tab="config" onclick="App.switchDetailTab('config')">Config</button>
             </div>
@@ -136,6 +137,39 @@
                 </div>
                 <div id="speaker-list" class="speaker-list">
                     <div class="empty-state">Start zone to discover speakers</div>
+                </div>
+            </div>
+
+            <!-- TTS Tab -->
+            <div id="tab-tts" class="tab-content" style="display:none;">
+                <div class="tts-panel">
+                    <div class="tts-row tts-mode-row">
+                        <span class="tts-label">Scope</span>
+                        <div class="segmented-control">
+                            <button id="tts-mode-room" class="segment active" onclick="App.setTtsPolicyMode('room')">Room</button>
+                            <button id="tts-mode-speaker" class="segment" onclick="App.setTtsPolicyMode('speaker')">Speaker</button>
+                        </div>
+                    </div>
+                    <div class="tts-row">
+                        <label for="tts-room-level" class="tts-label">TTS Level</label>
+                        <input type="range" id="tts-room-level" min="5" max="200" step="1" value="100" class="volume-slider"
+                            oninput="App.onTtsRoomInput()">
+                        <span id="tts-room-level-val" class="volume-val">100</span>
+                    </div>
+                    <div class="tts-row">
+                        <label for="tts-room-reduction" class="tts-label">Music Reduction</label>
+                        <input type="range" id="tts-room-reduction" min="0" max="95" step="1" value="72" class="volume-slider"
+                            oninput="App.onTtsRoomInput()">
+                        <span id="tts-room-reduction-val" class="volume-val">72</span>
+                    </div>
+                    <div class="tts-effective">
+                        <span>Effective</span>
+                        <strong id="tts-effective-text">—</strong>
+                    </div>
+                    <div id="tts-speaker-settings" class="tts-speaker-settings"></div>
+                    <div class="tts-actions">
+                        <button class="btn btn-primary btn-sm" onclick="App.saveTtsPolicy()">Save TTS Levels</button>
+                    </div>
                 </div>
             </div>
 
