@@ -36,6 +36,7 @@
             <button id="refresh-dashboard" class="icon-btn" title="Refresh" aria-label="Refresh">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.4 6.4L3 16m0 5v-5h5M3 12A9 9 0 0 1 18.4 5.6L21 8m0-5v5h-5"/></svg>
             </button>
+            <button id="open-injector" class="text-btn">Inject</button>
             <button id="open-diagnostics" class="text-btn">Diagnostics</button>
             <button id="open-settings" class="text-btn">Settings</button>
         </nav>
@@ -102,6 +103,40 @@
             </div>
         </div>
         <div id="log-feed" class="log-feed"></div>
+    </section>
+
+    <section id="inject-panel" class="modal-backdrop" aria-hidden="true">
+        <div class="inject-modal">
+            <div class="panel-head">
+                <div>
+                    <span class="eyebrow">Injection</span>
+                    <h2>Room Test Audio</h2>
+                </div>
+                <button id="close-injector" class="icon-btn" title="Close" aria-label="Close">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div class="inject-body">
+                <form id="inject-built-in-form" class="stacked-form">
+                    <label class="field">
+                        <span>Room</span>
+                        <select id="inject-room"></select>
+                    </label>
+                    <label class="field">
+                        <span>Clip</span>
+                        <select id="inject-clip"></select>
+                    </label>
+                    <button class="primary-btn" type="submit">Inject Clip</button>
+                </form>
+                <form id="inject-upload-form" class="stacked-form">
+                    <label class="field">
+                        <span>WAV upload</span>
+                        <input id="inject-file" type="file" accept=".wav,audio/wav,audio/x-wav">
+                    </label>
+                    <button class="primary-btn" type="submit">Inject WAV</button>
+                </form>
+            </div>
+        </div>
     </section>
 
     <section id="settings-panel" class="modal-backdrop" aria-hidden="true">

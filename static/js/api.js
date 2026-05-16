@@ -37,8 +37,30 @@ export async function api(path, options = {}) {
     return payload;
 }
 
+export async function apiForm(path, formData) {
+    const response = await fetch(`/api${path}`, {
+        method: 'POST',
+        body: formData,
+    });
+    const text = await response.text();
+    let payload = null;
+    if (text) {
+        try {
+            payload = JSON.parse(text);
+        } catch {
+            payload = { error: text };
+        }
+    }
+    if (!response.ok) {
+        const message = payload?.error || response.statusText || 'Request failed';
+        throw new ApiError(message, response.status, payload);
+    }
+    return payload;
+}
+
 export const Api = {
     dashboard: () => api('/dashboard'),
+    testClips: () => api('/test-clips'),
     settings: () => api('/settings'),
     saveSettings: (body) => api('/settings', { method: 'PUT', body }),
     interfaces: () => api('/system/interfaces'),
@@ -75,4 +97,12 @@ export const Api = {
         method: 'POST',
         body,
     }),
+    injectTestClip: (roomId, body) => api(`/rooms/${encodeURIComponent(roomId)}/inject-test`, {
+        method: 'POST',
+        body,
+    }),
+    uploadTestClip: (roomId, formData) => apiForm(
+        `/rooms/${encodeURIComponent(roomId)}/inject-test`,
+        formData,
+    ),
 };
