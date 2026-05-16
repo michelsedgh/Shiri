@@ -62,6 +62,16 @@
                     <span class="form-hint">This is how the zone will appear on your iPhone/Mac</span>
                 </div>
                 <div class="form-group">
+                    <label for="zone-room-id">LionOS Room ID</label>
+                    <input type="text" id="zone-room-id" placeholder="living_room" autocomplete="off">
+                    <span class="form-hint">LionOS uses this ID when routing TTS to this zone</span>
+                </div>
+                <div class="form-group">
+                    <label for="zone-room-name">Room Name</label>
+                    <input type="text" id="zone-room-name" placeholder="Living Room" autocomplete="off">
+                    <span class="form-hint">Human-readable room name for status and diagnostics</span>
+                </div>
+                <div class="form-group">
                     <label for="zone-interface">Network Interface</label>
                     <select id="zone-interface">
                         <option value="">Loading interfaces...</option>
@@ -72,6 +82,12 @@
                     <label class="checkbox-label">
                         <input type="checkbox" id="zone-autostart">
                         <span>Auto-start on daemon launch</span>
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="zone-default-room">
+                        <span>Use as default TTS room</span>
                     </label>
                 </div>
                 <div class="form-group" id="latency-group">
@@ -129,7 +145,7 @@
                     <button class="log-tab active" data-logtype="shairport" onclick="App.switchLogType('shairport')">Shairport</button>
                     <button class="log-tab" data-logtype="owntone" onclick="App.switchLogType('owntone')">OwnTone</button>
                     <button class="log-tab" data-logtype="owntone_wrapper" onclick="App.switchLogType('owntone_wrapper')">Wrapper</button>
-                    <button class="log-tab" data-logtype="arecord" onclick="App.switchLogType('arecord')">Arecord</button>
+                    <button class="log-tab" data-logtype="arecord" onclick="App.switchLogType('arecord')">Mixer</button>
                     <button class="log-tab" data-logtype="pause_bridge" onclick="App.switchLogType('pause_bridge')">Pause</button>
                     <button class="log-tab" data-logtype="volume_bridge" onclick="App.switchLogType('volume_bridge')">Volume</button>
                     <button class="log-tab" data-logtype="sync_reset" onclick="App.switchLogType('sync_reset')">Sync</button>
@@ -145,6 +161,14 @@
                     <div class="config-row">
                         <span class="config-label">Zone ID</span>
                         <span id="config-zone-id" class="config-value">—</span>
+                    </div>
+                    <div class="config-row">
+                        <span class="config-label">LionOS Room ID</span>
+                        <span id="config-room-id" class="config-value">—</span>
+                    </div>
+                    <div class="config-row">
+                        <span class="config-label">Room Name</span>
+                        <span id="config-room-name" class="config-value">—</span>
                     </div>
                     <div class="config-row">
                         <span class="config-label">Shairport IP</span>

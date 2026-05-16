@@ -289,8 +289,8 @@ def _kill_orphaned_host_processes():
         pid_str, ppid_str, args = parts
         if ppid_str != "1" or "/var/lib/shiri/groups/" not in args:
             continue
-        if "arecord_supervisor.sh" in args:
-            _kill_pid(int(pid_str), "orphaned arecord supervisor")
+        if "arecord_supervisor.sh" in args or "audio_mixer.py" in args:
+            _kill_pid(int(pid_str), "orphaned audio mixer")
         elif "pause_bridge.sh" in args:
             _kill_pid(int(pid_str), "orphaned pause bridge")
 
@@ -732,8 +732,8 @@ def _wait_for_owntone(zone, timeout=60):
 
 def _start_arecord_supervisor(zone):
     """
-    Start the arecord supervisor on the HOST.
-    arecord captures from ALSA loopback and pipes to OwnTone's audio.pipe.
+    Start the host audio mixer.
+    It captures ALSA loopback, overlays queued TTS, and writes OwnTone's audio.pipe.
     Runs on host because ALSA loopback is a kernel device accessible from anywhere.
     shairport-sync now starts inside the netns wrapper (not here).
     """

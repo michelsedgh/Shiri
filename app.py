@@ -10,10 +10,12 @@ Run with: sudo python3 app.py
 
 import logging
 import os
+import base64
 import signal
 import sys
 import threading
 import time
+import uuid
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -173,6 +175,9 @@ def create_zone():
         interface=interface,
         auto_start=data.get("auto_start", False),
         latency_offset=latency_offset,
+        room_id=data.get("room_id"),
+        room_name=data.get("room_name"),
+        default_room=bool(data.get("default_room", False)),
     )
     return jsonify(zone.to_dict()), 201
 
@@ -218,6 +223,133 @@ def stop_zone(zone_id):
         stop_log_watch(zone_id)
         return jsonify({"ok": True})
     return jsonify({"error": "Cannot stop zone (not found or not running)"}), 400
+
+# ---------------------------------------------------------------------------
+# Room routing API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/rooms")
+def list_rooms():
+    return jsonify({"rooms": zone_manager.list_rooms()})
+
+@app.route("/api/zones/<zone_id>/room", methods=["PUT"])
+def set_zone_room(zone_id):
+    data = request.get_json() or {}
+    room_id = (data.get("room_id") or "").strip()
+    if not room_id:
+        return jsonify({"error": "room_id is required"}), 400
+    zone, error = zone_manager.set_zone_room(
+        zone_id,
+        room_id,
+        room_name=data.get("room_name"),
+        default_room=bool(data.get("default_room", False)),
+    )
+    if error:
+        return jsonify({"error": error}), 404
+    return jsonify(zone.to_dict())
+
+# ---------------------------------------------------------------------------
+# TTS routing API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/tts", methods=["POST"])
+def queue_tts_default():
+    payload, error = _extract_tts_payload()
+    if error:
+        return jsonify({"error": error}), 400
+    room_id = payload.pop("room_id", None)
+    zone, error = zone_manager.resolve_zone_for_room(room_id)
+    if error:
+        return jsonify({"error": error}), 404
+    result, error = zone_manager.enqueue_tts(zone.zone_id, **payload)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify(result), 202
+
+@app.route("/api/rooms/<room_id>/tts", methods=["POST"])
+def queue_tts_for_room(room_id):
+    payload, error = _extract_tts_payload(default_room_id=room_id)
+    if error:
+        return jsonify({"error": error}), 400
+    resolved_room_id = payload.pop("room_id", None)
+    zone, error = zone_manager.resolve_zone_for_room(resolved_room_id)
+    if error:
+        return jsonify({"error": error}), 404
+    result, error = zone_manager.enqueue_tts(zone.zone_id, **payload)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify(result), 202
+
+@app.route("/api/zones/<zone_id>/tts", methods=["POST"])
+def queue_tts_for_zone(zone_id):
+    payload, error = _extract_tts_payload()
+    if error:
+        return jsonify({"error": error}), 400
+    payload.pop("room_id", None)
+    result, error = zone_manager.enqueue_tts(zone_id, **payload)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify(result), 202
+
+
+def _extract_tts_payload(default_room_id=None):
+    """
+    Accept TTS audio from LionOS as multipart, JSON base64, or raw audio/wav.
+    LionOS owns synthesis; Shiri only queues the WAV for the per-zone mixer.
+    """
+    data = {}
+    audio_bytes = None
+    audio_format = None
+
+    if request.files:
+        data.update(request.form.to_dict())
+        upload = request.files.get("audio") or next(iter(request.files.values()))
+        audio_bytes = upload.read()
+        filename = upload.filename or ""
+        if "." in filename:
+            audio_format = filename.rsplit(".", 1)[-1]
+    elif request.is_json:
+        data.update(request.get_json() or {})
+        encoded = data.get("audio_base64")
+        if encoded:
+            if "," in encoded and encoded.strip().startswith("data:"):
+                encoded = encoded.split(",", 1)[1]
+            try:
+                audio_bytes = base64.b64decode(encoded)
+            except (ValueError, TypeError) as exc:
+                return None, f"Invalid audio_base64: {exc}"
+    else:
+        data.update(request.args.to_dict())
+        audio_bytes = request.get_data()
+
+    if not audio_bytes:
+        return None, "Provide WAV audio as multipart field 'audio', JSON audio_base64, or raw audio/wav body"
+    if len(audio_bytes) > 25 * 1024 * 1024:
+        return None, "TTS audio payload is too large"
+
+    audio_format = (
+        data.get("format")
+        or data.get("audio_format")
+        or audio_format
+        or _format_from_mimetype(request.mimetype)
+        or "wav"
+    )
+    return {
+        "audio_bytes": audio_bytes,
+        "request_id": data.get("request_id") or uuid.uuid4().hex,
+        "audio_format": audio_format,
+        "duck_gain": data.get("duck_gain"),
+        "tts_gain": data.get("tts_gain") or data.get("gain"),
+        "volume_pct": data.get("volume_pct"),
+        "text": data.get("text"),
+        "room_id": data.get("room_id") or default_room_id,
+    }, None
+
+
+def _format_from_mimetype(mimetype):
+    if mimetype in {"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"}:
+        return "wav"
+    return None
 
 # ---------------------------------------------------------------------------
 # Speaker / Output API

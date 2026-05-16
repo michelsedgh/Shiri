@@ -246,7 +246,8 @@ const App = (() => {
         card.className = `zone-card ${zone.status}`;
         
         document.getElementById(`name-${zone.zone_id}`).textContent = zone.config?.name || zone.zone_id;
-        document.getElementById(`iface-${zone.zone_id}`).textContent = '⌘ ' + (zone.config?.interface || '—');
+        const roomLabel = zone.room_id || zone.config?.room_id || 'room';
+        document.getElementById(`iface-${zone.zone_id}`).textContent = '⌘ ' + (zone.config?.interface || '—') + ' · ' + roomLabel;
 
         const badge = document.getElementById(`badge-${zone.zone_id}`);
         badge.className = `status-badge ${zone.status}`;
@@ -344,6 +345,9 @@ const App = (() => {
         const dialogTitle = document.getElementById('zone-dialog-title');
         const saveBtn = document.getElementById('btn-save-zone');
         const nameInput = document.getElementById('zone-name');
+        const roomIdInput = document.getElementById('zone-room-id');
+        const roomNameInput = document.getElementById('zone-room-name');
+        const defaultRoomInput = document.getElementById('zone-default-room');
         const autoStartInput = document.getElementById('zone-autostart');
         const latencySlider = document.getElementById('zone-latency');
         const latencyVal = document.getElementById('zone-latency-val');
@@ -360,6 +364,9 @@ const App = (() => {
             dialogTitle.textContent = 'Edit Zone';
             saveBtn.textContent = 'Save Changes';
             nameInput.value = zone.config.name || '';
+            roomIdInput.value = zone.room_id || zone.config.room_id || '';
+            roomNameInput.value = zone.room_name || zone.config.room_name || zone.config.name || '';
+            defaultRoomInput.checked = !!zone.config.default_room;
             autoStartInput.checked = !!zone.config.auto_start;
             // Load latency offset (default -2.3 if not set)
             const latency = zone.latency_offset !== undefined ? zone.latency_offset : (zone.config.latency_offset || -2.3);
@@ -369,6 +376,9 @@ const App = (() => {
             dialogTitle.textContent = 'Create New Zone';
             saveBtn.textContent = 'Create Zone';
             nameInput.value = '';
+            roomIdInput.value = '';
+            roomNameInput.value = '';
+            defaultRoomInput.checked = Object.keys(zones).length === 0;
             autoStartInput.checked = false;
             // Default latency for new zones
             latencySlider.value = -2.3;
@@ -413,6 +423,9 @@ const App = (() => {
 
     async function saveZone() {
         const name = document.getElementById('zone-name').value.trim();
+        const roomId = document.getElementById('zone-room-id').value.trim();
+        const roomName = document.getElementById('zone-room-name').value.trim();
+        const defaultRoom = document.getElementById('zone-default-room').checked;
         const iface = document.getElementById('zone-interface').value;
         const autoStart = document.getElementById('zone-autostart').checked;
         const latencyOffset = parseFloat(document.getElementById('zone-latency').value);
@@ -426,7 +439,15 @@ const App = (() => {
             return;
         }
 
-        const payload = { name, interface: iface, auto_start: autoStart, latency_offset: latencyOffset };
+        const payload = {
+            name,
+            interface: iface,
+            auto_start: autoStart,
+            latency_offset: latencyOffset,
+            room_id: roomId || name,
+            room_name: roomName || name,
+            default_room: defaultRoom,
+        };
 
         if (editingZoneId) {
             const result = await api(`/zones/${editingZoneId}`, 'PUT', payload);
@@ -506,6 +527,8 @@ const App = (() => {
 
         // Config tab
         document.getElementById('config-zone-id').textContent = zone.zone_id;
+        document.getElementById('config-room-id').textContent = zone.room_id || zone.config?.room_id || '—';
+        document.getElementById('config-room-name').textContent = zone.room_name || zone.config?.room_name || '—';
         document.getElementById('config-shairport-ip').textContent = zone.shairport_ip || '—';
         document.getElementById('config-owntone-ip').textContent = zone.owntone_ip || '—';
         document.getElementById('config-netns').textContent = zone.netns_name || '—';

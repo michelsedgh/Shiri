@@ -24,6 +24,7 @@ _LOOPBACK_ALLOC_LOCK = threading.Lock()
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_DIR = os.path.join(_THIS_DIR, "templates")
 SCRIPT_DIR = os.path.join(_THIS_DIR, "scripts")
+MIXER_SCRIPT = os.path.join(_THIS_DIR, "audio_mixer.py")
 
 # Default latency offset for timeline/lyrics sync
 # Negative = audio delivered EARLIER to compensate for pipeline buffer delay
@@ -127,12 +128,12 @@ def setup_directories(zone):
     Creates dirs, clears stale state, creates FIFOs.
     """
     grp_dir = zone.grp_dir
-    for subdir in ["pipes", "config", "logs", "state"]:
+    for subdir in ["pipes", "config", "logs", "state", "tts_queue"]:
         os.makedirs(os.path.join(grp_dir, subdir), exist_ok=True)
         os.chmod(os.path.join(grp_dir, subdir), 0o755)
 
-    # Clear stale state and logs
-    for subdir in ["state", "logs"]:
+    # Clear stale state, logs, and queued TTS from the last daemon run.
+    for subdir in ["state", "logs", "tts_queue"]:
         for f in os.listdir(os.path.join(grp_dir, subdir)):
             try:
                 os.remove(os.path.join(grp_dir, subdir, f))
@@ -314,17 +315,20 @@ def generate_owntone_config(zone):
 def generate_arecord_supervisor(zone):
     """
     Generate the arecord supervisor script for the HOST.
-    arecord captures from ALSA loopback and pipes to OwnTone's audio.pipe.
+    The supervisor starts the Shiri mixer, which captures ALSA loopback audio
+    and overlays queued TTS before writing OwnTone's audio.pipe.
     """
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
     capture_dev = f"hw:Loopback,1,{subdev}"
+    os.chmod(MIXER_SCRIPT, 0o755)
 
     script_path = os.path.join(grp_dir, "config", "arecord_supervisor.sh")
     template = _read_template("arecord_supervisor.sh")
     content = (template
                .replace("%%CAPTURE_DEV%%", capture_dev)
-               .replace("%%GRP_DIR%%", grp_dir))
+               .replace("%%GRP_DIR%%", grp_dir)
+               .replace("%%MIXER_SCRIPT%%", MIXER_SCRIPT))
     _write_file(script_path, content, executable=True)
 
     log.info("Generated arecord supervisor script for %s", zone.zone_id)

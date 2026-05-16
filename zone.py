@@ -10,10 +10,13 @@ Start/stop implementation details are delegated to zone_lifecycle.py.
 
 import logging
 import os
+import json
+import re
 import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from config import (
     BASE_DIR,
@@ -29,6 +32,31 @@ from zone_lifecycle import (
 )
 
 log = logging.getLogger("shiri.zone")
+
+
+def _slugify_room_id(value):
+    """Return a stable LionOS-style room id."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "default"
+
+
+def _safe_request_id(value):
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
+    return text or uuid.uuid4().hex
+
+
+def _gain_from_volume(volume_pct):
+    if volume_pct is None:
+        return None
+    try:
+        pct = float(volume_pct)
+    except (TypeError, ValueError):
+        return None
+    # LionOS defaults to 60%; map that to unity gain and cap the top end.
+    return min(max(pct / 60.0, 0.05), 1.6)
 
 
 class Zone:
@@ -86,6 +114,14 @@ class Zone:
         return self.config.get("name", f"Shiri {self.zone_id}")
 
     @property
+    def room_id(self):
+        return self.config.get("room_id") or _slugify_room_id(self.display_name)
+
+    @property
+    def room_name(self):
+        return self.config.get("room_name") or self.display_name
+
+    @property
     def interface(self):
         return self.config.get("interface", "")
 
@@ -107,6 +143,8 @@ class Zone:
             "netns_name": self.netns_name,
             "allocated_subdevice": self.allocated_subdevice,
             "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
+            "room_id": self.room_id,
+            "room_name": self.room_name,
         }
 
 
@@ -224,7 +262,8 @@ class ZoneManager:
     # Zone CRUD
     # -------------------------------------------------------------------------
 
-    def create_zone(self, name, interface, auto_start=False, latency_offset=None):
+    def create_zone(self, name, interface, auto_start=False, latency_offset=None,
+                    room_id=None, room_name=None, default_room=False):
         """Create a new zone (does not start it)."""
         zone_id = f"zone_{uuid.uuid4().hex[:8]}"
         config = {
@@ -232,7 +271,11 @@ class ZoneManager:
             "interface": interface,
             "auto_start": auto_start,
             "speakers": [],
+            "room_id": _slugify_room_id(room_id or name),
+            "room_name": room_name or name,
         }
+        if default_room:
+            config["default_room"] = True
         if latency_offset is not None:
             config["latency_offset"] = latency_offset
         zone = Zone(zone_id, config, on_status_change=self._emit_zone_status)
@@ -286,7 +329,12 @@ class ZoneManager:
             if was_running and not restart_if_running:
                 return None, False
             
-            zone.config.update(updates)
+            sanitized = dict(updates)
+            if "room_id" in sanitized:
+                sanitized["room_id"] = _slugify_room_id(sanitized.get("room_id"))
+            if "room_name" in sanitized and not sanitized.get("room_name"):
+                sanitized["room_name"] = sanitized.get("name") or zone.display_name
+            zone.config.update(sanitized)
         
         self.config_store.save_zone(zone_id, zone.config)
         self._emit_zone_status(zone)
@@ -324,6 +372,126 @@ class ZoneManager:
             with self._lock:
                 self.zones[zone_id] = zone
             log.info("Loaded saved zone: %s (%s)", zone_id, config.get("name"))
+
+    # -------------------------------------------------------------------------
+    # Room routing
+    # -------------------------------------------------------------------------
+
+    def list_rooms(self):
+        """Return room-to-zone mappings for LionOS."""
+        rooms = []
+        for zone in self.list_zones():
+            rooms.append({
+                "room_id": zone.room_id,
+                "room_name": zone.room_name,
+                "zone_id": zone.zone_id,
+                "zone_name": zone.display_name,
+                "status": zone.status,
+                "default_room": bool(zone.config.get("default_room", False)),
+                "speakers": zone.config.get("speaker_names", []),
+            })
+        return rooms
+
+    def set_zone_room(self, zone_id, room_id, room_name=None, default_room=False):
+        """Bind a Shiri zone to a LionOS room id."""
+        zone = self.get_zone(zone_id)
+        if not zone:
+            return None, "Zone not found"
+
+        zone.config["room_id"] = _slugify_room_id(room_id)
+        zone.config["room_name"] = room_name or zone.config.get("room_name") or zone.display_name
+        zone.config["default_room"] = bool(default_room)
+        self.config_store.save_zone(zone_id, zone.config)
+        self._emit_zone_status(zone)
+        return zone, None
+
+    def resolve_zone_for_room(self, room_id=None, require_running=True):
+        """
+        Find the zone that should speak for a room. With one zone, "default"
+        resolves to that zone so early LionOS integration stays simple.
+        """
+        zones = self.list_zones()
+        candidates = []
+        normalized = _slugify_room_id(room_id) if room_id else None
+
+        if normalized and normalized != "default":
+            for zone in zones:
+                aliases = {
+                    zone.zone_id,
+                    zone.room_id,
+                    _slugify_room_id(zone.display_name),
+                    _slugify_room_id(zone.room_name),
+                }
+                if normalized in aliases:
+                    candidates.append(zone)
+        else:
+            candidates = [z for z in zones if z.config.get("default_room")]
+            if not candidates:
+                candidates = zones
+
+        if require_running:
+            running = [z for z in candidates if z.status == Zone.STATUS_RUNNING]
+            if running:
+                return running[0], None
+            if candidates:
+                return None, "Matched room, but its Shiri zone is not running"
+            return None, "No Shiri zone found for room"
+
+        if candidates:
+            return candidates[0], None
+        return None, "No Shiri zone found for room"
+
+    # -------------------------------------------------------------------------
+    # TTS queue
+    # -------------------------------------------------------------------------
+
+    def enqueue_tts(self, zone_id, audio_bytes, *, request_id=None, audio_format="wav",
+                    duck_gain=None, tts_gain=None, volume_pct=None, text=None):
+        """Queue a TTS WAV for the zone mixer. Returns (payload, error)."""
+        zone = self.get_zone(zone_id)
+        if not zone:
+            return None, "Zone not found"
+        if zone.status != Zone.STATUS_RUNNING:
+            return None, "Zone must be running before TTS can be queued"
+        if not audio_bytes:
+            return None, "No audio payload provided"
+
+        fmt = (audio_format or "wav").lower().strip(".")
+        if fmt not in {"wav", "wave"}:
+            return None, "Only WAV TTS payloads are currently supported"
+
+        queue_dir = Path(zone.grp_dir) / "tts_queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = _safe_request_id(request_id)
+        prefix = f"{int(time.time() * 1000)}_{safe_id}"
+        audio_path = queue_dir / f"{prefix}.wav"
+        meta_path = queue_dir / f"{prefix}.json"
+        tmp_meta_path = queue_dir / f"{prefix}.json.tmp"
+
+        audio_path.write_bytes(audio_bytes)
+        meta = {
+            "request_id": safe_id,
+            "audio_path": str(audio_path),
+            "format": "wav",
+            "room_id": zone.room_id,
+            "zone_id": zone.zone_id,
+            "text": text,
+            "duck_gain": duck_gain,
+            "tts_gain": tts_gain if tts_gain is not None else _gain_from_volume(volume_pct),
+            "queued_at": time.time(),
+        }
+        tmp_meta_path.write_text(json.dumps(meta, indent=2))
+        os.replace(tmp_meta_path, meta_path)
+
+        log.info("Queued TTS %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
+        return {
+            "ok": True,
+            "request_id": safe_id,
+            "room_id": zone.room_id,
+            "room_name": zone.room_name,
+            "zone_id": zone.zone_id,
+            "queued_bytes": len(audio_bytes),
+        }, None
 
     # -------------------------------------------------------------------------
     # Speaker management (consolidated from routes + startup restore)
