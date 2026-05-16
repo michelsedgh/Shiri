@@ -189,6 +189,9 @@ function renderRoomRow(room) {
     const ttsLevel = clampNumber(roomSettings.tts_level_pct, 5, 200, 100);
     const reduction = clampNumber(roomSettings.reduction_pct, 0, 95, 72);
     const activity = activityText(room);
+    const roomTtsDisabled = !binding || mode === 'speaker';
+    const ttsLabel = mode === 'speaker' ? 'Room fallback' : 'Room TTS';
+    const reductionLabel = mode === 'speaker' ? 'Fallback duck' : 'Reduction';
 
     return `
         <article class="room-row ${binding ? '' : 'unbound'}" data-room-id="${escapeHtml(room.room_id)}">
@@ -221,16 +224,16 @@ function renderRoomRow(room) {
                         </div>
                     </div>
                     <div class="control">
-                        <label for="tts-${escapeHtml(room.room_id)}">TTS</label>
+                        <label for="tts-${escapeHtml(room.room_id)}">${ttsLabel}</label>
                         <div class="range-line">
-                            <input id="tts-${escapeHtml(room.room_id)}" type="range" min="5" max="200" value="${ttsLevel}" data-action="room-tts-level" data-room-id="${escapeHtml(room.room_id)}" ${binding ? '' : 'disabled'}>
+                            <input id="tts-${escapeHtml(room.room_id)}" type="range" min="5" max="200" value="${ttsLevel}" data-action="room-tts-level" data-room-id="${escapeHtml(room.room_id)}" ${roomTtsDisabled ? 'disabled' : ''}>
                             <output>${ttsLevel}%</output>
                         </div>
                     </div>
                     <div class="control">
-                        <label for="duck-${escapeHtml(room.room_id)}">Reduction</label>
+                        <label for="duck-${escapeHtml(room.room_id)}">${reductionLabel}</label>
                         <div class="range-line">
-                            <input id="duck-${escapeHtml(room.room_id)}" type="range" min="0" max="95" value="${reduction}" data-action="room-reduction" data-room-id="${escapeHtml(room.room_id)}" ${binding ? '' : 'disabled'}>
+                            <input id="duck-${escapeHtml(room.room_id)}" type="range" min="0" max="95" value="${reduction}" data-action="room-reduction" data-room-id="${escapeHtml(room.room_id)}" ${roomTtsDisabled ? 'disabled' : ''}>
                             <output>${reduction}%</output>
                         </div>
                     </div>
@@ -257,7 +260,10 @@ function renderRoomRow(room) {
 
 function onRangeInput(event) {
     if (event.target.type !== 'range') return;
-    const output = event.target.closest('.range-line')?.querySelector('output');
+    const output = (
+        event.target.closest('.range-line')?.querySelector('output')
+        || event.target.closest('.speaker-controls')?.querySelector('output')
+    );
     if (output) output.textContent = `${event.target.value}%`;
 }
 
@@ -308,6 +314,7 @@ async function saveRoomPolicyFromRow(roomId) {
     const row = els.roomList.querySelector(`[data-room-id="${cssEscape(roomId)}"]`);
     if (!room || !row) return;
     const policy = policyFor(room);
+    if (policy.mode === 'speaker') return;
     policy.room = {
         tts_level_pct: clampNumber(row.querySelector('[data-action="room-tts-level"]')?.value, 5, 200, 100),
         reduction_pct: clampNumber(row.querySelector('[data-action="room-reduction"]')?.value, 0, 95, 72),
@@ -420,35 +427,98 @@ function renderDrawerSpeakers(room) {
         els.drawerSpeakers.innerHTML = '<div class="empty-state">No speakers discovered or saved</div>';
         return;
     }
+    const enabledSpeakers = speakers.filter((speaker) => speaker.selected);
+    const modeSummary = policy.mode === 'speaker'
+        ? `${enabledSpeakers.length} speaker${enabledSpeakers.length === 1 ? '' : 's'} using overrides`
+        : 'Main row room controls active';
+    const ttsBlock = policy.mode === 'speaker'
+        ? renderSpeakerTtsBlock(room, binding, policy, enabledSpeakers)
+        : '';
     els.drawerSpeakers.innerHTML = `
         <div class="drawer-stack">
-            ${speakers.map((speaker) => renderSpeakerRow(binding, policy, speaker)).join('')}
-            <button class="primary-btn" data-action="save-speakers" data-zone-id="${escapeHtml(binding.zone_id)}">Save Speakers</button>
-            <button class="primary-btn" data-action="save-speaker-tts" data-room-id="${escapeHtml(room.room_id)}">Save Speaker TTS</button>
+            <div class="drawer-block speaker-mode-block">
+                <div>
+                    <strong>TTS scope</strong>
+                    <span>${policy.mode === 'speaker' ? 'Per speaker' : 'Per room'}</span>
+                </div>
+                <span class="mode-badge">${escapeHtml(modeSummary)}</span>
+            </div>
+            <div class="drawer-block">
+                <div class="section-title">
+                    <h3>Routing</h3>
+                    <span class="mode-badge">${enabledSpeakers.length}/${speakers.length} enabled</span>
+                </div>
+                <div class="speaker-route-list">
+                    ${speakers.map((speaker) => renderSpeakerRouteRow(binding, speaker)).join('')}
+                </div>
+                <button class="primary-btn" data-action="save-speakers" data-zone-id="${escapeHtml(binding.zone_id)}">Save Routing</button>
+            </div>
+            ${ttsBlock}
         </div>
     `;
 }
 
-function renderSpeakerRow(binding, policy, speaker) {
+function renderSpeakerRouteRow(binding, speaker) {
+    const speakerId = String(speaker.id ?? '');
+    const volume = clampNumber(speaker.volume, 0, 100, 100);
+    const selected = !!speaker.selected;
+    return `
+        <div class="speaker-row speaker-route-row" data-speaker-id="${escapeHtml(speakerId)}" data-speaker-name="${escapeHtml(speaker.name || '')}">
+            <div>
+                <strong>${escapeHtml(speaker.name || speakerId || 'Speaker')}</strong>
+                <span>${selected ? 'enabled' : 'available'} / ${escapeHtml(speakerId || 'no id')}</span>
+            </div>
+            <label class="check-field">
+                <input type="checkbox" data-field="selected" ${selected ? 'checked' : ''}>
+                <span>Route</span>
+            </label>
+            ${selected ? `
+                <div class="speaker-controls">
+                    <span>Volume</span>
+                    <input type="range" min="0" max="100" value="${volume}" data-action="speaker-volume" data-zone-id="${escapeHtml(binding.zone_id)}" data-speaker-id="${escapeHtml(speakerId)}" ${binding.status === 'running' ? '' : 'disabled'}>
+                    <output>${volume}%</output>
+                </div>
+            ` : ''}
+        </div>
+    `;
+}
+
+function renderSpeakerTtsBlock(room, binding, policy, enabledSpeakers) {
+    if (!enabledSpeakers.length) {
+        return `
+            <div class="drawer-block">
+                <div class="section-title">
+                    <h3>Per-Speaker TTS</h3>
+                    <span class="mode-badge">0 enabled</span>
+                </div>
+                <div class="empty-state">No enabled speakers in this room</div>
+            </div>
+        `;
+    }
+    return `
+        <div class="drawer-block">
+            <div class="section-title">
+                <h3>Per-Speaker TTS</h3>
+                <span class="mode-badge">${enabledSpeakers.length} enabled</span>
+            </div>
+            <div class="speaker-tts-list">
+                ${enabledSpeakers.map((speaker) => renderSpeakerTtsRow(binding, policy, speaker)).join('')}
+            </div>
+            <button class="primary-btn" data-action="save-speaker-tts" data-room-id="${escapeHtml(room.room_id)}">Save Per-Speaker TTS</button>
+        </div>
+    `;
+}
+
+function renderSpeakerTtsRow(binding, policy, speaker) {
     const speakerId = String(speaker.id ?? '');
     const override = policy.speakers?.[speakerId] || policy.room || {};
-    const volume = clampNumber(speaker.volume, 0, 100, 100);
     const tts = clampNumber(override.tts_level_pct, 5, 200, 100);
     const reduction = clampNumber(override.reduction_pct, 0, 95, 72);
     return `
-        <div class="speaker-row" data-speaker-id="${escapeHtml(speakerId)}" data-speaker-name="${escapeHtml(speaker.name || '')}">
+        <div class="speaker-row speaker-tts-row" data-speaker-id="${escapeHtml(speakerId)}" data-speaker-name="${escapeHtml(speaker.name || '')}">
             <div>
                 <strong>${escapeHtml(speaker.name || speakerId || 'Speaker')}</strong>
-                <span>${escapeHtml(speakerId || 'no id')}</span>
-            </div>
-            <label class="check-field">
-                <input type="checkbox" data-field="selected" ${speaker.selected ? 'checked' : ''}>
-                <span>Enabled</span>
-            </label>
-            <div class="speaker-controls">
-                <span>Volume</span>
-                <input type="range" min="0" max="100" value="${volume}" data-action="speaker-volume" data-zone-id="${escapeHtml(binding.zone_id)}" data-speaker-id="${escapeHtml(speakerId)}" ${binding.status === 'running' ? '' : 'disabled'}>
-                <output>${volume}%</output>
+                <span>enabled / ${escapeHtml(speakerId || 'no id')}</span>
             </div>
             <div class="speaker-tts-grid">
                 <div class="control">
@@ -565,7 +635,7 @@ async function saveBinding(roomId) {
 }
 
 async function saveSpeakers(zoneId) {
-    const speakerIds = [...els.drawerSpeakers.querySelectorAll('.speaker-row')]
+    const speakerIds = [...els.drawerSpeakers.querySelectorAll('.speaker-route-row')]
         .filter((row) => row.querySelector('[data-field="selected"]')?.checked)
         .map((row) => row.dataset.speakerId)
         .filter(Boolean);
@@ -578,7 +648,7 @@ async function saveSpeakerTts(roomId) {
     const room = findRoom(roomId);
     const policy = policyFor(room);
     const speakers = {};
-    els.drawerSpeakers.querySelectorAll('.speaker-row').forEach((row) => {
+    els.drawerSpeakers.querySelectorAll('.speaker-tts-row').forEach((row) => {
         if (!row.dataset.speakerId) return;
         speakers[row.dataset.speakerId] = {
             name: row.dataset.speakerName || undefined,

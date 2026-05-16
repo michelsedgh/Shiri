@@ -633,6 +633,21 @@ input[type="range"] {
     grid-template-columns: 76px 1fr 46px;
     gap: 10px;
     align-items: center;
+    grid-column: 1 / -1;
+}
+
+.speaker-route-list,
+.speaker-tts-list {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.speaker-mode-block {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
 }
 
 .speaker-tts-grid {
