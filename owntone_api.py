@@ -64,10 +64,11 @@ class OwnToneAPI:
       ip netns exec <ns> curl -s http://<ip>:3689/api/...
     """
 
-    def __init__(self, owntone_ip, netns_name):
+    def __init__(self, owntone_ip, netns_name, port=3689):
         self.owntone_ip = owntone_ip
         self.netns_name = netns_name
-        self.base_url = f"http://{owntone_ip}:3689"
+        self.port = int(port)
+        self.base_url = f"http://{owntone_ip}:{self.port}"
 
     def _api(self, path, method="GET", data=None):
         """Call OwnTone API endpoint."""

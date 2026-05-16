@@ -20,6 +20,7 @@ from owntone_api import OwnToneAPI
 from config import (
     BASE_DIR,
     SCRIPT_DIR,
+    OWNTONE_PORT_BASE,
     setup_directories,
     allocate_loopback_subdevice,
     release_loopback_subdevice,
@@ -124,6 +125,12 @@ def _kill_pid_if_command(pid, needle, label):
         _kill_pid(pid, label)
 
 
+def _terminate_pid_if_command(pid, needle, label, timeout=2):
+    cmdline = _pid_command(pid)
+    if cmdline and needle in cmdline:
+        _terminate_pid(pid, label, timeout=timeout)
+
+
 def _state_path(grp_dir, filename):
     return os.path.join(grp_dir, "state", filename)
 
@@ -207,25 +214,47 @@ def _release_dhcp_lease(grp_dir, ns, iface):
     if not released:
         _netns_exec(ns, ["dhclient", "-r", iface])
 
-    _netns_exec(ns, ["pkill", "-TERM", "dhclient"])
+    _terminate_namespace_processes(ns, ["dhclient"])
     log.info("Released DHCP lease on %s in %s", iface, ns)
 
 
-def _terminate_namespace_services(ns):
+def _namespace_pids(ns):
     if not ns or not _netns_exists(ns):
-        return
-    for name in ["shairport-sync", "nqptp", "avahi-daemon", "owntone", "dbus-daemon"]:
-        _netns_exec(ns, ["pkill", "-TERM", name])
+        return []
+    result = _run(["ip", "netns", "pids", ns])
+    pids = []
+    for pid_str in (result.stdout or "").split():
+        try:
+            pids.append(int(pid_str))
+        except ValueError:
+            pass
+    return pids
+
+
+def _terminate_namespace_processes(ns, names, timeout=2):
+    wanted = tuple(names)
+    for pid in _namespace_pids(ns):
+        cmdline = _pid_command(pid)
+        if any(name in cmdline for name in wanted):
+            _terminate_pid(pid, f"netns {ns} process", timeout=timeout)
+
+
+def _terminate_namespace_services(ns):
+    _terminate_namespace_processes(ns, [
+        "shairport-sync",
+        "nqptp",
+        "avahi-daemon",
+        "owntone",
+        "dbus-daemon",
+        "dhclient",
+    ])
 
 
 def _kill_namespace_pids(ns):
-    if not ns or not _netns_exists(ns):
-        return
-    result = _run(["ip", "netns", "pids", ns])
-    for pid_str in (result.stdout or "").split():
+    for pid in _namespace_pids(ns):
         try:
-            os.kill(int(pid_str), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, ValueError):
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
             pass
 
 
@@ -259,6 +288,8 @@ def _delete_host_link(iface):
 def _clear_runtime_state(grp_dir):
     for filename in [
         "arecord.pid",
+        "avahi.pid",
+        "dbus.pid",
         "dhclient.leases",
         "dhclient.pid",
         "dhclient_lease_path.txt",
@@ -268,6 +299,7 @@ def _clear_runtime_state(grp_dir):
         "nqptp.pid",
         "owntone.pid",
         "owntone_ip.txt",
+        "owntone_port.txt",
         "owntone_netns.txt",
         "shairport.pid",
         "shairport_ip.txt",
@@ -293,6 +325,10 @@ def _kill_orphaned_host_processes():
             _kill_pid(int(pid_str), "orphaned audio mixer")
         elif "pause_bridge.sh" in args:
             _kill_pid(int(pid_str), "orphaned pause bridge")
+        elif "shairport-sync" in args:
+            _kill_pid(int(pid_str), "orphaned shairport-sync")
+        elif "owntone" in args:
+            _kill_pid(int(pid_str), "orphaned owntone")
 
 
 def _zone_id_from_netns(ns):
@@ -376,7 +412,7 @@ def start_zone_thread(zone, cleanup_fn):
     1. Allocate loopback subdevice
     2. Setup directories & FIFOs
     3. Generate configs
-    4. Start zone in netns (nqptp + shairport-sync + OwnTone)
+    4. Start Shairport + OwnTone on host-network ports
     5. Wait for OwnTone, rescan library, verify pipe
     6. Start arecord supervisor on host
     7. Start pause bridge on host
@@ -440,8 +476,15 @@ def _generate_configs(zone):
 
 
 def _launch_netns(zone):
-    """Step 4: Create netns + macvlan and start OwnTone in it."""
-    _start_owntone_in_netns(zone)
+    """Step 4: Start Shairport + OwnTone.
+
+    Host mode is the default because this VM/router path drops unicast traffic
+    for macvlan child MAC addresses even while mDNS still arrives.
+    """
+    if zone.config.get("network_mode") == "macvlan":
+        _start_owntone_in_netns(zone)
+    else:
+        _start_zone_on_host(zone)
 
 
 def _wait_and_verify(zone):
@@ -474,6 +517,11 @@ def _read_shairport_pid(zone):
     """Read shairport-sync PID from the file the netns wrapper wrote."""
     # shairport-sync now runs inside the netns wrapper (with per-zone nqptp)
     # Read its PID from the file the wrapper wrote
+    if zone.shairport_pid:
+        zone.shairport_ip = zone.shairport_ip or _host_ipv4_for_interface(zone.interface)
+        time.sleep(2)
+        return
+
     shairport_pid_file = os.path.join(zone.grp_dir, "state", "shairport.pid")
     for _ in range(10):
         if os.path.exists(shairport_pid_file):
@@ -595,18 +643,39 @@ def cleanup_zone(zone):
     _kill_pid(zone.metadata_relay_pid, f"metadata relay ({zone.zone_id})")
     _kill_pid(zone.pause_bridge_pid, f"pause_bridge ({zone.zone_id})")
 
-    zone.shairport_pid = None
     zone.arecord_supervisor_pid = None
     zone.metadata_relay_pid = None
     zone.pause_bridge_pid = None
 
+    # Host-network mode has direct child PIDs instead of a zone wrapper.
+    _terminate_pid(
+        zone.shairport_pid or _read_pid(_state_path(grp_dir, "shairport.pid")),
+        f"shairport-sync ({zone.zone_id})",
+        timeout=3,
+    )
+    zone.shairport_pid = None
+
     # Let the wrapper run its trap first; it owns the private mount namespace
     # where dhclient keeps its lease/pid files.
-    _terminate_pid(zone.owntone_pid, f"zone wrapper ({zone.zone_id})", timeout=5)
+    _terminate_pid(
+        zone.owntone_pid or _read_pid(_state_path(grp_dir, "owntone.pid")),
+        f"owntone/wrapper ({zone.zone_id})",
+        timeout=5,
+    )
 
     # 2-3. Release the DHCP lease and stop services while the namespace exists.
     if ns and _netns_exists(ns):
         _release_dhcp_lease(grp_dir, ns, macvlan_if)
+        _terminate_pid_if_command(
+            _read_pid(_state_path(grp_dir, "avahi.pid")),
+            "avahi-daemon",
+            f"avahi ({zone.zone_id})",
+        )
+        _terminate_pid_if_command(
+            _read_pid(_state_path(grp_dir, "dbus.pid")),
+            "dbus-daemon",
+            f"dbus ({zone.zone_id})",
+        )
         _terminate_namespace_services(ns)
         time.sleep(2)
 
@@ -630,6 +699,8 @@ def cleanup_zone(zone):
     zone.macvlan_if = None
     zone.shairport_ip = None
     zone.owntone_ip = None
+    zone.shairport_port = None
+    zone.owntone_port = None
     zone.owntone_api = None
     zone.owntone_pid = None
     zone.nqptp_pid = None
@@ -640,6 +711,67 @@ def cleanup_zone(zone):
 # ---------------------------------------------------------------------------
 # Internal helpers — netns + process launching
 # ---------------------------------------------------------------------------
+
+def _host_ipv4_for_interface(iface):
+    if not iface:
+        return "127.0.0.1"
+    result = _run(["ip", "-4", "-o", "addr", "show", "dev", iface])
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if "inet" in parts:
+            cidr = parts[parts.index("inet") + 1]
+            return cidr.split("/", 1)[0]
+    return "127.0.0.1"
+
+
+def _start_zone_on_host(zone):
+    """Start Shairport and OwnTone on host ports, avoiding macvlan extra MACs."""
+    grp_dir = zone.grp_dir
+    subdev = zone.allocated_subdevice
+    owntone_port = zone.owntone_port or (OWNTONE_PORT_BASE + subdev * 10)
+    shairport_ip = _host_ipv4_for_interface(zone.interface)
+
+    zone.netns_name = ""
+    zone.macvlan_if = ""
+    zone.owntone_ip = "127.0.0.1"
+    zone.shairport_ip = shairport_ip
+    zone.owntone_port = owntone_port
+
+    with open(os.path.join(grp_dir, "state", "owntone_ip.txt"), "w") as f:
+        f.write(zone.owntone_ip)
+    with open(os.path.join(grp_dir, "state", "owntone_port.txt"), "w") as f:
+        f.write(str(owntone_port))
+    with open(os.path.join(grp_dir, "state", "shairport_ip.txt"), "w") as f:
+        f.write(shairport_ip)
+
+    shairport_log = open(os.path.join(grp_dir, "logs", "shairport.log"), "w")
+    shairport_proc = subprocess.Popen(
+        ["setsid", "chrt", "-f", "50", "shairport-sync",
+         "-c", os.path.join(grp_dir, "config", "shairport-sync.conf"),
+         "--statistics"],
+        stdout=shairport_log,
+        stderr=subprocess.STDOUT,
+    )
+    zone.shairport_pid = shairport_proc.pid
+    with open(os.path.join(grp_dir, "state", "shairport.pid"), "w") as f:
+        f.write(str(shairport_proc.pid))
+    log.info("Started shairport-sync for %s on host (pid %d)",
+             zone.zone_id, shairport_proc.pid)
+
+    owntone_log = open(os.path.join(grp_dir, "logs", "owntone_wrapper.log"), "w")
+    owntone_proc = subprocess.Popen(
+        ["chrt", "-f", "50", "owntone", "-f",
+         "-c", os.path.join(grp_dir, "config", "owntone.conf"),
+         "--mdns-no-rsp", "--mdns-no-daap", "--mdns-no-web", "--mdns-no-cname"],
+        stdout=owntone_log,
+        stderr=subprocess.STDOUT,
+    )
+    zone.owntone_pid = owntone_proc.pid
+    with open(os.path.join(grp_dir, "state", "owntone.pid"), "w") as f:
+        f.write(str(owntone_proc.pid))
+    log.info("Started OwnTone for %s on host port %d (pid %d)",
+             zone.zone_id, owntone_port, owntone_proc.pid)
+
 
 def _start_owntone_in_netns(zone):
     """
@@ -712,10 +844,12 @@ def _wait_for_owntone(zone, timeout=60):
         return False
 
     # Create API client
-    zone.owntone_api = OwnToneAPI(zone.owntone_ip, zone.netns_name)
+    port = zone.owntone_port or int(_read_text(_state_path(zone.grp_dir, "owntone_port.txt")) or 3689)
+    zone.owntone_port = port
+    zone.owntone_api = OwnToneAPI(zone.owntone_ip, zone.netns_name, port=port)
 
     # Wait for API to respond
-    log.info("Waiting for OwnTone API at %s:3689...", zone.owntone_ip)
+    log.info("Waiting for OwnTone API at %s:%d...", zone.owntone_ip, port)
     for i in range(timeout):
         if zone._stop_event.is_set():
             return False

@@ -13,9 +13,8 @@ echo "[$TIMESTAMP] ========== SYNC RESET TRIGGERED ==========" >> "$LOG"
 
 # Step 1: STOP OwnTone playback to flush its internal buffers
 # This is CRITICAL - without this, OwnTone accumulates delay each reconnect
-# NOTE: shairport-sync now runs IN the netns, so curl reaches OwnTone directly
 echo "[$TIMESTAMP] Stopping OwnTone playback (flush buffers)" >> "$LOG"
-curl -s -X PUT "http://127.0.0.1:3689/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
+curl -s -X PUT "http://127.0.0.1:%%OWNTONE_PORT%%/api/player/stop" --connect-timeout 1 >> "$LOG" 2>&1 || true
 echo "[$TIMESTAMP] OwnTone stopped" >> "$LOG"
 
 # Step 2: Kill arecord to stop writing to pipe

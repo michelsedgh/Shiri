@@ -35,6 +35,7 @@ AIRPLAY_VOL="$2"
 
 LOG="$GRP_DIR/logs/volume_bridge.log"
 OWNTONE_IP_FILE="$GRP_DIR/state/owntone_ip.txt"
+OWNTONE_PORT_FILE="$GRP_DIR/state/owntone_port.txt"
 OWNTONE_NETNS_FILE="$GRP_DIR/state/owntone_netns.txt"
 LAST_VOL_FILE="$GRP_DIR/state/master_volume_last.txt"
 
@@ -48,6 +49,10 @@ if [[ ! -f "$OWNTONE_IP_FILE" ]]; then
   exit 1
 fi
 OWNTONE_IP=$(cat "$OWNTONE_IP_FILE")
+OWNTONE_PORT=3689
+if [[ -f "$OWNTONE_PORT_FILE" ]]; then
+  OWNTONE_PORT=$(cat "$OWNTONE_PORT_FILE")
+fi
 
 # Read netns name (for curl exec)
 OWNTONE_NETNS=""
@@ -105,7 +110,7 @@ run_curl() {
 log "Setting OwnTone MASTER volume to $OWNTONE_VOL (preserves speaker ratio)"
 
 RESULT=$(run_curl -s --connect-timeout 2 -X PUT \
-  "http://$OWNTONE_IP:3689/api/player/volume?volume=$OWNTONE_VOL" 2>&1)
+  "http://$OWNTONE_IP:$OWNTONE_PORT/api/player/volume?volume=$OWNTONE_VOL" 2>&1)
 
 if [[ $? -eq 0 ]]; then
   # Persist last known master volume for pause_bridge

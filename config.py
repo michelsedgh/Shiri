@@ -19,6 +19,9 @@ BASE_DIR = "/var/lib/shiri"
 LOOPBACK_LOCK_DIR = os.path.join(BASE_DIR, "loopback")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 _LOOPBACK_ALLOC_LOCK = threading.Lock()
+OWNTONE_PORT_BASE = 3869
+OWNTONE_WEBSOCKET_PORT_BASE = 3868
+OWNTONE_MPD_PORT_BASE = 6700
 
 # Resolve paths relative to this file's location
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -244,6 +247,10 @@ def generate_shairport_config(zone):
     device_offset = subdev + 1
     port = 7000 + subdev
     udp_port_base = 6001 + subdev * 100
+    owntone_port = OWNTONE_PORT_BASE + subdev * 10
+
+    zone.shairport_port = port
+    zone.owntone_port = owntone_port
 
     volume_bridge_script = os.path.join(SCRIPT_DIR, "volume_bridge.sh")
     os.chmod(volume_bridge_script, 0o755)
@@ -261,7 +268,9 @@ def generate_shairport_config(zone):
     # This ensures NO accumulated buffer state between sessions
     flush_script = os.path.join(grp_dir, "config", "reset_audio_pipe.sh")
     reset_template = _read_template("reset_audio_pipe.sh")
-    reset_content = reset_template.replace("%%GRP_DIR%%", grp_dir)
+    reset_content = (reset_template
+                     .replace("%%GRP_DIR%%", grp_dir)
+                     .replace("%%OWNTONE_PORT%%", str(owntone_port)))
     _write_file(flush_script, reset_content, executable=True)
 
     # Generate shairport-sync config — SAME template as dual_zone_demo.sh
@@ -278,6 +287,7 @@ def generate_shairport_config(zone):
                .replace("%%GRP_DIR%%", grp_dir)
                .replace("%%ALSA_DEVICE%%", alsa_device)
                .replace("%%FLUSH_SCRIPT%%", flush_script))
+    content = content.replace('interface = "enp0s1";', f'interface = "{zone.interface}";')
     _write_file(conf_path, content)
 
     log.info("Generated shairport-sync config for %s at %s", zone.zone_id, conf_path)
@@ -298,6 +308,12 @@ def generate_owntone_config(zone):
     """
     grp_dir = zone.grp_dir
     conf_path = os.path.join(grp_dir, "config", "owntone.conf")
+    subdev = zone.allocated_subdevice
+    owntone_port = OWNTONE_PORT_BASE + subdev * 10
+    websocket_port = OWNTONE_WEBSOCKET_PORT_BASE + subdev * 10
+    mpd_port = OWNTONE_MPD_PORT_BASE + subdev
+
+    zone.owntone_port = owntone_port
 
     # Ensure cache dir exists
     os.makedirs(os.path.join(grp_dir, "state", "cache"), exist_ok=True)
@@ -306,7 +322,10 @@ def generate_owntone_config(zone):
     content = (template
                .replace("%%ZONE_ID%%", zone.zone_id)
                .replace("%%DISPLAY_NAME%%", zone.display_name)
-               .replace("%%GRP_DIR%%", grp_dir))
+               .replace("%%GRP_DIR%%", grp_dir)
+               .replace("%%OWNTONE_PORT%%", str(owntone_port))
+               .replace("%%OWNTONE_WEBSOCKET_PORT%%", str(websocket_port))
+               .replace("%%OWNTONE_MPD_PORT%%", str(mpd_port)))
     _write_file(conf_path, content)
 
     log.info("Generated OwnTone config for %s", zone.zone_id)

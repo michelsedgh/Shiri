@@ -11,6 +11,8 @@ DHCLIENT_PID="/run/dhclient-$GRP.pid"
 NQPTP_PID=""
 SHAIRPORT_PID=""
 OWNTONE_PID=""
+AVAHI_PID=""
+DBUS_PID=""
 
 cleanup() {
   trap - EXIT INT TERM HUP
@@ -20,7 +22,7 @@ cleanup() {
     dhclient -r -lf "$DHCLIENT_LEASE" -pf "$DHCLIENT_PID" "$MV_IF" >/dev/null 2>&1 || true
   fi
 
-  for pid in "${OWNTONE_PID:-}" "${SHAIRPORT_PID:-}" "${NQPTP_PID:-}"; do
+  for pid in "${OWNTONE_PID:-}" "${SHAIRPORT_PID:-}" "${NQPTP_PID:-}" "${AVAHI_PID:-}" "${DBUS_PID:-}"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -28,7 +30,7 @@ cleanup() {
 
   sleep 1
 
-  for pid in "${OWNTONE_PID:-}" "${SHAIRPORT_PID:-}" "${NQPTP_PID:-}"; do
+  for pid in "${OWNTONE_PID:-}" "${SHAIRPORT_PID:-}" "${NQPTP_PID:-}" "${AVAHI_PID:-}" "${DBUS_PID:-}"; do
     if [[ -n "$pid" ]]; then
       kill -9 "$pid" 2>/dev/null || true
     fi
@@ -72,8 +74,14 @@ cat "/sys/class/net/$MV_IF/address" > "$GRP_DIR/state/macvlan_mac.txt"
 echo "[zone:$GRP] Got IP: $MY_IP"
 
 echo "[zone:$GRP] Starting dbus..."
-dbus-daemon --system --fork --nopidfile
+dbus-daemon --system --nofork --nopidfile &
+DBUS_PID=$!
+echo "$DBUS_PID" > "$STATE_DIR/dbus.pid"
 sleep 1
+if ! kill -0 "$DBUS_PID" 2>/dev/null; then
+  echo "[zone:$GRP] FATAL: dbus failed to start" >&2
+  exit 1
+fi
 
 # Create per-instance avahi config to avoid mDNS conflicts
 cat > /tmp/avahi-daemon.conf <<AVAHI_EOF
@@ -100,8 +108,14 @@ enable-reflector=no
 AVAHI_EOF
 
 echo "[zone:$GRP] Starting avahi..."
-avahi-daemon --daemonize --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits 2>/dev/null || true
+avahi-daemon --no-chroot --no-drop-root --file /tmp/avahi-daemon.conf --no-rlimits &
+AVAHI_PID=$!
+echo "$AVAHI_PID" > "$STATE_DIR/avahi.pid"
 sleep 1
+if ! kill -0 "$AVAHI_PID" 2>/dev/null; then
+  echo "[zone:$GRP] FATAL: avahi failed to start" >&2
+  exit 1
+fi
 
 # Start per-zone nqptp with ISOLATED /dev/shm/nqptp
 # Each zone gets its own PTP timing — one zone's disconnect

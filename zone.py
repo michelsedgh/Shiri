@@ -177,6 +177,8 @@ class Zone:
         self.macvlan_if = None
         self.shairport_ip = None
         self.owntone_ip = None
+        self.shairport_port = None
+        self.owntone_port = None
         self.owntone_api = None  # OwnToneAPI instance
         self._grp_dir = None
         self._stop_event = threading.Event()
@@ -218,6 +220,8 @@ class Zone:
             "error_message": self.error_message,
             "shairport_ip": self.shairport_ip,
             "owntone_ip": self.owntone_ip,
+            "shairport_port": self.shairport_port,
+            "owntone_port": self.owntone_port,
             "netns_name": self.netns_name,
             "allocated_subdevice": self.allocated_subdevice,
             "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
@@ -281,11 +285,9 @@ class ZoneManager:
 
     def start_host_nqptp(self):
         """
-        Previously started a shared host nqptp for all zones.
-        Now each zone runs its own nqptp inside its netns with private /dev/shm.
-        This isolates PTP timing so one zone's disconnect can't poison another's clock.
-        
-        If a stale host nqptp is running, kill it to free ports 319/320 for per-zone instances.
+        Start one host nqptp for all host-network Shairport instances.
+        Host networking avoids macvlan's extra-MAC reachability failures on
+        this VM/router path, so a shared nqptp owns UDP 319/320 again.
         """
         host_netns = os.stat("/proc/self/ns/net").st_ino
         result = _run(["pgrep", "-x", "nqptp"])
@@ -296,12 +298,21 @@ class ZoneManager:
                     pid_netns = os.stat(f"/proc/{pid}/ns/net").st_ino
                 except OSError:
                     continue
-                if pid_netns != host_netns:
+                if pid_netns == host_netns:
+                    self._host_nqptp_pid = pid
+                    log.info("Using existing host nqptp (pid %d)", pid)
+                    return True
+                else:
                     continue
-                log.info("Killing stale host nqptp (pid %d) — now per-zone in netns", pid)
-                _kill_pid(pid, "stale host nqptp")
-        self._host_nqptp_pid = None
-        log.info("nqptp is now per-zone (each zone runs its own in isolated netns)")
+
+        proc = subprocess.Popen(["nqptp"])
+        self._host_nqptp_pid = proc.pid
+        time.sleep(1)
+        if proc.poll() is not None:
+            log.error("Failed to start host nqptp")
+            self._host_nqptp_pid = None
+            return False
+        log.info("Started host nqptp (pid %d)", proc.pid)
         return True
 
     def cleanup_stale_runtime(self):
@@ -333,7 +344,7 @@ class ZoneManager:
     def get_system_status(self):
         """Return system-level health info."""
         return {
-            "nqptp_mode": "per-zone",
+            "nqptp_mode": "host-shared",
             "alsa_ready": self._alsa_ready,
             "interfaces": self.get_network_interfaces(),
             "zone_count": len(self.zones),
@@ -659,7 +670,7 @@ class ZoneManager:
             except Exception as e:
                 log.debug("Could not read outputs for TTS policy: %s", e)
         if outputs:
-            return outputs
+            return self._external_speaker_outputs(outputs)
         speakers = zone.config.get("speaker_names", [])
         if speakers:
             return [
@@ -731,13 +742,40 @@ class ZoneManager:
     # Speaker management (consolidated from routes + startup restore)
     # -------------------------------------------------------------------------
 
+    def _shiri_airplay_output_names(self):
+        return {
+            z.display_name
+            for z in self.zones.values()
+            if z.display_name
+        }
+
+    def _is_shiri_airplay_output(self, output):
+        output_type = str(output.get("type") or "")
+        if not output_type.startswith("AirPlay"):
+            return False
+        return str(output.get("name") or "") in self._shiri_airplay_output_names()
+
+    def _external_speaker_outputs(self, outputs):
+        return [
+            output
+            for output in outputs
+            if not self._is_shiri_airplay_output(output)
+        ]
+
+    def _external_speaker_ids(self, outputs):
+        return {
+            str(output.get("id"))
+            for output in self._external_speaker_outputs(outputs)
+            if output.get("id") is not None
+        }
+
     def get_speakers(self, zone_id):
         """Get available speakers for a zone. Returns (speakers, error)."""
         zone = self.get_zone(zone_id)
         if not zone or not zone.owntone_api:
             return None, "Zone not running or not found"
         outputs = zone.owntone_api.get_outputs()
-        return outputs, None
+        return self._external_speaker_outputs(outputs), None
 
     def set_speakers(self, zone_id, speaker_ids):
         """Set active speakers for a zone and persist selection. Returns (ok, error)."""
@@ -745,10 +783,18 @@ class ZoneManager:
         if not zone or not zone.owntone_api:
             return False, "Zone not running or not found"
 
+        outputs = zone.owntone_api.get_outputs()
+        allowed_ids = self._external_speaker_ids(outputs)
+        speaker_ids = [
+            str(sid)
+            for sid in speaker_ids
+            if str(sid) in allowed_ids
+        ]
+
         zone.owntone_api.set_outputs(speaker_ids)
 
         # Get current outputs to save names for reliable restoration
-        outputs = zone.owntone_api.get_outputs()
+        outputs = self._external_speaker_outputs(zone.owntone_api.get_outputs())
         selected_speakers = []
         for out in outputs:
             if str(out.get("id")) in [str(sid) for sid in speaker_ids]:
@@ -770,6 +816,10 @@ class ZoneManager:
         if not zone or not zone.owntone_api:
             return False, "Zone not running or not found"
 
+        outputs = zone.owntone_api.get_outputs()
+        if str(speaker_id) not in self._external_speaker_ids(outputs):
+            return False, "Refusing to select Shiri virtual AirPlay output"
+
         if enabled:
             zone.owntone_api.enable_output(speaker_id)
         else:
@@ -778,7 +828,7 @@ class ZoneManager:
         # CRITICAL: Save current speaker selection to config for persistence
         # Without this, speaker selections are lost on zone restart!
         try:
-            outputs = zone.owntone_api.get_outputs()
+            outputs = self._external_speaker_outputs(zone.owntone_api.get_outputs())
             selected_speakers = []
             selected_ids = []
             for out in outputs:
