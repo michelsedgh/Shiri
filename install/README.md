@@ -1,11 +1,11 @@
 # Shiri — Multiroom AirPlay Manager
 
-Shiri creates isolated AirPlay 2 zones using Linux network namespaces, ALSA loopback devices, and OwnTone. Each zone gets its own shairport-sync, OwnTone, and nqptp instance running in a dedicated network namespace with full PTP timing isolation.
+Shiri creates AirPlay zones using ALSA loopback devices, shairport-sync, OwnTone, and a shared host nqptp clock. Each zone gets its own Shairport and OwnTone instance on dedicated host ports.
 
 ## Requirements
 
 - **Linux** (Ubuntu 22.04+ recommended) — uses kernel features not available on macOS
-- **Root access** — required for network namespaces, ALSA loopback, and macvlan
+- **Root access** — required for ALSA loopback, realtime audio scheduling, and AirPlay timing
 - **Python 3.8+**
 - System dependencies: `nqptp`, `shairport-sync` (AirPlay 2 build), `owntone`
 
@@ -47,9 +47,9 @@ The web UI will be available at **http://\<your-ip\>:8080**
 ```
 app.py               Entry point — Flask app, startup, shutdown
 zone.py              Zone model + ZoneManager API facade
-zone_lifecycle.py    Start/stop, namespace, macvlan, DHCP, and process cleanup
+zone_lifecycle.py    Start/stop, host audio services, and stale runtime cleanup
 config.py            Persistent JSON config plus template/config generation
-owntone_api.py       OwnTone REST API client, executed through the zone netns
+owntone_api.py       OwnTone REST API client for per-zone host ports
 
 templates/           Config/script templates (native format, %%PLACEHOLDER%% syntax)
   shairport_sync.conf    Shairport-sync config template
@@ -58,7 +58,6 @@ templates/           Config/script templates (native format, %%PLACEHOLDER%% syn
   arecord_supervisor.sh  ALSA capture supervisor template
 
 scripts/             Runtime shell scripts
-  zone_wrapper.sh        Zone process supervisor (runs in netns)
   pause_bridge.sh        Shairport→OwnTone play/pause bridge
   volume_bridge.sh       Shairport→OwnTone volume bridge
 

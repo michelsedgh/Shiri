@@ -1,8 +1,8 @@
 """
 owntone_api.py — OwnTone REST API client for Shiri zones.
 
-All calls run curl inside the zone's network namespace, exactly like
-dual_zone_demo.sh does. This preserves the proven netns isolation.
+All zone OwnTone instances now run on host-network ports. Calls go directly
+to the host listener for the zone.
 """
 
 import json
@@ -12,11 +12,8 @@ import logging
 log = logging.getLogger("shiri.owntone")
 
 
-def _run_curl_in_netns(netns_name, url, method="GET", data=None, timeout=5):
-    """
-    Run curl inside a network namespace (same pattern as dual_zone_demo.sh).
-    Falls back to host curl if netns_name is empty.
-    """
+def _run_curl(url, method="GET", data=None, timeout=5):
+    """Run curl against a host-network OwnTone API endpoint."""
     curl_cmd = ["curl", "-s", "--connect-timeout", str(timeout)]
 
     if method == "PUT":
@@ -29,15 +26,9 @@ def _run_curl_in_netns(netns_name, url, method="GET", data=None, timeout=5):
 
     curl_cmd.append(url)
 
-    # Wrap in netns exec if we have a namespace
-    if netns_name:
-        cmd = ["ip", "netns", "exec", netns_name] + curl_cmd
-    else:
-        cmd = curl_cmd
-
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout + 5
+            curl_cmd, capture_output=True, text=True, timeout=timeout + 5
         )
         if result.returncode != 0:
             log.warning("curl failed (rc=%d): %s", result.returncode, result.stderr)
@@ -57,23 +48,17 @@ def _run_curl_in_netns(netns_name, url, method="GET", data=None, timeout=5):
 
 
 class OwnToneAPI:
-    """
-    OwnTone REST API client for a single zone.
+    """OwnTone REST API client for a single host-network zone."""
 
-    Uses the same curl-in-netns pattern from dual_zone_demo.sh:
-      ip netns exec <ns> curl -s http://<ip>:3689/api/...
-    """
-
-    def __init__(self, owntone_ip, netns_name, port=3689):
+    def __init__(self, owntone_ip, port=3689):
         self.owntone_ip = owntone_ip
-        self.netns_name = netns_name
         self.port = int(port)
         self.base_url = f"http://{owntone_ip}:{self.port}"
 
     def _api(self, path, method="GET", data=None):
         """Call OwnTone API endpoint."""
         url = f"{self.base_url}{path}"
-        return _run_curl_in_netns(self.netns_name, url, method=method, data=data)
+        return _run_curl(url, method=method, data=data)
 
     # -- Config / Health --
 

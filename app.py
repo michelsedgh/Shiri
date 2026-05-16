@@ -264,8 +264,9 @@ def _zone_summary(zone):
         "auto_start": bool(zone.config.get("auto_start", False)),
         "latency_offset": zone.config.get("latency_offset"),
         "shairport_ip": zone.shairport_ip,
+        "shairport_port": zone.shairport_port,
         "owntone_ip": zone.owntone_ip,
-        "netns_name": zone.netns_name,
+        "owntone_port": zone.owntone_port,
         "allocated_subdevice": zone.allocated_subdevice,
         "volume": volume,
         "volume_error": volume_error,
@@ -1102,10 +1103,10 @@ def startup():
     if not zone_manager.setup_alsa_loopback():
         log.error("Failed to setup ALSA loopback — some features may not work")
 
-    # Reap namespaces/macvlans/leases left by an unclean previous daemon exit.
+    # Reap legacy namespaces/macvlans/leases left by older daemon versions.
     zone_manager.cleanup_stale_runtime()
 
-    # Clean up any stale host nqptp (each zone now runs its own in netns)
+    # Start the shared host nqptp used by all Shairport instances.
     zone_manager.start_host_nqptp()
 
     # Load saved zones from config

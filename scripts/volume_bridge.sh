@@ -36,7 +36,6 @@ AIRPLAY_VOL="$2"
 LOG="$GRP_DIR/logs/volume_bridge.log"
 OWNTONE_IP_FILE="$GRP_DIR/state/owntone_ip.txt"
 OWNTONE_PORT_FILE="$GRP_DIR/state/owntone_port.txt"
-OWNTONE_NETNS_FILE="$GRP_DIR/state/owntone_netns.txt"
 LAST_VOL_FILE="$GRP_DIR/state/master_volume_last.txt"
 
 log() {
@@ -52,12 +51,6 @@ OWNTONE_IP=$(cat "$OWNTONE_IP_FILE")
 OWNTONE_PORT=3689
 if [[ -f "$OWNTONE_PORT_FILE" ]]; then
   OWNTONE_PORT=$(cat "$OWNTONE_PORT_FILE")
-fi
-
-# Read netns name (for curl exec)
-OWNTONE_NETNS=""
-if [[ -f "$OWNTONE_NETNS_FILE" ]]; then
-  OWNTONE_NETNS=$(cat "$OWNTONE_NETNS_FILE")
 fi
 
 log "Volume event: AirPlay volume = $AIRPLAY_VOL"
@@ -95,21 +88,12 @@ fi
 
 log "Mapped to OwnTone volume: $OWNTONE_VOL"
 
-# Function to run curl (either in netns or on host)
-run_curl() {
-  if [[ -n "$OWNTONE_NETNS" ]] && ip netns list 2>/dev/null | grep -qw "$OWNTONE_NETNS"; then
-    ip netns exec "$OWNTONE_NETNS" curl "$@"
-  else
-    curl "$@"
-  fi
-}
-
 # Set MASTER volume (preserves ratio between individual speakers)
 # Using /api/player/volume without output_id changes the master volume
 # This is different from setting individual output volumes which would break the ratio
 log "Setting OwnTone MASTER volume to $OWNTONE_VOL (preserves speaker ratio)"
 
-RESULT=$(run_curl -s --connect-timeout 2 -X PUT \
+RESULT=$(curl -s --connect-timeout 2 -X PUT \
   "http://$OWNTONE_IP:$OWNTONE_PORT/api/player/volume?volume=$OWNTONE_VOL" 2>&1)
 
 if [[ $? -eq 0 ]]; then

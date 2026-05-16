@@ -1,12 +1,10 @@
 """
 zone_lifecycle.py — Zone start/stop implementation for Shiri.
 
-All the heavy subprocess/netns/process launching machinery lives here.
+All the subprocess and process-lifecycle machinery lives here.
 ZoneManager (in zone.py) delegates to these functions for the actual
 start and stop sequences. This keeps the manager focused on CRUD and
 API concerns while lifecycle implementation details stay isolated.
-
-Translates dual_zone_demo.sh into Python, calling the SAME system commands.
 """
 
 import logging
@@ -27,7 +25,6 @@ from config import (
     generate_shairport_config,
     generate_owntone_config,
     generate_arecord_supervisor,
-    get_zone_wrapper_path,
 )
 
 log = logging.getLogger("shiri.zone")
@@ -427,7 +424,7 @@ def start_zone_thread(zone, cleanup_fn):
 
         _allocate_resources(zone)
         _generate_configs(zone)
-        _launch_netns(zone)
+        _start_zone_on_host(zone)
 
         if zone._stop_event.is_set():
             return
@@ -475,18 +472,6 @@ def _generate_configs(zone):
     generate_owntone_config(zone)
 
 
-def _launch_netns(zone):
-    """Step 4: Start Shairport + OwnTone.
-
-    Host mode is the default because this VM/router path drops unicast traffic
-    for macvlan child MAC addresses even while mDNS still arrives.
-    """
-    if zone.config.get("network_mode") == "macvlan":
-        _start_owntone_in_netns(zone)
-    else:
-        _start_zone_on_host(zone)
-
-
 def _wait_and_verify(zone):
     """Step 5: Wait for OwnTone to be ready, rescan library, verify pipe."""
     if not _wait_for_owntone(zone):
@@ -514,9 +499,7 @@ def _launch_host_processes(zone):
 
 
 def _read_shairport_pid(zone):
-    """Read shairport-sync PID from the file the netns wrapper wrote."""
-    # shairport-sync now runs inside the netns wrapper (with per-zone nqptp)
-    # Read its PID from the file the wrapper wrote
+    """Ensure shairport-sync runtime metadata is populated."""
     if zone.shairport_pid:
         zone.shairport_ip = zone.shairport_ip or _host_ipv4_for_interface(zone.interface)
         time.sleep(2)
@@ -529,15 +512,12 @@ def _read_shairport_pid(zone):
                 pid_str = f.read().strip()
             if pid_str:
                 zone.shairport_pid = int(pid_str)
-                log.info("shairport-sync for %s running in netns (pid %d)",
+                log.info("shairport-sync for %s running on host (pid %d)",
                          zone.zone_id, zone.shairport_pid)
                 break
         time.sleep(1)
 
-    # shairport_ip = macvlan IP (same as OwnTone, both in the netns)
-    zone.shairport_ip = zone.owntone_ip
-
-    # Brief pause for avahi registration
+    zone.shairport_ip = _host_ipv4_for_interface(zone.interface)
     time.sleep(2)
 
 
@@ -622,22 +602,19 @@ def cleanup_zone(zone):
     """
     Zone cleanup sequence:
     1. Stop HOST processes (arecord, pause_bridge)
-    2. Release the zone DHCP lease while the macvlan is still alive
-    3. Stop NETNS processes (nqptp, shairport-sync, owntone, avahi, dbus)
-    4. Force kill remaining netns processes
-    5. Tear down netns + macvlan
-    6. Release loopback subdevice after all users are gone
+    2. Stop Shairport and OwnTone
+    3. Reap stale legacy namespace state if present
+    4. Release loopback subdevice after all users are gone
     """
     log.info("Cleaning up zone %s...", zone.zone_id)
 
     grp_dir = zone.grp_dir
-    ns = zone.netns_name or _read_text(_state_path(grp_dir, "owntone_netns.txt"))
-    macvlan_if = zone.macvlan_if or _read_text(_state_path(grp_dir, "macvlan_if.txt"))
+    ns = _read_text(_state_path(grp_dir, "owntone_netns.txt"))
+    macvlan_if = _read_text(_state_path(grp_dir, "macvlan_if.txt"))
     if ns and _netns_exists(ns):
         macvlan_if = _find_macvlan_in_netns(ns, macvlan_if) or macvlan_if
 
-    # 1. Stop HOST processes (arecord + pause_bridge remain on host).
-    # shairport-sync is in the netns and is killed below.
+    # 1. Stop host-side audio helpers.
     _kill_pid(zone.arecord_supervisor_pid, f"arecord supervisor ({zone.zone_id})")
     _kill_pid(_read_pid(_state_path(grp_dir, "arecord.pid")), f"arecord ({zone.zone_id})")
     _kill_pid(zone.metadata_relay_pid, f"metadata relay ({zone.zone_id})")
@@ -647,7 +624,7 @@ def cleanup_zone(zone):
     zone.metadata_relay_pid = None
     zone.pause_bridge_pid = None
 
-    # Host-network mode has direct child PIDs instead of a zone wrapper.
+    # 2. Stop host-network AirPlay and OwnTone services.
     _terminate_pid(
         zone.shairport_pid or _read_pid(_state_path(grp_dir, "shairport.pid")),
         f"shairport-sync ({zone.zone_id})",
@@ -655,15 +632,13 @@ def cleanup_zone(zone):
     )
     zone.shairport_pid = None
 
-    # Let the wrapper run its trap first; it owns the private mount namespace
-    # where dhclient keeps its lease/pid files.
     _terminate_pid(
         zone.owntone_pid or _read_pid(_state_path(grp_dir, "owntone.pid")),
-        f"owntone/wrapper ({zone.zone_id})",
+        f"owntone ({zone.zone_id})",
         timeout=5,
     )
 
-    # 2-3. Release the DHCP lease and stop services while the namespace exists.
+    # 3. Legacy cleanup only: remove stale namespaces from older macvlan builds.
     if ns and _netns_exists(ns):
         _release_dhcp_lease(grp_dir, ns, macvlan_if)
         _terminate_pid_if_command(
@@ -679,37 +654,30 @@ def cleanup_zone(zone):
         _terminate_namespace_services(ns)
         time.sleep(2)
 
-    # 4. Force kill remaining namespace processes
     _kill_namespace_pids(ns)
     time.sleep(0.3)
-
-    # 5. Delete namespace. A macvlan inside the namespace usually disappears
-    # with it; the host-link fallback handles failed/partial starts.
     _delete_netns(ns)
     _delete_host_link(macvlan_if)
 
-    # 6. Release loopback subdevice only after all processes that could touch it
+    # 4. Release loopback subdevice only after all processes that could touch it
     # have been stopped.
     release_loopback_subdevice(zone.allocated_subdevice)
     zone.allocated_subdevice = None
     _clear_runtime_state(grp_dir)
 
     # Reset state
-    zone.netns_name = None
-    zone.macvlan_if = None
     zone.shairport_ip = None
     zone.owntone_ip = None
     zone.shairport_port = None
     zone.owntone_port = None
     zone.owntone_api = None
     zone.owntone_pid = None
-    zone.nqptp_pid = None
 
     log.info("Zone %s cleanup complete", zone.zone_id)
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — netns + process launching
+# Internal helpers — host process launching
 # ---------------------------------------------------------------------------
 
 def _host_ipv4_for_interface(iface):
@@ -725,14 +693,12 @@ def _host_ipv4_for_interface(iface):
 
 
 def _start_zone_on_host(zone):
-    """Start Shairport and OwnTone on host ports, avoiding macvlan extra MACs."""
+    """Start Shairport and OwnTone on host ports."""
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
     owntone_port = zone.owntone_port or (OWNTONE_PORT_BASE + subdev * 10)
     shairport_ip = _host_ipv4_for_interface(zone.interface)
 
-    zone.netns_name = ""
-    zone.macvlan_if = ""
     zone.owntone_ip = "127.0.0.1"
     zone.shairport_ip = shairport_ip
     zone.owntone_port = owntone_port
@@ -772,53 +738,6 @@ def _start_zone_on_host(zone):
     log.info("Started OwnTone for %s on host port %d (pid %d)",
              zone.zone_id, owntone_port, owntone_proc.pid)
 
-
-def _start_owntone_in_netns(zone):
-    """
-    Creates netns + macvlan, runs the zone wrapper script inside.
-    The wrapper starts nqptp + shairport-sync + OwnTone, all with
-    private /dev/shm for PTP isolation between zones.
-    """
-    grp_dir = zone.grp_dir
-    iface = zone.interface
-
-    suffix = str(int(time.time() * 1e9))[-9:]
-    ns_name = f"owntone_{zone.zone_id}_{suffix}"
-    mv_if = f"ot_{zone.zone_id[:6]}_{suffix[:5]}"
-
-    zone.netns_name = ns_name
-    zone.macvlan_if = mv_if
-
-    log.info("Creating OwnTone netns %s for %s", ns_name, zone.zone_id)
-
-    # Create namespace and macvlan.
-    _run(["ip", "netns", "add", ns_name], check=True)
-    _run(["ip", "link", "add", mv_if, "link", iface, "type", "macvlan", "mode", "bridge"],
-         check=True)
-    _run(["ip", "link", "set", mv_if, "netns", ns_name], check=True)
-
-    # Save netns name so volume_bridge.sh can use it
-    with open(os.path.join(grp_dir, "state", "owntone_netns.txt"), "w") as f:
-        f.write(ns_name)
-    with open(os.path.join(grp_dir, "state", "macvlan_if.txt"), "w") as f:
-        f.write(mv_if)
-
-    # Use the static zone wrapper script (no longer generated per-zone)
-    wrapper_path = get_zone_wrapper_path()
-
-    # Launch wrapper inside netns — same command as demo.sh
-    log_path = os.path.join(grp_dir, "logs", "owntone_wrapper.log")
-    # Don't use context manager - file must stay open for subprocess lifetime
-    log_file = open(log_path, "w")
-    proc = subprocess.Popen(
-        ["ip", "netns", "exec", ns_name, "unshare", "-m",
-         "bash", wrapper_path, mv_if, grp_dir, zone.zone_id],
-        stdout=log_file, stderr=subprocess.STDOUT
-    )
-    zone.owntone_pid = proc.pid
-    log.info("Started OwnTone for %s (pid %d)", zone.zone_id, proc.pid)
-
-
 def _wait_for_owntone(zone, timeout=60):
     """
     Same as wait_for_owntone() in dual_zone_demo.sh.
@@ -846,7 +765,7 @@ def _wait_for_owntone(zone, timeout=60):
     # Create API client
     port = zone.owntone_port or int(_read_text(_state_path(zone.grp_dir, "owntone_port.txt")) or 3689)
     zone.owntone_port = port
-    zone.owntone_api = OwnToneAPI(zone.owntone_ip, zone.netns_name, port=port)
+    zone.owntone_api = OwnToneAPI(zone.owntone_ip, port=port)
 
     # Wait for API to respond
     log.info("Waiting for OwnTone API at %s:%d...", zone.owntone_ip, port)
@@ -868,8 +787,7 @@ def _start_arecord_supervisor(zone):
     """
     Start the host audio mixer.
     It captures ALSA loopback, overlays queued TTS, and writes OwnTone's audio.pipe.
-    Runs on host because ALSA loopback is a kernel device accessible from anywhere.
-    shairport-sync now starts inside the netns wrapper (not here).
+    Runs on host beside Shairport and OwnTone.
     """
     # Generate the supervisor script from template
     script_path = generate_arecord_supervisor(zone)

@@ -39,6 +39,7 @@ MIN_TTS_LEVEL_PCT = 5
 MAX_TTS_LEVEL_PCT = 200
 MIN_REDUCTION_PCT = 0
 MAX_REDUCTION_PCT = 95
+LEGACY_ZONE_CONFIG_KEYS = {"network_mode", "netns_name", "macvlan_if"}
 
 
 def _slugify_room_id(value):
@@ -116,6 +117,13 @@ def _normalize_tts_policy(raw=None):
     }
 
 
+def _sanitize_zone_config(raw):
+    config = dict(raw or {})
+    for key in LEGACY_ZONE_CONFIG_KEYS:
+        config.pop(key, None)
+    return config
+
+
 def _settings_to_mix(settings):
     tts_level_pct = _clamp_int(
         settings.get("tts_level_pct"),
@@ -154,7 +162,7 @@ class Zone:
         """
         config: {
             "name": "Living Room",          # Display name / AirPlay name
-            "interface": "eth0",            # Network interface for macvlan
+            "interface": "eth0",            # LAN interface for AirPlay ads
             "auto_start": False,
             "speakers": ["speaker_id_1"],   # Saved speaker selections
         }
@@ -172,9 +180,6 @@ class Zone:
         self.metadata_relay_pid = None
         self.pause_bridge_pid = None
         self.owntone_pid = None
-        self.nqptp_pid = None  # Per-zone, runs inside netns
-        self.netns_name = None
-        self.macvlan_if = None
         self.shairport_ip = None
         self.owntone_ip = None
         self.shairport_port = None
@@ -222,7 +227,6 @@ class Zone:
             "owntone_ip": self.owntone_ip,
             "shairport_port": self.shairport_port,
             "owntone_port": self.owntone_port,
-            "netns_name": self.netns_name,
             "allocated_subdevice": self.allocated_subdevice,
             "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
             "room_id": self.room_id,
@@ -286,24 +290,14 @@ class ZoneManager:
     def start_host_nqptp(self):
         """
         Start one host nqptp for all host-network Shairport instances.
-        Host networking avoids macvlan's extra-MAC reachability failures on
-        this VM/router path, so a shared nqptp owns UDP 319/320 again.
+        A shared host nqptp owns UDP 319/320 for every zone.
         """
-        host_netns = os.stat("/proc/self/ns/net").st_ino
         result = _run(["pgrep", "-x", "nqptp"])
         if result.returncode == 0 and result.stdout.strip():
-            for pid_str in result.stdout.strip().split():
-                pid = int(pid_str)
-                try:
-                    pid_netns = os.stat(f"/proc/{pid}/ns/net").st_ino
-                except OSError:
-                    continue
-                if pid_netns == host_netns:
-                    self._host_nqptp_pid = pid
-                    log.info("Using existing host nqptp (pid %d)", pid)
-                    return True
-                else:
-                    continue
+            pid = int(result.stdout.strip().split()[0])
+            self._host_nqptp_pid = pid
+            log.info("Using existing host nqptp (pid %d)", pid)
+            return True
 
         proc = subprocess.Popen(["nqptp"])
         self._host_nqptp_pid = proc.pid
@@ -424,7 +418,7 @@ class ZoneManager:
             if was_running and not restart_if_running:
                 return None, False
             
-            sanitized = dict(updates)
+            sanitized = _sanitize_zone_config(updates)
             if "room_id" in sanitized:
                 sanitized["room_id"] = _slugify_room_id(sanitized.get("room_id"))
             if "room_name" in sanitized and not sanitized.get("room_name"):
@@ -432,6 +426,7 @@ class ZoneManager:
             if "tts_policy" in sanitized:
                 sanitized["tts_policy"] = _normalize_tts_policy(sanitized.get("tts_policy"))
             zone.config.update(sanitized)
+            zone.config = _sanitize_zone_config(zone.config)
         
         self.config_store.save_zone(zone_id, zone.config)
         self._emit_zone_status(zone)
@@ -465,6 +460,10 @@ class ZoneManager:
         """Load zones from persistent config (called on startup)."""
         saved = self.config_store.list_zones()
         for zone_id, config in saved.items():
+            sanitized = _sanitize_zone_config(config)
+            if sanitized != config:
+                self.config_store.save_zone(zone_id, sanitized)
+                config = sanitized
             zone = Zone(zone_id, config, on_status_change=self._emit_zone_status)
             with self._lock:
                 self.zones[zone_id] = zone

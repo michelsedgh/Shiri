@@ -34,7 +34,6 @@ LOG="$GRP_DIR/logs/pause_bridge.log"
 META_PIPE="$GRP_DIR/pipes/pause_bridge.metadata"
 OWNTONE_IP_FILE="$GRP_DIR/state/owntone_ip.txt"
 OWNTONE_PORT_FILE="$GRP_DIR/state/owntone_port.txt"
-OWNTONE_NETNS_FILE="$GRP_DIR/state/owntone_netns.txt"
 SAVED_VOLUME_FILE="$GRP_DIR/state/saved_volume.txt"
 LAST_VOL_FILE="$GRP_DIR/state/master_volume_last.txt"  # Written by volume_bridge.sh
 
@@ -72,22 +71,6 @@ if [[ -f "$OWNTONE_PORT_FILE" ]]; then
 fi
 log "OwnTone port: $OWNTONE_PORT"
 
-# Read netns name for curl
-OWNTONE_NETNS=""
-if [[ -f "$OWNTONE_NETNS_FILE" ]]; then
-  OWNTONE_NETNS=$(cat "$OWNTONE_NETNS_FILE")
-  log "OwnTone netns: $OWNTONE_NETNS"
-fi
-
-# Function to run curl (either in netns or on host)
-run_curl() {
-  if [[ -n "$OWNTONE_NETNS" ]] && ip netns list 2>/dev/null | grep -qw "$OWNTONE_NETNS"; then
-    ip netns exec "$OWNTONE_NETNS" curl "$@"
-  else
-    curl "$@"
-  fi
-}
-
 # Get current master volume
 # Prefer the last value persisted by volume_bridge.sh, fall back to /api/player.
 get_current_volume() {
@@ -100,7 +83,7 @@ get_current_volume() {
     fi
   fi
 
-  vol=$(run_curl -s --connect-timeout 2 "http://$OWNTONE_IP:$OWNTONE_PORT/api/player" 2>/dev/null | jq -r '.volume // empty')
+  vol=$(curl -s --connect-timeout 2 "http://$OWNTONE_IP:$OWNTONE_PORT/api/player" 2>/dev/null | jq -r '.volume // empty')
   if [[ -n "$vol" ]]; then
     echo "$vol"
   else
@@ -112,7 +95,7 @@ get_current_volume() {
 # Set master volume
 set_volume() {
   local vol="$1"
-  run_curl -s --connect-timeout 2 -X PUT "http://$OWNTONE_IP:$OWNTONE_PORT/api/player/volume?volume=$vol" >/dev/null 2>&1
+  curl -s --connect-timeout 2 -X PUT "http://$OWNTONE_IP:$OWNTONE_PORT/api/player/volume?volume=$vol" >/dev/null 2>&1
 }
 
 # Cancel any pending restore

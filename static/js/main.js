@@ -621,6 +621,7 @@ function renderDrawerAdvanced(room) {
         return;
     }
     const interfaces = state.dashboard?.system?.interfaces || [];
+    const ownTonePort = binding.owntone_port ?? 3689;
     els.drawerAdvanced.innerHTML = `
         <div class="drawer-stack">
             <label class="field">
@@ -645,14 +646,14 @@ function renderDrawerAdvanced(room) {
             <div class="advanced-row">
                 <div>
                     <strong>OwnTone</strong>
-                    <span>${binding.owntone_ip ? escapeHtml(binding.owntone_ip) : 'not running'}</span>
+                    <span>${binding.owntone_ip ? `${escapeHtml(binding.owntone_ip)}:${escapeHtml(ownTonePort)}` : 'not running'}</span>
                 </div>
-                ${binding.owntone_ip ? `<a class="small-btn" href="http://${escapeHtml(binding.owntone_ip)}:3689" target="_blank" rel="noreferrer">Open</a>` : '<span></span>'}
+                ${binding.owntone_ip ? `<a class="small-btn" href="http://${escapeHtml(binding.owntone_ip)}:${escapeHtml(ownTonePort)}" target="_blank" rel="noreferrer">Open</a>` : '<span></span>'}
             </div>
             <div class="advanced-row">
                 <div>
                     <strong>Runtime</strong>
-                    <span>${escapeHtml(binding.netns_name || 'no namespace')} / subdev ${escapeHtml(binding.allocated_subdevice ?? '-')}</span>
+                    <span>host ports / subdev ${escapeHtml(binding.allocated_subdevice ?? '-')}</span>
                 </div>
                 <span class="state-badge ${statusClass(binding.status)}">${escapeHtml(binding.status)}</span>
             </div>

@@ -351,10 +351,3 @@ def generate_arecord_supervisor(zone):
 
     log.info("Generated arecord supervisor script for %s", zone.zone_id)
     return script_path
-
-
-def get_zone_wrapper_path():
-    """Return path to the static zone_wrapper.sh script."""
-    wrapper = os.path.join(SCRIPT_DIR, "zone_wrapper.sh")
-    os.chmod(wrapper, 0o755)
-    return wrapper
