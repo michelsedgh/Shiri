@@ -42,17 +42,6 @@ log() {
   echo "[$(date '+%H:%M:%S.%3N')] $*" >> "$LOG"
 }
 
-# Read OwnTone IP
-if [[ ! -f "$OWNTONE_IP_FILE" ]]; then
-  log "ERROR: OwnTone IP file not found: $OWNTONE_IP_FILE"
-  exit 1
-fi
-OWNTONE_IP=$(cat "$OWNTONE_IP_FILE")
-OWNTONE_PORT=3689
-if [[ -f "$OWNTONE_PORT_FILE" ]]; then
-  OWNTONE_PORT=$(cat "$OWNTONE_PORT_FILE")
-fi
-
 log "Volume event: AirPlay volume = $AIRPLAY_VOL"
 
 # Handle mute (-144.0 is AirPlay mute)
@@ -87,6 +76,19 @@ else
 fi
 
 log "Mapped to OwnTone volume: $OWNTONE_VOL"
+echo "$OWNTONE_VOL" > "$LAST_VOL_FILE" 2>/dev/null || true
+
+# OwnTone may not be ready yet during AirPlay session startup. Keep the latest
+# requested phone volume and let Shiri apply it once the API is available.
+if [[ ! -f "$OWNTONE_IP_FILE" ]]; then
+  log "PENDING: OwnTone IP file not ready; saved master volume $OWNTONE_VOL"
+  exit 0
+fi
+OWNTONE_IP=$(cat "$OWNTONE_IP_FILE")
+OWNTONE_PORT=3689
+if [[ -f "$OWNTONE_PORT_FILE" ]]; then
+  OWNTONE_PORT=$(cat "$OWNTONE_PORT_FILE")
+fi
 
 # Set MASTER volume (preserves ratio between individual speakers)
 # Using /api/player/volume without output_id changes the master volume
@@ -97,12 +99,10 @@ RESULT=$(curl -s --connect-timeout 2 -X PUT \
   "http://$OWNTONE_IP:$OWNTONE_PORT/api/player/volume?volume=$OWNTONE_VOL" 2>&1)
 
 if [[ $? -eq 0 ]]; then
-  # Persist last known master volume for pause_bridge
-  echo "$OWNTONE_VOL" > "$LAST_VOL_FILE" 2>/dev/null || true
   log "SUCCESS: Master volume set to $OWNTONE_VOL (persisted)"
 else
-  log "ERROR: Failed to set master volume: $RESULT"
-  exit 1
+  log "PENDING: Failed to set master volume, will retry on zone readiness: $RESULT"
+  exit 0
 fi
 
 log "Volume bridge complete"

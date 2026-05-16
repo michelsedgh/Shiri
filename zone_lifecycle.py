@@ -477,6 +477,8 @@ def _wait_and_verify(zone):
     if not _wait_for_owntone(zone):
         raise RuntimeError(f"OwnTone did not become ready for {zone.zone_id}")
 
+    _apply_persisted_master_volume(zone)
+
     # Trigger library rescan so OwnTone finds the pipes
     if zone.owntone_api:
         zone.owntone_api.rescan_library()
@@ -488,6 +490,25 @@ def _wait_and_verify(zone):
             log.info("OwnTone %s found the audio pipe!", zone.zone_id)
         else:
             log.warning("OwnTone %s has NOT discovered audio pipe yet", zone.zone_id)
+
+
+def _apply_persisted_master_volume(zone):
+    """Apply the latest phone volume captured before OwnTone was ready."""
+    if not zone.owntone_api:
+        return
+    volume_path = os.path.join(zone.grp_dir, "state", "master_volume_last.txt")
+    try:
+        raw = _read_text(volume_path)
+        if raw == "":
+            return
+        volume = max(0, min(100, int(round(float(raw)))))
+    except (OSError, ValueError):
+        return
+    try:
+        zone.owntone_api.set_volume(volume)
+        log.info("Applied persisted master volume %s for %s", volume, zone.zone_id)
+    except Exception as exc:
+        log.warning("Could not apply persisted master volume for %s: %s", zone.zone_id, exc)
 
 
 def _launch_host_processes(zone):
