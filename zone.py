@@ -515,10 +515,18 @@ class ZoneManager:
             return None, "Zone not found"
         current = _normalize_tts_policy(zone.config.get("tts_policy"))
         incoming = policy_updates if isinstance(policy_updates, dict) else {}
+        if isinstance(incoming.get("policy"), dict):
+            incoming = incoming["policy"]
+        room_update = incoming.get("room", current["room"])
+        if not isinstance(room_update, dict):
+            room_update = current["room"]
+        speaker_updates = incoming.get("speakers", current["speakers"])
+        if not isinstance(speaker_updates, dict):
+            speaker_updates = current["speakers"]
         merged = {
             "mode": incoming.get("mode", current["mode"]),
-            "room": incoming.get("room", current["room"]),
-            "speakers": incoming.get("speakers", current["speakers"]),
+            "room": room_update,
+            "speakers": speaker_updates,
         }
         policy = _normalize_tts_policy(merged)
         zone.config["tts_policy"] = policy
