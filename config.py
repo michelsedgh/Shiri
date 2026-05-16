@@ -321,7 +321,6 @@ def generate_arecord_supervisor(zone):
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
     capture_dev = f"hw:Loopback,1,{subdev}"
-    os.chmod(MIXER_SCRIPT, 0o755)
 
     script_path = os.path.join(grp_dir, "config", "arecord_supervisor.sh")
     template = _read_template("arecord_supervisor.sh")
