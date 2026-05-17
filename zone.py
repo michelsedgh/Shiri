@@ -555,7 +555,7 @@ class ZoneManager:
                               sample_rate=24000, channels=1, sample_width=2,
                               text=None,
                               speaker_id=None, speaker_name=None):
-        """Resolve room policy and return the direct mixer WebSocket target."""
+        """Resolve room policy and return the live mixer WebSocket target."""
         zone = self.get_zone(zone_id)
         if not zone:
             return None, "Zone not found"

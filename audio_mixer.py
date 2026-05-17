@@ -3,15 +3,15 @@
 audio_mixer.py - Shiri zone audio mixer.
 
 OwnTone reads one raw PCM FIFO per zone. This process feeds that FIFO with a
-single GStreamer pipeline:
+single long-running GStreamer mixer pipeline:
 
   ALSA loopback capture  -> volume -> \
   live silence bed ------------------> audiomixer -> OwnTone FIFO
-  TTS appsrc -----------> convert/resample -> /
+  live TTS appsrc branch ------------> /
 
-Python only owns control-plane work here: websocket stream intake, TTS appsrc
-buffering, ducking targets, and FIFO reconnects. GStreamer owns live capture,
-format conversion, resampling, mixing, clipping, and output pacing.
+Each TTS websocket creates a short-lived branch. Python pushes raw PCM bytes
+into appsrc; rawaudioparse turns those bytes into timestamped audio frames.
+GStreamer owns backpressure, conversion, resampling, mixing, and output pacing.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ import fcntl
 import json
 import logging
 import os
-import queue
 import re
 import signal
 import threading
@@ -45,19 +44,19 @@ DEFAULT_DUCK_GAIN = 0.28
 DUCK_ATTACK_SECONDS = 0.08
 DUCK_RELEASE_SECONDS = 0.45
 DUCK_UPDATE_SECONDS = 0.02
-TTS_DUCK_START_FRACTION = 0.65
-
-TTS_PREBUFFER_SECONDS = 0.10
-TTS_PUSH_SECONDS = 0.02
-TTS_START_LEAD_SECONDS = 0.05
-TTS_MAX_PUSH_BUFFERS_PER_TICK = 32
-TTS_GAP_SECONDS = 0.03
 TTS_DUCK_TAIL_SECONDS = 0.20
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
-STREAM_START_TIMEOUT_SECONDS = 5.0
-STREAM_STALL_TIMEOUT_SECONDS = 6.0
+PIPELINE_READY_TIMEOUT_SECONDS = 5.0
+# This is queued-ahead audio, not startup latency. Playback starts as soon as
+# the first buffers arrive; the queue lets faster-than-realtime TTS producers
+# finish sending without being forced to trickle at speaker playback speed.
+TTS_QUEUE_SECONDS = 30.0
+TTS_START_LEAD_SECONDS = 0.03
+TTS_DRAIN_MIN_SECONDS = 5.0
+TTS_DRAIN_MARGIN_SECONDS = 1.5
+TTS_DRAIN_MAX_SECONDS = 120.0
 
 
 log = logging.getLogger("shiri.audio_mixer")
@@ -67,121 +66,56 @@ class PipelineRestart(RuntimeError):
     """Raised when the GStreamer pipeline must be rebuilt."""
 
 
-@dataclass
-class LiveTTSBuffer:
-    data: bytearray = field(default_factory=bytearray)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    complete: bool = False
-    error: str | None = None
-    total_received: int = 0
-    created_at: float = field(default_factory=time.monotonic)
-    last_write_at: float = field(default_factory=time.monotonic)
-
-    def append(self, chunk: bytes) -> None:
-        if not chunk:
-            return
-        with self.lock:
-            if self.complete:
-                return
-            self.data.extend(chunk)
-            self.total_received += len(chunk)
-            self.last_write_at = time.monotonic()
-
-    def finish(self, error: str | None = None) -> None:
-        with self.lock:
-            self.complete = True
-            if error:
-                self.error = error
-            self.last_write_at = time.monotonic()
-
-    def available_bytes(self) -> int:
-        with self.lock:
-            return len(self.data)
-
-    def read(self, limit: int) -> bytes:
-        with self.lock:
-            if not self.data:
-                return b""
-            size = min(limit, len(self.data))
-            chunk = bytes(self.data[:size])
-            del self.data[:size]
-            return chunk
+class PipelineNotReady(RuntimeError):
+    """Raised when a TTS stream arrives before the mixer pipeline is ready."""
 
 
-@dataclass
-class TTSClip:
+@dataclass(frozen=True)
+class TTSStreamSpec:
     request_id: str
     sample_rate: int
     channels: int
     sample_width: int
     duck_gain: float
-    kind: str
-    live_buffer: LiveTTSBuffer
-    pending: bytes = b""
-    loaded_at: float = field(default_factory=time.monotonic)
-    last_progress_at: float = field(default_factory=time.monotonic)
-    started_at: float | None = None
-    pushed_buffers: int = 0
-    pushed_bytes: int = 0
-    pushed_duration_ns: int = 0
-    next_pts_ns: int | None = None
 
     @property
     def frame_width(self) -> int:
         return max(1, self.channels * self.sample_width)
 
     @property
-    def push_chunk_bytes(self) -> int:
-        frames = max(1, int(self.sample_rate * TTS_PUSH_SECONDS))
-        return frames * self.frame_width
+    def bytes_per_second(self) -> int:
+        return max(1, self.sample_rate * self.frame_width)
+
+
+@dataclass
+class LiveTTSBranch:
+    spec: TTSStreamSpec
+    appsrc: object
+    elements: list[object]
+    mixer_pad: object
+    src_pad: object
+    eos_probe_id: int | None
+    finished: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    pushed_bytes: int = 0
+    pushed_buffers: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+    first_audio_at: float | None = None
+    last_audio_at: float | None = None
+    offset_set: bool = False
+    closed: bool = False
 
     @property
-    def prebuffer_bytes(self) -> int:
-        frames = max(1, int(self.sample_rate * TTS_PREBUFFER_SECONDS))
-        return frames * self.frame_width
+    def request_id(self) -> str:
+        return self.spec.request_id
 
-    def ready_to_start(self) -> bool:
-        available = self.live_buffer.available_bytes()
-        return available >= self.prebuffer_bytes or (self.live_buffer.complete and available > 0)
+    @property
+    def frame_width(self) -> int:
+        return self.spec.frame_width
 
-    def source_size(self) -> int:
-        return self.live_buffer.total_received
-
-    def source_complete(self) -> bool:
-        return self.live_buffer.complete
-
-    def exhausted(self) -> bool:
-        return self.live_buffer.complete and self.live_buffer.available_bytes() <= 0 and not self.pending
-
-    def read_chunk(self) -> bytes:
-        raw = self.live_buffer.read(self.push_chunk_bytes)
-        if raw:
-            self.pending += raw
-
-        usable = (len(self.pending) // self.frame_width) * self.frame_width
-        if usable <= 0:
-            return b""
-
-        chunk = self.pending[:usable]
-        self.pending = self.pending[usable:]
-        self.last_progress_at = time.monotonic()
-        return chunk
-
-    def should_drop(self) -> str | None:
-        if self.live_buffer.complete:
-            if self.live_buffer.error:
-                return self.live_buffer.error
-            return None
-        now = time.monotonic()
-        available = self.live_buffer.available_bytes()
-        if self.live_buffer.total_received <= 0 and now - self.live_buffer.created_at > STREAM_START_TIMEOUT_SECONDS:
-            return "websocket stream never received audio"
-        if available <= 0 and now - self.live_buffer.last_write_at > STREAM_STALL_TIMEOUT_SECONDS:
-            return "websocket stream stopped receiving audio before finish"
-        return None
-
-    def cleanup(self) -> None:
-        return None
+    @property
+    def duck_gain(self) -> float:
+        return self.spec.duck_gain
 
 
 class GstZoneMixer:
@@ -196,21 +130,21 @@ class GstZoneMixer:
         self.Gst = None
         self.pipeline = None
         self.bus = None
+        self.mixer = None
         self.pipe_fd: int | None = None
-        self.tts_src = None
         self.music_volume = None
 
         self._stop = False
-        self._active_clip: TTSClip | None = None
-        self._tts_caps_key: tuple[int, int] | None = None
         self._duck_level = 1.0
         self._duck_target = 1.0
         self._duck_hold_gain = 1.0
         self._duck_hold_until = 0.0
-        self._tts_next_free_pts_ns: int | None = None
         self._last_duck_update = time.monotonic()
         self._last_pipe_wait_log = 0.0
-        self._live_clips: queue.Queue[TTSClip] = queue.Queue()
+
+        self._gst_lock = threading.RLock()
+        self._tts_stream_lock = threading.Lock()
+        self._active_branch: LiveTTSBranch | None = None
         self._ws_thread: threading.Thread | None = None
 
     def run(self) -> None:
@@ -267,26 +201,27 @@ class GstZoneMixer:
             raise
 
     def _start_pipeline(self) -> None:
-        if self.pipeline is not None:
-            return
-        Gst = self.Gst
-        self.pipeline = Gst.Pipeline.new("shiri-zone-mixer")
+        with self._gst_lock:
+            if self.pipeline is not None:
+                return
+            Gst = self.Gst
+            self.pipeline = Gst.Pipeline.new("shiri-zone-mixer")
 
-        mixer = make_element(Gst, "audiomixer", "mix")
-        set_property_if_present(mixer, "ignore-inactive-pads", True)
-        set_property_if_present(mixer, "output-buffer-duration", 10_000_000)
-        self.pipeline.add(mixer)
+            mixer = make_element(Gst, "audiomixer", "mix")
+            set_property_if_present(mixer, "ignore-inactive-pads", True)
+            set_property_if_present(mixer, "output-buffer-duration", 10_000_000)
+            self.pipeline.add(mixer)
+            self.mixer = mixer
 
-        self._add_silence_branch(mixer)
-        self._add_music_branch(mixer)
-        self._add_tts_branch(mixer)
-        self._add_output_branch(mixer)
+            self._add_silence_branch(mixer)
+            self._add_music_branch(mixer)
+            self._add_output_branch(mixer)
 
-        self.bus = self.pipeline.get_bus()
-        result = self.pipeline.set_state(Gst.State.PLAYING)
-        if result == Gst.StateChangeReturn.FAILURE:
-            raise PipelineRestart("GStreamer refused PLAYING state")
-        log.info("GStreamer pipeline started")
+            self.bus = self.pipeline.get_bus()
+            result = self.pipeline.set_state(Gst.State.PLAYING)
+            if result == Gst.StateChangeReturn.FAILURE:
+                raise PipelineRestart("GStreamer refused PLAYING state")
+            log.info("GStreamer pipeline started")
 
     def _add_silence_branch(self, mixer) -> None:
         Gst = self.Gst
@@ -319,29 +254,6 @@ class GstZoneMixer:
         self._add_and_link([src, caps, queue, self.music_volume])
         self._link_to_mixer(self.music_volume, mixer)
 
-    def _add_tts_branch(self, mixer) -> None:
-        Gst = self.Gst
-        self.tts_src = make_element(Gst, "appsrc", "tts_src")
-        self.tts_src.set_property("is-live", True)
-        self.tts_src.set_property("format", Gst.Format.TIME)
-        self.tts_src.set_property("block", False)
-        self.tts_src.set_property("do-timestamp", False)
-        self.tts_src.set_property("emit-signals", False)
-        set_property_if_present(self.tts_src, "max-bytes", 2 * 1024 * 1024)
-        set_property_if_present(self.tts_src, "min-latency", 0)
-        set_property_if_present(self.tts_src, "max-latency", int(0.5 * 1_000_000_000))
-
-        buffer_queue = make_element(Gst, "queue", "tts_buffer")
-        set_property_if_present(buffer_queue, "max-size-time", int(0.5 * 1_000_000_000))
-        set_property_if_present(buffer_queue, "max-size-bytes", 0)
-        convert = make_element(Gst, "audioconvert", "tts_convert")
-        resample = make_element(Gst, "audioresample", "tts_resample")
-        caps = make_element(Gst, "capsfilter", "tts_output_caps")
-        caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
-
-        self._add_and_link([self.tts_src, buffer_queue, convert, resample, caps])
-        self._link_to_mixer(caps, mixer)
-
     def _add_output_branch(self, mixer) -> None:
         Gst = self.Gst
         convert = make_element(Gst, "audioconvert", "mix_convert")
@@ -361,25 +273,37 @@ class GstZoneMixer:
     def _add_and_link(self, elements: list[object]) -> None:
         for element in elements:
             self.pipeline.add(element)
+        self._link_chain(elements)
+
+    def _link_chain(self, elements: list[object]) -> None:
         for left, right in zip(elements, elements[1:]):
             if not left.link(right):
                 raise RuntimeError(f"Could not link {left.get_name()} -> {right.get_name()}")
 
-    def _link_to_mixer(self, src_element, mixer) -> None:
+    def _link_to_mixer(self, src_element, mixer) -> object:
         src_pad = src_element.get_static_pad("src")
+        sink_pad = self._request_mixer_pad(mixer)
+        if src_pad is None or src_pad.link(sink_pad) != self.Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"Could not link {src_element.get_name()} to audiomixer")
+        return sink_pad
+
+    def _request_mixer_pad(self, mixer=None):
+        mixer = mixer or self.mixer
+        if mixer is None:
+            raise PipelineNotReady("GStreamer mixer is not ready")
         if hasattr(mixer, "request_pad_simple"):
             sink_pad = mixer.request_pad_simple("sink_%u")
         else:
             sink_pad = None
         if sink_pad is None:
             sink_pad = mixer.get_request_pad("sink_%u")
-        if sink_pad is None or src_pad.link(sink_pad) != self.Gst.PadLinkReturn.OK:
-            raise RuntimeError(f"Could not link {src_element.get_name()} to audiomixer")
+        if sink_pad is None:
+            raise RuntimeError("Could not request audiomixer sink pad")
+        return sink_pad
 
     def _run_pipeline_loop(self) -> None:
         while not self._stop and self.pipeline is not None:
             self._handle_bus_messages()
-            self._pump_tts()
             self._update_ducking()
             time.sleep(DUCK_UPDATE_SECONDS)
 
@@ -404,143 +328,179 @@ class GstZoneMixer:
             elif msg.type == Gst.MessageType.EOS:
                 raise PipelineRestart("unexpected pipeline EOS")
 
-    def _pump_tts(self) -> None:
-        if self.tts_src is None:
+    def _create_live_tts_branch(self, spec: TTSStreamSpec) -> LiveTTSBranch:
+        with self._gst_lock:
+            if self.pipeline is None or self.mixer is None:
+                raise PipelineNotReady("GStreamer mixer pipeline is not ready")
+            if self._active_branch is not None:
+                raise RuntimeError("Another TTS stream is already active")
+
+            Gst = self.Gst
+            appsrc = make_element(Gst, "appsrc", f"tts_src_{spec.request_id}")
+            appsrc.set_property("is-live", False)
+            appsrc.set_property("format", Gst.Format.BYTES)
+            appsrc.set_property("block", True)
+            appsrc.set_property("do-timestamp", False)
+            appsrc.set_property("emit-signals", False)
+            appsrc.set_property("caps", Gst.Caps.from_string(
+                "audio/x-unaligned-raw,format=S16LE,layout=interleaved,"
+                f"rate={spec.sample_rate},channels={spec.channels}"
+            ))
+            queue_time_ns = int(TTS_QUEUE_SECONDS * 1_000_000_000)
+            set_property_if_present(appsrc, "max-bytes", max(4096, int(spec.bytes_per_second * TTS_QUEUE_SECONDS)))
+            set_property_if_present(appsrc, "min-percent", 20)
+
+            parse = make_element(Gst, "rawaudioparse", f"tts_parse_{spec.request_id}")
+            parse.set_property("use-sink-caps", True)
+            set_property_if_present(parse, "disable-passthrough", True)
+
+            queue_element = make_element(Gst, "queue", f"tts_queue_{spec.request_id}")
+            set_property_if_present(queue_element, "max-size-time", queue_time_ns)
+            set_property_if_present(queue_element, "max-size-bytes", 0)
+            set_property_if_present(queue_element, "max-size-buffers", 0)
+            convert = make_element(Gst, "audioconvert", f"tts_convert_{spec.request_id}")
+            resample = make_element(Gst, "audioresample", f"tts_resample_{spec.request_id}")
+            caps = make_element(Gst, "capsfilter", f"tts_caps_{spec.request_id}")
+            caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
+            volume = make_element(Gst, "volume", f"tts_volume_{spec.request_id}")
+            volume.set_property("volume", 1.0)
+
+            elements = [appsrc, parse, queue_element, convert, resample, caps, volume]
+            mixer_pad = None
+            try:
+                for element in elements:
+                    self.pipeline.add(element)
+                self._link_chain(elements)
+
+                src_pad = volume.get_static_pad("src")
+                mixer_pad = self._request_mixer_pad()
+                if src_pad is None or src_pad.link(mixer_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError("Could not link live TTS branch to audiomixer")
+
+                branch = LiveTTSBranch(
+                    spec=spec,
+                    appsrc=appsrc,
+                    elements=elements,
+                    mixer_pad=mixer_pad,
+                    src_pad=src_pad,
+                    eos_probe_id=None,
+                )
+                branch.eos_probe_id = src_pad.add_probe(
+                    Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    self._tts_branch_event_probe,
+                    branch,
+                )
+
+                for element in elements:
+                    if not element.sync_state_with_parent():
+                        raise RuntimeError(f"Could not sync {element.get_name()} with mixer pipeline")
+
+                self._active_branch = branch
+                self._duck_target = spec.duck_gain
+                log.info(
+                    "Started live TTS stream %s sample_rate=%d channels=%d duck_gain=%.2f",
+                    spec.request_id,
+                    spec.sample_rate,
+                    spec.channels,
+                    spec.duck_gain,
+                )
+                return branch
+            except Exception:
+                if mixer_pad is not None:
+                    with contextlib.suppress(Exception):
+                        self.mixer.release_request_pad(mixer_pad)
+                for element in reversed(elements):
+                    with contextlib.suppress(Exception):
+                        element.set_state(Gst.State.NULL)
+                    with contextlib.suppress(Exception):
+                        self.pipeline.remove(element)
+                raise
+
+    def _tts_branch_event_probe(self, _pad, info, branch: LiveTTSBranch):
+        event = info.get_event()
+        if event is not None and event.type == self.Gst.EventType.EOS:
+            branch.finished.set()
+            return self.Gst.PadProbeReturn.DROP
+        return self.Gst.PadProbeReturn.OK
+
+    def _push_live_tts_buffer(self, branch: LiveTTSBranch, chunk: bytes) -> None:
+        if not chunk:
             return
-        if self._active_clip is None:
-            self._active_clip = self._load_next_clip()
-            if self._active_clip is None:
-                self._duck_target = 1.0
-                return
+        with branch.lock:
+            if branch.closed:
+                raise RuntimeError(f"TTS stream {branch.request_id} is already closed")
+            if not branch.offset_set:
+                start_offset_ns = self._pipeline_running_time_ns() + int(TTS_START_LEAD_SECONDS * 1_000_000_000)
+                branch.src_pad.set_offset(start_offset_ns)
+                branch.first_audio_at = time.monotonic()
+                branch.offset_set = True
+                log.info(
+                    "Anchored live TTS stream %s at running_time_ms=%d",
+                    branch.request_id,
+                    int(start_offset_ns / 1_000_000),
+                )
 
-        clip = self._active_clip
-        drop_reason = clip.should_drop()
-        if drop_reason:
-            log.warning("Dropping stalled TTS request %s: %s", clip.request_id, drop_reason)
-            clip.cleanup()
-            self._active_clip = None
-            self._duck_target = 1.0
-            return
-
-        source_size = clip.source_size()
-        if source_size > 0:
-            self._duck_target = clip.duck_gain
-
-        if not clip.ready_to_start():
-            if clip.source_complete() and source_size <= 0:
-                log.warning("Dropping empty TTS request %s", clip.request_id)
-                clip.cleanup()
-                self._active_clip = None
-                self._duck_target = 1.0
-                return
-            if source_size <= 0:
-                self._duck_target = 1.0
-            return
-
-        self._duck_target = clip.duck_gain
-        if clip.started_at is None:
-            if not self._duck_ready_for_tts(clip.duck_gain):
-                return
-            self._start_active_clip()
-
-        self._fill_tts_appsrc(clip)
-
-        if clip.exhausted():
-            self._finish_active_clip(clip, reason="pushed_to_gstreamer")
-
-    def _start_active_clip(self) -> None:
-        clip = self._active_clip
-        if clip is None:
-            return
-        self._set_tts_caps(clip)
-        clip.started_at = time.monotonic()
-        start_pts_ns = self._pipeline_running_time_ns() + int(TTS_START_LEAD_SECONDS * 1_000_000_000)
-        if self._tts_next_free_pts_ns is not None:
-            gap_ns = int(TTS_GAP_SECONDS * 1_000_000_000)
-            start_pts_ns = max(start_pts_ns, self._tts_next_free_pts_ns + gap_ns)
-        clip.next_pts_ns = start_pts_ns
-        log.info(
-            "Starting %s TTS request %s sample_rate=%d channels=%d duck_gain=%.2f prebuffer=%d bytes start_pts_ms=%d",
-            clip.kind,
-            clip.request_id,
-            clip.sample_rate,
-            clip.channels,
-            clip.duck_gain,
-            min(clip.source_size(), clip.prebuffer_bytes),
-            int((clip.next_pts_ns or 0) / 1_000_000),
-        )
-
-    def _set_tts_caps(self, clip: TTSClip) -> None:
-        caps_key = (clip.sample_rate, clip.channels)
-        if caps_key == self._tts_caps_key:
-            return
-        caps_text = (
-            "audio/x-raw,format=S16LE,layout=interleaved,"
-            f"rate={clip.sample_rate},channels={clip.channels}"
-        )
-        self.tts_src.set_property("caps", self.Gst.Caps.from_string(caps_text))
-        self._tts_caps_key = caps_key
-        log.info("Configured TTS appsrc caps: %s", caps_text)
-
-    def _fill_tts_appsrc(self, clip: TTSClip) -> None:
-        pushed = 0
-        while not self._stop and pushed < TTS_MAX_PUSH_BUFFERS_PER_TICK:
-            chunk = clip.read_chunk()
-            if not chunk:
-                return
-            self._push_tts_buffer(clip, chunk)
-            pushed += 1
-
-    def _push_tts_buffer(self, clip: TTSClip, chunk: bytes) -> None:
-        frames = len(chunk) // clip.frame_width
-        duration_ns = int(frames * 1_000_000_000 / clip.sample_rate)
-        pts_ns = clip.next_pts_ns
-        if pts_ns is None:
-            pts_ns = self._pipeline_running_time_ns()
         buffer = self.Gst.Buffer.new_allocate(None, len(chunk), None)
         buffer.fill(0, chunk)
-        buffer.pts = pts_ns
-        buffer.dts = pts_ns
-        buffer.duration = duration_ns
-        if clip.pushed_buffers == 0:
-            buffer.set_flags(self.Gst.BufferFlags.DISCONT)
-        ret = self.tts_src.emit("push-buffer", buffer)
+
+        ret = branch.appsrc.emit("push-buffer", buffer)
         if ret != self.Gst.FlowReturn.OK:
-            raise PipelineRestart(f"TTS appsrc push failed: {ret.value_nick}")
-        clip.pushed_buffers += 1
-        clip.pushed_bytes += len(chunk)
-        clip.pushed_duration_ns += duration_ns
-        clip.next_pts_ns = pts_ns + duration_ns
-        self._tts_next_free_pts_ns = clip.next_pts_ns
+            raise RuntimeError(f"TTS appsrc push failed: {ret.value_nick}")
 
-    def _finish_active_clip(self, clip: TTSClip, *, reason: str) -> None:
-        received_bytes = clip.source_size()
+        with branch.lock:
+            if not branch.closed:
+                branch.pushed_buffers += 1
+                branch.pushed_bytes += len(chunk)
+                branch.last_audio_at = time.monotonic()
+
+    def _end_live_tts_stream(self, branch: LiveTTSBranch) -> None:
+        with branch.lock:
+            if branch.closed:
+                return
+        ret = branch.appsrc.emit("end-of-stream")
+        if ret not in {self.Gst.FlowReturn.OK, self.Gst.FlowReturn.FLUSHING}:
+            raise RuntimeError(f"TTS appsrc EOS failed: {ret.value_nick}")
+
+    async def _wait_for_branch_drain(self, branch: LiveTTSBranch) -> bool:
+        timeout = self._branch_drain_timeout_seconds(branch)
+        deadline = time.monotonic() + timeout
+        expected_end = self._branch_expected_end_time(branch)
         log.info(
-            "Finished TTS request %s reason=%s received=%d pushed=%d buffers=%d scheduled_ms=%d",
-            clip.request_id,
-            reason,
-            received_bytes,
-            clip.pushed_bytes,
-            clip.pushed_buffers,
-            int(clip.pushed_duration_ns / 1_000_000),
+            "Waiting up to %.1fs for live TTS stream %s to drain audio_duration_ms=%d remaining_ms=%d",
+            timeout,
+            branch.request_id,
+            int(self._branch_audio_duration_seconds(branch) * 1000),
+            int(max(0.0, expected_end - time.monotonic()) * 1000),
         )
-        self._hold_duck_for_clip(clip)
-        clip.cleanup()
-        self._active_clip = None
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if branch.finished.is_set() and now >= expected_end:
+                return True
+            await asyncio.sleep(0.02)
+        return branch.finished.is_set()
 
-    def _hold_duck_for_clip(self, clip: TTSClip) -> None:
-        if clip.started_at is None or clip.pushed_duration_ns <= 0:
-            return
-        until = clip.started_at + (clip.pushed_duration_ns / 1_000_000_000) + TTS_DUCK_TAIL_SECONDS
-        self._duck_hold_until = max(self._duck_hold_until, until)
-        self._duck_hold_gain = min(self._duck_hold_gain, clip.duck_gain)
+    def _branch_audio_duration_seconds(self, branch: LiveTTSBranch) -> float:
+        return branch.pushed_bytes / max(1, branch.spec.bytes_per_second)
 
-    def _duck_ready_for_tts(self, duck_gain: float) -> bool:
-        target = clamp_float(duck_gain, 0.0, 1.0, DEFAULT_DUCK_GAIN)
-        if target >= 0.98:
-            return True
-        start_level = 1.0 - ((1.0 - target) * TTS_DUCK_START_FRACTION)
-        return self._duck_level <= start_level
+    def _branch_expected_end_time(self, branch: LiveTTSBranch) -> float:
+        start = branch.first_audio_at if branch.first_audio_at is not None else time.monotonic()
+        return start + TTS_START_LEAD_SECONDS + self._branch_audio_duration_seconds(branch)
+
+    def _branch_drain_timeout_seconds(self, branch: LiveTTSBranch) -> float:
+        remaining = max(0.0, self._branch_expected_end_time(branch) - time.monotonic())
+        timeout = remaining + TTS_DRAIN_MARGIN_SECONDS
+        return min(TTS_DRAIN_MAX_SECONDS, max(TTS_DRAIN_MIN_SECONDS, timeout))
+
+    async def _create_live_tts_branch_when_ready(self, spec: TTSStreamSpec) -> LiveTTSBranch:
+        deadline = time.monotonic() + PIPELINE_READY_TIMEOUT_SECONDS
+        last_error: Exception | None = None
+        while not self._stop and time.monotonic() < deadline:
+            try:
+                return self._create_live_tts_branch(spec)
+            except PipelineNotReady as exc:
+                last_error = exc
+                await asyncio.sleep(0.05)
+        raise RuntimeError(str(last_error or "GStreamer mixer pipeline is not ready"))
 
     def _pipeline_running_time_ns(self) -> int:
         if self.pipeline is None:
@@ -550,11 +510,45 @@ class GstZoneMixer:
             return 0
         return max(0, int(clock.get_time() - self.pipeline.get_base_time()))
 
-    def _load_next_clip(self) -> TTSClip | None:
-        try:
-            return self._live_clips.get_nowait()
-        except queue.Empty:
-            return None
+    def _destroy_live_tts_branch(self, branch: LiveTTSBranch, *, reason: str, hold_duck: bool = True) -> None:
+        with branch.lock:
+            if branch.closed:
+                return
+            branch.closed = True
+
+        with self._gst_lock:
+            Gst = self.Gst
+            if branch.eos_probe_id is not None:
+                with contextlib.suppress(Exception):
+                    branch.src_pad.remove_probe(branch.eos_probe_id)
+                branch.eos_probe_id = None
+            with contextlib.suppress(Exception):
+                branch.src_pad.unlink(branch.mixer_pad)
+            for element in reversed(branch.elements):
+                with contextlib.suppress(Exception):
+                    element.set_state(Gst.State.NULL)
+            if self.pipeline is not None:
+                for element in branch.elements:
+                    with contextlib.suppress(Exception):
+                        self.pipeline.remove(element)
+            if self.mixer is not None:
+                with contextlib.suppress(Exception):
+                    self.mixer.release_request_pad(branch.mixer_pad)
+
+            if self._active_branch is branch:
+                self._active_branch = None
+                self._duck_target = 1.0
+                if hold_duck and branch.pushed_bytes > 0:
+                    self._duck_hold_until = max(self._duck_hold_until, time.monotonic() + TTS_DUCK_TAIL_SECONDS)
+                    self._duck_hold_gain = min(self._duck_hold_gain, branch.duck_gain)
+
+        log.info(
+            "Closed live TTS stream %s reason=%s pushed=%d buffers=%d",
+            branch.request_id,
+            reason,
+            branch.pushed_bytes,
+            branch.pushed_buffers,
+        )
 
     def _update_ducking(self) -> None:
         if self.music_volume is None:
@@ -577,22 +571,27 @@ class GstZoneMixer:
         self.music_volume.set_property("volume", self._duck_level)
 
     def _stop_pipeline(self) -> None:
-        if self.pipeline is not None:
-            try:
-                self.pipeline.set_state(self.Gst.State.NULL)
-            except Exception:
-                log.exception("Could not stop GStreamer pipeline cleanly")
-        self.pipeline = None
-        self.bus = None
-        self.tts_src = None
-        self.music_volume = None
-        self._tts_caps_key = None
-        if self.pipe_fd is not None:
-            try:
-                os.close(self.pipe_fd)
-            except OSError:
-                pass
-            self.pipe_fd = None
+        with self._gst_lock:
+            branch = self._active_branch
+            if branch is not None:
+                with branch.lock:
+                    branch.closed = True
+                self._active_branch = None
+            if self.pipeline is not None:
+                try:
+                    self.pipeline.set_state(self.Gst.State.NULL)
+                except Exception:
+                    log.exception("Could not stop GStreamer pipeline cleanly")
+            self.pipeline = None
+            self.bus = None
+            self.mixer = None
+            self.music_volume = None
+            if self.pipe_fd is not None:
+                try:
+                    os.close(self.pipe_fd)
+                except OSError:
+                    pass
+                self.pipe_fd = None
 
     def _start_tts_websocket(self) -> None:
         if self.tts_ws_port <= 0:
@@ -626,7 +625,6 @@ class GstZoneMixer:
                 await asyncio.sleep(0.2)
 
     async def _handle_tts_websocket(self, websocket, _path: str | None = None) -> None:
-        clip: TTSClip | None = None
         try:
             while True:
                 first = await websocket.recv()
@@ -638,77 +636,87 @@ class GstZoneMixer:
                     await websocket.send(json.dumps({"type": "error", "error": "message must have type=start"}))
                     continue
 
-                clip = self._clip_from_websocket_start(start)
-                await websocket.send(json.dumps({
-                    "type": "started",
-                    "request_id": clip.request_id,
-                    "sample_rate": clip.sample_rate,
-                    "channels": clip.channels,
-                    "sample_width": clip.sample_width,
-                }))
-
-                keep_open = await self._receive_tts_clip(websocket, clip)
-                clip = None
+                keep_open = await self._receive_tts_stream(websocket, start)
                 if not keep_open:
                     return
         except Exception as exc:
             with contextlib.suppress(Exception):
                 await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
 
-    async def _receive_tts_clip(self, websocket, clip: TTSClip) -> bool:
-        queued = False
+    async def _receive_tts_stream(self, websocket, start: dict) -> bool:
+        branch: LiveTTSBranch | None = None
+        stream_lock_acquired = False
+        spec = self._stream_spec_from_websocket_start(start)
         try:
+            stream_lock_acquired = self._tts_stream_lock.acquire(blocking=False)
+            if not stream_lock_acquired:
+                await websocket.send(json.dumps({"type": "error", "error": "another TTS stream is active"}))
+                return True
+
+            branch = await self._create_live_tts_branch_when_ready(spec)
+            await websocket.send(json.dumps({
+                "type": "started",
+                "request_id": spec.request_id,
+                "sample_rate": spec.sample_rate,
+                "channels": spec.channels,
+                "sample_width": spec.sample_width,
+            }))
+
             async for message in websocket:
                 if isinstance(message, bytes):
-                    clip.live_buffer.append(message)
-                    if not queued and clip.live_buffer.total_received > 0:
-                        self._live_clips.put(clip)
-                        queued = True
-                        log.info(
-                            "Queued websocket TTS request %s after first audio received=%d",
-                            clip.request_id,
-                            clip.live_buffer.total_received,
-                        )
+                    await asyncio.to_thread(self._push_live_tts_buffer, branch, message)
                     continue
+
                 payload = json.loads(message)
                 msg_type = payload.get("type")
                 if msg_type == "end":
-                    if not queued and clip.live_buffer.total_received > 0:
-                        self._live_clips.put(clip)
-                        queued = True
-                        log.info(
-                            "Queued websocket TTS request %s at stream end received=%d",
-                            clip.request_id,
-                            clip.live_buffer.total_received,
-                        )
-                    clip.live_buffer.finish()
                     log.info(
-                        "Received websocket TTS request %s complete received=%d",
-                        clip.request_id,
-                        clip.live_buffer.total_received,
+                        "Received websocket end for live TTS stream %s received=%d audio_duration_ms=%d",
+                        spec.request_id,
+                        branch.pushed_bytes,
+                        int(self._branch_audio_duration_seconds(branch) * 1000),
                     )
+                    await asyncio.to_thread(self._end_live_tts_stream, branch)
                     await websocket.send(json.dumps({
                         "type": "ended",
-                        "request_id": clip.request_id,
-                        "received_bytes": clip.live_buffer.total_received,
+                        "request_id": spec.request_id,
+                        "received_bytes": branch.pushed_bytes,
                     }))
+                    if not await self._wait_for_branch_drain(branch):
+                        log.warning("Timed out waiting for live TTS stream %s to drain", spec.request_id)
+                    self._destroy_live_tts_branch(branch, reason="end")
+                    branch = None
                     return True
                 if msg_type == "cancel":
-                    if queued:
-                        clip.live_buffer.finish(str(payload.get("error") or "cancelled"))
-                    log.info("Cancelled websocket TTS request %s", clip.request_id)
-                    await websocket.send(json.dumps({"type": "cancelled", "request_id": clip.request_id}))
+                    self._destroy_live_tts_branch(branch, reason=str(payload.get("error") or "cancelled"), hold_duck=False)
+                    branch = None
+                    await websocket.send(json.dumps({"type": "cancelled", "request_id": spec.request_id}))
                     return True
                 await websocket.send(json.dumps({"type": "error", "error": f"unknown message type: {msg_type}"}))
-            if queued:
-                clip.live_buffer.finish()
+
+            if branch is not None:
+                if branch.pushed_bytes > 0:
+                    await asyncio.to_thread(self._end_live_tts_stream, branch)
+                    await self._wait_for_branch_drain(branch)
+                    self._destroy_live_tts_branch(branch, reason="websocket_closed")
+                else:
+                    self._destroy_live_tts_branch(branch, reason="websocket_closed_empty", hold_duck=False)
+                branch = None
             return False
         except Exception as exc:
-            if queued:
-                clip.live_buffer.finish(str(exc))
-            raise
+            if branch is not None:
+                self._destroy_live_tts_branch(branch, reason=f"error: {exc}", hold_duck=False)
+                branch = None
+            with contextlib.suppress(Exception):
+                await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
+            return False
+        finally:
+            if branch is not None:
+                self._destroy_live_tts_branch(branch, reason="handler_exit", hold_duck=False)
+            if stream_lock_acquired:
+                self._tts_stream_lock.release()
 
-    def _clip_from_websocket_start(self, payload: dict) -> TTSClip:
+    def _stream_spec_from_websocket_start(self, payload: dict) -> TTSStreamSpec:
         sample_rate = int(payload.get("sample_rate") or 24000)
         channels = int(payload.get("channels") or 1)
         sample_width = int(payload.get("sample_width") or 2)
@@ -719,14 +727,12 @@ class GstZoneMixer:
             raise ValueError("sample_rate and channels must be positive")
         if sample_width != 2:
             raise ValueError("websocket TTS only accepts 16-bit PCM")
-        return TTSClip(
+        return TTSStreamSpec(
             request_id=safe_request_id(payload.get("request_id")),
             sample_rate=sample_rate,
             channels=channels,
             sample_width=sample_width,
             duck_gain=clamp_float(payload.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
-            kind="websocket",
-            live_buffer=LiveTTSBuffer(),
         )
 
 
@@ -752,19 +758,6 @@ def set_property_if_present(element, prop: str, value) -> bool:
         return False
     element.set_property(prop, value)
     return True
-
-
-def get_int_property(element, prop: str, default: int) -> int:
-    if element.find_property(prop) is None:
-        return default
-    try:
-        value = element.get_property(prop)
-    except Exception:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def clamp_float(value: object, minimum: float, maximum: float, default: float) -> float:

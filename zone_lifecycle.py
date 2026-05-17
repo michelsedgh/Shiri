@@ -814,7 +814,7 @@ def _wait_for_owntone(zone, timeout=60):
 def _start_mixer(zone):
     """
     Start the host audio mixer.
-    It captures ALSA loopback, overlays queued TTS, and writes OwnTone's audio.pipe.
+    It captures ALSA loopback, overlays live streamed TTS, and writes OwnTone's audio.pipe.
     Runs on host beside Shairport and OwnTone.
     """
     # Generate the supervisor script from template
