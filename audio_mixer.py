@@ -58,7 +58,6 @@ PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
 STREAM_START_TIMEOUT_SECONDS = 5.0
 STREAM_STALL_TIMEOUT_SECONDS = 6.0
-WS_RECV_TIMEOUT_SECONDS = 10.0
 
 
 log = logging.getLogger("shiri.audio_mixer")
@@ -628,25 +627,37 @@ class GstZoneMixer:
 
     async def _handle_tts_websocket(self, websocket, _path: str | None = None) -> None:
         clip: TTSClip | None = None
+        try:
+            while True:
+                first = await websocket.recv()
+                if not isinstance(first, str):
+                    await websocket.send(json.dumps({"type": "error", "error": "message must be JSON start"}))
+                    continue
+                start = json.loads(first)
+                if start.get("type") != "start":
+                    await websocket.send(json.dumps({"type": "error", "error": "message must have type=start"}))
+                    continue
+
+                clip = self._clip_from_websocket_start(start)
+                await websocket.send(json.dumps({
+                    "type": "started",
+                    "request_id": clip.request_id,
+                    "sample_rate": clip.sample_rate,
+                    "channels": clip.channels,
+                    "sample_width": clip.sample_width,
+                }))
+
+                keep_open = await self._receive_tts_clip(websocket, clip)
+                clip = None
+                if not keep_open:
+                    return
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
+
+    async def _receive_tts_clip(self, websocket, clip: TTSClip) -> bool:
         queued = False
         try:
-            first = await asyncio.wait_for(websocket.recv(), timeout=WS_RECV_TIMEOUT_SECONDS)
-            if not isinstance(first, str):
-                await websocket.send(json.dumps({"type": "error", "error": "first message must be JSON start"}))
-                return
-            start = json.loads(first)
-            if start.get("type") != "start":
-                await websocket.send(json.dumps({"type": "error", "error": "first message must have type=start"}))
-                return
-            clip = self._clip_from_websocket_start(start)
-            await websocket.send(json.dumps({
-                "type": "started",
-                "request_id": clip.request_id,
-                "sample_rate": clip.sample_rate,
-                "channels": clip.channels,
-                "sample_width": clip.sample_width,
-            }))
-
             async for message in websocket:
                 if isinstance(message, bytes):
                     clip.live_buffer.append(message)
@@ -681,21 +692,21 @@ class GstZoneMixer:
                         "request_id": clip.request_id,
                         "received_bytes": clip.live_buffer.total_received,
                     }))
-                    return
+                    return True
                 if msg_type == "cancel":
                     if queued:
                         clip.live_buffer.finish(str(payload.get("error") or "cancelled"))
                     log.info("Cancelled websocket TTS request %s", clip.request_id)
                     await websocket.send(json.dumps({"type": "cancelled", "request_id": clip.request_id}))
-                    return
+                    return True
                 await websocket.send(json.dumps({"type": "error", "error": f"unknown message type: {msg_type}"}))
-            if queued and clip.live_buffer is not None:
+            if queued:
                 clip.live_buffer.finish()
+            return False
         except Exception as exc:
-            if queued and clip is not None and clip.live_buffer is not None:
+            if queued:
                 clip.live_buffer.finish(str(exc))
-            with contextlib.suppress(Exception):
-                await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
+            raise
 
     def _clip_from_websocket_start(self, payload: dict) -> TTSClip:
         sample_rate = int(payload.get("sample_rate") or 24000)
