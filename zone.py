@@ -661,6 +661,108 @@ class ZoneManager:
             "queued_bytes": len(audio_bytes),
         }, None
 
+    def start_tts_stream(self, zone_id, *, request_id=None, audio_format="pcm_s16le",
+                         sample_rate=24000, channels=1, sample_width=2,
+                         duck_gain=None, tts_gain=None, volume_pct=None, text=None,
+                         speaker_id=None, speaker_name=None):
+        """Create a streaming raw PCM TTS item for the zone mixer."""
+        zone = self.get_zone(zone_id)
+        if not zone:
+            return None, "Zone not found"
+        if zone.status != Zone.STATUS_RUNNING:
+            return None, "Zone must be running before TTS can be streamed"
+        if zone.owntone_api:
+            try:
+                zone.owntone_api.play()
+            except Exception as e:
+                log.debug("Could not nudge OwnTone play state before TTS: %s", e)
+
+        fmt = (audio_format or "pcm_s16le").lower().strip(".")
+        if fmt not in {"pcm_s16le", "raw"}:
+            return None, "Only raw signed 16-bit PCM streams are currently supported"
+        try:
+            parsed_rate = int(sample_rate)
+            parsed_channels = int(channels)
+            parsed_width = int(sample_width)
+        except (TypeError, ValueError):
+            return None, "sample_rate, channels, and sample_width must be integers"
+        if parsed_rate <= 0 or parsed_channels <= 0:
+            return None, "sample_rate and channels must be positive"
+        if parsed_width != 2:
+            return None, "Only 16-bit PCM streams are currently supported"
+
+        stream_dir = Path(zone.grp_dir) / "tts_streams"
+        stream_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = _safe_request_id(request_id)
+        prefix = f"{int(time.time() * 1000)}_{safe_id}"
+        stream_path = stream_dir / f"{prefix}.pcm"
+        meta_path = stream_dir / f"{prefix}.json"
+        tmp_meta_path = stream_dir / f"{prefix}.json.tmp"
+        done_path = stream_dir / f"{prefix}.done"
+        stream_path.write_bytes(b"")
+
+        effective = self._effective_tts_mix(
+            zone,
+            speaker_id=speaker_id,
+            speaker_name=speaker_name,
+        )
+        if duck_gain is None:
+            duck_gain = effective["duck_gain"]
+        if tts_gain is None:
+            tts_gain = _gain_from_volume(volume_pct)
+        if tts_gain is None:
+            tts_gain = effective["tts_gain"]
+
+        meta = {
+            "request_id": safe_id,
+            "stream_path": str(stream_path),
+            "done_path": str(done_path),
+            "format": "pcm_s16le",
+            "sample_rate": parsed_rate,
+            "channels": parsed_channels,
+            "sample_width": parsed_width,
+            "room_id": zone.room_id,
+            "zone_id": zone.zone_id,
+            "text": text,
+            "speaker_id": speaker_id,
+            "speaker_name": speaker_name,
+            "duck_gain": duck_gain,
+            "tts_gain": tts_gain,
+            "effective_policy": effective,
+            "queued_at": time.time(),
+            "complete": False,
+        }
+        tmp_meta_path.write_text(json.dumps(meta, indent=2))
+        os.replace(tmp_meta_path, meta_path)
+
+        log.info("Started streaming TTS %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
+        return {
+            "ok": True,
+            "request_id": safe_id,
+            "room_id": zone.room_id,
+            "room_name": zone.room_name,
+            "zone_id": zone.zone_id,
+            "effective_policy": effective,
+            "stream_path": str(stream_path),
+            "meta_path": str(meta_path),
+            "done_path": str(done_path),
+        }, None
+
+    def finish_tts_stream(self, meta_path, done_path, *, error=None):
+        """Mark a streaming TTS item complete so the mixer can release it."""
+        try:
+            path = Path(meta_path)
+            meta = json.loads(path.read_text()) if path.exists() else {}
+            meta["complete"] = True
+            if error:
+                meta["error"] = str(error)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(meta, indent=2))
+            os.replace(tmp_path, path)
+            Path(done_path).write_text(str(time.time()))
+        except Exception as e:
+            log.warning("Could not mark TTS stream complete: %s", e)
+
     def _known_speakers(self, zone):
         outputs = []
         if zone.owntone_api:

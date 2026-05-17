@@ -60,6 +60,103 @@ class TTSClip:
             chunk += b"\x00" * (size - len(chunk))
         return chunk
 
+    def duration_seconds(self) -> float:
+        return len(self.pcm) / (RATE * CHANNELS * SAMPLE_WIDTH)
+
+    def cleanup(self) -> None:
+        return
+
+    def snapshot(self):
+        return self.position
+
+    def restore(self, state) -> None:
+        self.position = state
+
+
+@dataclass
+class StreamingTTSClip:
+    request_id: str
+    pcm_path: Path
+    meta_path: Path
+    done_path: Path
+    sample_rate: int
+    channels: int
+    sample_width: int
+    duck_gain: float
+    tts_gain: float
+    position: int = 0
+    buffer: bytes = b""
+    pending_source: bytes = b""
+
+    @property
+    def done(self) -> bool:
+        return self._complete() and self.position >= self._source_size() and not self.buffer
+
+    def next_chunk(self, size: int) -> bytes:
+        while len(self.buffer) < size:
+            data = self._read_source()
+            if not data:
+                break
+            self.buffer += pcm_to_pipe_pcm(
+                data,
+                sample_rate=self.sample_rate,
+                channels=self.channels,
+                sample_width=self.sample_width,
+            )
+
+        chunk = self.buffer[:size]
+        self.buffer = self.buffer[size:]
+        if len(chunk) < size:
+            chunk += b"\x00" * (size - len(chunk))
+        return chunk
+
+    def duration_seconds(self) -> float | None:
+        return None
+
+    def cleanup(self) -> None:
+        safe_unlink(self.pcm_path)
+        safe_unlink(self.meta_path)
+        safe_unlink(self.done_path)
+
+    def snapshot(self):
+        return self.position, self.buffer, self.pending_source
+
+    def restore(self, state) -> None:
+        self.position, self.buffer, self.pending_source = state
+
+    def _read_source(self) -> bytes:
+        try:
+            available = self._source_size()
+            if available <= self.position:
+                return b""
+            with self.pcm_path.open("rb") as fh:
+                fh.seek(self.position)
+                data = fh.read(min(65536, available - self.position))
+            self.position += len(data)
+        except OSError:
+            return b""
+
+        frame_width = max(1, self.channels * self.sample_width)
+        data = self.pending_source + data
+        usable = (len(data) // frame_width) * frame_width
+        self.pending_source = data[usable:]
+        return data[:usable]
+
+    def _source_size(self) -> int:
+        try:
+            return self.pcm_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _complete(self) -> bool:
+        if self.done_path.exists():
+            return True
+        try:
+            meta = json.loads(self.meta_path.read_text())
+            return bool(meta.get("complete"))
+        except Exception:
+            return False
+
 
 class AudioMixer:
     def __init__(self, *, capture_dev: str, grp_dir: Path) -> None:
@@ -67,6 +164,7 @@ class AudioMixer:
         self.grp_dir = grp_dir
         self.pipe_path = grp_dir / "pipes" / "audio.pipe"
         self.queue_dir = grp_dir / "tts_queue"
+        self.stream_dir = grp_dir / "tts_streams"
         self.arecord_pid_path = grp_dir / "state" / "arecord.pid"
         self._stop = False
         self._arecord: subprocess.Popen[bytes] | None = None
@@ -78,6 +176,7 @@ class AudioMixer:
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
         self.queue_dir.mkdir(parents=True, exist_ok=True)
+        self.stream_dir.mkdir(parents=True, exist_ok=True)
 
         log.info("Starting mixer capture_dev=%s grp_dir=%s", self.capture_dev, self.grp_dir)
         while not self._stop:
@@ -186,7 +285,7 @@ class AudioMixer:
             live += b"\x00" * (CHUNK_BYTES - len(live))
 
         clip = self._active_clip
-        clip_position = clip.position if clip is not None else None
+        clip_state = clip.snapshot() if clip is not None else None
         if clip is not None:
             tts = clip.next_chunk(CHUNK_BYTES)
             target_duck = clip.duck_gain
@@ -199,8 +298,8 @@ class AudioMixer:
         self._duck_level = self._next_duck_level(target_duck)
         mixed = mix_pcm16(live, tts, music_gain=self._duck_level, tts_gain=tts_gain)
         if not self._write_pipe(mixed):
-            if clip is not None and clip_position is not None:
-                clip.position = clip_position
+            if clip is not None and clip_state is not None:
+                clip.restore(clip_state)
             time.sleep(CHUNK_SECONDS)
             return
         if generated_silence:
@@ -208,6 +307,7 @@ class AudioMixer:
 
         if clip is not None and clip.done:
             log.info("Finished TTS request %s", clip.request_id)
+            clip.cleanup()
             self._active_clip = None
 
     def _read_live_chunk(self, *, timeout: float) -> bytes | None:
@@ -236,13 +336,22 @@ class AudioMixer:
             return
         self._active_clip = self._load_next_clip()
         if self._active_clip is not None:
-            log.info(
-                "Starting TTS request %s duration=%.2fs duck_gain=%.2f tts_gain=%.2f",
-                self._active_clip.request_id,
-                len(self._active_clip.pcm) / (RATE * CHANNELS * SAMPLE_WIDTH),
-                self._active_clip.duck_gain,
-                self._active_clip.tts_gain,
-            )
+            duration = self._active_clip.duration_seconds()
+            if duration is None:
+                log.info(
+                    "Starting streaming TTS request %s duck_gain=%.2f tts_gain=%.2f",
+                    self._active_clip.request_id,
+                    self._active_clip.duck_gain,
+                    self._active_clip.tts_gain,
+                )
+            else:
+                log.info(
+                    "Starting TTS request %s duration=%.2fs duck_gain=%.2f tts_gain=%.2f",
+                    self._active_clip.request_id,
+                    duration,
+                    self._active_clip.duck_gain,
+                    self._active_clip.tts_gain,
+                )
 
     def _load_next_clip(self) -> TTSClip | None:
         for meta_path in sorted(glob(str(self.queue_dir / "*.json"))):
@@ -266,6 +375,32 @@ class AudioMixer:
                 return clip
             except Exception:
                 log.exception("Failed to load TTS queue item %s", path)
+                safe_unlink(path)
+        return self._load_next_stream()
+
+    def _load_next_stream(self) -> StreamingTTSClip | None:
+        for meta_path in sorted(glob(str(self.stream_dir / "*.json"))):
+            path = Path(meta_path)
+            try:
+                meta = json.loads(path.read_text())
+                pcm_path = Path(meta["stream_path"])
+                if not pcm_path.exists():
+                    log.warning("Dropping TTS stream with missing audio: %s", pcm_path)
+                    safe_unlink(path)
+                    continue
+                return StreamingTTSClip(
+                    request_id=str(meta.get("request_id") or path.stem),
+                    pcm_path=pcm_path,
+                    meta_path=path,
+                    done_path=Path(meta.get("done_path") or str(path.with_suffix(".done"))),
+                    sample_rate=int(meta.get("sample_rate") or 24000),
+                    channels=int(meta.get("channels") or 1),
+                    sample_width=int(meta.get("sample_width") or 2),
+                    duck_gain=clamp_float(meta.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
+                    tts_gain=clamp_float(meta.get("tts_gain"), 0.05, 2.0, DEFAULT_TTS_GAIN),
+                )
+            except Exception:
+                log.exception("Failed to load TTS stream item %s", path)
                 safe_unlink(path)
         return None
 
@@ -298,6 +433,14 @@ def load_wav_as_pipe_pcm(path: Path) -> bytes:
     stereo = to_stereo(samples, channels)
     if rate != RATE:
         stereo = resample_stereo(stereo, rate, RATE)
+    return samples_to_bytes(stereo)
+
+
+def pcm_to_pipe_pcm(data: bytes, *, sample_rate: int, channels: int, sample_width: int) -> bytes:
+    samples = decode_pcm_samples(data, sample_width)
+    stereo = to_stereo(samples, channels)
+    if sample_rate != RATE:
+        stereo = resample_stereo(stereo, sample_rate, RATE)
     return samples_to_bytes(stereo)
 
 

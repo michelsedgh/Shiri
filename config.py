@@ -131,12 +131,12 @@ def setup_directories(zone):
     Creates dirs, clears stale state, creates FIFOs.
     """
     grp_dir = zone.grp_dir
-    for subdir in ["pipes", "config", "logs", "state", "tts_queue"]:
+    for subdir in ["pipes", "config", "logs", "state", "tts_queue", "tts_streams"]:
         os.makedirs(os.path.join(grp_dir, subdir), exist_ok=True)
         os.chmod(os.path.join(grp_dir, subdir), 0o755)
 
     # Clear stale state, logs, and queued TTS from the last daemon run.
-    for subdir in ["state", "logs", "tts_queue"]:
+    for subdir in ["state", "logs", "tts_queue", "tts_streams"]:
         for f in os.listdir(os.path.join(grp_dir, subdir)):
             try:
                 os.remove(os.path.join(grp_dir, subdir, f))

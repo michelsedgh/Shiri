@@ -750,6 +750,46 @@ def queue_tts_for_zone(zone_id):
     return jsonify(result), 202
 
 
+@app.route("/api/rooms/<room_id>/tts-stream", methods=["POST"])
+def stream_tts_for_room(room_id):
+    result, error = _start_tts_stream(default_room_id=room_id)
+    if error:
+        return jsonify({"error": error}), 400
+    try:
+        bytes_written = _write_request_stream(result["stream_path"])
+        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"])
+    except Exception as exc:
+        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"], error=exc)
+        log.exception("TTS stream failed for room=%s request=%s", room_id, result.get("request_id"))
+        return jsonify({"error": str(exc)}), 500
+    response = dict(result)
+    response.pop("stream_path", None)
+    response.pop("meta_path", None)
+    response.pop("done_path", None)
+    response["streamed_bytes"] = bytes_written
+    return jsonify(response), 202
+
+
+@app.route("/api/zones/<zone_id>/tts-stream", methods=["POST"])
+def stream_tts_for_zone(zone_id):
+    result, error = _start_tts_stream(zone_id=zone_id)
+    if error:
+        return jsonify({"error": error}), 400
+    try:
+        bytes_written = _write_request_stream(result["stream_path"])
+        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"])
+    except Exception as exc:
+        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"], error=exc)
+        log.exception("TTS stream failed for zone=%s request=%s", zone_id, result.get("request_id"))
+        return jsonify({"error": str(exc)}), 500
+    response = dict(result)
+    response.pop("stream_path", None)
+    response.pop("meta_path", None)
+    response.pop("done_path", None)
+    response["streamed_bytes"] = bytes_written
+    return jsonify(response), 202
+
+
 @app.route("/api/test-clips")
 def list_test_clips():
     return jsonify({
@@ -798,6 +838,51 @@ def inject_test_clip(room_id):
         return jsonify({"error": error}), 400
     result["injected"] = True
     return jsonify(result), 202
+
+
+def _start_tts_stream(default_room_id=None, zone_id=None):
+    data = request.args.to_dict()
+    if request.is_json:
+        data.update(request.get_json(silent=True) or {})
+
+    resolved_zone = None
+    if zone_id is not None:
+        resolved_zone = zone_manager.get_zone(zone_id)
+        if not resolved_zone:
+            return None, "Zone not found"
+    else:
+        room_id = data.get("room_id") or default_room_id
+        resolved_zone, error = zone_manager.resolve_zone_for_room(room_id)
+        if error:
+            return None, error
+
+    return zone_manager.start_tts_stream(
+        resolved_zone.zone_id,
+        request_id=data.get("request_id") or uuid.uuid4().hex,
+        audio_format=data.get("format") or data.get("audio_format") or "pcm_s16le",
+        sample_rate=data.get("sample_rate") or 24000,
+        channels=data.get("channels") or 1,
+        sample_width=data.get("sample_width") or 2,
+        duck_gain=data.get("duck_gain"),
+        tts_gain=data.get("tts_gain") or data.get("gain"),
+        volume_pct=data.get("volume_pct"),
+        text=data.get("text"),
+        speaker_id=data.get("speaker_id"),
+        speaker_name=data.get("speaker_name"),
+    )
+
+
+def _write_request_stream(path):
+    bytes_written = 0
+    with open(path, "ab") as fh:
+        while True:
+            chunk = request.stream.read(65536)
+            if not chunk:
+                break
+            fh.write(chunk)
+            fh.flush()
+            bytes_written += len(chunk)
+    return bytes_written
 
 
 def _extract_tts_payload(default_room_id=None):
