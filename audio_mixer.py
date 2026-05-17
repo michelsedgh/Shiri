@@ -44,9 +44,10 @@ OUTPUT_CAPS = (
 )
 
 DEFAULT_DUCK_GAIN = 0.28
-DUCK_ATTACK_SECONDS = 0.04
-DUCK_RELEASE_SECONDS = 0.25
+DUCK_ATTACK_SECONDS = 0.08
+DUCK_RELEASE_SECONDS = 0.45
 DUCK_UPDATE_SECONDS = 0.02
+TTS_DUCK_START_FRACTION = 0.65
 
 TTS_PREBUFFER_SECONDS = 0.10
 TTS_PUSH_SECONDS = 0.02
@@ -490,20 +491,27 @@ class GstZoneMixer:
             self._duck_target = 1.0
             return
 
+        source_size = clip.source_size()
+        if source_size > 0:
+            self._duck_target = clip.duck_gain
+
         if not clip.ready_to_start():
-            if clip.source_complete() and clip.source_size() <= 0:
+            if clip.source_complete() and source_size <= 0:
                 log.warning("Dropping empty TTS request %s", clip.request_id)
                 clip.cleanup()
                 self._active_clip = None
                 self._duck_target = 1.0
                 return
-            self._duck_target = 1.0
+            if source_size <= 0:
+                self._duck_target = 1.0
             return
 
+        self._duck_target = clip.duck_gain
         if clip.started_at is None:
+            if not self._duck_ready_for_tts(clip.duck_gain):
+                return
             self._start_active_clip()
 
-        self._duck_target = clip.duck_gain
         self._fill_tts_queue(clip)
 
         if clip.exhausted() and self._tts_buffer_ahead_ns(clip) <= int(TTS_DRAIN_GRACE_SECONDS * 1_000_000_000):
@@ -592,6 +600,13 @@ class GstZoneMixer:
         clip.cleanup()
         self._active_clip = None
         self._duck_target = 1.0
+
+    def _duck_ready_for_tts(self, duck_gain: float) -> bool:
+        target = clamp_float(duck_gain, 0.0, 1.0, DEFAULT_DUCK_GAIN)
+        if target >= 0.98:
+            return True
+        start_level = 1.0 - ((1.0 - target) * TTS_DUCK_START_FRACTION)
+        return self._duck_level <= start_level
 
     def _pipeline_running_time_ns(self) -> int:
         if self.pipeline is None:
