@@ -81,6 +81,7 @@ class TTSClip:
     last_progress_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
     fully_pushed_at: float | None = None
+    next_pts_ns: int | None = None
 
     @property
     def frame_width(self) -> int:
@@ -317,7 +318,7 @@ class GstZoneMixer:
         self.tts_src.set_property("is-live", True)
         self.tts_src.set_property("format", Gst.Format.TIME)
         self.tts_src.set_property("block", True)
-        self.tts_src.set_property("do-timestamp", True)
+        self.tts_src.set_property("do-timestamp", False)
         self.tts_src.set_property("emit-signals", False)
         set_property_if_present(self.tts_src, "max-time", int(TTS_TARGET_QUEUE_SECONDS * 1_000_000_000))
         set_property_if_present(self.tts_src, "max-bytes", 512 * 1024)
@@ -439,6 +440,7 @@ class GstZoneMixer:
             return
         self._set_tts_caps(clip)
         clip.started_at = time.monotonic()
+        clip.next_pts_ns = self._pipeline_running_time_ns() + int(0.05 * 1_000_000_000)
         log.info(
             "Starting %s TTS request %s sample_rate=%d channels=%d duck_gain=%.2f prebuffer=%d bytes",
             clip.kind,
@@ -473,11 +475,22 @@ class GstZoneMixer:
             duration_ns = int(frames * 1_000_000_000 / clip.sample_rate)
             buffer = self.Gst.Buffer.new_allocate(None, len(chunk), None)
             buffer.fill(0, chunk)
+            buffer.pts = clip.next_pts_ns
+            buffer.dts = clip.next_pts_ns
             buffer.duration = duration_ns
+            clip.next_pts_ns += duration_ns
             ret = self.tts_src.emit("push-buffer", buffer)
             if ret != self.Gst.FlowReturn.OK:
                 raise PipelineRestart(f"TTS appsrc push failed: {ret.value_nick}")
             queued_ns += duration_ns
+
+    def _pipeline_running_time_ns(self) -> int:
+        if self.pipeline is None:
+            return 0
+        clock = self.pipeline.get_clock()
+        if clock is None:
+            return 0
+        return max(0, int(clock.get_time() - self.pipeline.get_base_time()))
 
     def _load_next_clip(self) -> TTSClip | None:
         clip = self._load_next_wav_clip()
