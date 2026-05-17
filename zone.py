@@ -144,7 +144,7 @@ class Zone:
         # Runtime state (populated when running)
         self.allocated_subdevice = None
         self.shairport_pid = None
-        self.arecord_supervisor_pid = None
+        self.mixer_pid = None
         self.metadata_relay_pid = None
         self.pause_bridge_pid = None
         self.owntone_pid = None
@@ -1179,7 +1179,7 @@ class ZoneManager:
 
                     # Check process liveness
                     for label, pid in [("shairport-sync", zone.shairport_pid),
-                                       ("arecord-supervisor", zone.arecord_supervisor_pid),
+                                       ("mixer", zone.mixer_pid),
                                        ("pause-bridge", zone.pause_bridge_pid)]:
                         if pid is None:
                             continue

@@ -24,7 +24,7 @@ from config import (
     release_loopback_subdevice,
     generate_shairport_config,
     generate_owntone_config,
-    generate_arecord_supervisor,
+    generate_mixer_supervisor,
 )
 
 log = logging.getLogger("shiri.zone")
@@ -285,6 +285,7 @@ def _delete_host_link(iface):
 def _clear_runtime_state(grp_dir):
     for filename in [
         "arecord.pid",
+        "mixer.pid",
         "avahi.pid",
         "dbus.pid",
         "dhclient.leases",
@@ -318,7 +319,7 @@ def _kill_orphaned_host_processes():
         pid_str, ppid_str, args = parts
         if ppid_str != "1" or "/var/lib/shiri/groups/" not in args:
             continue
-        if "arecord_supervisor.sh" in args or "audio_mixer.py" in args:
+        if "mixer_supervisor.sh" in args or "arecord_supervisor.sh" in args or "audio_mixer.py" in args:
             _kill_pid(int(pid_str), "orphaned audio mixer")
         elif "pause_bridge.sh" in args:
             _kill_pid(int(pid_str), "orphaned pause bridge")
@@ -378,6 +379,11 @@ def cleanup_stale_runtime():
 
     for grp_dir in stale_group_dirs:
         _kill_pid_if_command(
+            _read_pid(_state_path(grp_dir, "mixer.pid")),
+            "audio_mixer.py",
+            "stale mixer",
+        )
+        _kill_pid_if_command(
             _read_pid(_state_path(grp_dir, "arecord.pid")),
             "arecord",
             "stale arecord",
@@ -411,7 +417,7 @@ def start_zone_thread(zone, cleanup_fn):
     3. Generate configs
     4. Start Shairport + OwnTone on host-network ports
     5. Wait for OwnTone, rescan library, verify pipe
-    6. Start arecord supervisor on host
+    6. Start mixer on host
     7. Start pause bridge on host
     8. Restore saved speaker selections
     """
@@ -512,11 +518,11 @@ def _apply_persisted_master_volume(zone):
 
 
 def _launch_host_processes(zone):
-    """Step 6-7: Start arecord supervisor and pause bridge on host."""
+    """Step 6-7: Start mixer and pause bridge on host."""
     # Note: metadata_relay disabled - shairport writes directly to pause_bridge.metadata
     # which pause_bridge.sh reads. OwnTone metadata (for lyrics) not currently supported.
     _start_pause_bridge(zone)
-    _start_arecord_supervisor(zone)
+    _start_mixer(zone)
 
 
 def _read_shairport_pid(zone):
@@ -622,7 +628,7 @@ def stop_zone_thread(zone, cleanup_fn):
 def cleanup_zone(zone):
     """
     Zone cleanup sequence:
-    1. Stop HOST processes (arecord, pause_bridge)
+    1. Stop HOST processes (mixer, pause_bridge)
     2. Stop Shairport and OwnTone
     3. Reap stale legacy namespace state if present
     4. Release loopback subdevice after all users are gone
@@ -636,12 +642,13 @@ def cleanup_zone(zone):
         macvlan_if = _find_macvlan_in_netns(ns, macvlan_if) or macvlan_if
 
     # 1. Stop host-side audio helpers.
-    _kill_pid(zone.arecord_supervisor_pid, f"arecord supervisor ({zone.zone_id})")
-    _kill_pid(_read_pid(_state_path(grp_dir, "arecord.pid")), f"arecord ({zone.zone_id})")
+    _kill_pid(zone.mixer_pid, f"mixer supervisor ({zone.zone_id})")
+    _kill_pid(_read_pid(_state_path(grp_dir, "mixer.pid")), f"mixer ({zone.zone_id})")
+    _kill_pid_if_command(_read_pid(_state_path(grp_dir, "arecord.pid")), "arecord", f"legacy arecord ({zone.zone_id})")
     _kill_pid(zone.metadata_relay_pid, f"metadata relay ({zone.zone_id})")
     _kill_pid(zone.pause_bridge_pid, f"pause_bridge ({zone.zone_id})")
 
-    zone.arecord_supervisor_pid = None
+    zone.mixer_pid = None
     zone.metadata_relay_pid = None
     zone.pause_bridge_pid = None
 
@@ -804,24 +811,24 @@ def _wait_for_owntone(zone, timeout=60):
     return False
 
 
-def _start_arecord_supervisor(zone):
+def _start_mixer(zone):
     """
     Start the host audio mixer.
     It captures ALSA loopback, overlays queued TTS, and writes OwnTone's audio.pipe.
     Runs on host beside Shairport and OwnTone.
     """
     # Generate the supervisor script from template
-    script_path = generate_arecord_supervisor(zone)
+    script_path = generate_mixer_supervisor(zone)
 
-    log_path = os.path.join(zone.grp_dir, "logs", "arecord.log")
+    log_path = os.path.join(zone.grp_dir, "logs", "mixer.log")
     # Don't use context manager - file must stay open for subprocess lifetime
     log_file = open(log_path, "w")
     proc = subprocess.Popen(
         ["bash", script_path],
         stdout=log_file, stderr=subprocess.STDOUT
     )
-    zone.arecord_supervisor_pid = proc.pid
-    log.info("Started arecord supervisor for %s (pid %d)", zone.zone_id, proc.pid)
+    zone.mixer_pid = proc.pid
+    log.info("Started mixer supervisor for %s (pid %d)", zone.zone_id, proc.pid)
 
 
 def _start_pause_bridge(zone):

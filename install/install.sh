@@ -32,7 +32,13 @@ apt install -y \
   autoconf \
   automake \
   libtool \
-  pkg-config
+  pkg-config \
+  python3-gi \
+  gir1.2-gstreamer-1.0 \
+  gstreamer1.0-tools \
+  gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good \
+  gstreamer1.0-alsa
 
 log "Installing shairport-sync build dependencies..."
 apt install -y \

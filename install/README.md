@@ -7,7 +7,7 @@ Shiri creates AirPlay zones using ALSA loopback devices, shairport-sync, OwnTone
 - **Linux** (Ubuntu 22.04+ recommended) — uses kernel features not available on macOS
 - **Root access** — required for ALSA loopback, realtime audio scheduling, and AirPlay timing
 - **Python 3.8+**
-- System dependencies: `nqptp`, `shairport-sync` (AirPlay 2 build), `owntone`
+- System dependencies: `nqptp`, `shairport-sync` (AirPlay 2 build), `owntone`, GStreamer 1.0 with Python GI bindings
 
 ### Running on macOS
 
@@ -26,7 +26,7 @@ Bridged networking is essential — your phone needs to see the AirPlay devices 
 sudo ./install.sh
 ```
 
-This installs `nqptp`, `shairport-sync` (with AirPlay 2 + pipe support), and `owntone`.
+This installs `nqptp`, `shairport-sync` (with AirPlay 2 + pipe support), `owntone`, and the GStreamer packages used by the zone mixer.
 
 ### 2. Install Python dependencies
 
@@ -55,7 +55,7 @@ templates/           Config/script templates (native format, %%PLACEHOLDER%% syn
   shairport_sync.conf    Shairport-sync config template
   owntone.conf           OwnTone config template
   reset_audio_pipe.sh    Audio pipeline flush script template
-  arecord_supervisor.sh  ALSA capture supervisor template
+  mixer_supervisor.sh    GStreamer zone mixer supervisor template
 
 scripts/             Runtime shell scripts
   pause_bridge.sh        Shairport→OwnTone play/pause bridge

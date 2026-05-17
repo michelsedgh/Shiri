@@ -62,10 +62,10 @@ zone_manager = ZoneManager(config_store, socketio)
 # Log streaming — single thread tails all watched zones
 # ---------------------------------------------------------------------------
 LOG_DIR = "/var/lib/shiri/groups"
-LOG_TYPES = ["shairport", "owntone", "owntone_wrapper", "arecord", "pause_bridge", "volume_bridge", "sync_reset"]
+LOG_TYPES = ["shairport", "owntone", "owntone_wrapper", "mixer", "pause_bridge", "volume_bridge", "sync_reset"]
 LOG_FILTERS = {
     "all": LOG_TYPES,
-    "tts": ["arecord"],
+    "tts": ["mixer"],
     "speaker": ["owntone", "owntone_wrapper"],
     "volume": ["volume_bridge", "owntone"],
     "airplay": ["shairport"],
@@ -404,7 +404,7 @@ def _log_severity(line):
 
 
 def _log_category(log_type, line):
-    if log_type == "arecord" or "tts" in line.lower():
+    if log_type in {"mixer", "arecord"} or "tts" in line.lower():
         return "tts"
     if log_type == "shairport":
         return "airplay"
@@ -908,7 +908,8 @@ def _tts_debug_payload(zone):
         "tts_queue": _recent_tts_files(grp_dir / "tts_queue"),
         "tts_streams": _recent_tts_files(grp_dir / "tts_streams"),
         "tts_pending_streams": _recent_tts_files(grp_dir / "tts_streams" / "pending"),
-        "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=80),
+        "mixer_log_tail": _read_log_tail(zone.zone_id, "mixer", lines=80),
+        "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=20),
     }
 
 

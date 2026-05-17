@@ -11,6 +11,7 @@ Two responsibilities:
 import json
 import logging
 import os
+import shutil
 import threading
 
 log = logging.getLogger("shiri.config")
@@ -138,8 +139,12 @@ def setup_directories(zone):
     # Clear stale state, logs, and queued TTS from the last daemon run.
     for subdir in ["state", "logs", "tts_queue", "tts_streams"]:
         for f in os.listdir(os.path.join(grp_dir, subdir)):
+            path = os.path.join(grp_dir, subdir, f)
             try:
-                os.remove(os.path.join(grp_dir, subdir, f))
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
             except OSError:
                 pass
 
@@ -263,8 +268,7 @@ def generate_shairport_config(zone):
     # Create pipe reset script — CRITICAL FOR MULTI-ROOM SYNC
     # This script:
     # 1. Stops OwnTone playback (flushes its internal buffers)
-    # 2. Kills arecord
-    # 3. Drains the audio pipe
+    # 2. Leaves the GStreamer mixer running so it can reconnect to the FIFO
     # This ensures NO accumulated buffer state between sessions
     flush_script = os.path.join(grp_dir, "config", "reset_audio_pipe.sh")
     reset_template = _read_template("reset_audio_pipe.sh")
@@ -331,23 +335,28 @@ def generate_owntone_config(zone):
     log.info("Generated OwnTone config for %s", zone.zone_id)
 
 
-def generate_arecord_supervisor(zone):
+def generate_mixer_supervisor(zone):
     """
-    Generate the arecord supervisor script for the HOST.
-    The supervisor starts the Shiri mixer, which captures ALSA loopback audio
-    and overlays queued TTS before writing OwnTone's audio.pipe.
+    Generate the host mixer launcher.
+    The mixer captures ALSA loopback audio, overlays queued/streamed TTS, and
+    writes OwnTone's audio.pipe.
     """
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
     capture_dev = f"hw:Loopback,1,{subdev}"
 
-    script_path = os.path.join(grp_dir, "config", "arecord_supervisor.sh")
-    template = _read_template("arecord_supervisor.sh")
+    script_path = os.path.join(grp_dir, "config", "mixer_supervisor.sh")
+    template = _read_template("mixer_supervisor.sh")
     content = (template
                .replace("%%CAPTURE_DEV%%", capture_dev)
                .replace("%%GRP_DIR%%", grp_dir)
                .replace("%%MIXER_SCRIPT%%", MIXER_SCRIPT))
     _write_file(script_path, content, executable=True)
 
-    log.info("Generated arecord supervisor script for %s", zone.zone_id)
+    log.info("Generated mixer supervisor script for %s", zone.zone_id)
     return script_path
+
+
+def generate_arecord_supervisor(zone):
+    """Backward-compatible wrapper for older imports."""
+    return generate_mixer_supervisor(zone)
