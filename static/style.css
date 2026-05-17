@@ -636,8 +636,7 @@ input[type="range"] {
     grid-column: 1 / -1;
 }
 
-.speaker-route-list,
-.speaker-tts-list {
+.speaker-route-list {
     display: grid;
     gap: 10px;
     margin-bottom: 12px;
@@ -648,13 +647,6 @@ input[type="range"] {
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-}
-
-.speaker-tts-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    grid-column: 1 / -1;
 }
 
 .drawer-block {
@@ -810,7 +802,6 @@ input[type="range"] {
 
     .control-bank,
     .row-actions,
-    .speaker-tts-grid,
     .inject-body,
     .settings-columns {
         grid-template-columns: 1fr;

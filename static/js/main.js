@@ -193,19 +193,15 @@ function renderRoomRow(room) {
     const binding = room.binding;
     const policy = policyFor(room);
     const roomSettings = policy.room || {};
-    const mode = policy.mode || 'room';
     const volume = binding?.volume ?? binding?.player?.volume ?? 50;
     const isRunning = binding?.status === 'running';
     const disabled = !binding || !isRunning;
     const status = binding?.status || 'unbound';
     const speakers = binding?.speakers || [];
     const volumeValue = clampNumber(volume, 0, 100, 50);
-    const ttsLevel = clampNumber(roomSettings.tts_level_pct, 5, 200, 100);
     const reduction = clampNumber(roomSettings.reduction_pct, 0, 95, 72);
     const activity = activityText(room);
-    const roomTtsDisabled = !binding || mode === 'speaker';
-    const ttsLabel = mode === 'speaker' ? 'Room fallback' : 'Room TTS';
-    const reductionLabel = mode === 'speaker' ? 'Fallback duck' : 'Reduction';
+    const duckDisabled = !binding || !isRunning;
 
     return `
         <article class="room-row ${binding ? '' : 'unbound'}" data-room-id="${escapeHtml(room.room_id)}">
@@ -238,24 +234,10 @@ function renderRoomRow(room) {
                         </div>
                     </div>
                     <div class="control">
-                        <label for="tts-${escapeHtml(room.room_id)}">${ttsLabel}</label>
+                        <label for="duck-${escapeHtml(room.room_id)}">Reduce playing audio</label>
                         <div class="range-line">
-                            <input id="tts-${escapeHtml(room.room_id)}" type="range" min="5" max="200" value="${ttsLevel}" data-action="room-tts-level" data-room-id="${escapeHtml(room.room_id)}" ${roomTtsDisabled ? 'disabled' : ''}>
-                            <output>${ttsLevel}%</output>
-                        </div>
-                    </div>
-                    <div class="control">
-                        <label for="duck-${escapeHtml(room.room_id)}">${reductionLabel}</label>
-                        <div class="range-line">
-                            <input id="duck-${escapeHtml(room.room_id)}" type="range" min="0" max="95" value="${reduction}" data-action="room-reduction" data-room-id="${escapeHtml(room.room_id)}" ${roomTtsDisabled ? 'disabled' : ''}>
+                            <input id="duck-${escapeHtml(room.room_id)}" type="range" min="0" max="95" value="${reduction}" data-action="room-reduction" data-room-id="${escapeHtml(room.room_id)}" ${duckDisabled ? 'disabled' : ''}>
                             <output>${reduction}%</output>
-                        </div>
-                    </div>
-                    <div class="control">
-                        <label>Scope</label>
-                        <div class="segmented" data-room-id="${escapeHtml(room.room_id)}">
-                            <button data-action="tts-mode" data-mode="room" class="${mode === 'room' ? 'active' : ''}" ${binding ? '' : 'disabled'}>Room</button>
-                            <button data-action="tts-mode" data-mode="speaker" class="${mode === 'speaker' ? 'active' : ''}" ${binding ? '' : 'disabled'}>Speaker</button>
                         </div>
                     </div>
                 </div>
@@ -298,8 +280,6 @@ async function onRoomListClick(event) {
             openRoomDrawer(button.dataset.roomId);
         } else if (action === 'test-tts') {
             openInjector(button.dataset.roomId);
-        } else if (action === 'tts-mode') {
-            await savePolicyMode(button.closest('[data-room-id]')?.dataset.roomId, button.dataset.mode);
         }
     } catch (error) {
         showError(error);
@@ -314,7 +294,7 @@ async function onRoomListChange(event) {
         if (input.dataset.action === 'room-volume') {
             await Api.setRoomVolume(roomId, clampNumber(input.value, 0, 100, 50));
             showToast('Playback volume saved');
-        } else if (input.dataset.action === 'room-tts-level' || input.dataset.action === 'room-reduction') {
+        } else if (input.dataset.action === 'room-reduction') {
             await saveRoomPolicyFromRow(roomId);
         }
         refreshSoon();
@@ -327,24 +307,15 @@ async function saveRoomPolicyFromRow(roomId) {
     const room = findRoom(roomId);
     const row = els.roomList.querySelector(`[data-room-id="${cssEscape(roomId)}"]`);
     if (!room || !row) return;
-    const policy = policyFor(room);
-    if (policy.mode === 'speaker') return;
-    policy.room = {
-        tts_level_pct: clampNumber(row.querySelector('[data-action="room-tts-level"]')?.value, 5, 200, 100),
-        reduction_pct: clampNumber(row.querySelector('[data-action="room-reduction"]')?.value, 0, 95, 72),
+    const policy = {
+        mode: 'room',
+        room: {
+            reduction_pct: clampNumber(row.querySelector('[data-action="room-reduction"]')?.value, 0, 95, 72),
+        },
+        speakers: {},
     };
     await Api.setRoomTtsPolicy(roomId, policy);
-    showToast('TTS levels saved');
-}
-
-async function savePolicyMode(roomId, mode) {
-    const room = findRoom(roomId);
-    if (!room) return;
-    const policy = policyFor(room);
-    policy.mode = mode;
-    await Api.setRoomTtsPolicy(roomId, policy);
-    showToast(`TTS scope set to ${mode}`);
-    await loadDashboard({ quiet: true });
+    showToast('Ducking saved');
 }
 
 async function openInjector(roomId = '') {
@@ -502,21 +473,8 @@ function renderDrawerSpeakers(room) {
         return;
     }
     const enabledSpeakers = speakers.filter((speaker) => speaker.selected);
-    const modeSummary = policy.mode === 'speaker'
-        ? `${enabledSpeakers.length} speaker${enabledSpeakers.length === 1 ? '' : 's'} using overrides`
-        : 'Main row room controls active';
-    const ttsBlock = policy.mode === 'speaker'
-        ? renderSpeakerTtsBlock(room, binding, policy, enabledSpeakers)
-        : '';
     els.drawerSpeakers.innerHTML = `
         <div class="drawer-stack">
-            <div class="drawer-block speaker-mode-block">
-                <div>
-                    <strong>TTS scope</strong>
-                    <span>${policy.mode === 'speaker' ? 'Per speaker' : 'Per room'}</span>
-                </div>
-                <span class="mode-badge">${escapeHtml(modeSummary)}</span>
-            </div>
             <div class="drawer-block">
                 <div class="section-title">
                     <h3>Routing</h3>
@@ -527,7 +485,6 @@ function renderDrawerSpeakers(room) {
                 </div>
                 <button class="primary-btn" data-action="save-speakers" data-zone-id="${escapeHtml(binding.zone_id)}">Save Routing</button>
             </div>
-            ${ttsBlock}
         </div>
     `;
 }
@@ -553,63 +510,6 @@ function renderSpeakerRouteRow(binding, speaker) {
                     <output>${volume}%</output>
                 </div>
             ` : ''}
-        </div>
-    `;
-}
-
-function renderSpeakerTtsBlock(room, binding, policy, enabledSpeakers) {
-    if (!enabledSpeakers.length) {
-        return `
-            <div class="drawer-block">
-                <div class="section-title">
-                    <h3>Per-Speaker TTS</h3>
-                    <span class="mode-badge">0 enabled</span>
-                </div>
-                <div class="empty-state">No enabled speakers in this room</div>
-            </div>
-        `;
-    }
-    return `
-        <div class="drawer-block">
-            <div class="section-title">
-                <h3>Per-Speaker TTS</h3>
-                <span class="mode-badge">${enabledSpeakers.length} enabled</span>
-            </div>
-            <div class="speaker-tts-list">
-                ${enabledSpeakers.map((speaker) => renderSpeakerTtsRow(binding, policy, speaker)).join('')}
-            </div>
-            <button class="primary-btn" data-action="save-speaker-tts" data-room-id="${escapeHtml(room.room_id)}">Save Per-Speaker TTS</button>
-        </div>
-    `;
-}
-
-function renderSpeakerTtsRow(binding, policy, speaker) {
-    const speakerId = String(speaker.id ?? '');
-    const override = policy.speakers?.[speakerId] || policy.room || {};
-    const tts = clampNumber(override.tts_level_pct, 5, 200, 100);
-    const reduction = clampNumber(override.reduction_pct, 0, 95, 72);
-    return `
-        <div class="speaker-row speaker-tts-row" data-speaker-id="${escapeHtml(speakerId)}" data-speaker-name="${escapeHtml(speaker.name || '')}">
-            <div>
-                <strong>${escapeHtml(speaker.name || speakerId || 'Speaker')}</strong>
-                <span>enabled / ${escapeHtml(speakerId || 'no id')}</span>
-            </div>
-            <div class="speaker-tts-grid">
-                <div class="control">
-                    <label>TTS</label>
-                    <div class="range-line">
-                        <input type="range" min="5" max="200" value="${tts}" data-field="tts_level_pct">
-                        <output>${tts}%</output>
-                    </div>
-                </div>
-                <div class="control">
-                    <label>Reduction</label>
-                    <div class="range-line">
-                        <input type="range" min="0" max="95" value="${reduction}" data-field="reduction_pct">
-                        <output>${reduction}%</output>
-                    </div>
-                </div>
-            </div>
         </div>
     `;
 }
@@ -676,7 +576,6 @@ async function onDrawerClick(event) {
     try {
         if (action === 'save-binding') await saveBinding(button.dataset.roomId);
         if (action === 'save-speakers') await saveSpeakers(button.dataset.zoneId);
-        if (action === 'save-speaker-tts') await saveSpeakerTts(button.dataset.roomId);
         if (action === 'save-zone-advanced') await saveZoneAdvanced(button.dataset.zoneId, button.dataset.roomId);
         if (action === 'delete-zone') await deleteZone(button.dataset.zoneId);
     } catch (error) {
@@ -716,25 +615,6 @@ async function saveSpeakers(zoneId) {
         .filter(Boolean);
     await Api.setSpeakers(zoneId, speakerIds);
     showToast('Speaker selection saved');
-    await loadDashboard({ quiet: true });
-}
-
-async function saveSpeakerTts(roomId) {
-    const room = findRoom(roomId);
-    const policy = policyFor(room);
-    const speakers = {};
-    els.drawerSpeakers.querySelectorAll('.speaker-tts-row').forEach((row) => {
-        if (!row.dataset.speakerId) return;
-        speakers[row.dataset.speakerId] = {
-            name: row.dataset.speakerName || undefined,
-            tts_level_pct: clampNumber(row.querySelector('[data-field="tts_level_pct"]')?.value, 5, 200, 100),
-            reduction_pct: clampNumber(row.querySelector('[data-field="reduction_pct"]')?.value, 0, 95, 72),
-        };
-    });
-    policy.mode = 'speaker';
-    policy.speakers = speakers;
-    await Api.setRoomTtsPolicy(roomId, policy);
-    showToast('Speaker TTS saved');
     await loadDashboard({ quiet: true });
 }
 
@@ -925,12 +805,11 @@ function subscribeLogs(enabled) {
 function policyFor(room) {
     const raw = room?.binding?.tts_policy || {};
     return {
-        mode: raw.mode === 'speaker' ? 'speaker' : 'room',
+        mode: 'room',
         room: {
-            tts_level_pct: clampNumber(raw.room?.tts_level_pct, 5, 200, 100),
             reduction_pct: clampNumber(raw.room?.reduction_pct, 0, 95, 72),
         },
-        speakers: { ...(raw.speakers || {}) },
+        speakers: {},
     };
 }
 

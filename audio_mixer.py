@@ -33,7 +33,6 @@ CHUNK_FRAMES = 512
 CHUNK_BYTES = CHUNK_FRAMES * CHANNELS * SAMPLE_WIDTH
 CHUNK_SECONDS = CHUNK_FRAMES / RATE
 DEFAULT_DUCK_GAIN = 0.28
-DEFAULT_TTS_GAIN = 1.0
 ATTACK_SECONDS = 0.04
 RELEASE_SECONDS = 0.25
 
@@ -46,7 +45,6 @@ class TTSClip:
     request_id: str
     pcm: bytes
     duck_gain: float
-    tts_gain: float
     position: int = 0
 
     @property
@@ -83,7 +81,6 @@ class StreamingTTSClip:
     channels: int
     sample_width: int
     duck_gain: float
-    tts_gain: float
     position: int = 0
     buffer: bytes = b""
     pending_source: bytes = b""
@@ -289,14 +286,12 @@ class AudioMixer:
         if clip is not None:
             tts = clip.next_chunk(CHUNK_BYTES)
             target_duck = clip.duck_gain
-            tts_gain = clip.tts_gain
         else:
             tts = b"\x00" * CHUNK_BYTES
             target_duck = 1.0
-            tts_gain = 0.0
 
         self._duck_level = self._next_duck_level(target_duck)
-        mixed = mix_pcm16(live, tts, music_gain=self._duck_level, tts_gain=tts_gain)
+        mixed = mix_pcm16(live, tts, music_gain=self._duck_level)
         if not self._write_pipe(mixed):
             if clip is not None and clip_state is not None:
                 clip.restore(clip_state)
@@ -339,18 +334,16 @@ class AudioMixer:
             duration = self._active_clip.duration_seconds()
             if duration is None:
                 log.info(
-                    "Starting streaming TTS request %s duck_gain=%.2f tts_gain=%.2f",
+                    "Starting streaming TTS request %s duck_gain=%.2f",
                     self._active_clip.request_id,
                     self._active_clip.duck_gain,
-                    self._active_clip.tts_gain,
                 )
             else:
                 log.info(
-                    "Starting TTS request %s duration=%.2fs duck_gain=%.2f tts_gain=%.2f",
+                    "Starting TTS request %s duration=%.2fs duck_gain=%.2f",
                     self._active_clip.request_id,
                     duration,
                     self._active_clip.duck_gain,
-                    self._active_clip.tts_gain,
                 )
 
     def _load_next_clip(self) -> TTSClip | None:
@@ -368,7 +361,6 @@ class AudioMixer:
                     request_id=str(meta.get("request_id") or path.stem),
                     pcm=pcm,
                     duck_gain=clamp_float(meta.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
-                    tts_gain=clamp_float(meta.get("tts_gain"), 0.05, 2.0, DEFAULT_TTS_GAIN),
                 )
                 safe_unlink(audio_path)
                 safe_unlink(path)
@@ -397,7 +389,6 @@ class AudioMixer:
                     channels=int(meta.get("channels") or 1),
                     sample_width=int(meta.get("sample_width") or 2),
                     duck_gain=clamp_float(meta.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
-                    tts_gain=clamp_float(meta.get("tts_gain"), 0.05, 2.0, DEFAULT_TTS_GAIN),
                 )
             except Exception:
                 log.exception("Failed to load TTS stream item %s", path)
@@ -517,7 +508,7 @@ def samples_to_bytes(samples: Iterable[int]) -> bytes:
     return out.tobytes()
 
 
-def mix_pcm16(live: bytes, tts: bytes, *, music_gain: float, tts_gain: float) -> bytes:
+def mix_pcm16(live: bytes, tts: bytes, *, music_gain: float) -> bytes:
     live_samples = array("h")
     live_samples.frombytes(live)
     tts_samples = array("h")
@@ -527,7 +518,7 @@ def mix_pcm16(live: bytes, tts: bytes, *, music_gain: float, tts_gain: float) ->
     out = array("h")
     append = out.append
     for index in range(count):
-        mixed = int(live_samples[index] * music_gain + tts_samples[index] * tts_gain)
+        mixed = int(live_samples[index] * music_gain + tts_samples[index])
         append(clip_int(mixed))
     return out.tobytes()
 
