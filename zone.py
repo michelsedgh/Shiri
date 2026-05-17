@@ -37,6 +37,7 @@ DEFAULT_REDUCTION_PCT = 72
 MIN_REDUCTION_PCT = 0
 MAX_REDUCTION_PCT = 95
 LEGACY_ZONE_CONFIG_KEYS = {"network_mode", "netns_name", "macvlan_if"}
+TTS_STREAM_PENDING_DIR = "pending"
 
 
 def _slugify_room_id(value):
@@ -651,11 +652,12 @@ class ZoneManager:
             return None, "Only 16-bit PCM streams are currently supported"
 
         stream_dir = Path(zone.grp_dir) / "tts_streams"
-        stream_dir.mkdir(parents=True, exist_ok=True)
+        pending_dir = stream_dir / TTS_STREAM_PENDING_DIR
+        pending_dir.mkdir(parents=True, exist_ok=True)
         safe_id = _safe_request_id(request_id)
         prefix = f"{int(time.time() * 1000)}_{safe_id}"
-        stream_path = stream_dir / f"{prefix}.pcm"
-        meta_path = stream_dir / f"{prefix}.json"
+        stream_path = pending_dir / f"{prefix}.pcm"
+        meta_path = pending_dir / f"{prefix}.json"
         tmp_meta_path = stream_dir / f"{prefix}.json.tmp"
         done_path = stream_dir / f"{prefix}.done"
         stream_path.write_bytes(b"")
@@ -681,6 +683,7 @@ class ZoneManager:
             "duck_gain": effective["duck_gain"],
             "effective_policy": effective,
             "queued_at": time.time(),
+            "pending": True,
             "complete": False,
         }
         tmp_meta_path.write_text(json.dumps(meta, indent=2))
@@ -731,6 +734,11 @@ class ZoneManager:
             fh.write(data)
             fh.flush()
         total_bytes = stream["stream_path"].stat().st_size
+        if not stream["active"]:
+            stream, error = self._activate_tts_stream(stream)
+            if error:
+                return None, error
+            total_bytes = stream["stream_path"].stat().st_size
         return {
             "ok": True,
             "stream_id": stream["stream_id"],
@@ -748,6 +756,22 @@ class ZoneManager:
         if lookup_error:
             return None, lookup_error
         total_bytes = stream["stream_path"].stat().st_size if stream["stream_path"].exists() else 0
+        if not stream["active"] and total_bytes <= 0:
+            self._discard_pending_tts_stream(stream, error=error)
+            return {
+                "ok": error is None,
+                "stream_id": stream["stream_id"],
+                "request_id": stream["stream_id"],
+                "room_id": stream["room_id"],
+                "room_name": stream["room_name"],
+                "zone_id": stream["zone_id"],
+                "streamed_bytes": 0,
+                "error": str(error) if error else None,
+            }, None
+        if not stream["active"]:
+            stream, error = self._activate_tts_stream(stream)
+            if error:
+                return None, error
         self.finish_tts_stream(
             stream["meta_path"],
             stream["done_path"],
@@ -772,7 +796,9 @@ class ZoneManager:
             return None, "Zone not found"
         safe_id = _safe_request_id(stream_id)
         stream_dir = Path(zone.grp_dir) / "tts_streams"
-        for meta_path in sorted(stream_dir.glob("*.json")):
+        pending_dir = stream_dir / TTS_STREAM_PENDING_DIR
+        candidates = list(sorted(stream_dir.glob("*.json"))) + list(sorted(pending_dir.glob("*.json")))
+        for meta_path in candidates:
             try:
                 meta = json.loads(meta_path.read_text())
             except Exception:
@@ -785,6 +811,7 @@ class ZoneManager:
                 return None, "Invalid TTS stream path"
             if not stream_path.exists():
                 return None, "TTS stream audio file is missing"
+            active = not _path_inside(meta_path, pending_dir)
             return {
                 "stream_id": safe_id,
                 "zone_id": zone.zone_id,
@@ -794,8 +821,59 @@ class ZoneManager:
                 "meta_path": meta_path,
                 "stream_path": stream_path,
                 "done_path": done_path,
+                "active": active,
+                "active_meta_path": stream_dir / meta_path.name,
+                "active_stream_path": stream_dir / stream_path.name,
+                "active_done_path": stream_dir / done_path.name,
             }, None
         return None, "TTS stream not found"
+
+    def _activate_tts_stream(self, stream):
+        """Publish a stream to the mixer only after its first audio bytes exist."""
+        if stream["active"]:
+            return stream, None
+        try:
+            if stream["stream_path"].stat().st_size <= 0:
+                return None, "Cannot activate an empty TTS stream"
+            active_stream_path = stream["active_stream_path"]
+            active_meta_path = stream["active_meta_path"]
+            active_done_path = stream["active_done_path"]
+            meta = dict(stream["meta"])
+            meta.update({
+                "stream_path": str(active_stream_path),
+                "done_path": str(active_done_path),
+                "pending": False,
+                "activated_at": time.time(),
+            })
+            os.replace(stream["stream_path"], active_stream_path)
+            tmp_meta_path = active_meta_path.with_suffix(active_meta_path.suffix + ".tmp")
+            tmp_meta_path.write_text(json.dumps(meta, indent=2))
+            os.replace(tmp_meta_path, active_meta_path)
+            try:
+                stream["meta_path"].unlink()
+            except FileNotFoundError:
+                pass
+            stream.update({
+                "meta": meta,
+                "meta_path": active_meta_path,
+                "stream_path": active_stream_path,
+                "done_path": active_done_path,
+                "active": True,
+            })
+            return stream, None
+        except Exception as e:
+            return None, f"Could not activate TTS stream: {e}"
+
+    def _discard_pending_tts_stream(self, stream, *, error=None):
+        if error:
+            log.warning("Discarding pending TTS stream %s: %s", stream["stream_id"], error)
+        for path in (stream["stream_path"], stream["meta_path"], stream["done_path"]):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log.debug("Could not remove pending TTS stream file %s: %s", path, e)
 
     def _known_speakers(self, zone):
         outputs = []

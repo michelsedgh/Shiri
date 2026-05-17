@@ -907,6 +907,7 @@ def _tts_debug_payload(zone):
         "grp_dir": str(grp_dir),
         "tts_queue": _recent_tts_files(grp_dir / "tts_queue"),
         "tts_streams": _recent_tts_files(grp_dir / "tts_streams"),
+        "tts_pending_streams": _recent_tts_files(grp_dir / "tts_streams" / "pending"),
         "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=80),
     }
 

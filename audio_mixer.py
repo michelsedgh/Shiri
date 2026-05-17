@@ -20,7 +20,7 @@ import subprocess
 import time
 import wave
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from glob import glob
 from pathlib import Path
 from typing import Iterable
@@ -35,6 +35,9 @@ CHUNK_SECONDS = CHUNK_FRAMES / RATE
 DEFAULT_DUCK_GAIN = 0.28
 ATTACK_SECONDS = 0.04
 RELEASE_SECONDS = 0.25
+STREAM_START_TIMEOUT_SECONDS = 5.0
+STREAM_STALL_TIMEOUT_SECONDS = 15.0
+STREAM_QUEUE_STALE_SECONDS = 60.0
 
 
 log = logging.getLogger("shiri.audio_mixer")
@@ -70,6 +73,13 @@ class TTSClip:
     def restore(self, state) -> None:
         self.position = state
 
+    def should_drop(self) -> str | None:
+        return None
+
+    @property
+    def has_audio_this_chunk(self) -> bool:
+        return True
+
 
 @dataclass
 class StreamingTTSClip:
@@ -84,12 +94,16 @@ class StreamingTTSClip:
     position: int = 0
     buffer: bytes = b""
     pending_source: bytes = b""
+    loaded_at: float = field(default_factory=time.monotonic)
+    last_progress_at: float = field(default_factory=time.monotonic)
+    last_chunk_audio_bytes: int = 0
 
     @property
     def done(self) -> bool:
         return self._complete() and self.position >= self._source_size() and not self.buffer
 
     def next_chunk(self, size: int) -> bytes:
+        position_before = self.position
         while len(self.buffer) < size:
             data = self._read_source()
             if not data:
@@ -103,6 +117,9 @@ class StreamingTTSClip:
 
         chunk = self.buffer[:size]
         self.buffer = self.buffer[size:]
+        self.last_chunk_audio_bytes = len(chunk)
+        if self.position > position_before or self.last_chunk_audio_bytes > 0:
+            self.last_progress_at = time.monotonic()
         if len(chunk) < size:
             chunk += b"\x00" * (size - len(chunk))
         return chunk
@@ -116,10 +133,31 @@ class StreamingTTSClip:
         safe_unlink(self.done_path)
 
     def snapshot(self):
-        return self.position, self.buffer, self.pending_source
+        return self.position, self.buffer, self.pending_source, self.last_progress_at, self.last_chunk_audio_bytes
 
     def restore(self, state) -> None:
-        self.position, self.buffer, self.pending_source = state
+        (
+            self.position,
+            self.buffer,
+            self.pending_source,
+            self.last_progress_at,
+            self.last_chunk_audio_bytes,
+        ) = state
+
+    def should_drop(self) -> str | None:
+        if self._complete():
+            return None
+        now = time.monotonic()
+        source_size = self._source_size()
+        if source_size <= 0 and now - self.loaded_at > STREAM_START_TIMEOUT_SECONDS:
+            return "stream never received audio"
+        if source_size <= self.position and not self.buffer and now - self.last_progress_at > STREAM_STALL_TIMEOUT_SECONDS:
+            return "stream stopped receiving audio before finish"
+        return None
+
+    @property
+    def has_audio_this_chunk(self) -> bool:
+        return self.last_chunk_audio_bytes > 0
 
     def _read_source(self) -> bytes:
         try:
@@ -166,7 +204,7 @@ class AudioMixer:
         self._stop = False
         self._arecord: subprocess.Popen[bytes] | None = None
         self._pipe_fd: int | None = None
-        self._active_clip: TTSClip | None = None
+        self._active_clip: TTSClip | StreamingTTSClip | None = None
         self._duck_level = 1.0
 
     def run(self) -> None:
@@ -285,7 +323,7 @@ class AudioMixer:
         clip_state = clip.snapshot() if clip is not None else None
         if clip is not None:
             tts = clip.next_chunk(CHUNK_BYTES)
-            target_duck = clip.duck_gain
+            target_duck = clip.duck_gain if clip.has_audio_this_chunk else 1.0
         else:
             tts = b"\x00" * CHUNK_BYTES
             target_duck = 1.0
@@ -304,6 +342,12 @@ class AudioMixer:
             log.info("Finished TTS request %s", clip.request_id)
             clip.cleanup()
             self._active_clip = None
+        elif clip is not None:
+            drop_reason = clip.should_drop()
+            if drop_reason:
+                log.warning("Dropping stalled TTS request %s: %s", clip.request_id, drop_reason)
+                clip.cleanup()
+                self._active_clip = None
 
     def _read_live_chunk(self, *, timeout: float) -> bytes | None:
         proc = self._arecord
@@ -380,11 +424,19 @@ class AudioMixer:
                     log.warning("Dropping TTS stream with missing audio: %s", pcm_path)
                     safe_unlink(path)
                     continue
+                done_path = Path(meta.get("done_path") or str(path.with_suffix(".done")))
+                stale_reason = self._stale_stream_reason(path, meta, pcm_path, done_path)
+                if stale_reason:
+                    log.warning("Dropping stale TTS stream %s: %s", path.name, stale_reason)
+                    safe_unlink(pcm_path)
+                    safe_unlink(done_path)
+                    safe_unlink(path)
+                    continue
                 return StreamingTTSClip(
                     request_id=str(meta.get("request_id") or path.stem),
                     pcm_path=pcm_path,
                     meta_path=path,
-                    done_path=Path(meta.get("done_path") or str(path.with_suffix(".done"))),
+                    done_path=done_path,
                     sample_rate=int(meta.get("sample_rate") or 24000),
                     channels=int(meta.get("channels") or 1),
                     sample_width=int(meta.get("sample_width") or 2),
@@ -394,6 +446,16 @@ class AudioMixer:
                 log.exception("Failed to load TTS stream item %s", path)
                 safe_unlink(path)
         return None
+
+    def _stale_stream_reason(self, meta_path: Path, meta: dict, pcm_path: Path, done_path: Path) -> str | None:
+        if pcm_path.stat().st_size <= 0:
+            return "active stream has no audio"
+        age = stream_age_seconds(meta_path, meta)
+        if age is None or age <= STREAM_QUEUE_STALE_SECONDS:
+            return None
+        if meta.get("complete") or done_path.exists():
+            return f"completed stream is {age:.1f}s old"
+        return f"incomplete stream is {age:.1f}s old"
 
     def _next_duck_level(self, target: float) -> float:
         if target < self._duck_level:
@@ -541,6 +603,19 @@ def clamp_float(value: object, minimum: float, maximum: float, default: float) -
     except (TypeError, ValueError):
         return default
     return min(max(parsed, minimum), maximum)
+
+
+def stream_age_seconds(meta_path: Path, meta: dict) -> float | None:
+    queued_at = meta.get("queued_at")
+    try:
+        if queued_at is not None:
+            return max(0.0, time.time() - float(queued_at))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(0.0, time.time() - meta_path.stat().st_mtime)
+    except OSError:
+        return None
 
 
 def safe_unlink(path: Path) -> None:
