@@ -618,6 +618,7 @@ class GstZoneMixer:
 
     async def _handle_tts_websocket(self, websocket, _path: str | None = None) -> None:
         clip: TTSClip | None = None
+        queued = False
         try:
             first = await asyncio.wait_for(websocket.recv(), timeout=WS_RECV_TIMEOUT_SECONDS)
             if not isinstance(first, str):
@@ -628,7 +629,6 @@ class GstZoneMixer:
                 await websocket.send(json.dumps({"type": "error", "error": "first message must have type=start"}))
                 return
             clip = self._clip_from_websocket_start(start)
-            self._live_clips.put(clip)
             await websocket.send(json.dumps({
                 "type": "started",
                 "request_id": clip.request_id,
@@ -640,10 +640,26 @@ class GstZoneMixer:
             async for message in websocket:
                 if isinstance(message, bytes):
                     clip.live_buffer.append(message)
+                    if not queued and clip.live_buffer.total_received > 0:
+                        self._live_clips.put(clip)
+                        queued = True
+                        log.info(
+                            "Queued websocket TTS request %s after first audio received=%d",
+                            clip.request_id,
+                            clip.live_buffer.total_received,
+                        )
                     continue
                 payload = json.loads(message)
                 msg_type = payload.get("type")
                 if msg_type == "end":
+                    if not queued and clip.live_buffer.total_received > 0:
+                        self._live_clips.put(clip)
+                        queued = True
+                        log.info(
+                            "Queued websocket TTS request %s at stream end received=%d",
+                            clip.request_id,
+                            clip.live_buffer.total_received,
+                        )
                     clip.live_buffer.finish()
                     log.info(
                         "Received websocket TTS request %s complete received=%d",
@@ -657,15 +673,16 @@ class GstZoneMixer:
                     }))
                     return
                 if msg_type == "cancel":
-                    clip.live_buffer.finish(str(payload.get("error") or "cancelled"))
+                    if queued:
+                        clip.live_buffer.finish(str(payload.get("error") or "cancelled"))
                     log.info("Cancelled websocket TTS request %s", clip.request_id)
                     await websocket.send(json.dumps({"type": "cancelled", "request_id": clip.request_id}))
                     return
                 await websocket.send(json.dumps({"type": "error", "error": f"unknown message type: {msg_type}"}))
-            if clip.live_buffer is not None:
+            if queued and clip.live_buffer is not None:
                 clip.live_buffer.finish()
         except Exception as exc:
-            if clip is not None and clip.live_buffer is not None:
+            if queued and clip is not None and clip.live_buffer is not None:
                 clip.live_buffer.finish(str(exc))
             with contextlib.suppress(Exception):
                 await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
