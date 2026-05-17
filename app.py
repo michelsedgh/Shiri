@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 import wave
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -750,44 +751,67 @@ def queue_tts_for_zone(zone_id):
     return jsonify(result), 202
 
 
+@app.route("/api/rooms/<room_id>/tts-streams", methods=["POST"])
+def create_tts_stream_for_room(room_id):
+    result, error = _start_tts_stream(default_room_id=room_id)
+    return _create_tts_stream_response(result, error)
+
+
+@app.route("/api/zones/<zone_id>/tts-streams", methods=["POST"])
+def create_tts_stream_for_zone(zone_id):
+    result, error = _start_tts_stream(zone_id=zone_id)
+    return _create_tts_stream_response(result, error)
+
+
+@app.route("/api/zones/<zone_id>/tts-streams/<stream_id>/chunks", methods=["POST"])
+def append_tts_stream_chunk(zone_id, stream_id):
+    chunk = request.get_data(cache=False)
+    if not chunk:
+        return jsonify({"error": "No audio chunk provided", "request_debug": _request_stream_debug()}), 400
+    if len(chunk) > 2 * 1024 * 1024:
+        return jsonify({"error": "Audio chunk is too large"}), 413
+    result, error = zone_manager.append_tts_stream(zone_id, stream_id, chunk)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify(result), 202
+
+
+@app.route("/api/zones/<zone_id>/tts-streams/<stream_id>/finish", methods=["POST"])
+def finish_tts_stream_chunked(zone_id, stream_id):
+    data = request.get_json(silent=True) if request.is_json else {}
+    error_text = data.get("error") if isinstance(data, dict) else None
+    result, error = zone_manager.finish_tts_stream_by_id(zone_id, stream_id, error=error_text)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify(result), 200
+
+
 @app.route("/api/rooms/<room_id>/tts-stream", methods=["POST"])
 def stream_tts_for_room(room_id):
     result, error = _start_tts_stream(default_room_id=room_id)
-    if error:
-        return jsonify({"error": error}), 400
-    try:
-        bytes_written = _write_request_stream(result["stream_path"])
-        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"])
-    except Exception as exc:
-        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"], error=exc)
-        log.exception("TTS stream failed for room=%s request=%s", room_id, result.get("request_id"))
-        return jsonify({"error": str(exc)}), 500
-    response = dict(result)
-    response.pop("stream_path", None)
-    response.pop("meta_path", None)
-    response.pop("done_path", None)
-    response["streamed_bytes"] = bytes_written
-    return jsonify(response), 202
+    return _finish_tts_stream_response(result, error, room_id=room_id)
 
 
 @app.route("/api/zones/<zone_id>/tts-stream", methods=["POST"])
 def stream_tts_for_zone(zone_id):
     result, error = _start_tts_stream(zone_id=zone_id)
+    return _finish_tts_stream_response(result, error, zone_id=zone_id)
+
+
+@app.route("/api/rooms/<room_id>/tts-debug")
+def tts_debug_for_room(room_id):
+    zone, error = zone_manager.resolve_zone_for_room(room_id, require_running=False)
     if error:
-        return jsonify({"error": error}), 400
-    try:
-        bytes_written = _write_request_stream(result["stream_path"])
-        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"])
-    except Exception as exc:
-        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"], error=exc)
-        log.exception("TTS stream failed for zone=%s request=%s", zone_id, result.get("request_id"))
-        return jsonify({"error": str(exc)}), 500
-    response = dict(result)
-    response.pop("stream_path", None)
-    response.pop("meta_path", None)
-    response.pop("done_path", None)
-    response["streamed_bytes"] = bytes_written
-    return jsonify(response), 202
+        return jsonify({"error": error}), 404
+    return jsonify(_tts_debug_payload(zone))
+
+
+@app.route("/api/zones/<zone_id>/tts-debug")
+def tts_debug_for_zone(zone_id):
+    zone = zone_manager.get_zone(zone_id)
+    if not zone:
+        return jsonify({"error": "Zone not found"}), 404
+    return jsonify(_tts_debug_payload(zone))
 
 
 @app.route("/api/test-clips")
@@ -866,17 +890,126 @@ def _start_tts_stream(default_room_id=None, zone_id=None):
     )
 
 
+def _finish_tts_stream_response(result, error, *, room_id=None, zone_id=None):
+    if error:
+        return jsonify({"error": error}), 400
+    try:
+        bytes_written = _write_request_stream(result["stream_path"])
+        if bytes_written <= 0:
+            zone_manager.finish_tts_stream(result["meta_path"], result["done_path"], error="empty_request_body", bytes_written=0)
+            log.warning(
+                "TTS stream rejected empty body room=%s zone=%s request=%s content_length=%s transfer_encoding=%s input_terminated=%s",
+                room_id,
+                zone_id,
+                result.get("request_id"),
+                request.content_length,
+                request.headers.get("Transfer-Encoding"),
+                request.environ.get("wsgi.input_terminated"),
+            )
+            response = _public_tts_stream_response(result, 0)
+            response["error"] = "empty_request_body"
+            response["request_debug"] = _request_stream_debug()
+            return jsonify(response), 400
+        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"], bytes_written=bytes_written)
+    except Exception as exc:
+        zone_manager.finish_tts_stream(result["meta_path"], result["done_path"], error=exc)
+        log.exception("TTS stream failed for room=%s zone=%s request=%s", room_id, zone_id, result.get("request_id"))
+        return jsonify({"error": str(exc), "request_debug": _request_stream_debug()}), 500
+    return jsonify(_public_tts_stream_response(result, bytes_written)), 202
+
+
+def _create_tts_stream_response(result, error):
+    if error:
+        return jsonify({"error": error}), 400
+    response = _public_tts_stream_response(result, 0)
+    response["append_url"] = f"/api/zones/{result['zone_id']}/tts-streams/{result['stream_id']}/chunks"
+    response["finish_url"] = f"/api/zones/{result['zone_id']}/tts-streams/{result['stream_id']}/finish"
+    return jsonify(response), 201
+
+
+def _public_tts_stream_response(result, bytes_written):
+    response = dict(result)
+    response.pop("stream_path", None)
+    response.pop("meta_path", None)
+    response.pop("done_path", None)
+    response["streamed_bytes"] = bytes_written
+    return response
+
+
 def _write_request_stream(path):
-    bytes_written = 0
-    with open(path, "ab") as fh:
-        while True:
-            chunk = request.stream.read(65536)
-            if not chunk:
-                break
-            fh.write(chunk)
+    body = request.get_data(cache=False)
+    bytes_written = len(body)
+    if bytes_written > 0:
+        with open(path, "ab") as fh:
+            fh.write(body)
             fh.flush()
-            bytes_written += len(chunk)
+    if bytes_written == 0:
+        log.warning(
+            "TTS stream read zero bytes content_length=%s transfer_encoding=%s input_terminated=%s",
+            request.content_length,
+            request.headers.get("Transfer-Encoding"),
+            request.environ.get("wsgi.input_terminated"),
+        )
     return bytes_written
+
+
+def _request_stream_debug():
+    return {
+        "content_length": request.content_length,
+        "transfer_encoding": request.headers.get("Transfer-Encoding"),
+        "input_terminated": bool(request.environ.get("wsgi.input_terminated")),
+    }
+
+
+def _tts_debug_payload(zone):
+    grp_dir = Path(zone.grp_dir)
+    return {
+        "ok": True,
+        "zone_id": zone.zone_id,
+        "zone_status": zone.status,
+        "room_id": zone.room_id,
+        "room_name": zone.room_name,
+        "grp_dir": str(grp_dir),
+        "tts_queue": _recent_tts_files(grp_dir / "tts_queue"),
+        "tts_streams": _recent_tts_files(grp_dir / "tts_streams"),
+        "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=80),
+    }
+
+
+def _recent_tts_files(path, limit=30):
+    if not path.exists():
+        return {"exists": False, "path": str(path), "items": []}
+    items = []
+    for item in sorted(path.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:limit]:
+        try:
+            stat = item.stat()
+        except OSError:
+            continue
+        meta = None
+        if item.suffix == ".json":
+            try:
+                meta = json.loads(item.read_text())
+            except Exception:
+                meta = None
+        items.append({
+            "name": item.name,
+            "path": str(item),
+            "bytes": stat.st_size,
+            "mtime": stat.st_mtime,
+            "meta": _trim_tts_meta(meta),
+        })
+    return {"exists": True, "path": str(path), "items": items}
+
+
+def _trim_tts_meta(meta):
+    if not isinstance(meta, dict):
+        return None
+    keep = [
+        "request_id", "room_id", "zone_id", "format", "sample_rate", "channels",
+        "sample_width", "complete", "error", "bytes_written", "queued_at", "text",
+        "duck_gain", "effective_policy",
+    ]
+    return {key: meta.get(key) for key in keep if key in meta}
 
 
 def _extract_tts_payload(default_room_id=None):

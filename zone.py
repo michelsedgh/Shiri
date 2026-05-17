@@ -53,6 +53,14 @@ def _safe_request_id(value):
     return text or uuid.uuid4().hex
 
 
+def _path_inside(path, root):
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def _clamp_int(value, minimum, maximum, default):
     try:
         parsed = int(round(float(value)))
@@ -681,6 +689,7 @@ class ZoneManager:
         log.info("Started streaming TTS %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
         return {
             "ok": True,
+            "stream_id": safe_id,
             "request_id": safe_id,
             "room_id": zone.room_id,
             "room_name": zone.room_name,
@@ -691,12 +700,14 @@ class ZoneManager:
             "done_path": str(done_path),
         }, None
 
-    def finish_tts_stream(self, meta_path, done_path, *, error=None):
+    def finish_tts_stream(self, meta_path, done_path, *, error=None, bytes_written=None):
         """Mark a streaming TTS item complete so the mixer can release it."""
         try:
             path = Path(meta_path)
             meta = json.loads(path.read_text()) if path.exists() else {}
             meta["complete"] = True
+            if bytes_written is not None:
+                meta["bytes_written"] = int(bytes_written)
             if error:
                 meta["error"] = str(error)
             tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -705,6 +716,86 @@ class ZoneManager:
             Path(done_path).write_text(str(time.time()))
         except Exception as e:
             log.warning("Could not mark TTS stream complete: %s", e)
+
+    def append_tts_stream(self, zone_id, stream_id, data):
+        """Append one fixed-length PCM chunk to an active streaming TTS item."""
+        stream, error = self.get_tts_stream(zone_id, stream_id)
+        if error:
+            return None, error
+        if not data:
+            return None, "No audio chunk provided"
+        if stream["meta"].get("complete") or stream["done_path"].exists():
+            return None, "TTS stream is already complete"
+
+        with stream["stream_path"].open("ab") as fh:
+            fh.write(data)
+            fh.flush()
+        total_bytes = stream["stream_path"].stat().st_size
+        return {
+            "ok": True,
+            "stream_id": stream["stream_id"],
+            "request_id": stream["stream_id"],
+            "room_id": stream["room_id"],
+            "room_name": stream["room_name"],
+            "zone_id": stream["zone_id"],
+            "chunk_bytes": len(data),
+            "total_bytes": total_bytes,
+        }, None
+
+    def finish_tts_stream_by_id(self, zone_id, stream_id, *, error=None):
+        """Mark an active streaming TTS item complete by stream id."""
+        stream, lookup_error = self.get_tts_stream(zone_id, stream_id)
+        if lookup_error:
+            return None, lookup_error
+        total_bytes = stream["stream_path"].stat().st_size if stream["stream_path"].exists() else 0
+        self.finish_tts_stream(
+            stream["meta_path"],
+            stream["done_path"],
+            error=error,
+            bytes_written=total_bytes,
+        )
+        return {
+            "ok": error is None,
+            "stream_id": stream["stream_id"],
+            "request_id": stream["stream_id"],
+            "room_id": stream["room_id"],
+            "room_name": stream["room_name"],
+            "zone_id": stream["zone_id"],
+            "streamed_bytes": total_bytes,
+            "error": str(error) if error else None,
+        }, None
+
+    def get_tts_stream(self, zone_id, stream_id):
+        """Return paths and metadata for an active stream id without exposing paths over the API."""
+        zone = self.get_zone(zone_id)
+        if not zone:
+            return None, "Zone not found"
+        safe_id = _safe_request_id(stream_id)
+        stream_dir = Path(zone.grp_dir) / "tts_streams"
+        for meta_path in sorted(stream_dir.glob("*.json")):
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception:
+                continue
+            if str(meta.get("request_id") or "") != safe_id:
+                continue
+            stream_path = Path(meta.get("stream_path") or "")
+            done_path = Path(meta.get("done_path") or str(meta_path.with_suffix(".done")))
+            if not _path_inside(stream_path, stream_dir) or not _path_inside(done_path, stream_dir):
+                return None, "Invalid TTS stream path"
+            if not stream_path.exists():
+                return None, "TTS stream audio file is missing"
+            return {
+                "stream_id": safe_id,
+                "zone_id": zone.zone_id,
+                "room_id": zone.room_id,
+                "room_name": zone.room_name,
+                "meta": meta,
+                "meta_path": meta_path,
+                "stream_path": stream_path,
+                "done_path": done_path,
+            }, None
+        return None, "TTS stream not found"
 
     def _known_speakers(self, zone):
         outputs = []
