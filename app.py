@@ -10,18 +10,12 @@ Run with: sudo python3 app.py
 
 import logging
 import os
-import base64
-import io
 import json
-import math
 import signal
-import struct
 import sys
 import threading
 import time
 import uuid
-import wave
-from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -74,23 +68,6 @@ LOG_FILTERS = {
 }
 DEFAULT_LIONOS_BASE_URL = os.environ.get("SHIRI_LIONOS_BASE_URL", "http://192.168.1.198:7001")
 LIONOS_TIMEOUT_SECONDS = float(os.environ.get("SHIRI_LIONOS_TIMEOUT", "1.5"))
-TEST_CLIPS = {
-    "announce": {
-        "name": "Announcement",
-        "description": "Short placeholder announcement tone",
-        "seconds": 1.35,
-    },
-    "chime": {
-        "name": "Chime",
-        "description": "Fast room routing check",
-        "seconds": 0.7,
-    },
-    "ducking": {
-        "name": "Ducking Check",
-        "description": "Longer clip for hearing music reduction",
-        "seconds": 3.0,
-    },
-}
 _watched_zones = set()
 _log_positions = {}
 _log_lock = threading.Lock()
@@ -711,46 +688,6 @@ def set_room_tts_policy(room_id):
 # TTS routing API
 # ---------------------------------------------------------------------------
 
-@app.route("/api/tts", methods=["POST"])
-def queue_tts_default():
-    payload, error = _extract_tts_payload()
-    if error:
-        return jsonify({"error": error}), 400
-    room_id = payload.pop("room_id", None)
-    zone, error = zone_manager.resolve_zone_for_room(room_id)
-    if error:
-        return jsonify({"error": error}), 404
-    result, error = zone_manager.enqueue_tts(zone.zone_id, **payload)
-    if error:
-        return jsonify({"error": error}), 400
-    return jsonify(result), 202
-
-@app.route("/api/rooms/<room_id>/tts", methods=["POST"])
-def queue_tts_for_room(room_id):
-    payload, error = _extract_tts_payload(default_room_id=room_id)
-    if error:
-        return jsonify({"error": error}), 400
-    resolved_room_id = payload.pop("room_id", None)
-    zone, error = zone_manager.resolve_zone_for_room(resolved_room_id)
-    if error:
-        return jsonify({"error": error}), 404
-    result, error = zone_manager.enqueue_tts(zone.zone_id, **payload)
-    if error:
-        return jsonify({"error": error}), 400
-    return jsonify(result), 202
-
-@app.route("/api/zones/<zone_id>/tts", methods=["POST"])
-def queue_tts_for_zone(zone_id):
-    payload, error = _extract_tts_payload()
-    if error:
-        return jsonify({"error": error}), 400
-    payload.pop("room_id", None)
-    result, error = zone_manager.enqueue_tts(zone_id, **payload)
-    if error:
-        return jsonify({"error": error}), 400
-    return jsonify(result), 202
-
-
 @app.route("/api/rooms/<room_id>/tts-websocket", methods=["POST"])
 def prepare_tts_websocket_for_room(room_id):
     result, error = _prepare_tts_websocket(default_room_id=room_id)
@@ -781,53 +718,6 @@ def tts_debug_for_zone(zone_id):
     if not zone:
         return jsonify({"error": "Zone not found"}), 404
     return jsonify(_tts_debug_payload(zone))
-
-
-@app.route("/api/test-clips")
-def list_test_clips():
-    return jsonify({
-        "clips": [
-            {"id": clip_id, **meta}
-            for clip_id, meta in TEST_CLIPS.items()
-        ]
-    })
-
-
-@app.route("/api/rooms/<room_id>/inject-test", methods=["POST"])
-def inject_test_clip(room_id):
-    """
-    Queue a built-in or uploaded WAV through the same room mixer path LionOS will use.
-    This is intentionally separate from /tts so the UI can test routing before
-    LionOS synthesis is finished.
-    """
-    if request.files or not request.is_json:
-        payload, error = _extract_tts_payload(default_room_id=room_id)
-        if error:
-            return jsonify({"error": error}), 400
-    else:
-        data = request.get_json() or {}
-        clip_id = str(data.get("clip_id") or "announce")
-        if clip_id not in TEST_CLIPS:
-            return jsonify({"error": "Unknown test clip"}), 400
-        payload = {
-            "audio_bytes": _generate_test_clip_wav(clip_id),
-            "request_id": data.get("request_id") or f"ui_inject_{clip_id}_{uuid.uuid4().hex[:8]}",
-            "audio_format": "wav",
-            "text": data.get("text") or f"Shiri test clip: {TEST_CLIPS[clip_id]['name']}",
-            "room_id": room_id,
-            "speaker_id": data.get("speaker_id"),
-            "speaker_name": data.get("speaker_name"),
-        }
-
-    resolved_room_id = payload.pop("room_id", None) or room_id
-    zone, error = zone_manager.resolve_zone_for_room(resolved_room_id)
-    if error:
-        return jsonify({"error": error}), 404
-    result, error = zone_manager.enqueue_tts(zone.zone_id, **payload)
-    if error:
-        return jsonify({"error": error}), 400
-    result["injected"] = True
-    return jsonify(result), 202
 
 
 def _prepare_tts_websocket(default_room_id=None, zone_id=None):
@@ -875,172 +765,18 @@ def _mixer_websocket_url(port):
 
 
 def _tts_debug_payload(zone):
-    grp_dir = Path(zone.grp_dir)
     return {
         "ok": True,
         "zone_id": zone.zone_id,
         "zone_status": zone.status,
         "room_id": zone.room_id,
         "room_name": zone.room_name,
-        "grp_dir": str(grp_dir),
+        "grp_dir": zone.grp_dir,
         "tts_transport": "websocket",
         "tts_ws_port": zone.tts_ws_port,
-        "tts_queue": _recent_tts_files(grp_dir / "tts_queue"),
         "mixer_log_tail": _read_log_tail(zone.zone_id, "mixer", lines=80),
         "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=20),
     }
-
-
-def _recent_tts_files(path, limit=30):
-    if not path.exists():
-        return {"exists": False, "path": str(path), "items": []}
-    items = []
-    files = [item for item in path.iterdir() if item.is_file()]
-    for item in sorted(files, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:limit]:
-        try:
-            stat = item.stat()
-        except OSError:
-            continue
-        meta = None
-        if item.suffix == ".json":
-            try:
-                meta = json.loads(item.read_text())
-            except Exception:
-                meta = None
-        items.append({
-            "name": item.name,
-            "path": str(item),
-            "bytes": stat.st_size,
-            "mtime": stat.st_mtime,
-            "meta": _trim_tts_meta(meta),
-        })
-    return {"exists": True, "path": str(path), "items": items}
-
-
-def _trim_tts_meta(meta):
-    if not isinstance(meta, dict):
-        return None
-    keep = [
-        "request_id", "room_id", "zone_id", "format", "sample_rate", "channels",
-        "sample_width", "complete", "error", "bytes_written", "queued_at", "text",
-        "duck_gain", "effective_policy",
-    ]
-    return {key: meta.get(key) for key in keep if key in meta}
-
-
-def _extract_tts_payload(default_room_id=None):
-    """
-    Accept TTS audio from LionOS as multipart, JSON base64, or raw audio/wav.
-    LionOS owns synthesis; Shiri only queues the WAV for the per-zone mixer.
-    """
-    data = {}
-    audio_bytes = None
-    audio_format = None
-
-    if request.files:
-        data.update(request.form.to_dict())
-        upload = request.files.get("audio") or next(iter(request.files.values()))
-        audio_bytes = upload.read()
-        filename = upload.filename or ""
-        if "." in filename:
-            audio_format = filename.rsplit(".", 1)[-1]
-    elif request.is_json:
-        data.update(request.get_json() or {})
-        encoded = data.get("audio_base64")
-        if encoded:
-            if "," in encoded and encoded.strip().startswith("data:"):
-                encoded = encoded.split(",", 1)[1]
-            try:
-                audio_bytes = base64.b64decode(encoded)
-            except (ValueError, TypeError) as exc:
-                return None, f"Invalid audio_base64: {exc}"
-    else:
-        data.update(request.args.to_dict())
-        audio_bytes = request.get_data()
-
-    if not audio_bytes:
-        return None, "Provide WAV audio as multipart field 'audio', JSON audio_base64, or raw audio/wav body"
-    if len(audio_bytes) > 25 * 1024 * 1024:
-        return None, "TTS audio payload is too large"
-
-    audio_format = (
-        data.get("format")
-        or data.get("audio_format")
-        or audio_format
-        or _format_from_mimetype(request.mimetype)
-        or "wav"
-    )
-    return {
-        "audio_bytes": audio_bytes,
-        "request_id": data.get("request_id") or uuid.uuid4().hex,
-        "audio_format": audio_format,
-        "text": data.get("text"),
-        "room_id": data.get("room_id") or default_room_id,
-        "speaker_id": data.get("speaker_id"),
-        "speaker_name": data.get("speaker_name"),
-    }, None
-
-
-def _format_from_mimetype(mimetype):
-    if mimetype in {"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"}:
-        return "wav"
-    return None
-
-
-def _generate_test_clip_wav(clip_id):
-    sample_rate = 44100
-    clips = {
-        "announce": [
-            (0.10, 0, 0.0),
-            (0.18, 659.25, 0.23),
-            (0.07, 0, 0.0),
-            (0.24, 880.0, 0.20),
-            (0.07, 0, 0.0),
-            (0.32, 523.25, 0.22),
-            (0.07, 0, 0.0),
-            (0.28, 784.0, 0.18),
-        ],
-        "chime": [
-            (0.16, 987.77, 0.22),
-            (0.06, 0, 0.0),
-            (0.24, 1318.51, 0.2),
-        ],
-        "ducking": [
-            (0.35, 440.0, 0.18),
-            (0.35, 554.37, 0.18),
-            (0.35, 659.25, 0.18),
-            (0.35, 554.37, 0.18),
-            (0.35, 440.0, 0.18),
-            (0.35, 329.63, 0.18),
-            (0.35, 392.0, 0.18),
-            (0.35, 493.88, 0.18),
-        ],
-    }
-    frames = bytearray()
-    phase = 0.0
-    for seconds, freq, volume in clips.get(clip_id, clips["announce"]):
-        count = int(sample_rate * seconds)
-        for index in range(count):
-            if freq <= 0 or volume <= 0:
-                sample = 0
-            else:
-                edge = max(1, int(sample_rate * min(0.025, seconds / 4)))
-                fade = 1.0
-                if index < edge:
-                    fade = index / edge
-                elif index > count - edge:
-                    fade = max(0.0, (count - index) / edge)
-                sample = int(math.sin(phase) * volume * fade * 32767)
-                phase += 2 * math.pi * freq / sample_rate
-            frames.extend(struct.pack("<hh", sample, sample))
-
-    out = io.BytesIO()
-    with wave.open(out, "wb") as wav:
-        wav.setnchannels(2)
-        wav.setsampwidth(2)
-        wav.setframerate(sample_rate)
-        wav.writeframes(bytes(frames))
-    return out.getvalue()
 
 # ---------------------------------------------------------------------------
 # Speaker / Output API

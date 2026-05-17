@@ -133,12 +133,12 @@ def setup_directories(zone):
     Creates dirs, clears stale state, creates FIFOs.
     """
     grp_dir = zone.grp_dir
-    for subdir in ["pipes", "config", "logs", "state", "tts_queue"]:
+    for subdir in ["pipes", "config", "logs", "state"]:
         os.makedirs(os.path.join(grp_dir, subdir), exist_ok=True)
         os.chmod(os.path.join(grp_dir, subdir), 0o755)
 
-    # Clear stale state, logs, and queued TTS from the last daemon run.
-    for subdir in ["state", "logs", "tts_queue"]:
+    # Clear stale state and logs from the last daemon run.
+    for subdir in ["state", "logs"]:
         for f in os.listdir(os.path.join(grp_dir, subdir)):
             path = os.path.join(grp_dir, subdir, f)
             try:
@@ -340,7 +340,7 @@ def generate_owntone_config(zone):
 def generate_mixer_supervisor(zone):
     """
     Generate the host mixer launcher.
-    The mixer captures ALSA loopback audio, overlays queued/streamed TTS, and
+    The mixer captures ALSA loopback audio, overlays streamed TTS, and
     writes OwnTone's audio.pipe.
     """
     grp_dir = zone.grp_dir

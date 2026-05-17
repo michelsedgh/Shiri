@@ -16,7 +16,6 @@ import subprocess
 import threading
 import time
 import uuid
-from pathlib import Path
 
 from config import (
     BASE_DIR,
@@ -549,70 +548,8 @@ class ZoneManager:
         return None, "No Shiri zone found for room"
 
     # -------------------------------------------------------------------------
-    # TTS queue
+    # TTS stream routing
     # -------------------------------------------------------------------------
-
-    def enqueue_tts(self, zone_id, audio_bytes, *, request_id=None, audio_format="wav",
-                    text=None,
-                    speaker_id=None, speaker_name=None):
-        """Queue a TTS WAV for the zone mixer. Returns (payload, error)."""
-        zone = self.get_zone(zone_id)
-        if not zone:
-            return None, "Zone not found"
-        if zone.status != Zone.STATUS_RUNNING:
-            return None, "Zone must be running before TTS can be queued"
-        if not audio_bytes:
-            return None, "No audio payload provided"
-        if zone.owntone_api:
-            try:
-                zone.owntone_api.play()
-            except Exception as e:
-                log.debug("Could not nudge OwnTone play state before TTS: %s", e)
-
-        fmt = (audio_format or "wav").lower().strip(".")
-        if fmt not in {"wav", "wave"}:
-            return None, "Only WAV TTS payloads are currently supported"
-
-        queue_dir = Path(zone.grp_dir) / "tts_queue"
-        queue_dir.mkdir(parents=True, exist_ok=True)
-        safe_id = _safe_request_id(request_id)
-        prefix = f"{int(time.time() * 1000)}_{safe_id}"
-        audio_path = queue_dir / f"{prefix}.wav"
-        meta_path = queue_dir / f"{prefix}.json"
-        tmp_meta_path = queue_dir / f"{prefix}.json.tmp"
-
-        effective = self._effective_tts_mix(
-            zone,
-            speaker_id=speaker_id,
-            speaker_name=speaker_name,
-        )
-        audio_path.write_bytes(audio_bytes)
-        meta = {
-            "request_id": safe_id,
-            "audio_path": str(audio_path),
-            "format": "wav",
-            "room_id": zone.room_id,
-            "zone_id": zone.zone_id,
-            "text": text,
-            "speaker_id": speaker_id,
-            "speaker_name": speaker_name,
-            "duck_gain": effective["duck_gain"],
-            "effective_policy": effective,
-            "queued_at": time.time(),
-        }
-        tmp_meta_path.write_text(json.dumps(meta, indent=2))
-        os.replace(tmp_meta_path, meta_path)
-
-        log.info("Queued TTS %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
-        return {
-            "ok": True,
-            "request_id": safe_id,
-            "room_id": zone.room_id,
-            "room_name": zone.room_name,
-            "zone_id": zone.zone_id,
-            "effective_policy": effective,
-            "queued_bytes": len(audio_bytes),
-        }, None
 
     def prepare_tts_websocket(self, zone_id, *, request_id=None, audio_format="pcm_s16le",
                               sample_rate=24000, channels=1, sample_width=2,

@@ -9,7 +9,7 @@ single GStreamer pipeline:
   live silence bed ------------------> audiomixer -> OwnTone FIFO
   TTS appsrc -----------> convert/resample -> /
 
-Python only owns control-plane work here: queue/stream discovery, TTS appsrc
+Python only owns control-plane work here: websocket stream intake, TTS appsrc
 buffering, ducking targets, and FIFO reconnects. GStreamer owns live capture,
 format conversion, resampling, mixing, clipping, and output pacing.
 """
@@ -29,9 +29,7 @@ import re
 import signal
 import threading
 import time
-import wave
 from dataclasses import dataclass, field
-from glob import glob
 from pathlib import Path
 
 
@@ -119,13 +117,7 @@ class TTSClip:
     sample_width: int
     duck_gain: float
     kind: str
-    data: bytes | None = None
-    live_buffer: LiveTTSBuffer | None = None
-    pcm_path: Path | None = None
-    meta_path: Path | None = None
-    done_path: Path | None = None
-    cleanup_paths: tuple[Path, ...] = ()
-    position: int = 0
+    live_buffer: LiveTTSBuffer
     pending: bytes = b""
     loaded_at: float = field(default_factory=time.monotonic)
     last_progress_at: float = field(default_factory=time.monotonic)
@@ -150,46 +142,20 @@ class TTSClip:
         return frames * self.frame_width
 
     def ready_to_start(self) -> bool:
-        if self.live_buffer is not None:
-            available = self.live_buffer.available_bytes()
-            return available >= self.prebuffer_bytes or (self.live_buffer.complete and available > 0)
-        size = self.source_size()
-        return size > 0
+        available = self.live_buffer.available_bytes()
+        return available >= self.prebuffer_bytes or (self.live_buffer.complete and available > 0)
 
     def source_size(self) -> int:
-        if self.live_buffer is not None:
-            return self.live_buffer.total_received
-        if self.data is not None:
-            return len(self.data)
-        if self.pcm_path is None:
-            return 0
-        try:
-            return self.pcm_path.stat().st_size
-        except OSError:
-            return 0
+        return self.live_buffer.total_received
 
     def source_complete(self) -> bool:
-        if self.live_buffer is not None:
-            return self.live_buffer.complete
-        if self.data is not None:
-            return True
-        if self.done_path and self.done_path.exists():
-            return True
-        if not self.meta_path:
-            return False
-        try:
-            meta = json.loads(self.meta_path.read_text())
-            return bool(meta.get("complete"))
-        except Exception:
-            return False
+        return self.live_buffer.complete
 
     def exhausted(self) -> bool:
-        if self.live_buffer is not None:
-            return self.live_buffer.complete and self.live_buffer.available_bytes() <= 0 and not self.pending
-        return self.source_complete() and self.position >= self.source_size() and not self.pending
+        return self.live_buffer.complete and self.live_buffer.available_bytes() <= 0 and not self.pending
 
     def read_chunk(self) -> bytes:
-        raw = self._read_raw(self.push_chunk_bytes)
+        raw = self.live_buffer.read(self.push_chunk_bytes)
         if raw:
             self.pending += raw
 
@@ -203,55 +169,20 @@ class TTSClip:
         return chunk
 
     def should_drop(self) -> str | None:
-        if self.live_buffer is not None:
-            if self.live_buffer.complete:
-                if self.live_buffer.error:
-                    return self.live_buffer.error
-                return None
-            now = time.monotonic()
-            available = self.live_buffer.available_bytes()
-            if self.live_buffer.total_received <= 0 and now - self.live_buffer.created_at > STREAM_START_TIMEOUT_SECONDS:
-                return "websocket stream never received audio"
-            if available <= 0 and now - self.live_buffer.last_write_at > STREAM_STALL_TIMEOUT_SECONDS:
-                return "websocket stream stopped receiving audio before finish"
-            return None
-        if self.kind != "stream" or self.source_complete():
+        if self.live_buffer.complete:
+            if self.live_buffer.error:
+                return self.live_buffer.error
             return None
         now = time.monotonic()
-        size = self.source_size()
-        if size <= 0 and now - self.loaded_at > STREAM_START_TIMEOUT_SECONDS:
-            return "stream never received audio"
-        if size <= self.position and not self.pending and now - self.last_progress_at > STREAM_STALL_TIMEOUT_SECONDS:
-            return "stream stopped receiving audio before finish"
+        available = self.live_buffer.available_bytes()
+        if self.live_buffer.total_received <= 0 and now - self.live_buffer.created_at > STREAM_START_TIMEOUT_SECONDS:
+            return "websocket stream never received audio"
+        if available <= 0 and now - self.live_buffer.last_write_at > STREAM_STALL_TIMEOUT_SECONDS:
+            return "websocket stream stopped receiving audio before finish"
         return None
 
     def cleanup(self) -> None:
-        for path in self.cleanup_paths:
-            safe_unlink(path)
-
-    def _read_raw(self, limit: int) -> bytes:
-        if self.live_buffer is not None:
-            return self.live_buffer.read(limit)
-        if self.data is not None:
-            if self.position >= len(self.data):
-                return b""
-            chunk = self.data[self.position:self.position + limit]
-            self.position += len(chunk)
-            return chunk
-
-        if self.pcm_path is None:
-            return b""
-        try:
-            available = self.pcm_path.stat().st_size
-            if available <= self.position:
-                return b""
-            with self.pcm_path.open("rb") as fh:
-                fh.seek(self.position)
-                chunk = fh.read(min(limit, available - self.position))
-            self.position += len(chunk)
-            return chunk
-        except OSError:
-            return b""
+        return None
 
 
 class GstZoneMixer:
@@ -259,7 +190,6 @@ class GstZoneMixer:
         self.capture_dev = capture_dev
         self.grp_dir = grp_dir
         self.pipe_path = grp_dir / "pipes" / "audio.pipe"
-        self.queue_dir = grp_dir / "tts_queue"
         self.tts_ws_port = int(tts_ws_port or 0)
         self.mixer_pid_path = grp_dir / "state" / "mixer.pid"
         self.legacy_arecord_pid_path = grp_dir / "state" / "arecord.pid"
@@ -284,7 +214,6 @@ class GstZoneMixer:
     def run(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
-        self.queue_dir.mkdir(parents=True, exist_ok=True)
         self.mixer_pid_path.write_text(str(os.getpid()))
         safe_unlink(self.legacy_arecord_pid_path)
 
@@ -400,15 +329,15 @@ class GstZoneMixer:
         set_property_if_present(self.tts_src, "min-latency", 0)
         set_property_if_present(self.tts_src, "max-latency", int(0.5 * 1_000_000_000))
 
-        queue = make_element(Gst, "queue", "tts_queue")
-        set_property_if_present(queue, "max-size-time", int(0.5 * 1_000_000_000))
-        set_property_if_present(queue, "max-size-bytes", 0)
+        buffer_queue = make_element(Gst, "queue", "tts_buffer")
+        set_property_if_present(buffer_queue, "max-size-time", int(0.5 * 1_000_000_000))
+        set_property_if_present(buffer_queue, "max-size-bytes", 0)
         convert = make_element(Gst, "audioconvert", "tts_convert")
         resample = make_element(Gst, "audioresample", "tts_resample")
         caps = make_element(Gst, "capsfilter", "tts_output_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
 
-        self._add_and_link([self.tts_src, queue, convert, resample, caps])
+        self._add_and_link([self.tts_src, buffer_queue, convert, resample, caps])
         self._link_to_mixer(caps, mixer)
 
     def _add_output_branch(self, mixer) -> None:
@@ -512,7 +441,7 @@ class GstZoneMixer:
                 return
             self._start_active_clip()
 
-        self._fill_tts_queue(clip)
+        self._fill_tts_appsrc(clip)
 
         if clip.exhausted() and self._tts_buffer_ahead_ns(clip) <= int(TTS_DRAIN_GRACE_SECONDS * 1_000_000_000):
             self._finish_active_clip(clip, reason="drained")
@@ -547,7 +476,7 @@ class GstZoneMixer:
         self._tts_caps_key = caps_key
         log.info("Configured TTS appsrc caps: %s", caps_text)
 
-    def _fill_tts_queue(self, clip: TTSClip) -> None:
+    def _fill_tts_appsrc(self, clip: TTSClip) -> None:
         target_ahead_ns = int(TTS_BUFFER_AHEAD_SECONDS * 1_000_000_000)
         pushed = 0
         while (
@@ -617,43 +546,10 @@ class GstZoneMixer:
         return max(0, int(clock.get_time() - self.pipeline.get_base_time()))
 
     def _load_next_clip(self) -> TTSClip | None:
-        clip = self._load_next_live_clip()
-        if clip is not None:
-            return clip
-        clip = self._load_next_wav_clip()
-        if clip is not None:
-            return clip
-        return None
-
-    def _load_next_live_clip(self) -> TTSClip | None:
         try:
             return self._live_clips.get_nowait()
         except queue.Empty:
             return None
-
-    def _load_next_wav_clip(self) -> TTSClip | None:
-        for meta_path_str in sorted(glob(str(self.queue_dir / "*.json"))):
-            meta_path = Path(meta_path_str)
-            try:
-                meta = json.loads(meta_path.read_text())
-                audio_path = Path(meta["audio_path"])
-                if not audio_path.exists():
-                    log.warning("Dropping TTS queue item with missing audio: %s", audio_path)
-                    safe_unlink(meta_path)
-                    continue
-                clip = load_wav_clip(
-                    request_id=str(meta.get("request_id") or meta_path.stem),
-                    audio_path=audio_path,
-                    meta_path=meta_path,
-                    duck_gain=clamp_float(meta.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
-                )
-                safe_unlink(audio_path)
-                safe_unlink(meta_path)
-                return clip
-            except Exception:
-                log.exception("Failed to load queued TTS item %s", meta_path)
-                safe_unlink(meta_path)
-        return None
 
     def _update_ducking(self) -> None:
         if self.music_volume is None:
@@ -833,28 +729,6 @@ def get_int_property(element, prop: str, default: int) -> int:
         return default
 
 
-def load_wav_clip(*, request_id: str, audio_path: Path, meta_path: Path, duck_gain: float) -> TTSClip:
-    with wave.open(str(audio_path), "rb") as wav:
-        channels = int(wav.getnchannels())
-        sample_width = int(wav.getsampwidth())
-        sample_rate = int(wav.getframerate())
-        data = wav.readframes(wav.getnframes())
-    if sample_width != 2:
-        raise ValueError(f"Unsupported WAV sample width: {sample_width}; expected 16-bit PCM")
-    if channels <= 0 or sample_rate <= 0:
-        raise ValueError(f"Invalid WAV format channels={channels} sample_rate={sample_rate}")
-    return TTSClip(
-        request_id=request_id,
-        sample_rate=sample_rate,
-        channels=channels,
-        sample_width=sample_width,
-        duck_gain=duck_gain,
-        kind="queued",
-        data=data,
-        cleanup_paths=(audio_path, meta_path),
-    )
-
-
 def clamp_float(value: object, minimum: float, maximum: float, default: float) -> float:
     try:
         parsed = float(value)
@@ -867,16 +741,6 @@ def safe_request_id(value: object) -> str:
     text = str(value or "").strip()
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
     return text or f"tts_{int(time.time() * 1000)}"
-
-
-def safe_unlink(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        log.warning("Could not remove %s: %s", path, exc)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser()

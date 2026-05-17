@@ -722,23 +722,6 @@ input[type="range"] {
     box-shadow: var(--shadow);
 }
 
-.inject-modal {
-    width: min(560px, 100%);
-    max-height: min(620px, calc(100vh - 44px));
-    overflow: auto;
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    background: var(--panel);
-    box-shadow: var(--shadow);
-}
-
-.inject-body {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 18px;
-    padding: 16px;
-}
-
 .toast {
     position: fixed;
     left: 50%;
@@ -802,7 +785,6 @@ input[type="range"] {
 
     .control-bank,
     .row-actions,
-    .inject-body,
     .settings-columns {
         grid-template-columns: 1fr;
     }

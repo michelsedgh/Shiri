@@ -4,8 +4,6 @@ import {
     clampNumber,
     debounce,
     escapeHtml,
-    formatPct,
-    nowRequestId,
     roomLabel,
     selectedSpeakerText,
     statusClass,
@@ -18,7 +16,6 @@ const state = {
     diagnosticsOpen: false,
     logsPaused: false,
     socket: null,
-    testClips: [],
 };
 
 const els = {};
@@ -44,7 +41,6 @@ function bindElements() {
         'refresh-dashboard',
         'open-diagnostics',
         'open-settings',
-        'open-injector',
         'global-error',
         'room-list',
         'room-drawer',
@@ -61,13 +57,6 @@ function bindElements() {
         'refresh-logs',
         'close-diagnostics',
         'log-feed',
-        'inject-panel',
-        'inject-built-in-form',
-        'inject-upload-form',
-        'inject-room',
-        'inject-clip',
-        'inject-file',
-        'close-injector',
         'settings-panel',
         'settings-form',
         'lionos-base-url',
@@ -89,10 +78,6 @@ function bindElements() {
 
 function bindEvents() {
     els.refreshDashboard.addEventListener('click', () => loadDashboard());
-    els.openInjector.addEventListener('click', () => openInjector());
-    els.closeInjector.addEventListener('click', closeInjector);
-    els.injectBuiltInForm.addEventListener('submit', onInjectBuiltIn);
-    els.injectUploadForm.addEventListener('submit', onInjectUpload);
     els.openSettings.addEventListener('click', openSettings);
     els.closeSettings.addEventListener('click', closeSettings);
     els.openDiagnostics.addEventListener('click', openDiagnostics);
@@ -118,7 +103,6 @@ function bindEvents() {
         if (event.key !== 'Escape') return;
         closeRoomDrawer();
         closeDiagnostics();
-        closeInjector();
         closeSettings();
     });
 }
@@ -130,7 +114,6 @@ async function loadDashboard({ quiet = false } = {}) {
         renderDashboard();
         if (state.activeRoomId) renderRoomDrawer();
         if (state.diagnosticsOpen) renderDiagnosticsFilters();
-        if (els.injectPanel?.classList.contains('open')) renderInjector(els.injectRoom.value);
         if (!quiet) showToast('Dashboard refreshed');
     } catch (error) {
         showError(error);
@@ -246,7 +229,6 @@ function renderRoomRow(room) {
                 <div class="row-actions">
                     <button class="small-btn" data-action="zone-start" data-zone-id="${escapeHtml(binding?.zone_id || '')}" ${binding?.can_start ? '' : 'disabled'}>Start</button>
                     <button class="small-btn" data-action="zone-stop" data-zone-id="${escapeHtml(binding?.zone_id || '')}" ${binding?.can_stop ? '' : 'disabled'}>Stop</button>
-                    <button class="small-btn" data-action="test-tts" data-room-id="${escapeHtml(room.room_id)}" ${isRunning ? '' : 'disabled'}>Inject</button>
                     <button class="small-btn" data-action="room-details" data-room-id="${escapeHtml(room.room_id)}">Details</button>
                 </div>
             </div>
@@ -278,8 +260,6 @@ async function onRoomListClick(event) {
             refreshSoon();
         } else if (action === 'room-details') {
             openRoomDrawer(button.dataset.roomId);
-        } else if (action === 'test-tts') {
-            openInjector(button.dataset.roomId);
         }
     } catch (error) {
         showError(error);
@@ -316,78 +296,6 @@ async function saveRoomPolicyFromRow(roomId) {
     };
     await Api.setRoomTtsPolicy(roomId, policy);
     showToast('Ducking saved');
-}
-
-async function openInjector(roomId = '') {
-    els.injectPanel.classList.add('open');
-    els.injectPanel.setAttribute('aria-hidden', 'false');
-    await renderInjector(roomId);
-}
-
-function closeInjector() {
-    els.injectPanel.classList.remove('open');
-    els.injectPanel.setAttribute('aria-hidden', 'true');
-}
-
-async function renderInjector(selectedRoomId = '') {
-    if (!state.testClips.length) {
-        try {
-            const data = await Api.testClips();
-            state.testClips = data.clips || [];
-        } catch (error) {
-            showError(error);
-        }
-    }
-    const rooms = (state.dashboard?.rooms || []).filter((room) => room.binding?.status === 'running');
-    const currentRoomId = selectedRoomId || els.injectRoom.value || rooms[0]?.room_id || '';
-    els.injectRoom.innerHTML = rooms.map((room) => (
-        `<option value="${escapeHtml(room.room_id)}" ${room.room_id === currentRoomId ? 'selected' : ''}>${escapeHtml(roomLabel(room))}</option>`
-    )).join('');
-    els.injectClip.innerHTML = state.testClips.map((clip) => (
-        `<option value="${escapeHtml(clip.id)}">${escapeHtml(clip.name)} (${escapeHtml(`${clip.seconds}s`)})</option>`
-    )).join('');
-}
-
-async function onInjectBuiltIn(event) {
-    event.preventDefault();
-    const roomId = els.injectRoom.value;
-    const clipId = els.injectClip.value;
-    if (!roomId || !clipId) {
-        showToast('Select a running room and clip');
-        return;
-    }
-    try {
-        await Api.injectTestClip(roomId, {
-            clip_id: clipId,
-            request_id: nowRequestId(`ui_inject_${clipId}`),
-            text: `Injected ${clipId} test clip`,
-        });
-        showToast('Test clip injected');
-    } catch (error) {
-        showError(error);
-    }
-}
-
-async function onInjectUpload(event) {
-    event.preventDefault();
-    const roomId = els.injectRoom.value;
-    const file = els.injectFile.files?.[0];
-    if (!roomId || !file) {
-        showToast('Select a running room and WAV file');
-        return;
-    }
-    const form = new FormData();
-    form.append('audio', file);
-    form.append('request_id', nowRequestId('ui_upload'));
-    form.append('format', 'wav');
-    form.append('text', file.name || 'Uploaded test WAV');
-    try {
-        await Api.uploadTestClip(roomId, form);
-        els.injectFile.value = '';
-        showToast('Uploaded WAV injected');
-    } catch (error) {
-        showError(error);
-    }
 }
 
 function openRoomDrawer(roomId) {

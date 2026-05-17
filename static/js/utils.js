@@ -47,13 +47,3 @@ export function debounce(fn, delay = 350) {
         timer = window.setTimeout(() => fn(...args), delay);
     };
 }
-
-export function formatPct(value, fallback = 0) {
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) return `${fallback}%`;
-    return `${Math.round(parsed)}%`;
-}
-
-export function nowRequestId(prefix) {
-    return `${prefix}_${Date.now().toString(36)}`;
-}
