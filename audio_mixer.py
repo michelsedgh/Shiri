@@ -742,6 +742,16 @@ def safe_request_id(value: object) -> str:
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
     return text or f"tts_{int(time.time() * 1000)}"
 
+
+def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("Could not remove %s: %s", path, exc)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture-dev", required=True)
