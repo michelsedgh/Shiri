@@ -59,6 +59,8 @@ PIPE_LOG_INTERVAL_SECONDS = 5.0
 STREAM_START_TIMEOUT_SECONDS = 5.0
 STREAM_STALL_TIMEOUT_SECONDS = 6.0
 WS_RECV_TIMEOUT_SECONDS = 10.0
+PLAYBACK_ACK_GRACE_SECONDS = 20.0
+PLAYBACK_ACK_MAX_SECONDS = 120.0
 
 
 log = logging.getLogger("shiri.audio_mixer")
@@ -126,6 +128,10 @@ class TTSClip:
     pushed_bytes: int = 0
     pushed_duration_ns: int = 0
     next_pts_ns: int | None = None
+    finished: threading.Event = field(default_factory=threading.Event)
+    finish_reason: str | None = None
+    finish_error: str | None = None
+    finished_at: float | None = None
 
     @property
     def frame_width(self) -> int:
@@ -183,6 +189,28 @@ class TTSClip:
 
     def cleanup(self) -> None:
         return None
+
+    def estimated_duration_seconds(self) -> float:
+        frames = self.source_size() / max(1, self.frame_width)
+        return frames / max(1, self.sample_rate)
+
+    def mark_finished(self, *, reason: str, error: str | None = None) -> None:
+        self.finish_reason = reason
+        self.finish_error = error
+        self.finished_at = time.monotonic()
+        self.finished.set()
+
+    def playback_result(self) -> dict[str, object]:
+        return {
+            "played": self.finished.is_set() and not self.finish_error,
+            "playback_reason": self.finish_reason,
+            "playback_error": self.finish_error,
+            "received_bytes": self.source_size(),
+            "streamed_bytes": self.source_size(),
+            "played_bytes": self.pushed_bytes,
+            "pushed_buffers": self.pushed_buffers,
+            "estimated_audio_seconds": round(self.estimated_duration_seconds(), 3),
+        }
 
 
 class GstZoneMixer:
@@ -415,6 +443,7 @@ class GstZoneMixer:
         drop_reason = clip.should_drop()
         if drop_reason:
             log.warning("Dropping stalled TTS request %s: %s", clip.request_id, drop_reason)
+            clip.mark_finished(reason="dropped", error=drop_reason)
             clip.cleanup()
             self._active_clip = None
             self._duck_target = 1.0
@@ -427,6 +456,7 @@ class GstZoneMixer:
         if not clip.ready_to_start():
             if clip.source_complete() and source_size <= 0:
                 log.warning("Dropping empty TTS request %s", clip.request_id)
+                clip.mark_finished(reason="empty", error="empty TTS stream")
                 clip.cleanup()
                 self._active_clip = None
                 self._duck_target = 1.0
@@ -526,6 +556,7 @@ class GstZoneMixer:
             clip.pushed_bytes,
             clip.pushed_buffers,
         )
+        clip.mark_finished(reason=reason)
         clip.cleanup()
         self._active_clip = None
         self._duck_target = 1.0
@@ -666,10 +697,12 @@ class GstZoneMixer:
                         clip.request_id,
                         clip.live_buffer.total_received,
                     )
+                    playback = await self._wait_for_playback_result(clip, queued=queued)
                     await websocket.send(json.dumps({
                         "type": "ended",
                         "request_id": clip.request_id,
                         "received_bytes": clip.live_buffer.total_received,
+                        **playback,
                     }))
                     return
                 if msg_type == "cancel":
@@ -686,6 +719,38 @@ class GstZoneMixer:
                 clip.live_buffer.finish(str(exc))
             with contextlib.suppress(Exception):
                 await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
+
+    async def _wait_for_playback_result(self, clip: TTSClip, *, queued: bool) -> dict[str, object]:
+        if not queued:
+            return {
+                "played": False,
+                "playback_reason": "empty",
+                "playback_error": "websocket ended without audio",
+                "streamed_bytes": 0,
+                "played_bytes": 0,
+                "pushed_buffers": 0,
+                "estimated_audio_seconds": 0.0,
+            }
+        timeout = min(
+            PLAYBACK_ACK_MAX_SECONDS,
+            max(PLAYBACK_ACK_GRACE_SECONDS, clip.estimated_duration_seconds() + PLAYBACK_ACK_GRACE_SECONDS),
+        )
+        completed = await asyncio.to_thread(clip.finished.wait, timeout)
+        if completed:
+            return clip.playback_result()
+        log.warning(
+            "Timed out waiting for TTS playback to drain request=%s received=%d pushed=%d",
+            clip.request_id,
+            clip.source_size(),
+            clip.pushed_bytes,
+        )
+        result = clip.playback_result()
+        result.update({
+            "played": False,
+            "playback_reason": "timeout",
+            "playback_error": "mixer did not finish playback before websocket ack timeout",
+        })
+        return result
 
     def _clip_from_websocket_start(self, payload: dict) -> TTSClip:
         sample_rate = int(payload.get("sample_rate") or 24000)
