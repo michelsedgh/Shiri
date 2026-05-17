@@ -50,9 +50,9 @@ TTS_DUCK_START_FRACTION = 0.65
 TTS_PREBUFFER_SECONDS = 0.10
 TTS_PUSH_SECONDS = 0.02
 TTS_START_LEAD_SECONDS = 0.05
-TTS_BUFFER_AHEAD_SECONDS = 0.35
-TTS_DRAIN_GRACE_SECONDS = 0.03
 TTS_MAX_PUSH_BUFFERS_PER_TICK = 32
+TTS_GAP_SECONDS = 0.03
+TTS_DUCK_TAIL_SECONDS = 0.20
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
@@ -206,6 +206,9 @@ class GstZoneMixer:
         self._tts_caps_key: tuple[int, int] | None = None
         self._duck_level = 1.0
         self._duck_target = 1.0
+        self._duck_hold_gain = 1.0
+        self._duck_hold_until = 0.0
+        self._tts_next_free_pts_ns: int | None = None
         self._last_duck_update = time.monotonic()
         self._last_pipe_wait_log = 0.0
         self._live_clips: queue.Queue[TTSClip] = queue.Queue()
@@ -443,8 +446,8 @@ class GstZoneMixer:
 
         self._fill_tts_appsrc(clip)
 
-        if clip.exhausted() and self._tts_buffer_ahead_ns(clip) <= int(TTS_DRAIN_GRACE_SECONDS * 1_000_000_000):
-            self._finish_active_clip(clip, reason="drained")
+        if clip.exhausted():
+            self._finish_active_clip(clip, reason="pushed_to_gstreamer")
 
     def _start_active_clip(self) -> None:
         clip = self._active_clip
@@ -452,7 +455,11 @@ class GstZoneMixer:
             return
         self._set_tts_caps(clip)
         clip.started_at = time.monotonic()
-        clip.next_pts_ns = self._pipeline_running_time_ns() + int(TTS_START_LEAD_SECONDS * 1_000_000_000)
+        start_pts_ns = self._pipeline_running_time_ns() + int(TTS_START_LEAD_SECONDS * 1_000_000_000)
+        if self._tts_next_free_pts_ns is not None:
+            gap_ns = int(TTS_GAP_SECONDS * 1_000_000_000)
+            start_pts_ns = max(start_pts_ns, self._tts_next_free_pts_ns + gap_ns)
+        clip.next_pts_ns = start_pts_ns
         log.info(
             "Starting %s TTS request %s sample_rate=%d channels=%d duck_gain=%.2f prebuffer=%d bytes start_pts_ms=%d",
             clip.kind,
@@ -477,13 +484,8 @@ class GstZoneMixer:
         log.info("Configured TTS appsrc caps: %s", caps_text)
 
     def _fill_tts_appsrc(self, clip: TTSClip) -> None:
-        target_ahead_ns = int(TTS_BUFFER_AHEAD_SECONDS * 1_000_000_000)
         pushed = 0
-        while (
-            not self._stop
-            and self._tts_buffer_ahead_ns(clip) < target_ahead_ns
-            and pushed < TTS_MAX_PUSH_BUFFERS_PER_TICK
-        ):
+        while not self._stop and pushed < TTS_MAX_PUSH_BUFFERS_PER_TICK:
             chunk = clip.read_chunk()
             if not chunk:
                 return
@@ -510,25 +512,29 @@ class GstZoneMixer:
         clip.pushed_bytes += len(chunk)
         clip.pushed_duration_ns += duration_ns
         clip.next_pts_ns = pts_ns + duration_ns
-
-    def _tts_buffer_ahead_ns(self, clip: TTSClip) -> int:
-        if clip.next_pts_ns is None:
-            return 0
-        return max(0, clip.next_pts_ns - self._pipeline_running_time_ns())
+        self._tts_next_free_pts_ns = clip.next_pts_ns
 
     def _finish_active_clip(self, clip: TTSClip, *, reason: str) -> None:
         received_bytes = clip.source_size()
         log.info(
-            "Finished TTS request %s reason=%s received=%d pushed=%d buffers=%d",
+            "Finished TTS request %s reason=%s received=%d pushed=%d buffers=%d scheduled_ms=%d",
             clip.request_id,
             reason,
             received_bytes,
             clip.pushed_bytes,
             clip.pushed_buffers,
+            int(clip.pushed_duration_ns / 1_000_000),
         )
+        self._hold_duck_for_clip(clip)
         clip.cleanup()
         self._active_clip = None
-        self._duck_target = 1.0
+
+    def _hold_duck_for_clip(self, clip: TTSClip) -> None:
+        if clip.started_at is None or clip.pushed_duration_ns <= 0:
+            return
+        until = clip.started_at + (clip.pushed_duration_ns / 1_000_000_000) + TTS_DUCK_TAIL_SECONDS
+        self._duck_hold_until = max(self._duck_hold_until, until)
+        self._duck_hold_gain = min(self._duck_hold_gain, clip.duck_gain)
 
     def _duck_ready_for_tts(self, duck_gain: float) -> bool:
         target = clamp_float(duck_gain, 0.0, 1.0, DEFAULT_DUCK_GAIN)
@@ -559,6 +565,10 @@ class GstZoneMixer:
         self._last_duck_update = now
 
         target = clamp_float(self._duck_target, 0.0, 1.0, 1.0)
+        if now < self._duck_hold_until:
+            target = min(target, clamp_float(self._duck_hold_gain, 0.0, 1.0, 1.0))
+        else:
+            self._duck_hold_gain = 1.0
         seconds = DUCK_ATTACK_SECONDS if target < self._duck_level else DUCK_RELEASE_SECONDS
         step = elapsed / max(seconds, 0.001)
         if target < self._duck_level:
