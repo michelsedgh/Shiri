@@ -916,7 +916,8 @@ def _recent_tts_files(path, limit=30):
     if not path.exists():
         return {"exists": False, "path": str(path), "items": []}
     items = []
-    for item in sorted(path.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:limit]:
+    files = [item for item in path.iterdir() if item.is_file()]
+    for item in sorted(files, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:limit]:
         try:
             stat = item.stat()
         except OSError:
