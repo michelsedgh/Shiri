@@ -24,7 +24,6 @@ import fcntl
 import json
 import logging
 import os
-import queue
 import re
 import signal
 import threading
@@ -54,8 +53,6 @@ TTS_TARGET_QUEUE_SECONDS = 0.18
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
-STREAM_START_TIMEOUT_SECONDS = 5.0
-STREAM_STALL_TIMEOUT_SECONDS = 15.0
 WS_RECV_TIMEOUT_SECONDS = 10.0
 
 
@@ -67,44 +64,27 @@ class PipelineRestart(RuntimeError):
 
 
 @dataclass
-class LiveTTSBuffer:
-    data: bytearray = field(default_factory=bytearray)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    complete: bool = False
-    error: str | None = None
-    total_received: int = 0
-    created_at: float = field(default_factory=time.monotonic)
-    last_write_at: float = field(default_factory=time.monotonic)
+class DirectTTSSession:
+    request_id: str
+    sample_rate: int
+    channels: int
+    sample_width: int
+    duck_gain: float
+    pending: bytes = b""
+    next_pts_ns: int | None = None
+    received_bytes: int = 0
+    pushed_bytes: int = 0
+    pushed_buffers: int = 0
+    started_at: float = field(default_factory=time.monotonic)
 
-    def append(self, chunk: bytes) -> None:
-        if not chunk:
-            return
-        with self.lock:
-            if self.complete:
-                return
-            self.data.extend(chunk)
-            self.total_received += len(chunk)
-            self.last_write_at = time.monotonic()
+    @property
+    def frame_width(self) -> int:
+        return max(1, self.channels * self.sample_width)
 
-    def finish(self, error: str | None = None) -> None:
-        with self.lock:
-            self.complete = True
-            if error:
-                self.error = error
-            self.last_write_at = time.monotonic()
-
-    def available_bytes(self) -> int:
-        with self.lock:
-            return len(self.data)
-
-    def read(self, limit: int) -> bytes:
-        with self.lock:
-            if not self.data:
-                return b""
-            size = min(limit, len(self.data))
-            chunk = bytes(self.data[:size])
-            del self.data[:size]
-            return chunk
+    @property
+    def push_chunk_bytes(self) -> int:
+        frames = max(1, int(self.sample_rate * TTS_PUSH_SECONDS))
+        return frames * self.frame_width
 
 
 @dataclass
@@ -116,7 +96,6 @@ class TTSClip:
     duck_gain: float
     kind: str
     data: bytes | None = None
-    live_buffer: LiveTTSBuffer | None = None
     pcm_path: Path | None = None
     meta_path: Path | None = None
     done_path: Path | None = None
@@ -145,15 +124,10 @@ class TTSClip:
         return frames * self.frame_width
 
     def ready_to_start(self) -> bool:
-        if self.live_buffer is not None:
-            available = self.live_buffer.available_bytes()
-            return available >= self.prebuffer_bytes or (self.live_buffer.complete and available > 0)
         size = self.source_size()
         return size > 0
 
     def source_size(self) -> int:
-        if self.live_buffer is not None:
-            return self.live_buffer.total_received
         if self.data is not None:
             return len(self.data)
         if self.pcm_path is None:
@@ -164,8 +138,6 @@ class TTSClip:
             return 0
 
     def source_complete(self) -> bool:
-        if self.live_buffer is not None:
-            return self.live_buffer.complete
         if self.data is not None:
             return True
         if self.done_path and self.done_path.exists():
@@ -179,8 +151,6 @@ class TTSClip:
             return False
 
     def exhausted(self) -> bool:
-        if self.live_buffer is not None:
-            return self.live_buffer.complete and self.live_buffer.available_bytes() <= 0 and not self.pending
         return self.source_complete() and self.position >= self.source_size() and not self.pending
 
     def read_chunk(self) -> bytes:
@@ -198,26 +168,8 @@ class TTSClip:
         return chunk
 
     def should_drop(self) -> str | None:
-        if self.live_buffer is not None:
-            if self.live_buffer.complete:
-                if self.live_buffer.error:
-                    return self.live_buffer.error
-                return None
-            now = time.monotonic()
-            available = self.live_buffer.available_bytes()
-            if self.live_buffer.total_received <= 0 and now - self.live_buffer.created_at > STREAM_START_TIMEOUT_SECONDS:
-                return "websocket stream never received audio"
-            if available <= 0 and now - self.live_buffer.last_write_at > STREAM_STALL_TIMEOUT_SECONDS:
-                return "websocket stream stopped receiving audio before finish"
-            return None
         if self.kind != "stream" or self.source_complete():
             return None
-        now = time.monotonic()
-        size = self.source_size()
-        if size <= 0 and now - self.loaded_at > STREAM_START_TIMEOUT_SECONDS:
-            return "stream never received audio"
-        if size <= self.position and not self.pending and now - self.last_progress_at > STREAM_STALL_TIMEOUT_SECONDS:
-            return "stream stopped receiving audio before finish"
         return None
 
     def cleanup(self) -> None:
@@ -225,8 +177,6 @@ class TTSClip:
             safe_unlink(path)
 
     def _read_raw(self, limit: int) -> bytes:
-        if self.live_buffer is not None:
-            return self.live_buffer.read(limit)
         if self.data is not None:
             if self.position >= len(self.data):
                 return b""
@@ -273,8 +223,10 @@ class GstZoneMixer:
         self._duck_target = 1.0
         self._last_duck_update = time.monotonic()
         self._last_pipe_wait_log = 0.0
-        self._live_clips: queue.Queue[TTSClip] = queue.Queue()
         self._ws_thread: threading.Thread | None = None
+        self._direct_lock = threading.Lock()
+        self._direct_active = False
+        self._direct_request_id: str | None = None
 
     def run(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_stop)
@@ -472,6 +424,8 @@ class GstZoneMixer:
     def _pump_tts(self) -> None:
         if self.tts_src is None:
             return
+        if self._direct_active:
+            return
         if self._active_clip is None:
             self._active_clip = self._load_next_clip()
             if self._active_clip is None:
@@ -531,12 +485,15 @@ class GstZoneMixer:
         )
 
     def _set_tts_caps(self, clip: TTSClip) -> None:
-        caps_key = (clip.sample_rate, clip.channels)
+        self._set_tts_caps_values(clip.sample_rate, clip.channels)
+
+    def _set_tts_caps_values(self, sample_rate: int, channels: int) -> None:
+        caps_key = (sample_rate, channels)
         if caps_key == self._tts_caps_key:
             return
         caps_text = (
             "audio/x-raw,format=S16LE,layout=interleaved,"
-            f"rate={clip.sample_rate},channels={clip.channels}"
+            f"rate={sample_rate},channels={channels}"
         )
         self.tts_src.set_property("caps", self.Gst.Caps.from_string(caps_text))
         self._tts_caps_key = caps_key
@@ -575,19 +532,10 @@ class GstZoneMixer:
         return max(0, int(clock.get_time() - self.pipeline.get_base_time()))
 
     def _load_next_clip(self) -> TTSClip | None:
-        clip = self._load_next_live_clip()
-        if clip is not None:
-            return clip
         clip = self._load_next_wav_clip()
         if clip is not None:
             return clip
         return None
-
-    def _load_next_live_clip(self) -> TTSClip | None:
-        try:
-            return self._live_clips.get_nowait()
-        except queue.Empty:
-            return None
 
     def _load_next_wav_clip(self) -> TTSClip | None:
         for meta_path_str in sorted(glob(str(self.queue_dir / "*.json"))):
@@ -679,7 +627,7 @@ class GstZoneMixer:
                 await asyncio.sleep(0.2)
 
     async def _handle_tts_websocket(self, websocket, _path: str | None = None) -> None:
-        clip: TTSClip | None = None
+        session: DirectTTSSession | None = None
         try:
             first = await asyncio.wait_for(websocket.recv(), timeout=WS_RECV_TIMEOUT_SECONDS)
             if not isinstance(first, str):
@@ -689,44 +637,51 @@ class GstZoneMixer:
             if start.get("type") != "start":
                 await websocket.send(json.dumps({"type": "error", "error": "first message must have type=start"}))
                 return
-            clip = self._clip_from_websocket_start(start)
-            self._live_clips.put(clip)
+            session = await asyncio.to_thread(self._begin_direct_tts_session, start)
             await websocket.send(json.dumps({
                 "type": "started",
-                "request_id": clip.request_id,
-                "sample_rate": clip.sample_rate,
-                "channels": clip.channels,
-                "sample_width": clip.sample_width,
+                "request_id": session.request_id,
+                "sample_rate": session.sample_rate,
+                "channels": session.channels,
+                "sample_width": session.sample_width,
             }))
 
             async for message in websocket:
                 if isinstance(message, bytes):
-                    clip.live_buffer.append(message)
+                    await asyncio.to_thread(self._push_direct_tts_chunk, session, message)
                     continue
                 payload = json.loads(message)
                 msg_type = payload.get("type")
                 if msg_type == "end":
-                    clip.live_buffer.finish()
+                    await asyncio.to_thread(self._finish_direct_tts_session, session)
                     await websocket.send(json.dumps({
                         "type": "ended",
-                        "request_id": clip.request_id,
-                        "received_bytes": clip.live_buffer.total_received,
+                        "request_id": session.request_id,
+                        "received_bytes": session.received_bytes,
+                        "pushed_bytes": session.pushed_bytes,
                     }))
+                    log.info(
+                        "Finished websocket TTS request %s received=%d pushed=%d buffers=%d",
+                        session.request_id,
+                        session.received_bytes,
+                        session.pushed_bytes,
+                        session.pushed_buffers,
+                    )
                     return
                 if msg_type == "cancel":
-                    clip.live_buffer.finish(str(payload.get("error") or "cancelled"))
-                    await websocket.send(json.dumps({"type": "cancelled", "request_id": clip.request_id}))
+                    await asyncio.to_thread(self._cancel_direct_tts_session, session)
+                    await websocket.send(json.dumps({"type": "cancelled", "request_id": session.request_id}))
                     return
                 await websocket.send(json.dumps({"type": "error", "error": f"unknown message type: {msg_type}"}))
-            if clip.live_buffer is not None:
-                clip.live_buffer.finish()
+            if session is not None:
+                await asyncio.to_thread(self._finish_direct_tts_session, session)
         except Exception as exc:
-            if clip is not None and clip.live_buffer is not None:
-                clip.live_buffer.finish(str(exc))
+            if session is not None:
+                await asyncio.to_thread(self._cancel_direct_tts_session, session)
             with contextlib.suppress(Exception):
                 await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
 
-    def _clip_from_websocket_start(self, payload: dict) -> TTSClip:
+    def _begin_direct_tts_session(self, payload: dict) -> DirectTTSSession:
         sample_rate = int(payload.get("sample_rate") or 24000)
         channels = int(payload.get("channels") or 1)
         sample_width = int(payload.get("sample_width") or 2)
@@ -737,15 +692,102 @@ class GstZoneMixer:
             raise ValueError("sample_rate and channels must be positive")
         if sample_width != 2:
             raise ValueError("websocket TTS only accepts 16-bit PCM")
-        return TTSClip(
+        if self.tts_src is None or self.pipeline is None:
+            raise RuntimeError("GStreamer pipeline is not ready")
+        session = DirectTTSSession(
             request_id=safe_request_id(payload.get("request_id")),
             sample_rate=sample_rate,
             channels=channels,
             sample_width=sample_width,
             duck_gain=clamp_float(payload.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
-            kind="websocket",
-            live_buffer=LiveTTSBuffer(),
         )
+        with self._direct_lock:
+            if self._direct_active or self._active_clip is not None:
+                raise RuntimeError("TTS mixer is busy")
+            self._direct_active = True
+            self._direct_request_id = session.request_id
+            self._set_tts_caps_values(session.sample_rate, session.channels)
+            session.next_pts_ns = self._pipeline_running_time_ns() + int(0.05 * 1_000_000_000)
+            self._duck_target = session.duck_gain
+        log.info(
+            "Starting websocket TTS request %s sample_rate=%d channels=%d duck_gain=%.2f",
+            session.request_id,
+            session.sample_rate,
+            session.channels,
+            session.duck_gain,
+        )
+        return session
+
+    def _push_direct_tts_chunk(self, session: DirectTTSSession, chunk: bytes) -> None:
+        if not chunk:
+            return
+        session.received_bytes += len(chunk)
+        data = session.pending + chunk
+        usable = (len(data) // session.frame_width) * session.frame_width
+        session.pending = data[usable:]
+        if usable <= 0:
+            return
+
+        offset = 0
+        while offset < usable:
+            part = data[offset:offset + session.push_chunk_bytes]
+            offset += len(part)
+            self._push_direct_tts_buffer(session, part)
+
+    def _push_direct_tts_buffer(self, session: DirectTTSSession, chunk: bytes) -> None:
+        frames = len(chunk) // session.frame_width
+        if frames <= 0:
+            return
+        duration_ns = int(frames * 1_000_000_000 / session.sample_rate)
+        with self._direct_lock:
+            if not self._direct_active or self._direct_request_id != session.request_id:
+                raise RuntimeError("TTS session is no longer active")
+            if self.tts_src is None:
+                raise RuntimeError("TTS appsrc is not ready")
+            if session.next_pts_ns is None:
+                session.next_pts_ns = self._pipeline_running_time_ns() + int(0.05 * 1_000_000_000)
+            buffer = self.Gst.Buffer.new_allocate(None, len(chunk), None)
+            buffer.fill(0, chunk)
+            buffer.pts = session.next_pts_ns
+            buffer.dts = session.next_pts_ns
+            buffer.duration = duration_ns
+            if session.pushed_buffers == 0:
+                buffer.set_flags(self.Gst.BufferFlags.DISCONT)
+            session.next_pts_ns += duration_ns
+            session.pushed_bytes += len(chunk)
+            session.pushed_buffers += 1
+            self._duck_target = session.duck_gain
+            ret = self.tts_src.emit("push-buffer", buffer)
+        if ret != self.Gst.FlowReturn.OK:
+            raise PipelineRestart(f"TTS appsrc push failed: {ret.value_nick}")
+
+    def _finish_direct_tts_session(self, session: DirectTTSSession) -> None:
+        if session.pending:
+            padded = session.pending
+            remainder = len(padded) % session.frame_width
+            if remainder:
+                padded += b"\x00" * (session.frame_width - remainder)
+            session.pending = b""
+            offset = 0
+            while offset < len(padded):
+                part = padded[offset:offset + session.push_chunk_bytes]
+                offset += len(part)
+                self._push_direct_tts_buffer(session, part)
+        end_ns = session.next_pts_ns or self._pipeline_running_time_ns()
+        while not self._stop and self._pipeline_running_time_ns() < end_ns:
+            time.sleep(0.02)
+        with self._direct_lock:
+            if self._direct_request_id == session.request_id:
+                self._direct_active = False
+                self._direct_request_id = None
+                self._duck_target = 1.0
+
+    def _cancel_direct_tts_session(self, session: DirectTTSSession) -> None:
+        with self._direct_lock:
+            if self._direct_request_id == session.request_id:
+                self._direct_active = False
+                self._direct_request_id = None
+                self._duck_target = 1.0
 
 
 def require_gstreamer():
@@ -770,19 +812,6 @@ def set_property_if_present(element, prop: str, value) -> bool:
         return False
     element.set_property(prop, value)
     return True
-
-
-def get_int_property(element, prop: str, default: int) -> int:
-    if element.find_property(prop) is None:
-        return default
-    try:
-        value = element.get_property(prop)
-    except Exception:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def load_wav_clip(*, request_id: str, audio_path: Path, meta_path: Path, duck_gain: float) -> TTSClip:
