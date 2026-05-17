@@ -51,7 +51,6 @@ DUCK_UPDATE_SECONDS = 0.02
 TTS_PREBUFFER_SECONDS = 0.10
 TTS_PUSH_SECONDS = 0.02
 TTS_TARGET_QUEUE_SECONDS = 0.18
-TTS_DRAIN_GRACE_SECONDS = 0.10
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
@@ -129,6 +128,7 @@ class TTSClip:
     started_at: float | None = None
     fully_pushed_at: float | None = None
     next_pts_ns: int | None = None
+    pushed_buffers: int = 0
 
     @property
     def frame_width(self) -> int:
@@ -506,8 +506,8 @@ class GstZoneMixer:
         if clip.exhausted():
             if clip.fully_pushed_at is None:
                 clip.fully_pushed_at = time.monotonic()
-            queued_ns = get_int_property(self.tts_src, "current-level-time", 0)
-            if queued_ns <= int(0.02 * 1_000_000_000) or time.monotonic() - clip.fully_pushed_at >= TTS_DRAIN_GRACE_SECONDS:
+            end_ns = clip.next_pts_ns or self._pipeline_running_time_ns()
+            if self._pipeline_running_time_ns() >= end_ns:
                 log.info("Finished TTS request %s", clip.request_id)
                 clip.cleanup()
                 self._active_clip = None
@@ -543,9 +543,8 @@ class GstZoneMixer:
         log.info("Configured TTS appsrc caps: %s", caps_text)
 
     def _fill_tts_queue(self, clip: TTSClip) -> None:
-        queued_ns = get_int_property(self.tts_src, "current-level-time", 0)
-        target_ns = int(TTS_TARGET_QUEUE_SECONDS * 1_000_000_000)
-        while queued_ns < target_ns:
+        target_pts_ns = self._pipeline_running_time_ns() + int(TTS_TARGET_QUEUE_SECONDS * 1_000_000_000)
+        while clip.next_pts_ns is None or clip.next_pts_ns < target_pts_ns:
             chunk = clip.read_chunk()
             if not chunk:
                 return
@@ -559,11 +558,13 @@ class GstZoneMixer:
             buffer.pts = clip.next_pts_ns
             buffer.dts = clip.next_pts_ns
             buffer.duration = duration_ns
+            if clip.pushed_buffers == 0:
+                buffer.set_flags(self.Gst.BufferFlags.DISCONT)
             clip.next_pts_ns += duration_ns
+            clip.pushed_buffers += 1
             ret = self.tts_src.emit("push-buffer", buffer)
             if ret != self.Gst.FlowReturn.OK:
                 raise PipelineRestart(f"TTS appsrc push failed: {ret.value_nick}")
-            queued_ns += duration_ns
 
     def _pipeline_running_time_ns(self) -> int:
         if self.pipeline is None:
