@@ -50,13 +50,11 @@ DUCK_UPDATE_SECONDS = 0.02
 
 TTS_PREBUFFER_SECONDS = 0.10
 TTS_PUSH_SECONDS = 0.02
-TTS_TARGET_QUEUE_SECONDS = 0.18
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
 STREAM_START_TIMEOUT_SECONDS = 5.0
 STREAM_STALL_TIMEOUT_SECONDS = 6.0
-TTS_DRAIN_GRACE_SECONDS = 2.0
 WS_RECV_TIMEOUT_SECONDS = 10.0
 
 
@@ -127,8 +125,6 @@ class TTSClip:
     loaded_at: float = field(default_factory=time.monotonic)
     last_progress_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
-    fully_pushed_at: float | None = None
-    next_pts_ns: int | None = None
     pushed_buffers: int = 0
     pushed_bytes: int = 0
 
@@ -390,16 +386,15 @@ class GstZoneMixer:
         self.tts_src = make_element(Gst, "appsrc", "tts_src")
         self.tts_src.set_property("is-live", True)
         self.tts_src.set_property("format", Gst.Format.TIME)
-        self.tts_src.set_property("block", True)
-        self.tts_src.set_property("do-timestamp", False)
+        self.tts_src.set_property("block", False)
+        self.tts_src.set_property("do-timestamp", True)
         self.tts_src.set_property("emit-signals", False)
-        set_property_if_present(self.tts_src, "max-time", int(TTS_TARGET_QUEUE_SECONDS * 1_000_000_000))
-        set_property_if_present(self.tts_src, "max-bytes", 512 * 1024)
+        set_property_if_present(self.tts_src, "max-bytes", 2 * 1024 * 1024)
         set_property_if_present(self.tts_src, "min-latency", 0)
         set_property_if_present(self.tts_src, "max-latency", int(0.5 * 1_000_000_000))
 
         queue = make_element(Gst, "queue", "tts_queue")
-        set_property_if_present(queue, "max-size-time", int(0.25 * 1_000_000_000))
+        set_property_if_present(queue, "max-size-time", int(0.5 * 1_000_000_000))
         set_property_if_present(queue, "max-size-bytes", 0)
         convert = make_element(Gst, "audioconvert", "tts_convert")
         resample = make_element(Gst, "audioresample", "tts_resample")
@@ -506,20 +501,7 @@ class GstZoneMixer:
         self._fill_tts_queue(clip)
 
         if clip.exhausted():
-            if clip.fully_pushed_at is None:
-                clip.fully_pushed_at = time.monotonic()
-            end_ns = clip.next_pts_ns or self._pipeline_running_time_ns()
-            running_ns = self._pipeline_running_time_ns()
-            if running_ns >= end_ns:
-                self._finish_active_clip(clip, reason="rendered")
-            elif time.monotonic() - clip.fully_pushed_at >= TTS_DRAIN_GRACE_SECONDS:
-                log.warning(
-                    "Releasing TTS request %s after drain timeout running_ms=%d end_ms=%d",
-                    clip.request_id,
-                    running_ns // 1_000_000,
-                    end_ns // 1_000_000,
-                )
-                self._finish_active_clip(clip, reason="drain_timeout")
+            self._finish_active_clip(clip, reason="drained")
 
     def _start_active_clip(self) -> None:
         clip = self._active_clip
@@ -527,7 +509,6 @@ class GstZoneMixer:
             return
         self._set_tts_caps(clip)
         clip.started_at = time.monotonic()
-        clip.next_pts_ns = self._pipeline_running_time_ns() + int(0.05 * 1_000_000_000)
         log.info(
             "Starting %s TTS request %s sample_rate=%d channels=%d duck_gain=%.2f prebuffer=%d bytes",
             clip.kind,
@@ -551,29 +532,22 @@ class GstZoneMixer:
         log.info("Configured TTS appsrc caps: %s", caps_text)
 
     def _fill_tts_queue(self, clip: TTSClip) -> None:
-        target_pts_ns = self._pipeline_running_time_ns() + int(TTS_TARGET_QUEUE_SECONDS * 1_000_000_000)
-        while clip.next_pts_ns is None or clip.next_pts_ns < target_pts_ns:
-            chunk = clip.read_chunk()
-            if not chunk:
-                return
+        chunk = clip.read_chunk()
+        if not chunk:
+            return
 
-            frames = len(chunk) // clip.frame_width
-            duration_ns = int(frames * 1_000_000_000 / clip.sample_rate)
-            buffer = self.Gst.Buffer.new_allocate(None, len(chunk), None)
-            buffer.fill(0, chunk)
-            if clip.next_pts_ns is None:
-                clip.next_pts_ns = self._pipeline_running_time_ns() + int(0.05 * 1_000_000_000)
-            buffer.pts = clip.next_pts_ns
-            buffer.dts = clip.next_pts_ns
-            buffer.duration = duration_ns
-            if clip.pushed_buffers == 0:
-                buffer.set_flags(self.Gst.BufferFlags.DISCONT)
-            clip.next_pts_ns += duration_ns
-            clip.pushed_buffers += 1
-            clip.pushed_bytes += len(chunk)
-            ret = self.tts_src.emit("push-buffer", buffer)
-            if ret != self.Gst.FlowReturn.OK:
-                raise PipelineRestart(f"TTS appsrc push failed: {ret.value_nick}")
+        frames = len(chunk) // clip.frame_width
+        duration_ns = int(frames * 1_000_000_000 / clip.sample_rate)
+        buffer = self.Gst.Buffer.new_allocate(None, len(chunk), None)
+        buffer.fill(0, chunk)
+        buffer.duration = duration_ns
+        if clip.pushed_buffers == 0:
+            buffer.set_flags(self.Gst.BufferFlags.DISCONT)
+        clip.pushed_buffers += 1
+        clip.pushed_bytes += len(chunk)
+        ret = self.tts_src.emit("push-buffer", buffer)
+        if ret != self.Gst.FlowReturn.OK:
+            raise PipelineRestart(f"TTS appsrc push failed: {ret.value_nick}")
 
     def _finish_active_clip(self, clip: TTSClip, *, reason: str) -> None:
         received_bytes = clip.source_size()
