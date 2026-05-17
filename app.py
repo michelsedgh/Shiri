@@ -751,39 +751,20 @@ def queue_tts_for_zone(zone_id):
     return jsonify(result), 202
 
 
-@app.route("/api/rooms/<room_id>/tts-streams", methods=["POST"])
-def create_tts_stream_for_room(room_id):
-    result, error = _start_tts_stream(default_room_id=room_id)
-    return _create_tts_stream_response(result, error)
-
-
-@app.route("/api/zones/<zone_id>/tts-streams", methods=["POST"])
-def create_tts_stream_for_zone(zone_id):
-    result, error = _start_tts_stream(zone_id=zone_id)
-    return _create_tts_stream_response(result, error)
-
-
-@app.route("/api/zones/<zone_id>/tts-streams/<stream_id>/chunks", methods=["POST"])
-def append_tts_stream_chunk(zone_id, stream_id):
-    chunk = request.get_data(cache=False)
-    if not chunk:
-        return jsonify({"error": "No audio chunk provided"}), 400
-    if len(chunk) > 2 * 1024 * 1024:
-        return jsonify({"error": "Audio chunk is too large"}), 413
-    result, error = zone_manager.append_tts_stream(zone_id, stream_id, chunk)
+@app.route("/api/rooms/<room_id>/tts-websocket", methods=["POST"])
+def prepare_tts_websocket_for_room(room_id):
+    result, error = _prepare_tts_websocket(default_room_id=room_id)
     if error:
         return jsonify({"error": error}), 400
-    return jsonify(result), 202
+    return jsonify(result), 201
 
 
-@app.route("/api/zones/<zone_id>/tts-streams/<stream_id>/finish", methods=["POST"])
-def finish_tts_stream_session(zone_id, stream_id):
-    data = request.get_json(silent=True) if request.is_json else {}
-    error_text = data.get("error") if isinstance(data, dict) else None
-    result, error = zone_manager.finish_tts_stream_by_id(zone_id, stream_id, error=error_text)
+@app.route("/api/zones/<zone_id>/tts-websocket", methods=["POST"])
+def prepare_tts_websocket_for_zone(zone_id):
+    result, error = _prepare_tts_websocket(zone_id=zone_id)
     if error:
         return jsonify({"error": error}), 400
-    return jsonify(result), 200
+    return jsonify(result), 201
 
 
 @app.route("/api/rooms/<room_id>/tts-debug")
@@ -849,7 +830,7 @@ def inject_test_clip(room_id):
     return jsonify(result), 202
 
 
-def _start_tts_stream(default_room_id=None, zone_id=None):
+def _prepare_tts_websocket(default_room_id=None, zone_id=None):
     data = request.args.to_dict()
     if request.is_json:
         data.update(request.get_json(silent=True) or {})
@@ -865,7 +846,7 @@ def _start_tts_stream(default_room_id=None, zone_id=None):
         if error:
             return None, error
 
-    return zone_manager.start_tts_stream(
+    result, error = zone_manager.prepare_tts_websocket(
         resolved_zone.zone_id,
         request_id=data.get("request_id") or uuid.uuid4().hex,
         audio_format=data.get("format") or data.get("audio_format") or "pcm_s16le",
@@ -876,24 +857,21 @@ def _start_tts_stream(default_room_id=None, zone_id=None):
         speaker_id=data.get("speaker_id"),
         speaker_name=data.get("speaker_name"),
     )
-
-
-def _create_tts_stream_response(result, error):
     if error:
-        return jsonify({"error": error}), 400
-    response = _public_tts_stream_response(result, 0)
-    response["append_url"] = f"/api/zones/{result['zone_id']}/tts-streams/{result['stream_id']}/chunks"
-    response["finish_url"] = f"/api/zones/{result['zone_id']}/tts-streams/{result['stream_id']}/finish"
-    return jsonify(response), 201
+        return None, error
+    result["websocket_url"] = _mixer_websocket_url(result["tts_ws_port"])
+    result["transport"] = "websocket"
+    return result, None
 
 
-def _public_tts_stream_response(result, bytes_written):
-    response = dict(result)
-    response.pop("stream_path", None)
-    response.pop("meta_path", None)
-    response.pop("done_path", None)
-    response["streamed_bytes"] = bytes_written
-    return response
+def _mixer_websocket_url(port):
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    if host.startswith("["):
+        hostname = host.split("]", 1)[0] + "]"
+    else:
+        hostname = host.split(":", 1)[0]
+    scheme = "wss" if request.is_secure else "ws"
+    return f"{scheme}://{hostname}:{int(port)}/tts"
 
 
 def _tts_debug_payload(zone):
@@ -905,9 +883,9 @@ def _tts_debug_payload(zone):
         "room_id": zone.room_id,
         "room_name": zone.room_name,
         "grp_dir": str(grp_dir),
+        "tts_transport": "websocket",
+        "tts_ws_port": zone.tts_ws_port,
         "tts_queue": _recent_tts_files(grp_dir / "tts_queue"),
-        "tts_streams": _recent_tts_files(grp_dir / "tts_streams"),
-        "tts_pending_streams": _recent_tts_files(grp_dir / "tts_streams" / "pending"),
         "mixer_log_tail": _read_log_tail(zone.zone_id, "mixer", lines=80),
         "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=20),
     }

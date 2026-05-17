@@ -17,12 +17,17 @@ format conversion, resampling, mixing, clipping, and output pacing.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import errno
 import fcntl
 import json
 import logging
 import os
+import queue
+import re
 import signal
+import threading
 import time
 import wave
 from dataclasses import dataclass, field
@@ -52,7 +57,7 @@ PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
 STREAM_START_TIMEOUT_SECONDS = 5.0
 STREAM_STALL_TIMEOUT_SECONDS = 15.0
-STREAM_QUEUE_STALE_SECONDS = 60.0
+WS_RECV_TIMEOUT_SECONDS = 10.0
 
 
 log = logging.getLogger("shiri.audio_mixer")
@@ -60,6 +65,47 @@ log = logging.getLogger("shiri.audio_mixer")
 
 class PipelineRestart(RuntimeError):
     """Raised when the GStreamer pipeline must be rebuilt."""
+
+
+@dataclass
+class LiveTTSBuffer:
+    data: bytearray = field(default_factory=bytearray)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    complete: bool = False
+    error: str | None = None
+    total_received: int = 0
+    created_at: float = field(default_factory=time.monotonic)
+    last_write_at: float = field(default_factory=time.monotonic)
+
+    def append(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        with self.lock:
+            if self.complete:
+                return
+            self.data.extend(chunk)
+            self.total_received += len(chunk)
+            self.last_write_at = time.monotonic()
+
+    def finish(self, error: str | None = None) -> None:
+        with self.lock:
+            self.complete = True
+            if error:
+                self.error = error
+            self.last_write_at = time.monotonic()
+
+    def available_bytes(self) -> int:
+        with self.lock:
+            return len(self.data)
+
+    def read(self, limit: int) -> bytes:
+        with self.lock:
+            if not self.data:
+                return b""
+            size = min(limit, len(self.data))
+            chunk = bytes(self.data[:size])
+            del self.data[:size]
+            return chunk
 
 
 @dataclass
@@ -71,6 +117,7 @@ class TTSClip:
     duck_gain: float
     kind: str
     data: bytes | None = None
+    live_buffer: LiveTTSBuffer | None = None
     pcm_path: Path | None = None
     meta_path: Path | None = None
     done_path: Path | None = None
@@ -98,12 +145,15 @@ class TTSClip:
         return frames * self.frame_width
 
     def ready_to_start(self) -> bool:
+        if self.live_buffer is not None:
+            available = self.live_buffer.available_bytes()
+            return available >= self.prebuffer_bytes or (self.live_buffer.complete and available > 0)
         size = self.source_size()
-        if self.kind != "stream":
-            return size > 0
-        return size >= self.prebuffer_bytes or (self.source_complete() and size > 0)
+        return size > 0
 
     def source_size(self) -> int:
+        if self.live_buffer is not None:
+            return self.live_buffer.total_received
         if self.data is not None:
             return len(self.data)
         if self.pcm_path is None:
@@ -114,6 +164,8 @@ class TTSClip:
             return 0
 
     def source_complete(self) -> bool:
+        if self.live_buffer is not None:
+            return self.live_buffer.complete
         if self.data is not None:
             return True
         if self.done_path and self.done_path.exists():
@@ -127,6 +179,8 @@ class TTSClip:
             return False
 
     def exhausted(self) -> bool:
+        if self.live_buffer is not None:
+            return self.live_buffer.complete and self.live_buffer.available_bytes() <= 0 and not self.pending
         return self.source_complete() and self.position >= self.source_size() and not self.pending
 
     def read_chunk(self) -> bytes:
@@ -144,6 +198,18 @@ class TTSClip:
         return chunk
 
     def should_drop(self) -> str | None:
+        if self.live_buffer is not None:
+            if self.live_buffer.complete:
+                if self.live_buffer.error:
+                    return self.live_buffer.error
+                return None
+            now = time.monotonic()
+            available = self.live_buffer.available_bytes()
+            if self.live_buffer.total_received <= 0 and now - self.live_buffer.created_at > STREAM_START_TIMEOUT_SECONDS:
+                return "websocket stream never received audio"
+            if available <= 0 and now - self.live_buffer.last_write_at > STREAM_STALL_TIMEOUT_SECONDS:
+                return "websocket stream stopped receiving audio before finish"
+            return None
         if self.kind != "stream" or self.source_complete():
             return None
         now = time.monotonic()
@@ -159,6 +225,8 @@ class TTSClip:
             safe_unlink(path)
 
     def _read_raw(self, limit: int) -> bytes:
+        if self.live_buffer is not None:
+            return self.live_buffer.read(limit)
         if self.data is not None:
             if self.position >= len(self.data):
                 return b""
@@ -182,12 +250,12 @@ class TTSClip:
 
 
 class GstZoneMixer:
-    def __init__(self, *, capture_dev: str, grp_dir: Path) -> None:
+    def __init__(self, *, capture_dev: str, grp_dir: Path, tts_ws_port: int | None = None) -> None:
         self.capture_dev = capture_dev
         self.grp_dir = grp_dir
         self.pipe_path = grp_dir / "pipes" / "audio.pipe"
         self.queue_dir = grp_dir / "tts_queue"
-        self.stream_dir = grp_dir / "tts_streams"
+        self.tts_ws_port = int(tts_ws_port or 0)
         self.mixer_pid_path = grp_dir / "state" / "mixer.pid"
         self.legacy_arecord_pid_path = grp_dir / "state" / "arecord.pid"
 
@@ -205,18 +273,20 @@ class GstZoneMixer:
         self._duck_target = 1.0
         self._last_duck_update = time.monotonic()
         self._last_pipe_wait_log = 0.0
+        self._live_clips: queue.Queue[TTSClip] = queue.Queue()
+        self._ws_thread: threading.Thread | None = None
 
     def run(self) -> None:
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
         self.queue_dir.mkdir(parents=True, exist_ok=True)
-        self.stream_dir.mkdir(parents=True, exist_ok=True)
         self.mixer_pid_path.write_text(str(os.getpid()))
         safe_unlink(self.legacy_arecord_pid_path)
 
         log.info("Starting GStreamer mixer capture_dev=%s grp_dir=%s", self.capture_dev, self.grp_dir)
         try:
             self.Gst = require_gstreamer()
+            self._start_tts_websocket()
             while not self._stop:
                 try:
                     self._open_pipe_if_needed()
@@ -234,6 +304,7 @@ class GstZoneMixer:
                     self._stop_pipeline()
                     time.sleep(0.5)
         finally:
+            self._stop = True
             self._stop_pipeline()
             safe_unlink(self.mixer_pid_path)
             safe_unlink(self.legacy_arecord_pid_path)
@@ -406,7 +477,6 @@ class GstZoneMixer:
             if self._active_clip is None:
                 self._duck_target = 1.0
                 return
-            self._start_active_clip()
 
         clip = self._active_clip
         drop_reason = clip.should_drop()
@@ -418,8 +488,17 @@ class GstZoneMixer:
             return
 
         if not clip.ready_to_start():
+            if clip.source_complete() and clip.source_size() <= 0:
+                log.warning("Dropping empty TTS request %s", clip.request_id)
+                clip.cleanup()
+                self._active_clip = None
+                self._duck_target = 1.0
+                return
             self._duck_target = 1.0
             return
+
+        if clip.started_at is None:
+            self._start_active_clip()
 
         self._duck_target = clip.duck_gain
         self._fill_tts_queue(clip)
@@ -475,6 +554,8 @@ class GstZoneMixer:
             duration_ns = int(frames * 1_000_000_000 / clip.sample_rate)
             buffer = self.Gst.Buffer.new_allocate(None, len(chunk), None)
             buffer.fill(0, chunk)
+            if clip.next_pts_ns is None:
+                clip.next_pts_ns = self._pipeline_running_time_ns() + int(0.05 * 1_000_000_000)
             buffer.pts = clip.next_pts_ns
             buffer.dts = clip.next_pts_ns
             buffer.duration = duration_ns
@@ -493,10 +574,19 @@ class GstZoneMixer:
         return max(0, int(clock.get_time() - self.pipeline.get_base_time()))
 
     def _load_next_clip(self) -> TTSClip | None:
+        clip = self._load_next_live_clip()
+        if clip is not None:
+            return clip
         clip = self._load_next_wav_clip()
         if clip is not None:
             return clip
-        return self._load_next_stream_clip()
+        return None
+
+    def _load_next_live_clip(self) -> TTSClip | None:
+        try:
+            return self._live_clips.get_nowait()
+        except queue.Empty:
+            return None
 
     def _load_next_wav_clip(self) -> TTSClip | None:
         for meta_path_str in sorted(glob(str(self.queue_dir / "*.json"))):
@@ -519,49 +609,6 @@ class GstZoneMixer:
                 return clip
             except Exception:
                 log.exception("Failed to load queued TTS item %s", meta_path)
-                safe_unlink(meta_path)
-        return None
-
-    def _load_next_stream_clip(self) -> TTSClip | None:
-        for meta_path_str in sorted(glob(str(self.stream_dir / "*.json"))):
-            meta_path = Path(meta_path_str)
-            try:
-                meta = json.loads(meta_path.read_text())
-                pcm_path = Path(meta["stream_path"])
-                if not pcm_path.exists():
-                    log.warning("Dropping TTS stream with missing audio: %s", pcm_path)
-                    safe_unlink(meta_path)
-                    continue
-                done_path = Path(meta.get("done_path") or str(meta_path.with_suffix(".done")))
-                stale_reason = stale_stream_reason(meta_path, meta, pcm_path, done_path)
-                if stale_reason:
-                    log.warning("Dropping stale TTS stream %s: %s", meta_path.name, stale_reason)
-                    safe_unlink(pcm_path)
-                    safe_unlink(done_path)
-                    safe_unlink(meta_path)
-                    continue
-
-                clip = TTSClip(
-                    request_id=str(meta.get("request_id") or meta_path.stem),
-                    sample_rate=int(meta.get("sample_rate") or 24000),
-                    channels=int(meta.get("channels") or 1),
-                    sample_width=int(meta.get("sample_width") or 2),
-                    duck_gain=clamp_float(meta.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
-                    kind="stream",
-                    pcm_path=pcm_path,
-                    meta_path=meta_path,
-                    done_path=done_path,
-                    cleanup_paths=(pcm_path, done_path, meta_path),
-                )
-                if clip.sample_width != 2:
-                    log.warning("Dropping TTS stream %s with unsupported sample width %d", clip.request_id, clip.sample_width)
-                    clip.cleanup()
-                    continue
-                if not clip.ready_to_start():
-                    continue
-                return clip
-            except Exception:
-                log.exception("Failed to load streaming TTS item %s", meta_path)
                 safe_unlink(meta_path)
         return None
 
@@ -598,6 +645,106 @@ class GstZoneMixer:
             except OSError:
                 pass
             self.pipe_fd = None
+
+    def _start_tts_websocket(self) -> None:
+        if self.tts_ws_port <= 0:
+            return
+        self._ws_thread = threading.Thread(
+            target=self._run_tts_websocket_server,
+            name=f"tts-ws-{self.tts_ws_port}",
+            daemon=True,
+        )
+        self._ws_thread.start()
+
+    def _run_tts_websocket_server(self) -> None:
+        try:
+            asyncio.run(self._serve_tts_websocket())
+        except Exception:
+            log.exception("TTS websocket server failed")
+
+    async def _serve_tts_websocket(self) -> None:
+        import websockets
+
+        async with websockets.serve(
+            self._handle_tts_websocket,
+            "0.0.0.0",
+            self.tts_ws_port,
+            max_size=2 * 1024 * 1024,
+            ping_interval=20,
+            ping_timeout=20,
+        ):
+            log.info("TTS websocket listening on 0.0.0.0:%d", self.tts_ws_port)
+            while not self._stop:
+                await asyncio.sleep(0.2)
+
+    async def _handle_tts_websocket(self, websocket, _path: str | None = None) -> None:
+        clip: TTSClip | None = None
+        try:
+            first = await asyncio.wait_for(websocket.recv(), timeout=WS_RECV_TIMEOUT_SECONDS)
+            if not isinstance(first, str):
+                await websocket.send(json.dumps({"type": "error", "error": "first message must be JSON start"}))
+                return
+            start = json.loads(first)
+            if start.get("type") != "start":
+                await websocket.send(json.dumps({"type": "error", "error": "first message must have type=start"}))
+                return
+            clip = self._clip_from_websocket_start(start)
+            self._live_clips.put(clip)
+            await websocket.send(json.dumps({
+                "type": "started",
+                "request_id": clip.request_id,
+                "sample_rate": clip.sample_rate,
+                "channels": clip.channels,
+                "sample_width": clip.sample_width,
+            }))
+
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    clip.live_buffer.append(message)
+                    continue
+                payload = json.loads(message)
+                msg_type = payload.get("type")
+                if msg_type == "end":
+                    clip.live_buffer.finish()
+                    await websocket.send(json.dumps({
+                        "type": "ended",
+                        "request_id": clip.request_id,
+                        "received_bytes": clip.live_buffer.total_received,
+                    }))
+                    return
+                if msg_type == "cancel":
+                    clip.live_buffer.finish(str(payload.get("error") or "cancelled"))
+                    await websocket.send(json.dumps({"type": "cancelled", "request_id": clip.request_id}))
+                    return
+                await websocket.send(json.dumps({"type": "error", "error": f"unknown message type: {msg_type}"}))
+            if clip.live_buffer is not None:
+                clip.live_buffer.finish()
+        except Exception as exc:
+            if clip is not None and clip.live_buffer is not None:
+                clip.live_buffer.finish(str(exc))
+            with contextlib.suppress(Exception):
+                await websocket.send(json.dumps({"type": "error", "error": str(exc)}))
+
+    def _clip_from_websocket_start(self, payload: dict) -> TTSClip:
+        sample_rate = int(payload.get("sample_rate") or 24000)
+        channels = int(payload.get("channels") or 1)
+        sample_width = int(payload.get("sample_width") or 2)
+        audio_format = str(payload.get("format") or "pcm_s16le").lower().strip(".")
+        if audio_format not in {"pcm_s16le", "raw"}:
+            raise ValueError("websocket TTS only accepts raw signed 16-bit PCM")
+        if sample_rate <= 0 or channels <= 0:
+            raise ValueError("sample_rate and channels must be positive")
+        if sample_width != 2:
+            raise ValueError("websocket TTS only accepts 16-bit PCM")
+        return TTSClip(
+            request_id=safe_request_id(payload.get("request_id")),
+            sample_rate=sample_rate,
+            channels=channels,
+            sample_width=sample_width,
+            duck_gain=clamp_float(payload.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN),
+            kind="websocket",
+            live_buffer=LiveTTSBuffer(),
+        )
 
 
 def require_gstreamer():
@@ -659,40 +806,18 @@ def load_wav_clip(*, request_id: str, audio_path: Path, meta_path: Path, duck_ga
     )
 
 
-def stale_stream_reason(meta_path: Path, meta: dict, pcm_path: Path, done_path: Path) -> str | None:
-    try:
-        source_size = pcm_path.stat().st_size
-    except OSError:
-        return "stream audio file is missing"
-    if source_size <= 0:
-        return "active stream has no audio"
-    age = stream_age_seconds(meta_path, meta)
-    if age is None or age <= STREAM_QUEUE_STALE_SECONDS:
-        return None
-    if meta.get("complete") or done_path.exists():
-        return f"completed stream is {age:.1f}s old"
-    return f"incomplete stream is {age:.1f}s old"
-
-
-def stream_age_seconds(meta_path: Path, meta: dict) -> float | None:
-    queued_at = meta.get("queued_at")
-    try:
-        if queued_at is not None:
-            return max(0.0, time.time() - float(queued_at))
-    except (TypeError, ValueError):
-        pass
-    try:
-        return max(0.0, time.time() - meta_path.stat().st_mtime)
-    except OSError:
-        return None
-
-
 def clamp_float(value: object, minimum: float, maximum: float, default: float) -> float:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return default
     return min(max(parsed, minimum), maximum)
+
+
+def safe_request_id(value: object) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
+    return text or f"tts_{int(time.time() * 1000)}"
 
 
 def safe_unlink(path: Path) -> None:
@@ -708,6 +833,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture-dev", required=True)
     parser.add_argument("--grp-dir", required=True, type=Path)
+    parser.add_argument("--tts-ws-port", type=int, default=0)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -715,7 +841,7 @@ def main() -> None:
         format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    GstZoneMixer(capture_dev=args.capture_dev, grp_dir=args.grp_dir).run()
+    GstZoneMixer(capture_dev=args.capture_dev, grp_dir=args.grp_dir, tts_ws_port=args.tts_ws_port).run()
 
 
 if __name__ == "__main__":
