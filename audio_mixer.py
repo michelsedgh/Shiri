@@ -53,6 +53,9 @@ TTS_START_LEAD_SECONDS = 0.05
 TTS_BUFFER_AHEAD_SECONDS = 0.35
 TTS_DRAIN_GRACE_SECONDS = 0.03
 TTS_MAX_PUSH_BUFFERS_PER_TICK = 32
+LIVE_QUEUE_MAX_SECONDS = 0.50
+OUTPUT_QUEUE_MAX_SECONDS = 0.25
+QUEUE_LEAK_DOWNSTREAM = 2
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
@@ -324,6 +327,7 @@ class GstZoneMixer:
         caps = make_element(Gst, "capsfilter", "silence_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
         queue = make_element(Gst, "queue", "silence_queue")
+        configure_live_queue(queue, seconds=LIVE_QUEUE_MAX_SECONDS, leaky=True)
         self._add_and_link([src, caps, queue])
         self._link_to_mixer(queue, mixer)
 
@@ -339,6 +343,7 @@ class GstZoneMixer:
         caps = make_element(Gst, "capsfilter", "loopback_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
         queue = make_element(Gst, "queue", "loopback_queue")
+        configure_live_queue(queue, seconds=LIVE_QUEUE_MAX_SECONDS, leaky=True)
         self.music_volume = make_element(Gst, "volume", "music_volume")
         self.music_volume.set_property("volume", 1.0)
 
@@ -358,8 +363,7 @@ class GstZoneMixer:
         set_property_if_present(self.tts_src, "max-latency", int(0.5 * 1_000_000_000))
 
         buffer_queue = make_element(Gst, "queue", "tts_buffer")
-        set_property_if_present(buffer_queue, "max-size-time", int(0.5 * 1_000_000_000))
-        set_property_if_present(buffer_queue, "max-size-bytes", 0)
+        configure_live_queue(buffer_queue, seconds=0.5, leaky=False)
         convert = make_element(Gst, "audioconvert", "tts_convert")
         resample = make_element(Gst, "audioresample", "tts_resample")
         caps = make_element(Gst, "capsfilter", "tts_output_caps")
@@ -374,13 +378,15 @@ class GstZoneMixer:
         resample = make_element(Gst, "audioresample", "mix_resample")
         caps = make_element(Gst, "capsfilter", "mix_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
+        output_queue = make_element(Gst, "queue", "pipe_output_queue")
+        configure_live_queue(output_queue, seconds=OUTPUT_QUEUE_MAX_SECONDS, leaky=True)
         sink = make_element(Gst, "fdsink", "pipe_sink")
         sink.set_property("fd", self.pipe_fd)
-        sink.set_property("sync", False)
+        sink.set_property("sync", True)
         set_property_if_present(sink, "async", False)
         set_property_if_present(sink, "enable-last-sample", False)
 
-        self._add_and_link([convert, resample, caps, sink])
+        self._add_and_link([convert, resample, caps, output_queue, sink])
         if not mixer.link(convert):
             raise RuntimeError("Could not link mixer to output branch")
 
@@ -796,6 +802,14 @@ def set_property_if_present(element, prop: str, value) -> bool:
         return False
     element.set_property(prop, value)
     return True
+
+
+def configure_live_queue(element, *, seconds: float, leaky: bool) -> None:
+    set_property_if_present(element, "max-size-time", int(max(0.01, seconds) * 1_000_000_000))
+    set_property_if_present(element, "max-size-bytes", 0)
+    set_property_if_present(element, "max-size-buffers", 0)
+    if leaky:
+        set_property_if_present(element, "leaky", QUEUE_LEAK_DOWNSTREAM)
 
 
 def get_int_property(element, prop: str, default: int) -> int:
