@@ -55,7 +55,8 @@ TTS_TARGET_QUEUE_SECONDS = 0.18
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
 STREAM_START_TIMEOUT_SECONDS = 5.0
-STREAM_STALL_TIMEOUT_SECONDS = 15.0
+STREAM_STALL_TIMEOUT_SECONDS = 6.0
+TTS_DRAIN_GRACE_SECONDS = 2.0
 WS_RECV_TIMEOUT_SECONDS = 10.0
 
 
@@ -129,6 +130,7 @@ class TTSClip:
     fully_pushed_at: float | None = None
     next_pts_ns: int | None = None
     pushed_buffers: int = 0
+    pushed_bytes: int = 0
 
     @property
     def frame_width(self) -> int:
@@ -507,11 +509,17 @@ class GstZoneMixer:
             if clip.fully_pushed_at is None:
                 clip.fully_pushed_at = time.monotonic()
             end_ns = clip.next_pts_ns or self._pipeline_running_time_ns()
-            if self._pipeline_running_time_ns() >= end_ns:
-                log.info("Finished TTS request %s", clip.request_id)
-                clip.cleanup()
-                self._active_clip = None
-                self._duck_target = 1.0
+            running_ns = self._pipeline_running_time_ns()
+            if running_ns >= end_ns:
+                self._finish_active_clip(clip, reason="rendered")
+            elif time.monotonic() - clip.fully_pushed_at >= TTS_DRAIN_GRACE_SECONDS:
+                log.warning(
+                    "Releasing TTS request %s after drain timeout running_ms=%d end_ms=%d",
+                    clip.request_id,
+                    running_ns // 1_000_000,
+                    end_ns // 1_000_000,
+                )
+                self._finish_active_clip(clip, reason="drain_timeout")
 
     def _start_active_clip(self) -> None:
         clip = self._active_clip
@@ -562,9 +570,24 @@ class GstZoneMixer:
                 buffer.set_flags(self.Gst.BufferFlags.DISCONT)
             clip.next_pts_ns += duration_ns
             clip.pushed_buffers += 1
+            clip.pushed_bytes += len(chunk)
             ret = self.tts_src.emit("push-buffer", buffer)
             if ret != self.Gst.FlowReturn.OK:
                 raise PipelineRestart(f"TTS appsrc push failed: {ret.value_nick}")
+
+    def _finish_active_clip(self, clip: TTSClip, *, reason: str) -> None:
+        received_bytes = clip.source_size()
+        log.info(
+            "Finished TTS request %s reason=%s received=%d pushed=%d buffers=%d",
+            clip.request_id,
+            reason,
+            received_bytes,
+            clip.pushed_bytes,
+            clip.pushed_buffers,
+        )
+        clip.cleanup()
+        self._active_clip = None
+        self._duck_target = 1.0
 
     def _pipeline_running_time_ns(self) -> int:
         if self.pipeline is None:
@@ -707,6 +730,11 @@ class GstZoneMixer:
                 msg_type = payload.get("type")
                 if msg_type == "end":
                     clip.live_buffer.finish()
+                    log.info(
+                        "Received websocket TTS request %s complete received=%d",
+                        clip.request_id,
+                        clip.live_buffer.total_received,
+                    )
                     await websocket.send(json.dumps({
                         "type": "ended",
                         "request_id": clip.request_id,
@@ -715,6 +743,7 @@ class GstZoneMixer:
                     return
                 if msg_type == "cancel":
                     clip.live_buffer.finish(str(payload.get("error") or "cancelled"))
+                    log.info("Cancelled websocket TTS request %s", clip.request_id)
                     await websocket.send(json.dumps({"type": "cancelled", "request_id": clip.request_id}))
                     return
                 await websocket.send(json.dumps({"type": "error", "error": f"unknown message type: {msg_type}"}))
