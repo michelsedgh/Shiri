@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 
-OUTPUT_RATE = 44100
+OUTPUT_RATE = 48000
 OUTPUT_CHANNELS = 2
 OUTPUT_CAPS = (
     f"audio/x-raw,format=S16LE,layout=interleaved,"
@@ -37,8 +37,8 @@ OUTPUT_CAPS = (
 DEFAULT_TTS_RATE = 24000
 DEFAULT_TTS_CHANNELS = 1
 MIXER_ELEMENT = "liveadder"
-MIXER_BUFFER_MS = 20
-MIXER_LATENCY_MS = 60
+MIXER_BUFFER_MS = 10
+MIXER_LATENCY_MS = 30
 
 DEFAULT_DUCK_GAIN = 0.28
 DUCK_ATTACK_SECONDS = 0.08
@@ -229,13 +229,19 @@ class GstZoneMixer:
         set_property_if_present(src, "latency-time", 10_000)
         set_property_if_present(src, "buffer-time", 50_000)
 
+        convert = make_element(Gst, "audioconvert", "loopback_convert")
+        resample = make_element(Gst, "audioresample", "loopback_resample")
         caps = make_element(Gst, "capsfilter", "loopback_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
         queue = make_element(Gst, "queue", "loopback_queue")
+        set_property_if_present(queue, "leaky", 2)
+        set_property_if_present(queue, "max-size-time", int(0.25 * 1_000_000_000))
+        set_property_if_present(queue, "max-size-bytes", 0)
+        set_property_if_present(queue, "max-size-buffers", 0)
         self.music_volume = make_element(Gst, "volume", "music_volume")
         self.music_volume.set_property("volume", 1.0)
 
-        self._add_and_link([src, caps, queue, self.music_volume])
+        self._add_and_link([src, convert, resample, caps, queue, self.music_volume])
         self._link_to_mixer(self.music_volume, mixer)
 
     def _add_tts_pcm_branch(self, mixer) -> None:
@@ -280,15 +286,20 @@ class GstZoneMixer:
         resample = make_element(Gst, "audioresample", "mix_resample")
         caps = make_element(Gst, "capsfilter", "mix_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
+        queue = make_element(Gst, "queue", "mix_output_queue")
+        set_property_if_present(queue, "leaky", 2)
+        set_property_if_present(queue, "max-size-time", int(0.25 * 1_000_000_000))
+        set_property_if_present(queue, "max-size-bytes", 0)
+        set_property_if_present(queue, "max-size-buffers", 0)
         sink = make_element(Gst, "fdsink", "pipe_sink")
         sink.set_property("fd", self.pipe_fd)
-        sink.set_property("sync", True)
+        sink.set_property("sync", False)
         sink.set_property("blocksize", max(1, int(OUTPUT_RATE * OUTPUT_CHANNELS * 2 * MIXER_BUFFER_MS / 1000)))
         set_property_if_present(sink, "async", False)
         set_property_if_present(sink, "enable-last-sample", False)
         set_property_if_present(sink, "max-lateness", -1)
 
-        self._add_and_link([convert, resample, caps, sink])
+        self._add_and_link([convert, resample, caps, queue, sink])
         if not mixer.link(convert):
             raise RuntimeError("Could not link mixer to output branch")
 

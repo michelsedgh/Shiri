@@ -135,10 +135,10 @@ class OwnToneAPI:
         return self._api("/api/update", method="PUT")
 
     def get_tracks(self, limit=100):
-        """Get library tracks (to verify pipe discovery)."""
-        result = self._api(f"/api/library/tracks?limit={limit}")
+        """Get queued tracks; OwnTone does not expose a plain list-all-tracks API."""
+        result = self._api("/api/queue")
         if result and "items" in result:
-            return result["items"]
+            return result["items"][:limit]
         return []
 
     def verify_pipe(self):

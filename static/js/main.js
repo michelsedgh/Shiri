@@ -444,7 +444,7 @@ function renderDrawerAdvanced(room) {
             </label>
             <label class="field">
                 <span>Latency offset</span>
-                <input id="advanced-zone-latency" type="number" min="-10" max="5" step="0.1" value="${escapeHtml(binding.latency_offset ?? -2.3)}">
+                <input id="advanced-zone-latency" type="number" min="-0.25" max="0.25" step="0.01" value="${escapeHtml(binding.latency_offset ?? 0)}">
             </label>
             <label class="check-field">
                 <input id="advanced-zone-autostart" type="checkbox" ${binding.auto_start ? 'checked' : ''}>

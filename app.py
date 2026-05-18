@@ -23,7 +23,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
-from config import ConfigStore
+from config import ConfigStore, MAX_SHAIRPORT_LATENCY_OFFSET
 from tts_pcm_ws import TtsPcmWebSocketServer
 from zone import ZoneManager, _slugify_room_id
 
@@ -60,7 +60,7 @@ tts_pcm_ws_server = TtsPcmWebSocketServer(
 # Log streaming — single thread tails all watched zones
 # ---------------------------------------------------------------------------
 LOG_DIR = "/var/lib/shiri/groups"
-LOG_TYPES = ["shairport", "owntone", "owntone_wrapper", "mixer", "pause_bridge", "volume_bridge", "sync_reset"]
+LOG_TYPES = ["shairport", "owntone", "owntone_wrapper", "mixer", "volume_bridge"]
 LOG_FILTERS = {
     "all": LOG_TYPES,
     "tts": ["mixer"],
@@ -824,9 +824,10 @@ def set_latency(zone_id):
     except (ValueError, TypeError):
         return jsonify({"error": "latency_offset must be a number"}), 400
 
-    # Sanity check: offset should typically be between -5 and +1
-    if offset < -10 or offset > 5:
-        return jsonify({"error": "latency_offset should be between -10 and +5 seconds"}), 400
+    if abs(offset) > MAX_SHAIRPORT_LATENCY_OFFSET:
+        return jsonify({
+            "error": f"latency_offset should be between -{MAX_SHAIRPORT_LATENCY_OFFSET} and +{MAX_SHAIRPORT_LATENCY_OFFSET} seconds"
+        }), 400
 
     result, error = zone_manager.set_latency(zone_id, offset)
     if error:

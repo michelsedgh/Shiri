@@ -23,6 +23,15 @@ _LOOPBACK_ALLOC_LOCK = threading.Lock()
 OWNTONE_PORT_BASE = 3869
 OWNTONE_WEBSOCKET_PORT_BASE = 3868
 OWNTONE_MPD_PORT_BASE = 6700
+OWNTONE_SENDER_NS = "shiri_ot"
+OWNTONE_SENDER_IFACE = "otlan0"
+OWNTONE_API_HOST_IFACE = "otapi0"
+OWNTONE_API_NS_IFACE = "otapi1"
+OWNTONE_API_HOST_IP = "10.211.0.1"
+OWNTONE_API_NS_IP = "10.211.0.2"
+OWNTONE_API_HOST_CIDR = f"{OWNTONE_API_HOST_IP}/30"
+OWNTONE_API_NS_CIDR = f"{OWNTONE_API_NS_IP}/30"
+OWNTONE_SENDER_DIR = os.path.join(BASE_DIR, "owntone-sender")
 MIXER_TTS_PCM_RATE = 24000
 MIXER_TTS_PCM_CHANNELS = 1
 MIXER_TTS_PCM_PIPE_NAME = "tts.pipe"
@@ -33,10 +42,33 @@ TEMPLATE_DIR = os.path.join(_THIS_DIR, "templates")
 SCRIPT_DIR = os.path.join(_THIS_DIR, "scripts")
 MIXER_SCRIPT = os.path.join(_THIS_DIR, "audio_mixer.py")
 
-# Default latency offset for timeline/lyrics sync
-# Negative = audio delivered EARLIER to compensate for pipeline buffer delay
-# Tune this if lyrics on iPhone are ahead/behind speaker audio
-DEFAULT_LATENCY_OFFSET = -2.3
+# Shairport Sync documents this as a small hardware-output compensation knob.
+# Large negative values make AP2 timing unstable, so old pipeline-delay offsets
+# are normalized away when configs are loaded or generated.
+DEFAULT_LATENCY_OFFSET = 0.0
+MAX_SHAIRPORT_LATENCY_OFFSET = 0.25
+
+
+def normalize_latency_offset(value, default=DEFAULT_LATENCY_OFFSET):
+    try:
+        offset = float(value)
+    except (TypeError, ValueError):
+        return default
+    if abs(offset) > MAX_SHAIRPORT_LATENCY_OFFSET:
+        log.warning(
+            "Ignoring unsafe latency_offset=%s; Shairport AP2 offset must stay within ±%.2fs",
+            offset,
+            MAX_SHAIRPORT_LATENCY_OFFSET,
+        )
+        return default
+    return offset
+
+
+def sanitize_audio_settings(raw):
+    config = dict(raw or {})
+    if "latency_offset" in config:
+        config["latency_offset"] = normalize_latency_offset(config.get("latency_offset"))
+    return config
 
 
 # ===========================================================================
@@ -63,6 +95,14 @@ class ConfigStore:
         # Ensure structure
         self._data.setdefault("zones", {})
         self._data.setdefault("settings", {"default_interface": ""})
+        changed = False
+        for zone_id, zone_config in list(self._data["zones"].items()):
+            sanitized = sanitize_audio_settings(zone_config)
+            if sanitized != zone_config:
+                self._data["zones"][zone_id] = sanitized
+                changed = True
+        if changed:
+            self._save()
 
     def _save(self):
         """Write config to disk."""
@@ -85,7 +125,7 @@ class ConfigStore:
     def save_zone(self, zone_id, config):
         """Create or update a zone config."""
         with self._lock:
-            self._data["zones"][zone_id] = config
+            self._data["zones"][zone_id] = sanitize_audio_settings(config)
             self._save()
 
     def delete_zone(self, zone_id):
@@ -139,8 +179,10 @@ def setup_directories(zone):
         os.makedirs(os.path.join(grp_dir, subdir), exist_ok=True)
         os.chmod(os.path.join(grp_dir, subdir), 0o755)
 
-    # Clear stale state and logs from the last daemon run.
-    for subdir in ["state", "logs"]:
+    # Clear generated runtime files from the last daemon run. The config
+    # directory is generated too; clearing it prevents old hook scripts from
+    # lingering after pipeline changes.
+    for subdir in ["state", "logs", "config"]:
         for f in os.listdir(os.path.join(grp_dir, subdir)):
             path = os.path.join(grp_dir, subdir, f)
             try:
@@ -159,7 +201,6 @@ def setup_directories(zone):
     legacy_tts_pipe = os.path.join(grp_dir, "pipes", MIXER_TTS_PCM_PIPE_NAME)
     legacy_tts_meta_pipe = os.path.join(grp_dir, "pipes", f"{MIXER_TTS_PCM_PIPE_NAME}.metadata")
     meta_pipe = os.path.join(grp_dir, "pipes", "audio.pipe.metadata")
-    pause_meta_pipe = os.path.join(grp_dir, "pipes", "pause_bridge.metadata")
     shairport_meta_pipe = os.path.join(grp_dir, "pipes", "shairport.metadata")
     format_file = os.path.join(grp_dir, "pipes", "audio.pipe.format")
 
@@ -169,7 +210,6 @@ def setup_directories(zone):
         legacy_tts_pipe,
         legacy_tts_meta_pipe,
         meta_pipe,
-        pause_meta_pipe,
         shairport_meta_pipe,
         format_file,
     ]:
@@ -178,13 +218,13 @@ def setup_directories(zone):
         except FileNotFoundError:
             pass
 
-    for pipe in [audio_pipe, tts_pipe, meta_pipe, pause_meta_pipe, shairport_meta_pipe]:
+    for pipe in [audio_pipe, tts_pipe, meta_pipe, shairport_meta_pipe]:
         os.mkfifo(pipe, 0o666)
         os.chmod(pipe, 0o666)
 
     # Format file — OwnTone REQUIRES this to know the pipe's audio format
     with open(format_file, "w") as f:
-        f.write("16,44100,2\n")
+        f.write("16,48000,2\n")
 
     log.info("Created directories and FIFOs for %s", zone.zone_id)
 
@@ -277,24 +317,13 @@ def generate_shairport_config(zone):
     volume_bridge_script = os.path.join(SCRIPT_DIR, "volume_bridge.sh")
     os.chmod(volume_bridge_script, 0o755)
 
-    # Get latency offset from zone config, or use default
-    # This can be tuned per-zone if needed
-    latency_offset = zone.config.get("latency_offset", DEFAULT_LATENCY_OFFSET)
+    # Get the small hardware latency compensation from zone config. This is
+    # intentionally not a pipeline-delay workaround.
+    latency_offset = normalize_latency_offset(zone.config.get("latency_offset", DEFAULT_LATENCY_OFFSET))
+    zone.config["latency_offset"] = latency_offset
     log.info("Using latency offset: %s seconds for %s", latency_offset, zone.zone_id)
 
-    # Create pipe reset script — CRITICAL FOR MULTI-ROOM SYNC
-    # This script:
-    # 1. Stops OwnTone playback (flushes its internal buffers)
-    # 2. Leaves the GStreamer mixer running so it can reconnect to the FIFO
-    # This ensures NO accumulated buffer state between sessions
-    flush_script = os.path.join(grp_dir, "config", "reset_audio_pipe.sh")
-    reset_template = _read_template("reset_audio_pipe.sh")
-    reset_content = (reset_template
-                     .replace("%%GRP_DIR%%", grp_dir)
-                     .replace("%%OWNTONE_PORT%%", str(owntone_port)))
-    _write_file(flush_script, reset_content, executable=True)
-
-    # Generate shairport-sync config — SAME template as dual_zone_demo.sh
+    # Generate shairport-sync config.
     conf_path = os.path.join(grp_dir, "config", "shairport-sync.conf")
     template = _read_template("shairport_sync.conf")
     content = (template
@@ -307,8 +336,7 @@ def generate_shairport_config(zone):
                .replace("%%VOLUME_BRIDGE_SCRIPT%%", volume_bridge_script)
                .replace("%%GRP_DIR%%", grp_dir)
                .replace("%%ALSA_DEVICE%%", alsa_device)
-               .replace("%%FLUSH_SCRIPT%%", flush_script))
-    content = content.replace('interface = "enp0s1";', f'interface = "{zone.interface}";')
+               .replace("%%SHAIRPORT_INTERFACE%%", f"rx{subdev}"))
     _write_file(conf_path, content)
 
     log.info("Generated shairport-sync config for %s at %s", zone.zone_id, conf_path)

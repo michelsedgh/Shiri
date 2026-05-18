@@ -22,6 +22,8 @@ from config import (
     DEFAULT_LATENCY_OFFSET,
     MIXER_TTS_PCM_CHANNELS,
     MIXER_TTS_PCM_RATE,
+    normalize_latency_offset,
+    sanitize_audio_settings,
 )
 from zone_lifecycle import (
     _run,
@@ -95,7 +97,7 @@ def _normalize_tts_policy(raw=None):
 
 
 def _sanitize_zone_config(raw):
-    config = dict(raw or {})
+    config = sanitize_audio_settings(raw)
     for key in LEGACY_ZONE_CONFIG_KEYS:
         config.pop(key, None)
     return config
@@ -150,8 +152,6 @@ class Zone:
         self.allocated_subdevice = None
         self.shairport_pid = None
         self.mixer_pid = None
-        self.metadata_relay_pid = None
-        self.pause_bridge_pid = None
         self.owntone_pid = None
         self.shairport_ip = None
         self.owntone_ip = None
@@ -264,24 +264,18 @@ class ZoneManager:
 
     def start_host_nqptp(self):
         """
-        Start one host nqptp for all host-network Shairport instances.
-        A shared host nqptp owns UDP 319/320 for every zone.
+        Shiri runs nqptp inside each receiver namespace.
+        Stop any old host-shared nqptp left from the previous host-port runtime.
         """
         result = _run(["pgrep", "-x", "nqptp"])
         if result.returncode == 0 and result.stdout.strip():
-            pid = int(result.stdout.strip().split()[0])
-            self._host_nqptp_pid = pid
-            log.info("Using existing host nqptp (pid %d)", pid)
-            return True
-
-        proc = subprocess.Popen(["nqptp"])
-        self._host_nqptp_pid = proc.pid
-        time.sleep(1)
-        if proc.poll() is not None:
-            log.error("Failed to start host nqptp")
-            self._host_nqptp_pid = None
-            return False
-        log.info("Started host nqptp (pid %d)", proc.pid)
+            for pid_str in result.stdout.split():
+                try:
+                    _kill_pid(int(pid_str), "legacy host nqptp")
+                except ValueError:
+                    pass
+        self._host_nqptp_pid = None
+        log.info("Host nqptp disabled; receiver namespaces start their own nqptp")
         return True
 
     def cleanup_stale_runtime(self):
@@ -313,7 +307,7 @@ class ZoneManager:
     def get_system_status(self):
         """Return system-level health info."""
         return {
-            "nqptp_mode": "host-shared",
+            "nqptp_mode": "per-zone-netns",
             "alsa_ready": self._alsa_ready,
             "interfaces": self.get_network_interfaces(),
             "zone_count": len(self.zones),
@@ -341,7 +335,7 @@ class ZoneManager:
         if default_room:
             config["default_room"] = True
         if latency_offset is not None:
-            config["latency_offset"] = latency_offset
+            config["latency_offset"] = normalize_latency_offset(latency_offset)
         zone = Zone(zone_id, config, on_status_change=self._emit_zone_status)
         with self._lock:
             self.zones[zone_id] = zone
@@ -846,7 +840,7 @@ class ZoneManager:
         if not zone:
             return None, "Zone not found"
 
-        zone.config["latency_offset"] = offset
+        zone.config["latency_offset"] = normalize_latency_offset(offset)
         self.config_store.save_zone(zone_id, zone.config)
         
         log.info("Set latency_offset=%s for %s (restart zone to apply)", offset, zone_id)
@@ -964,8 +958,7 @@ class ZoneManager:
 
                     # Check process liveness
                     for label, pid in [("shairport-sync", zone.shairport_pid),
-                                       ("mixer", zone.mixer_pid),
-                                       ("pause-bridge", zone.pause_bridge_pid)]:
+                                       ("mixer", zone.mixer_pid)]:
                         if pid is None:
                             continue
                         alive_key = f"{zone_id}_{label}_alive"
