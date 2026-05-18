@@ -781,7 +781,7 @@ def _prepare_tts_rtp(default_room_id=None, zone_id=None):
     }
     result["sender_gstreamer_appsrc_pipeline"] = (
         "appsrc name=tts_src is-live=true format=bytes do-timestamp=false "
-        "block=true max-bytes=9600 "
+        "block=true max-bytes=960 "
         f"caps=audio/x-unaligned-raw,format=S16LE,layout=interleaved,rate={result['sample_rate']},"
         f"channels={result['channels']} ! "
         "rawaudioparse use-sink-caps=true ! audioconvert ! audioresample ! "
