@@ -15,7 +15,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -25,6 +24,7 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from config import ConfigStore
+from tts_pcm_ws import TtsPcmWebSocketServer
 from zone import ZoneManager, _slugify_room_id
 
 # ---------------------------------------------------------------------------
@@ -51,6 +51,10 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 # ---------------------------------------------------------------------------
 config_store = ConfigStore()
 zone_manager = ZoneManager(config_store, socketio)
+tts_pcm_ws_server = TtsPcmWebSocketServer(
+    zone_manager,
+    port=int(os.environ.get("SHIRI_TTS_PCM_WS_PORT", "8091")),
+)
 
 # ---------------------------------------------------------------------------
 # Log streaming — single thread tails all watched zones
@@ -688,22 +692,6 @@ def set_room_tts_policy(room_id):
 # TTS routing API
 # ---------------------------------------------------------------------------
 
-@app.route("/api/rooms/<room_id>/tts-rtp", methods=["POST"])
-def prepare_tts_rtp_for_room(room_id):
-    result, error = _prepare_tts_rtp(default_room_id=room_id)
-    if error:
-        return jsonify({"error": error}), 400
-    return jsonify(result), 201
-
-
-@app.route("/api/zones/<zone_id>/tts-rtp", methods=["POST"])
-def prepare_tts_rtp_for_zone(zone_id):
-    result, error = _prepare_tts_rtp(zone_id=zone_id)
-    if error:
-        return jsonify({"error": error}), 400
-    return jsonify(result), 201
-
-
 @app.route("/api/rooms/<room_id>/tts-debug")
 def tts_debug_for_room(room_id):
     zone, error = zone_manager.resolve_zone_for_room(room_id, require_running=False)
@@ -718,87 +706,6 @@ def tts_debug_for_zone(zone_id):
     if not zone:
         return jsonify({"error": "Zone not found"}), 404
     return jsonify(_tts_debug_payload(zone))
-
-
-def _prepare_tts_rtp(default_room_id=None, zone_id=None):
-    data = request.args.to_dict()
-    if request.is_json:
-        data.update(request.get_json(silent=True) or {})
-
-    resolved_zone = None
-    if zone_id is not None:
-        resolved_zone = zone_manager.get_zone(zone_id)
-        if not resolved_zone:
-            return None, "Zone not found"
-    else:
-        room_id = data.get("room_id") or default_room_id
-        resolved_zone, error = zone_manager.resolve_zone_for_room(room_id)
-        if error:
-            return None, error
-
-    result, error = zone_manager.prepare_tts_rtp(
-        resolved_zone.zone_id,
-        request_id=data.get("request_id") or uuid.uuid4().hex,
-        audio_format=data.get("format") or data.get("audio_format") or "rtp_l16",
-        sample_rate=data.get("sample_rate") or 24000,
-        channels=data.get("channels") or 1,
-        sample_width=data.get("sample_width") or 2,
-        text=data.get("text"),
-        speaker_id=data.get("speaker_id"),
-        speaker_name=data.get("speaker_name"),
-    )
-    if error:
-        return None, error
-    host = _request_hostname()
-    result["rtp"] = {
-        "host": host,
-        "port": result["tts_rtp_port"],
-        "payload_type": result["payload_type"],
-        "encoding_name": result["encoding_name"],
-        "clock_rate": result["sample_rate"],
-        "channels": result["channels"],
-        "sample_format": result["sample_format"],
-        "packet_time_ms": 20,
-    }
-    result["sender_contract"] = {
-        "pace": "realtime",
-        "rtp_timestamp_clock": result["sample_rate"],
-        "payload_bytes": "RTP/L16 16-bit signed big-endian PCM",
-        "appsrc_input": "Feed VibeVoice S16LE PCM bytes to appsrc; do not build RTP packets in Python.",
-        "timing_owner": "GStreamer rawaudioparse/rtpL16pay/udpsink owns RTP timestamps and packet pacing.",
-        "source_feeder": (
-            "Buffer the generated PCM for an utterance before playback, then hand it to a long-lived PCM feeder "
-            "that queues 20ms audio frames and feeds silence only while idle."
-        ),
-        "lifecycle": (
-            "Prefer one long-lived sender pipeline per Shiri RTP target. If creating a pipeline per utterance, "
-            "call appsrc end-of-stream and wait for the GStreamer bus EOS before setting the pipeline to NULL."
-        ),
-        "utterance_boundary": "For the long-lived sender, keep the pipeline in PLAYING and feed silence between utterances.",
-        "do_not": [
-            "Do not time.sleep between audio chunks.",
-            "Do not set RTP timestamps or sequence numbers in Python.",
-            "Do not set buffer PTS/duration when using the appsrc+rawaudioparse pipeline.",
-            "Do not send UDP packets directly from Python.",
-            "Do not stop the sender pipeline immediately after the last push-buffer.",
-        ],
-    }
-    result["sender_gstreamer_appsrc_pipeline"] = (
-        "appsrc name=tts_src is-live=true format=bytes do-timestamp=false "
-        "block=true max-bytes=960 "
-        f"caps=audio/x-unaligned-raw,format=S16LE,layout=interleaved,rate={result['sample_rate']},"
-        f"channels={result['channels']} ! "
-        "rawaudioparse use-sink-caps=true ! audioconvert ! audioresample ! "
-        f"audio/x-raw,format=S16BE,layout=interleaved,rate={result['sample_rate']},"
-        f"channels={result['channels']} ! "
-        f"rtpL16pay pt={result['payload_type']} perfect-rtptime=true "
-        f"ptime-multiple=20000000 ! udpsink host={host} "
-        f"port={result['tts_rtp_port']} sync=true async=false"
-    )
-    result["sender_gstreamer_sink"] = result["sender_gstreamer_appsrc_pipeline"]
-    return result, None
-
-
 def _request_hostname():
     host = request.headers.get("X-Forwarded-Host") or request.host
     if host.startswith("["):
@@ -807,6 +714,7 @@ def _request_hostname():
 
 
 def _tts_debug_payload(zone):
+    host = _request_hostname()
     return {
         "ok": True,
         "zone_id": zone.zone_id,
@@ -814,8 +722,17 @@ def _tts_debug_payload(zone):
         "room_id": zone.room_id,
         "room_name": zone.room_name,
         "grp_dir": zone.grp_dir,
-        "tts_transport": "rtp_l16",
-        "tts_rtp_port": zone.tts_rtp_port,
+        "tts_transport": "ws_pcm_s16le",
+        "tts_pcm_pipe": zone.tts_pcm_pipe,
+        "tts_pcm_ws": {
+            "url": f"ws://{host}:{tts_pcm_ws_server.port}/tts/rooms/{zone.room_id}/pcm",
+            "transport": "ws_pcm_s16le",
+            "format": "pcm_s16le",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "timing_owner": "Shiri mixer PCM FIFO",
+        },
         "mixer_log_tail": _read_log_tail(zone.zone_id, "mixer", lines=80),
         "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=20),
     }
@@ -1023,6 +940,7 @@ def startup():
 
     # Start diagnostic monitor for AirPlay disconnect debugging
     zone_manager.start_diagnostic_monitor()
+    tts_pcm_ws_server.start()
 
     log.info("Shiri daemon ready — UI at http://0.0.0.0:8080")
 
@@ -1031,6 +949,7 @@ def shutdown_handler(signum, frame):
     """Graceful shutdown on SIGTERM/SIGINT."""
     log.info("Shutdown signal received...")
     _log_stop.set()
+    tts_pcm_ws_server.stop()
     zone_manager.shutdown()
     sys.exit(0)
 

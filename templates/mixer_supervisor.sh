@@ -1,9 +1,7 @@
 #!/bin/bash
-exec python3 "%%MIXER_SCRIPT%%" \
+exec chrt -f 45 python3 "%%MIXER_SCRIPT%%" \
   --capture-dev "%%CAPTURE_DEV%%" \
   --grp-dir "%%GRP_DIR%%" \
-  --tts-rtp-port "%%TTS_RTP_PORT%%" \
-  --tts-payload-type "%%TTS_RTP_PAYLOAD_TYPE%%" \
-  --tts-rate "%%TTS_RTP_RATE%%" \
-  --tts-channels "%%TTS_RTP_CHANNELS%%" \
-  --rtp-jitter-ms "%%TTS_RTP_JITTER_MS%%"
+  --tts-pcm-pipe "%%TTS_PCM_PIPE%%" \
+  --tts-rate "%%TTS_PCM_RATE%%" \
+  --tts-channels "%%TTS_PCM_CHANNELS%%"

@@ -20,9 +20,8 @@ import uuid
 from config import (
     BASE_DIR,
     DEFAULT_LATENCY_OFFSET,
-    MIXER_TTS_RTP_CHANNELS,
-    MIXER_TTS_RTP_PAYLOAD_TYPE,
-    MIXER_TTS_RTP_RATE,
+    MIXER_TTS_PCM_CHANNELS,
+    MIXER_TTS_PCM_RATE,
 )
 from zone_lifecycle import (
     _run,
@@ -115,6 +114,10 @@ def _settings_to_mix(settings):
     }
 
 
+def _normalize_volume(value, default=50):
+    return _clamp_int(value, 0, 100, default)
+
+
 class Zone:
     """
     Represents a single Shiri AirPlay zone.
@@ -154,7 +157,7 @@ class Zone:
         self.owntone_ip = None
         self.shairport_port = None
         self.owntone_port = None
-        self.tts_rtp_port = None
+        self.tts_pcm_pipe = None
         self.owntone_api = None  # OwnToneAPI instance
         self._grp_dir = None
         self._stop_event = threading.Event()
@@ -198,7 +201,7 @@ class Zone:
             "owntone_ip": self.owntone_ip,
             "shairport_port": self.shairport_port,
             "owntone_port": self.owntone_port,
-            "tts_rtp_port": self.tts_rtp_port,
+            "tts_pcm_pipe": self.tts_pcm_pipe,
             "allocated_subdevice": self.allocated_subdevice,
             "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
             "room_id": self.room_id,
@@ -563,11 +566,11 @@ class ZoneManager:
     # TTS stream routing
     # -------------------------------------------------------------------------
 
-    def prepare_tts_rtp(self, zone_id, *, request_id=None, audio_format="rtp_l16",
-                        sample_rate=MIXER_TTS_RTP_RATE, channels=MIXER_TTS_RTP_CHANNELS,
+    def prepare_tts_pcm(self, zone_id, *, request_id=None, audio_format="pcm_s16le",
+                        sample_rate=MIXER_TTS_PCM_RATE, channels=MIXER_TTS_PCM_CHANNELS,
                         sample_width=2, text=None,
                         speaker_id=None, speaker_name=None):
-        """Resolve room policy and return the permanent RTP/L16 mixer target."""
+        """Resolve room policy and return the permanent PCM mixer pipe target."""
         zone = self.get_zone(zone_id)
         if not zone:
             return None, "Zone not found"
@@ -579,9 +582,9 @@ class ZoneManager:
             except Exception as e:
                 log.debug("Could not nudge OwnTone play state before TTS: %s", e)
 
-        fmt = (audio_format or "rtp_l16").lower().strip(".")
-        if fmt not in {"rtp_l16", "l16", "pcm_s16le", "raw"}:
-            return None, "Only RTP L16 streams are currently supported"
+        fmt = (audio_format or "pcm_s16le").lower().strip(".")
+        if fmt not in {"pcm_s16le", "raw", "s16le"}:
+            return None, "Only PCM S16LE streams are currently supported"
         try:
             parsed_rate = int(sample_rate)
             parsed_channels = int(channels)
@@ -592,10 +595,10 @@ class ZoneManager:
             return None, "sample_rate and channels must be positive"
         if parsed_width != 2:
             return None, "Only 16-bit PCM streams are currently supported"
-        if parsed_rate != MIXER_TTS_RTP_RATE or parsed_channels != MIXER_TTS_RTP_CHANNELS:
-            return None, f"RTP TTS must be {MIXER_TTS_RTP_RATE} Hz, {MIXER_TTS_RTP_CHANNELS} channel"
-        if not zone.tts_rtp_port:
-            return None, "Zone mixer RTP port is not ready"
+        if parsed_rate != MIXER_TTS_PCM_RATE or parsed_channels != MIXER_TTS_PCM_CHANNELS:
+            return None, f"TTS PCM must be {MIXER_TTS_PCM_RATE} Hz, {MIXER_TTS_PCM_CHANNELS} channel"
+        if not zone.tts_pcm_pipe:
+            return None, "Zone mixer PCM pipe is not ready"
 
         effective = self._effective_tts_mix(
             zone,
@@ -603,8 +606,8 @@ class ZoneManager:
             speaker_name=speaker_name,
         )
         safe_id = _safe_request_id(request_id)
-        self._write_tts_rtp_control(zone, request_id=safe_id, duck_gain=effective["duck_gain"])
-        log.info("Prepared TTS RTP %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
+        self._write_tts_pcm_control(zone, request_id=safe_id, duck_gain=effective["duck_gain"])
+        log.info("Prepared TTS PCM %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
         return {
             "ok": True,
             "request_id": safe_id,
@@ -613,24 +616,23 @@ class ZoneManager:
             "zone_id": zone.zone_id,
             "effective_policy": effective,
             "duck_gain": effective["duck_gain"],
-            "transport": "rtp_l16",
-            "format": "rtp_l16",
-            "encoding_name": "L16",
-            "sample_format": "s16be",
+            "transport": "ws_pcm_s16le",
+            "format": "pcm_s16le",
+            "encoding_name": "PCM",
+            "sample_format": "s16le",
             "sample_rate": parsed_rate,
             "channels": parsed_channels,
             "sample_width": parsed_width,
-            "payload_type": MIXER_TTS_RTP_PAYLOAD_TYPE,
-            "tts_rtp_port": zone.tts_rtp_port,
+            "tts_pcm_pipe": zone.tts_pcm_pipe,
             "text": text,
             "speaker_id": speaker_id,
             "speaker_name": speaker_name,
         }, None
 
-    def _write_tts_rtp_control(self, zone, *, request_id, duck_gain):
+    def _write_tts_pcm_control(self, zone, *, request_id, duck_gain):
         state_dir = os.path.join(zone.grp_dir, "state")
         os.makedirs(state_dir, exist_ok=True)
-        path = os.path.join(state_dir, "tts_rtp_control.json")
+        path = os.path.join(state_dir, "tts_pcm_control.json")
         tmp_path = f"{path}.tmp"
         payload = {
             "request_id": request_id,
@@ -738,7 +740,7 @@ class ZoneManager:
             if str(out.get("id")) in [str(sid) for sid in speaker_ids]:
                 selected_speakers.append({
                     "id": out.get("id"),
-                    "name": out.get("name", "Unknown")
+                    "name": out.get("name", "Unknown"),
                 })
         
         # Save speaker selection with names for restoration
@@ -774,7 +776,7 @@ class ZoneManager:
                     selected_ids.append(out.get("id"))
                     selected_speakers.append({
                         "id": out.get("id"),
-                        "name": out.get("name", "Unknown")
+                        "name": out.get("name", "Unknown"),
                     })
             zone.config["speakers"] = selected_ids
             zone.config["speaker_names"] = selected_speakers
@@ -794,6 +796,7 @@ class ZoneManager:
         if not zone or not zone.owntone_api:
             return None, "Zone not running or not found"
         volume = zone.owntone_api.get_volume()
+        self._persist_master_volume(zone, volume)
         return volume, None
 
     def set_volume(self, zone_id, volume):
@@ -801,7 +804,9 @@ class ZoneManager:
         zone = self.get_zone(zone_id)
         if not zone or not zone.owntone_api:
             return False, "Zone not running or not found"
+        volume = _normalize_volume(volume, zone.config.get("master_volume", 50))
         zone.owntone_api.set_volume(volume)
+        self._persist_master_volume(zone, volume)
         return True, None
 
     def set_speaker_volume(self, zone_id, speaker_id, volume):
@@ -809,8 +814,19 @@ class ZoneManager:
         zone = self.get_zone(zone_id)
         if not zone or not zone.owntone_api:
             return False, "Zone not running or not found"
+        volume = _normalize_volume(volume, 50)
         zone.owntone_api.set_output_volume(speaker_id, volume)
         return True, None
+
+    def _persist_master_volume(self, zone, volume):
+        try:
+            volume = _normalize_volume(volume, zone.config.get("master_volume", 50))
+        except Exception:
+            return
+        if zone.config.get("master_volume") == volume:
+            return
+        zone.config["master_volume"] = volume
+        self.config_store.save_zone(zone.zone_id, zone.config)
 
     # -------------------------------------------------------------------------
     # Latency management
@@ -935,6 +951,9 @@ class ZoneManager:
                     if volume != prev_volume and prev_volume != -1:
                         diag.info("[DIAG][%s] VOLUME CHANGED: %s -> %s (state=%s)",
                                   zone.display_name, prev_volume, volume, state)
+                        self._persist_master_volume(zone, volume)
+                    elif prev_volume == -1 and volume != -1 and zone.config.get("master_volume") is None:
+                        self._persist_master_volume(zone, volume)
                     if item_id != prev_item and prev_item != 0:
                         diag.info("[DIAG][%s] ITEM CHANGED: %s -> %s (state=%s)",
                                   zone.display_name, prev_item, item_id, state)

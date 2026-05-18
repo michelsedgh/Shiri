@@ -6,12 +6,12 @@ OwnTone reads one raw PCM FIFO per zone. This process feeds that FIFO with a
 single long-running GStreamer mixer pipeline:
 
   ALSA loopback capture -> volume -> \
-  silence clock bed ------------------> audiomixer -> OwnTone FIFO
-  RTP/L16 TTS receiver --------------> /
+  silence clock bed ------------------> liveadder -> OwnTone FIFO
+  PCM TTS FIFO ----------------------> /
 
-TTS audio reaches the mixer as RTP/L16 packets; Python never pushes audio
-buffers into GStreamer. A permanent receiver branch owns packet timing, jitter
-handling, depayloading, conversion, resampling, and mixing.
+TTS audio reaches the mixer as raw PCM written to a per-zone FIFO. The mixer
+process owns timing, conversion, resampling, level detection, ducking, and
+mixing. No packet transport is used in the TTS path.
 """
 
 from __future__ import annotations
@@ -36,8 +36,9 @@ OUTPUT_CAPS = (
 
 DEFAULT_TTS_RATE = 24000
 DEFAULT_TTS_CHANNELS = 1
-DEFAULT_RTP_PAYLOAD_TYPE = 96
-DEFAULT_RTP_JITTER_MS = 80
+MIXER_ELEMENT = "liveadder"
+MIXER_BUFFER_MS = 20
+MIXER_LATENCY_MS = 60
 
 DEFAULT_DUCK_GAIN = 0.28
 DUCK_ATTACK_SECONDS = 0.08
@@ -65,22 +66,18 @@ class GstZoneMixer:
         *,
         capture_dev: str,
         grp_dir: Path,
-        tts_rtp_port: int | None = None,
+        tts_pcm_pipe: Path | None = None,
         tts_rate: int = DEFAULT_TTS_RATE,
         tts_channels: int = DEFAULT_TTS_CHANNELS,
-        tts_payload_type: int = DEFAULT_RTP_PAYLOAD_TYPE,
         tts_duck_gain: float = DEFAULT_DUCK_GAIN,
-        rtp_jitter_ms: int = DEFAULT_RTP_JITTER_MS,
     ) -> None:
         self.capture_dev = capture_dev
         self.grp_dir = grp_dir
         self.pipe_path = grp_dir / "pipes" / "audio.pipe"
-        self.control_path = grp_dir / "state" / "tts_rtp_control.json"
-        self.tts_rtp_port = int(tts_rtp_port or 0)
+        self.tts_pipe_path = tts_pcm_pipe or (grp_dir / "state" / "tts.pipe")
+        self.control_path = grp_dir / "state" / "tts_pcm_control.json"
         self.tts_rate = int(tts_rate or DEFAULT_TTS_RATE)
         self.tts_channels = int(tts_channels or DEFAULT_TTS_CHANNELS)
-        self.tts_payload_type = int(tts_payload_type or DEFAULT_RTP_PAYLOAD_TYPE)
-        self.rtp_jitter_ms = int(rtp_jitter_ms or DEFAULT_RTP_JITTER_MS)
         self.mixer_pid_path = grp_dir / "state" / "mixer.pid"
         self.legacy_arecord_pid_path = grp_dir / "state" / "arecord.pid"
 
@@ -89,9 +86,8 @@ class GstZoneMixer:
         self.bus = None
         self.mixer = None
         self.pipe_fd: int | None = None
+        self.tts_pipe_fd: int | None = None
         self.music_volume = None
-        self.tts_jitter = None
-        self._tts_jitter_start_stats = None
 
         self._stop = False
         self._duck_level = 1.0
@@ -115,12 +111,12 @@ class GstZoneMixer:
         safe_unlink(self.legacy_arecord_pid_path)
 
         log.info(
-            "Starting GStreamer mixer capture_dev=%s tts_rtp_port=%d rate=%d channels=%d payload=%d grp_dir=%s",
+            "Starting GStreamer %s mixer capture_dev=%s tts_pcm_pipe=%s rate=%d channels=%d grp_dir=%s",
+            MIXER_ELEMENT,
             self.capture_dev,
-            self.tts_rtp_port,
+            self.tts_pipe_path,
             self.tts_rate,
             self.tts_channels,
-            self.tts_payload_type,
             self.grp_dir,
         )
         try:
@@ -128,7 +124,8 @@ class GstZoneMixer:
             while not self._stop:
                 try:
                     self._open_pipe_if_needed()
-                    if self.pipe_fd is None:
+                    self._open_tts_pipe_if_needed()
+                    if self.pipe_fd is None or self.tts_pipe_fd is None:
                         time.sleep(PIPE_RETRY_SECONDS)
                         continue
                     self._start_pipeline()
@@ -168,21 +165,40 @@ class GstZoneMixer:
                 return
             raise
 
+    def _open_tts_pipe_if_needed(self) -> None:
+        if self.tts_pipe_fd is not None:
+            return
+        try:
+            self.tts_pipe_fd = os.open(self.tts_pipe_path, os.O_RDWR | os.O_NONBLOCK)
+            flags = fcntl.fcntl(self.tts_pipe_fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.tts_pipe_fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+            log.info("Opened TTS PCM FIFO for mixer input: %s", self.tts_pipe_path)
+        except FileNotFoundError:
+            now = time.monotonic()
+            if now - self._last_pipe_wait_log >= PIPE_LOG_INTERVAL_SECONDS:
+                log.info("Waiting for TTS PCM FIFO: %s", self.tts_pipe_path)
+                self._last_pipe_wait_log = now
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                return
+            raise
+
     def _start_pipeline(self) -> None:
         if self.pipeline is not None:
             return
         Gst = self.Gst
         self.pipeline = Gst.Pipeline.new("shiri-zone-mixer")
 
-        mixer = make_element(Gst, "audiomixer", "mix")
+        mixer = make_element(Gst, MIXER_ELEMENT, "mix")
         set_property_if_present(mixer, "ignore-inactive-pads", True)
-        set_property_if_present(mixer, "output-buffer-duration", 10_000_000)
+        set_property_if_present(mixer, "latency", MIXER_LATENCY_MS)
+        set_property_if_present(mixer, "output-buffer-duration", MIXER_BUFFER_MS * 1_000_000)
         self.pipeline.add(mixer)
         self.mixer = mixer
 
         self._add_silence_branch(mixer)
         self._add_music_branch(mixer)
-        self._add_tts_rtp_branch(mixer)
+        self._add_tts_pcm_branch(mixer)
         self._add_output_branch(mixer)
 
         self.bus = self.pipeline.get_bus()
@@ -197,7 +213,7 @@ class GstZoneMixer:
         src.set_property("wave", 4)
         src.set_property("is-live", True)
         src.set_property("do-timestamp", True)
-        set_property_if_present(src, "samplesperbuffer", max(1, int(OUTPUT_RATE * 0.02)))
+        set_property_if_present(src, "samplesperbuffer", max(1, int(OUTPUT_RATE * MIXER_BUFFER_MS / 1000)))
         caps = make_element(Gst, "capsfilter", "silence_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
         queue = make_element(Gst, "queue", "silence_queue")
@@ -222,34 +238,21 @@ class GstZoneMixer:
         self._add_and_link([src, caps, queue, self.music_volume])
         self._link_to_mixer(self.music_volume, mixer)
 
-    def _add_tts_rtp_branch(self, mixer) -> None:
-        if self.tts_rtp_port <= 0:
-            log.info("TTS RTP receiver disabled")
-            return
-
+    def _add_tts_pcm_branch(self, mixer) -> None:
+        if self.tts_pipe_fd is None:
+            raise RuntimeError("TTS PCM FIFO is not open")
         Gst = self.Gst
-        src = make_element(Gst, "udpsrc", "tts_rtp_src")
-        src.set_property("address", "0.0.0.0")
-        src.set_property("port", self.tts_rtp_port)
-        src.set_property("caps", Gst.Caps.from_string(
-            "application/x-rtp,"
-            "media=(string)audio,"
-            "encoding-name=(string)L16,"
-            f"payload=(int){self.tts_payload_type},"
-            f"clock-rate=(int){self.tts_rate},"
-            f"channels=(int){self.tts_channels}"
+        src = make_element(Gst, "fdsrc", "tts_pcm_src")
+        src.set_property("fd", self.tts_pipe_fd)
+        src.set_property("blocksize", max(1, int(self.tts_rate * self.tts_channels * 2 * MIXER_BUFFER_MS / 1000)))
+        set_property_if_present(src, "do-timestamp", True)
+        input_caps = make_element(Gst, "capsfilter", "tts_input_caps")
+        input_caps.set_property("caps", Gst.Caps.from_string(
+            f"audio/x-unaligned-raw,format=S16LE,layout=interleaved,rate={self.tts_rate},"
+            f"channels={self.tts_channels}"
         ))
-        set_property_if_present(src, "buffer-size", 4 * 1024 * 1024)
-        set_property_if_present(src, "mtu", 4096)
-
-        jitter = make_element(Gst, "rtpjitterbuffer", "tts_jitter")
-        jitter.set_property("latency", self.rtp_jitter_ms)
-        set_property_if_present(jitter, "do-lost", True)
-        set_property_if_present(jitter, "post-drop-messages", True)
-        set_property_if_present(jitter, "drop-on-latency", False)
-        self.tts_jitter = jitter
-
-        depay = make_element(Gst, "rtpL16depay", "tts_depay")
+        parse = make_element(Gst, "rawaudioparse", "tts_raw_parse")
+        set_property_if_present(parse, "use-sink-caps", True)
         convert = make_element(Gst, "audioconvert", "tts_convert")
         resample = make_element(Gst, "audioresample", "tts_resample")
         caps = make_element(Gst, "capsfilter", "tts_output_caps")
@@ -262,15 +265,13 @@ class GstZoneMixer:
         set_property_if_present(queue, "max-size-bytes", 0)
         set_property_if_present(queue, "max-size-buffers", 0)
 
-        self._add_and_link([src, jitter, depay, convert, resample, caps, level, queue])
+        self._add_and_link([src, input_caps, parse, convert, resample, caps, level, queue])
         self._link_to_mixer(queue, mixer)
         log.info(
-            "TTS RTP receiver listening on 0.0.0.0:%d payload=%d L16/%d/%d jitter_ms=%d",
-            self.tts_rtp_port,
-            self.tts_payload_type,
+            "TTS PCM receiver reading %s S16LE/%d/%d",
+            self.tts_pipe_path,
             self.tts_rate,
             self.tts_channels,
-            self.rtp_jitter_ms,
         )
 
     def _add_output_branch(self, mixer) -> None:
@@ -281,9 +282,11 @@ class GstZoneMixer:
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
         sink = make_element(Gst, "fdsink", "pipe_sink")
         sink.set_property("fd", self.pipe_fd)
-        sink.set_property("sync", False)
+        sink.set_property("sync", True)
+        sink.set_property("blocksize", max(1, int(OUTPUT_RATE * OUTPUT_CHANNELS * 2 * MIXER_BUFFER_MS / 1000)))
         set_property_if_present(sink, "async", False)
         set_property_if_present(sink, "enable-last-sample", False)
+        set_property_if_present(sink, "max-lateness", -1)
 
         self._add_and_link([convert, resample, caps, sink])
         if not mixer.link(convert):
@@ -305,13 +308,12 @@ class GstZoneMixer:
         if sink_pad is None:
             sink_pad = mixer.get_request_pad("sink_%u")
         if sink_pad is None or src_pad is None or src_pad.link(sink_pad) != self.Gst.PadLinkReturn.OK:
-            raise RuntimeError(f"Could not link {src_element.get_name()} to audiomixer")
+            raise RuntimeError(f"Could not link {src_element.get_name()} to {MIXER_ELEMENT}")
 
     def _mark_tts_activity(self, now: float) -> None:
         if not self._tts_active:
             label = f" request_id={self._tts_request_id}" if self._tts_request_id else ""
-            log.info("TTS RTP audio active%s", label)
-            self._tts_jitter_start_stats = self._read_tts_jitter_stats()
+            log.info("TTS PCM audio active%s", label)
         self._tts_active = True
         self._tts_last_activity_at = now
         self._duck_target = self._tts_duck_gain
@@ -368,7 +370,7 @@ class GstZoneMixer:
         except FileNotFoundError:
             return
         except OSError as exc:
-            log.warning("Could not stat TTS RTP control file: %s", exc)
+            log.warning("Could not stat TTS PCM control file: %s", exc)
             return
         if stat.st_mtime_ns <= self._control_mtime_ns:
             return
@@ -377,11 +379,11 @@ class GstZoneMixer:
             with self.control_path.open("r") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
-            log.warning("Could not read TTS RTP control file: %s", exc)
+            log.warning("Could not read TTS PCM control file: %s", exc)
             return
         self._tts_duck_gain = clamp_float(data.get("duck_gain"), 0.0, 1.0, DEFAULT_DUCK_GAIN)
         self._tts_request_id = str(data.get("request_id") or "")
-        log.info("Loaded TTS RTP control request_id=%s duck_gain=%.2f",
+        log.info("Loaded TTS PCM control request_id=%s duck_gain=%.2f",
                  self._tts_request_id or "-", self._tts_duck_gain)
 
     def _update_tts_activity(self) -> None:
@@ -396,46 +398,7 @@ class GstZoneMixer:
         self._duck_hold_until = max(self._duck_hold_until, now + TTS_DUCK_TAIL_SECONDS)
         self._duck_hold_gain = min(self._duck_hold_gain, self._tts_duck_gain)
         label = f" request_id={self._tts_request_id}" if self._tts_request_id else ""
-        log.info("TTS RTP audio idle%s", label)
-        self._log_tts_jitter_stats()
-
-    def _log_tts_jitter_stats(self) -> None:
-        current = self._read_tts_jitter_stats()
-        if current is None:
-            return
-        start = self._tts_jitter_start_stats or {}
-        pushed = current.get("num-pushed", 0) - start.get("num-pushed", 0)
-        lost = current.get("num-lost", 0) - start.get("num-lost", 0)
-        late = current.get("num-late", 0) - start.get("num-late", 0)
-        duplicates = current.get("num-duplicates", 0) - start.get("num-duplicates", 0)
-        log.info(
-            "TTS RTP jitterbuffer stats request_id=%s pushed=%d lost=%d late=%d duplicates=%d avg_jitter_ns=%d",
-            self._tts_request_id or "-",
-            pushed,
-            lost,
-            late,
-            duplicates,
-            current.get("avg-jitter", 0),
-        )
-        self._tts_jitter_start_stats = None
-
-    def _read_tts_jitter_stats(self) -> dict | None:
-        if self.tts_jitter is None or self.tts_jitter.find_property("stats") is None:
-            return None
-        try:
-            stats = self.tts_jitter.get_property("stats")
-        except Exception:
-            log.debug("Could not read TTS RTP jitter stats", exc_info=True)
-            return None
-        if stats is None:
-            return None
-        values = {}
-        for key in ("num-pushed", "num-lost", "num-late", "num-duplicates", "avg-jitter"):
-            try:
-                values[key] = int(stats.get_value(key) or 0)
-            except Exception:
-                values[key] = 0
-        return values
+        log.info("TTS PCM audio idle%s", label)
 
     def _update_ducking(self) -> None:
         if self.music_volume is None:
@@ -467,14 +430,18 @@ class GstZoneMixer:
         self.bus = None
         self.mixer = None
         self.music_volume = None
-        self.tts_jitter = None
-        self._tts_jitter_start_stats = None
         if self.pipe_fd is not None:
             try:
                 os.close(self.pipe_fd)
             except OSError:
                 pass
             self.pipe_fd = None
+        if self.tts_pipe_fd is not None:
+            try:
+                os.close(self.tts_pipe_fd)
+            except OSError:
+                pass
+            self.tts_pipe_fd = None
 
 
 def require_gstreamer():
@@ -545,12 +512,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture-dev", required=True)
     parser.add_argument("--grp-dir", required=True, type=Path)
-    parser.add_argument("--tts-rtp-port", type=int, default=0)
+    parser.add_argument("--tts-pcm-pipe", type=Path)
     parser.add_argument("--tts-rate", type=int, default=DEFAULT_TTS_RATE)
     parser.add_argument("--tts-channels", type=int, default=DEFAULT_TTS_CHANNELS)
-    parser.add_argument("--tts-payload-type", type=int, default=DEFAULT_RTP_PAYLOAD_TYPE)
     parser.add_argument("--tts-duck-gain", type=float, default=DEFAULT_DUCK_GAIN)
-    parser.add_argument("--rtp-jitter-ms", type=int, default=DEFAULT_RTP_JITTER_MS)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -561,12 +526,10 @@ def main() -> None:
     GstZoneMixer(
         capture_dev=args.capture_dev,
         grp_dir=args.grp_dir,
-        tts_rtp_port=args.tts_rtp_port,
+        tts_pcm_pipe=args.tts_pcm_pipe,
         tts_rate=args.tts_rate,
         tts_channels=args.tts_channels,
-        tts_payload_type=args.tts_payload_type,
         tts_duck_gain=args.tts_duck_gain,
-        rtp_jitter_ms=args.rtp_jitter_ms,
     ).run()
 
 

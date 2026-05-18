@@ -26,7 +26,7 @@ Bridged networking is essential — your phone needs to see the AirPlay devices 
 sudo ./install.sh
 ```
 
-This installs `nqptp`, `shairport-sync` (with AirPlay 2 + pipe support), `owntone`, and the GStreamer packages used by the zone mixer, including RTP receive/depay/jitter-buffer elements.
+This installs `nqptp`, `shairport-sync` (with AirPlay 2 + pipe support), `owntone`, and the GStreamer packages used by the zone mixer.
 
 ### 2. Install Python dependencies
 
@@ -55,7 +55,7 @@ templates/           Config/script templates (native format, %%PLACEHOLDER%% syn
   shairport_sync.conf    Shairport-sync config template
   owntone.conf           OwnTone config template
   reset_audio_pipe.sh    Audio pipeline flush script template
-  mixer_supervisor.sh    GStreamer zone mixer/RTP TTS receiver supervisor template
+  mixer_supervisor.sh    GStreamer zone mixer/PCM TTS receiver supervisor template
 
 scripts/             Runtime shell scripts
   pause_bridge.sh        Shairport→OwnTone play/pause bridge

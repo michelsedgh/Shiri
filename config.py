@@ -23,11 +23,9 @@ _LOOPBACK_ALLOC_LOCK = threading.Lock()
 OWNTONE_PORT_BASE = 3869
 OWNTONE_WEBSOCKET_PORT_BASE = 3868
 OWNTONE_MPD_PORT_BASE = 6700
-MIXER_TTS_RTP_PORT_BASE = 10000
-MIXER_TTS_RTP_PAYLOAD_TYPE = 96
-MIXER_TTS_RTP_RATE = 24000
-MIXER_TTS_RTP_CHANNELS = 1
-MIXER_TTS_RTP_JITTER_MS = 80
+MIXER_TTS_PCM_RATE = 24000
+MIXER_TTS_PCM_CHANNELS = 1
+MIXER_TTS_PCM_PIPE_NAME = "tts.pipe"
 
 # Resolve paths relative to this file's location
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -154,20 +152,33 @@ def setup_directories(zone):
                 pass
     shutil.rmtree(os.path.join(grp_dir, "tts_streams"), ignore_errors=True)
 
-    # Create FIFOs (same as demo.sh)
+    # Create FIFOs (same as demo.sh). Keep the private TTS FIFO out of the
+    # OwnTone-scanned media directory so OwnTone cannot index/read it as a track.
     audio_pipe = os.path.join(grp_dir, "pipes", "audio.pipe")
+    tts_pipe = os.path.join(grp_dir, "state", MIXER_TTS_PCM_PIPE_NAME)
+    legacy_tts_pipe = os.path.join(grp_dir, "pipes", MIXER_TTS_PCM_PIPE_NAME)
+    legacy_tts_meta_pipe = os.path.join(grp_dir, "pipes", f"{MIXER_TTS_PCM_PIPE_NAME}.metadata")
     meta_pipe = os.path.join(grp_dir, "pipes", "audio.pipe.metadata")
     pause_meta_pipe = os.path.join(grp_dir, "pipes", "pause_bridge.metadata")
     shairport_meta_pipe = os.path.join(grp_dir, "pipes", "shairport.metadata")
     format_file = os.path.join(grp_dir, "pipes", "audio.pipe.format")
 
-    for pipe in [audio_pipe, meta_pipe, pause_meta_pipe, shairport_meta_pipe, format_file]:
+    for pipe in [
+        audio_pipe,
+        tts_pipe,
+        legacy_tts_pipe,
+        legacy_tts_meta_pipe,
+        meta_pipe,
+        pause_meta_pipe,
+        shairport_meta_pipe,
+        format_file,
+    ]:
         try:
             os.remove(pipe)
         except FileNotFoundError:
             pass
 
-    for pipe in [audio_pipe, meta_pipe, pause_meta_pipe, shairport_meta_pipe]:
+    for pipe in [audio_pipe, tts_pipe, meta_pipe, pause_meta_pipe, shairport_meta_pipe]:
         os.mkfifo(pipe, 0o666)
         os.chmod(pipe, 0o666)
 
@@ -350,18 +361,16 @@ def generate_mixer_supervisor(zone):
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
     capture_dev = f"hw:Loopback,1,{subdev}"
-    tts_rtp_port = MIXER_TTS_RTP_PORT_BASE + subdev
-    zone.tts_rtp_port = tts_rtp_port
+    tts_pcm_pipe = os.path.join(grp_dir, "state", MIXER_TTS_PCM_PIPE_NAME)
+    zone.tts_pcm_pipe = tts_pcm_pipe
 
     script_path = os.path.join(grp_dir, "config", "mixer_supervisor.sh")
     template = _read_template("mixer_supervisor.sh")
     content = (template
                .replace("%%CAPTURE_DEV%%", capture_dev)
-               .replace("%%TTS_RTP_PORT%%", str(tts_rtp_port))
-               .replace("%%TTS_RTP_PAYLOAD_TYPE%%", str(MIXER_TTS_RTP_PAYLOAD_TYPE))
-               .replace("%%TTS_RTP_RATE%%", str(MIXER_TTS_RTP_RATE))
-               .replace("%%TTS_RTP_CHANNELS%%", str(MIXER_TTS_RTP_CHANNELS))
-               .replace("%%TTS_RTP_JITTER_MS%%", str(MIXER_TTS_RTP_JITTER_MS))
+               .replace("%%TTS_PCM_PIPE%%", tts_pcm_pipe)
+               .replace("%%TTS_PCM_RATE%%", str(MIXER_TTS_PCM_RATE))
+               .replace("%%TTS_PCM_CHANNELS%%", str(MIXER_TTS_PCM_CHANNELS))
                .replace("%%GRP_DIR%%", grp_dir)
                .replace("%%MIXER_SCRIPT%%", MIXER_SCRIPT))
     _write_file(script_path, content, executable=True)

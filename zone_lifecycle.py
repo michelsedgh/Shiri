@@ -499,22 +499,31 @@ def _wait_and_verify(zone):
 
 
 def _apply_persisted_master_volume(zone):
-    """Apply the latest phone volume captured before OwnTone was ready."""
+    """Apply the latest saved playback volume before audio starts flowing."""
     if not zone.owntone_api:
         return
-    volume_path = os.path.join(zone.grp_dir, "state", "master_volume_last.txt")
-    try:
-        raw = _read_text(volume_path)
-        if raw == "":
-            return
-        volume = max(0, min(100, int(round(float(raw)))))
-    except (OSError, ValueError):
+    volume = _saved_master_volume(zone)
+    if volume is None:
         return
     try:
         zone.owntone_api.set_volume(volume)
         log.info("Applied persisted master volume %s for %s", volume, zone.zone_id)
     except Exception as exc:
         log.warning("Could not apply persisted master volume for %s: %s", zone.zone_id, exc)
+
+
+def _saved_master_volume(zone):
+    raw = zone.config.get("master_volume")
+    if raw is None:
+        raw = zone.config.get("volume")
+    if raw is None:
+        raw = _read_text(os.path.join(zone.grp_dir, "state", "master_volume_last.txt"))
+    if raw == "" or raw is None:
+        return None
+    try:
+        return max(0, min(100, int(round(float(raw)))))
+    except (TypeError, ValueError):
+        return None
 
 
 def _launch_host_processes(zone):
@@ -587,6 +596,7 @@ def _restore_speakers(zone):
             
             if matched_ids:
                 zone.owntone_api.set_outputs(matched_ids)
+                _apply_persisted_master_volume(zone)
                 log.info("Restored %d speakers for %s (attempt %d)", 
                          len(matched_ids), zone.zone_id, attempt + 1)
                 break
@@ -698,7 +708,7 @@ def cleanup_zone(zone):
     zone.owntone_ip = None
     zone.shairport_port = None
     zone.owntone_port = None
-    zone.tts_rtp_port = None
+    zone.tts_pcm_pipe = None
     zone.owntone_api = None
     zone.owntone_pid = None
 
