@@ -767,8 +767,8 @@ def _prepare_tts_rtp(default_room_id=None, zone_id=None):
         "appsrc_input": "Feed VibeVoice S16LE PCM bytes to appsrc; do not build RTP packets in Python.",
         "timing_owner": "GStreamer rawaudioparse/rtpL16pay/udpsink owns RTP timestamps and packet pacing.",
         "source_feeder": (
-            "Use a long-lived PCM feeder that queues 20ms audio frames, prebuffers briefly, and feeds silence "
-            "while idle or while the TTS generator is late so the RTP clock never falls behind and bursts."
+            "Buffer the generated PCM for an utterance before playback, then hand it to a long-lived PCM feeder "
+            "that queues 20ms audio frames and feeds silence only while idle."
         ),
         "lifecycle": (
             "Prefer one long-lived sender pipeline per Shiri RTP target. If creating a pipeline per utterance, "
