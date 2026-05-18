@@ -45,6 +45,7 @@ DUCK_RELEASE_SECONDS = 0.45
 DUCK_UPDATE_SECONDS = 0.02
 TTS_IDLE_RELEASE_SECONDS = 1.50
 TTS_DUCK_TAIL_SECONDS = 0.50
+TTS_ACTIVE_LEVEL_DB = -60.0
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
@@ -351,7 +352,8 @@ class GstZoneMixer:
                     and msg.src is not None
                     and msg.src.get_name() == "tts_level"
                 ):
-                    self._mark_tts_activity(time.monotonic())
+                    if level_message_is_audible(structure):
+                        self._mark_tts_activity(time.monotonic())
                     continue
                 if structure is not None and "drop" in structure.get_name().lower():
                     log.warning("GStreamer element message from %s: %s", msg.src.get_name(), structure.to_string())
@@ -497,6 +499,29 @@ def set_property_if_present(element, prop: str, value) -> bool:
         return False
     element.set_property(prop, value)
     return True
+
+
+def level_message_is_audible(structure) -> bool:
+    for field in ("peak", "rms"):
+        for value in structure_float_values(structure, field):
+            if value > TTS_ACTIVE_LEVEL_DB:
+                return True
+    return False
+
+
+def structure_float_values(structure, field: str) -> list[float]:
+    try:
+        value = structure.get_value(field)
+    except Exception:
+        return []
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    try:
+        return [float(item) for item in value]
+    except (TypeError, ValueError):
+        return []
 
 
 def clamp_float(value: object, minimum: float, maximum: float, default: float) -> float:
