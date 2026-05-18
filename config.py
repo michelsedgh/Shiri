@@ -27,7 +27,7 @@ MIXER_TTS_RTP_PORT_BASE = 10000
 MIXER_TTS_RTP_PAYLOAD_TYPE = 96
 MIXER_TTS_RTP_RATE = 24000
 MIXER_TTS_RTP_CHANNELS = 1
-MIXER_TTS_RTP_JITTER_MS = 240
+MIXER_TTS_RTP_JITTER_MS = 80
 
 # Resolve paths relative to this file's location
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))

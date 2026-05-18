@@ -770,7 +770,7 @@ def _prepare_tts_rtp(default_room_id=None, zone_id=None):
             "Prefer one long-lived sender pipeline per Shiri RTP target. If creating a pipeline per utterance, "
             "call appsrc end-of-stream and wait for the GStreamer bus EOS before setting the pipeline to NULL."
         ),
-        "tail_flush": "Pad the final PCM chunk to a 20 ms boundary, or EOS+wait, so rtpL16pay flushes the tail packet.",
+        "utterance_boundary": "For the long-lived sender, stop pushing bytes between utterances and keep the pipeline in PLAYING.",
         "do_not": [
             "Do not time.sleep between audio chunks.",
             "Do not set RTP timestamps or sequence numbers in Python.",
@@ -789,7 +789,7 @@ def _prepare_tts_rtp(default_room_id=None, zone_id=None):
         "audioconvert ! audioresample ! "
         f"audio/x-raw,format=S16BE,layout=interleaved,rate={result['sample_rate']},"
         f"channels={result['channels']} ! "
-        f"rtpL16pay pt={result['payload_type']} "
+        f"rtpL16pay pt={result['payload_type']} perfect-rtptime=true "
         f"ptime-multiple=20000000 ! udpsink host={host} "
         f"port={result['tts_rtp_port']} sync=true async=false"
     )
