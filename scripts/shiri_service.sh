@@ -73,8 +73,17 @@ stop_app() {
 kill_matching() {
   local pattern="$1"
   local label="$2"
-  local pids
+  local pids skip pid ppid
+  skip=" $$"
+  ppid="$(ps -o ppid= -p "$$" | tr -d ' ' || true)"
+  while [[ -n "$ppid" && "$ppid" != "0" ]]; do
+    skip="$skip $ppid"
+    ppid="$(ps -o ppid= -p "$ppid" | tr -d ' ' || true)"
+  done
   pids="$(pgrep -f "$pattern" || true)"
+  for pid in $skip; do
+    pids="$(printf '%s\n' "$pids" | awk -v skip_pid="$pid" '$1 != skip_pid')"
+  done
   [[ -z "$pids" ]] && return
   log "Cleaning $label: ${pids//$'\n'/ }"
   while read -r pid; do
@@ -88,7 +97,7 @@ kill_matching() {
 
 cleanup_netns() {
   local ns pids iface
-  ip netns list | awk '{print $1}' | grep -E '^shiri_(ot|rx_)' | while read -r ns; do
+  while read -r ns; do
     [[ -z "$ns" ]] && continue
     log "Cleaning namespace $ns"
     pids="$(ip netns pids "$ns" 2>/dev/null || true)"
@@ -102,9 +111,9 @@ cleanup_netns() {
       done <<< "$pids"
     fi
     ip netns delete "$ns" 2>/dev/null || true
-  done
+  done < <(ip netns list | awk '{print $1}' | grep -E '^shiri_(ot|rx_)' || true)
 
-  for iface in shiri_oth otlan0 rx0 rx1 rx2 rx3 rx4 rx5 rx6 rx7 rx8 rx9; do
+  for iface in otapi0 otlan0 rx0 rx1 rx2 rx3 rx4 rx5 rx6 rx7 rx8 rx9; do
     ip link delete "$iface" 2>/dev/null || true
   done
 }
@@ -118,8 +127,10 @@ cleanup_runtime() {
   kill_matching "avahi-daemon: running \\[shiri-" "Shiri Avahi daemons"
   kill_matching "airptpd -f -v" "Shiri airptpd"
   kill_matching "nqptp -v" "Shiri nqptp"
-  kill_matching "dhclient .* $BASE_DIR/(groups|owntone-sender)" "Shiri dhclient processes"
+  kill_matching "dhclient .*((/var/lib/dhcp/dhclient-shiri-)|($BASE_DIR/(groups|owntone-sender))|(/run/shiri/dhcp))" "Shiri dhclient processes"
   cleanup_netns
+  rm -rf "$BASE_DIR/timing" "$BASE_DIR/timing_sync"
+  rm -f "$BASE_DIR/network_leases.json"
 }
 
 start_service() {
@@ -141,7 +152,7 @@ start_service() {
 
   log "Starting Shiri"
   cd "$APP_DIR"
-  nohup env PATH="$PATH" "$PYTHON_BIN" "$APP_DIR/app.py" > "$LOGFILE" 2>&1 &
+  nohup env PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" "$APP_DIR/app.py" > "$LOGFILE" 2>&1 &
   pid="$!"
   echo "$pid" > "$PIDFILE"
   sleep 1

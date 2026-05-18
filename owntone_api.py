@@ -1,8 +1,8 @@
 """
 owntone_api.py — OwnTone REST API client for Shiri zones.
 
-All zone OwnTone instances now run on host-network ports. Calls go directly
-to the host listener for the zone.
+OwnTone runs in the shared Shiri sender namespace. The host reaches each zone's
+OwnTone HTTP API through the namespace veth address and unique per-zone port.
 """
 
 import json
@@ -13,7 +13,7 @@ log = logging.getLogger("shiri.owntone")
 
 
 def _run_curl(url, method="GET", data=None, timeout=5):
-    """Run curl against a host-network OwnTone API endpoint."""
+    """Run curl against a zone OwnTone API endpoint."""
     curl_cmd = ["curl", "-s", "--connect-timeout", str(timeout)]
 
     if method == "PUT":
@@ -48,7 +48,7 @@ def _run_curl(url, method="GET", data=None, timeout=5):
 
 
 class OwnToneAPI:
-    """OwnTone REST API client for a single host-network zone."""
+    """OwnTone REST API client for a single Shiri zone."""
 
     def __init__(self, owntone_ip, port=3689):
         self.owntone_ip = owntone_ip
@@ -68,7 +68,6 @@ class OwnToneAPI:
         return result is not None
 
     # -- Outputs / Speakers --
-    # Same logic as select_speaker_for_group() in dual_zone_demo.sh
 
     def get_outputs(self):
         """
@@ -82,8 +81,7 @@ class OwnToneAPI:
 
     def set_outputs(self, output_ids):
         """
-        Enable specific outputs (same as /api/outputs/set in dual_zone_demo.sh).
-        Disables all outputs not in the list.
+        Enable specific outputs and disable all outputs not in the list.
         """
         data = {"outputs": [str(oid) for oid in output_ids]}
         return self._api("/api/outputs/set", method="PUT", data=data)
@@ -128,7 +126,6 @@ class OwnToneAPI:
         return self._api("/api/player/play", method="PUT")
 
     # -- Library --
-    # Same as trigger_library_rescan() in dual_zone_demo.sh
 
     def rescan_library(self):
         """Trigger library rescan to discover pipes."""
@@ -142,10 +139,7 @@ class OwnToneAPI:
         return []
 
     def verify_pipe(self):
-        """
-        Check if OwnTone discovered the audio pipe.
-        Same logic as verify_pipe_discovery() in dual_zone_demo.sh.
-        """
+        """Check if OwnTone discovered the audio pipe."""
         tracks = self.get_tracks()
         pipe_tracks = [t for t in tracks if "audio.pipe" in t.get("path", "")]
         return len(pipe_tracks) > 0, pipe_tracks

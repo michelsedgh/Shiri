@@ -34,7 +34,6 @@ GRP_DIR="$1"
 AIRPLAY_VOL="$2"
 
 LOG="$GRP_DIR/logs/volume_bridge.log"
-OWNTONE_IP_FILE="$GRP_DIR/state/owntone_ip.txt"
 OWNTONE_BRIDGE_IP_FILE="$GRP_DIR/state/owntone_bridge_ip.txt"
 OWNTONE_PORT_FILE="$GRP_DIR/state/owntone_port.txt"
 LAST_VOL_FILE="$GRP_DIR/state/master_volume_last.txt"
@@ -81,15 +80,11 @@ echo "$OWNTONE_VOL" > "$LAST_VOL_FILE" 2>/dev/null || true
 
 # OwnTone may not be ready yet during AirPlay session startup. Keep the latest
 # requested phone volume and let Shiri apply it once the API is available.
-if [[ ! -f "$OWNTONE_BRIDGE_IP_FILE" && ! -f "$OWNTONE_IP_FILE" ]]; then
+if [[ ! -f "$OWNTONE_BRIDGE_IP_FILE" ]]; then
   log "PENDING: OwnTone IP file not ready; saved master volume $OWNTONE_VOL"
   exit 0
 fi
-if [[ -f "$OWNTONE_BRIDGE_IP_FILE" ]]; then
-  OWNTONE_IP=$(cat "$OWNTONE_BRIDGE_IP_FILE")
-else
-  OWNTONE_IP=$(cat "$OWNTONE_IP_FILE")
-fi
+OWNTONE_IP=$(cat "$OWNTONE_BRIDGE_IP_FILE")
 OWNTONE_PORT=3689
 if [[ -f "$OWNTONE_PORT_FILE" ]]; then
   OWNTONE_PORT=$(cat "$OWNTONE_PORT_FILE")

@@ -371,8 +371,8 @@ def _connection_path(websocket, path):
     request = getattr(websocket, "request", None)
     if request is not None and getattr(request, "path", None):
         return request.path
-    legacy_path = getattr(websocket, "path", None)
-    return legacy_path or "/"
+    websocket_path = getattr(websocket, "path", None)
+    return websocket_path or "/"
 
 
 def _parse_route(raw_path):

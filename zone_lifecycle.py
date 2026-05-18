@@ -8,10 +8,11 @@ API concerns while lifecycle implementation details stay isolated.
 """
 
 import logging
-import glob
+import hashlib
 import os
 import signal
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -29,6 +30,7 @@ from config import (
     OWNTONE_API_HOST_CIDR,
     OWNTONE_API_NS_CIDR,
     OWNTONE_SENDER_DIR,
+    SCRIPT_DIR,
     setup_directories,
     allocate_loopback_subdevice,
     release_loopback_subdevice,
@@ -181,12 +183,6 @@ def _kill_pid_if_command(pid, needle, label):
         _kill_pid(pid, label)
 
 
-def _terminate_pid_if_command(pid, needle, label, timeout=2):
-    cmdline = _pid_command(pid)
-    if cmdline and needle in cmdline:
-        _terminate_pid(pid, label, timeout=timeout)
-
-
 def _state_path(grp_dir, filename):
     return os.path.join(grp_dir, "state", filename)
 
@@ -325,13 +321,6 @@ def _start_avahi(run_dir, ns, hostname, iface, log_path):
     return proc
 
 
-def _dhclient_paths(grp_dir):
-    return (
-        _state_path(grp_dir, "dhclient.leases"),
-        _state_path(grp_dir, "dhclient.pid"),
-    )
-
-
 def _netns_list_output():
     result = _run(["ip", "netns", "list"])
     return result.stdout or ""
@@ -366,22 +355,60 @@ def _ensure_netns(ns):
     _netns_exec(ns, ["ip", "link", "set", "lo", "up"], check=False)
 
 
-def _dhclient_paths_for_run_dir(run_dir):
-    lease_file = _runtime_path(run_dir, "dhclient.leases")
-    pid_file = _runtime_path(run_dir, "dhclient.pid")
-    for path in [lease_file, pid_file]:
-        if not os.path.exists(path):
-            open(path, "a").close()
-        os.chmod(path, 0o666)
+def _stable_mac(role_key):
+    digest = hashlib.sha256(str(role_key).encode("utf-8")).digest()
+    octets = [0x02, digest[0], digest[1], digest[2], digest[3], digest[4]]
+    return ":".join(f"{octet:02x}" for octet in octets)
+
+
+def _dhclient_identity(role_key):
+    digest = hashlib.sha256(str(role_key).encode("utf-8")).hexdigest()[:16]
+    return f"shiri-{digest}"
+
+
+def _dhclient_paths(role_key):
+    identity = _dhclient_identity(role_key)
+    lease_file = f"/var/lib/dhcp/dhclient-{identity}.leases"
+    pid_file = f"/run/dhclient-{identity}.pid"
+    os.makedirs(os.path.dirname(lease_file), exist_ok=True)
+    if not os.path.exists(lease_file):
+        open(lease_file, "a").close()
+    os.chmod(lease_file, 0o666)
+    try:
+        os.remove(pid_file)
+    except FileNotFoundError:
+        pass
     return lease_file, pid_file
 
 
-def _acquire_dhcp(ns, iface, run_dir, timeout=12):
-    lease_file, pid_file = _dhclient_paths_for_run_dir(run_dir)
+def _namespace_dhclient_script():
+    source = os.path.join(SCRIPT_DIR, "dhclient_namespace.sh")
+    target = "/etc/dhcp/dhclient-script"
+    marker = "Minimal dhclient hook for Shiri network namespaces."
+    try:
+        existing = _read_text(target)
+    except OSError:
+        existing = ""
+    if existing and marker not in existing:
+        raise RuntimeError(
+            f"Refusing to overwrite non-Shiri dhclient script at {target}; "
+            "remove or move it before starting Shiri"
+        )
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if _read_text(source) != existing:
+        shutil.copyfile(source, target)
+    os.chmod(target, 0o755)
+    return target
+
+
+def _acquire_dhcp(ns, iface, role_key, timeout=20):
+    lease_file, pid_file = _dhclient_paths(role_key)
+    script_file = _namespace_dhclient_script()
     result = _netns_exec(ns, [
-        "dhclient", "-1", "-v",
+        "dhclient", "-4", "-1", "-v",
         "-lf", lease_file,
         "-pf", pid_file,
+        "-sf", script_file,
         iface,
     ], timeout=timeout)
     if result.returncode != 0:
@@ -390,33 +417,52 @@ def _acquire_dhcp(ns, iface, run_dir, timeout=12):
     ip = _iface_ipv4_in_netns(ns, iface)
     if not ip:
         raise RuntimeError(f"DHCP succeeded but {iface} in {ns} has no IPv4 address")
+    _preflight_lan_unicast(ns, iface, ip)
     return ip
 
 
-def _release_dhcp_for_run_dir(run_dir, ns, iface):
-    if not ns or not iface or not _netns_exists(ns):
+def _preflight_lan_unicast(ns, iface, ip):
+    result = _netns_exec(ns, ["ip", "-4", "route", "show", "default", "dev", iface])
+    gateway = ""
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if "via" in parts:
+            gateway = parts[parts.index("via") + 1]
+            break
+    if not gateway:
+        log.warning("No default gateway found for %s/%s after DHCP", ns, iface)
         return
-    lease_file, pid_file = _dhclient_paths_for_run_dir(run_dir)
-    if os.path.exists(lease_file) or os.path.exists(pid_file):
-        _netns_exec(ns, [
-            "dhclient", "-r",
-            "-lf", lease_file,
-            "-pf", pid_file,
-            iface,
-        ], timeout=3)
-    _terminate_namespace_processes(ns, ["dhclient"])
+
+    ping = _netns_exec(ns, ["ping", "-c", "2", "-W", "1", gateway], timeout=4)
+    if ping.returncode != 0:
+        neigh = _netns_exec(ns, ["ip", "neigh", "show", "dev", iface])
+        detail = (ping.stderr or ping.stdout or "").strip()
+        neighbors = (neigh.stdout or "").strip()
+        raise RuntimeError(
+            f"LAN preflight failed for {ns}/{iface} at {ip}: DHCP worked, "
+            f"but unicast to gateway {gateway} failed. This usually means the "
+            "VM bridge/router is not passing traffic for macvlan secondary MACs. "
+            f"ping={detail!r} neighbors={neighbors!r}"
+        )
+    log.info("LAN preflight OK for %s/%s at %s via %s", ns, iface, ip, gateway)
 
 
-def _create_macvlan_in_netns(parent_iface, ns, iface):
+def _create_macvlan_in_netns(parent_iface, ns, iface, role_key):
+    mac = _stable_mac(role_key)
     _delete_host_link(iface)
-    _run(["ip", "link", "add", iface, "link", parent_iface, "type", "macvlan", "mode", "bridge"],
-         check=True)
+    _run([
+        "ip", "link", "add", iface,
+        "link", parent_iface,
+        "address", mac,
+        "type", "macvlan", "mode", "bridge",
+    ], check=True)
     _run(["ip", "link", "set", iface, "netns", ns], check=True)
     _netns_exec(ns, ["ip", "link", "set", iface, "up"], check=True)
+    log.info("Created macvlan %s in %s on %s with stable MAC %s", iface, ns, parent_iface, mac)
 
 
 def _find_macvlan_in_netns(ns, preferred=None):
-    """Return the zone macvlan interface inside a namespace."""
+    """Return the Shiri macvlan interface inside a namespace."""
     if not _netns_exists(ns):
         return None
 
@@ -480,8 +526,17 @@ def _ensure_owntone_sender(parent_iface):
             ], check=True)
             _netns_exec(OWNTONE_SENDER_NS, ["ip", "link", "set", OWNTONE_API_NS_IFACE, "up"], check=True)
 
-            _create_macvlan_in_netns(parent_iface, OWNTONE_SENDER_NS, OWNTONE_SENDER_IFACE)
-            bridge_ip = _acquire_dhcp(OWNTONE_SENDER_NS, OWNTONE_SENDER_IFACE, run_dir)
+            _create_macvlan_in_netns(
+                parent_iface,
+                OWNTONE_SENDER_NS,
+                OWNTONE_SENDER_IFACE,
+                "sender:owntone",
+            )
+            bridge_ip = _acquire_dhcp(
+                OWNTONE_SENDER_NS,
+                OWNTONE_SENDER_IFACE,
+                "sender:owntone",
+            )
 
             _write_text(_sender_state("netns.txt"), OWNTONE_SENDER_NS)
             _write_text(_sender_state("iface.txt"), OWNTONE_SENDER_IFACE)
@@ -537,8 +592,6 @@ def _teardown_owntone_sender(force=False):
             _terminate_pid(_read_pid(_sender_state(filename)), label, timeout=2)
 
         if _netns_exists(OWNTONE_SENDER_NS):
-            iface = _read_text(_sender_state("iface.txt")) or OWNTONE_SENDER_IFACE
-            _release_dhcp_for_run_dir(run_dir, OWNTONE_SENDER_NS, iface)
             _terminate_namespace_processes(OWNTONE_SENDER_NS, [
                 "owntone",
                 "airptpd",
@@ -602,8 +655,8 @@ def _start_receiver_namespace(zone):
 
     _teardown_receiver_namespace(zone)
     _ensure_netns(ns)
-    _create_macvlan_in_netns(zone.interface, ns, iface)
-    receiver_ip = _acquire_dhcp(ns, iface, run_dir)
+    _create_macvlan_in_netns(zone.interface, ns, iface, f"receiver:{zone.zone_id}")
+    receiver_ip = _acquire_dhcp(ns, iface, f"receiver:{zone.zone_id}")
 
     _write_text(_state_path(zone.grp_dir, "receiver_netns.txt"), ns)
     _write_text(_state_path(zone.grp_dir, "receiver_iface.txt"), iface)
@@ -640,8 +693,6 @@ def _start_nqptp(zone, ns, run_dir):
 def _teardown_receiver_namespace(zone):
     ns = _read_text(_state_path(zone.grp_dir, "receiver_netns.txt")) or _receiver_ns(zone)
     iface = _read_text(_state_path(zone.grp_dir, "receiver_iface.txt")) or _receiver_iface(zone)
-    run_dir = _receiver_run_dir(zone)
-
     for filename, label in [
         ("shairport.pid", f"shairport-sync ({zone.zone_id})"),
         ("nqptp.pid", f"nqptp ({zone.zone_id})"),
@@ -651,9 +702,8 @@ def _teardown_receiver_namespace(zone):
         _terminate_pid(_read_pid(_state_path(zone.grp_dir, filename)), label, timeout=2)
 
     if _netns_exists(ns):
-        _release_dhcp_for_run_dir(run_dir, ns, iface)
         _terminate_namespace_processes(ns, [
-         _binary("shairport-sync"),
+            _binary("shairport-sync"),
             "nqptp",
             "avahi-daemon",
             "dhclient",
@@ -663,42 +713,6 @@ def _teardown_receiver_namespace(zone):
         _delete_netns(ns)
 
     _delete_host_link(iface)
-
-
-def _release_dhcp_lease(grp_dir, ns, iface):
-    """Release the DHCP lease using the same per-zone files used at acquire."""
-    if not ns or not iface or not _netns_exists(ns):
-        return
-
-    lease_file, pid_file = _dhclient_paths(grp_dir)
-    released = False
-    if os.path.exists(lease_file) or os.path.exists(pid_file):
-        result = _netns_exec(ns, [
-            "dhclient", "-r",
-            "-lf", lease_file,
-            "-pf", pid_file,
-            iface,
-        ], timeout=3)
-        released = result.returncode == 0
-        if result.returncode != 0:
-            log.warning("DHCP release using zone files failed for %s/%s: %s",
-                        ns, iface, (result.stderr or result.stdout or "").strip())
-
-    # Fallback for older runs that used dhclient defaults.
-    if not released:
-        legacy_result = _netns_exec(ns, [
-            "dhclient", "-r",
-            "-lf", "/run/dhclient.leases",
-            "-pf", "/run/dhclient.pid",
-            iface,
-        ], timeout=3)
-        released = legacy_result.returncode == 0
-
-    if not released:
-        _netns_exec(ns, ["dhclient", "-r", iface], timeout=3)
-
-    _terminate_namespace_processes(ns, ["dhclient"])
-    log.info("Released DHCP lease on %s in %s", iface, ns)
 
 
 def _namespace_pids(ns):
@@ -771,23 +785,14 @@ def _delete_host_link(iface):
 
 def _clear_runtime_state(grp_dir):
     for filename in [
-        "arecord.pid",
         "mixer.pid",
         "avahi.pid",
         "dbus.pid",
-        "dhclient.leases",
-        "dhclient.pid",
-        "dhclient_lease_path.txt",
-        "dhclient_pid_path.txt",
-        "macvlan_if.txt",
-        "macvlan_mac.txt",
         "nqptp.pid",
         "owntone_api_ip.txt",
         "owntone_bridge_ip.txt",
         "owntone.pid",
-        "owntone_ip.txt",
         "owntone_port.txt",
-        "owntone_netns.txt",
         "receiver_iface.txt",
         "receiver_netns.txt",
         "shairport.pid",
@@ -814,7 +819,7 @@ def _kill_orphaned_host_processes():
         pid_str, ppid_str, args = parts
         if ppid_str != "1" or "/var/lib/shiri/groups/" not in args:
             continue
-        if "mixer_supervisor.sh" in args or "arecord_supervisor.sh" in args or "audio_mixer.py" in args:
+        if "mixer_supervisor.sh" in args or "audio_mixer.py" in args:
             _kill_pid(int(pid_str), "orphaned audio mixer")
         elif "shairport-sync" in args:
             _kill_pid(int(pid_str), "orphaned shairport-sync")
@@ -822,71 +827,48 @@ def _kill_orphaned_host_processes():
             _kill_pid(int(pid_str), "orphaned owntone")
 
 
-def _zone_id_from_netns(ns):
-    if not ns.startswith("owntone_"):
-        return None
-    body = ns[len("owntone_"):]
-    if "_" not in body:
-        return body
-    return body.rsplit("_", 1)[0]
-
-
 def cleanup_stale_runtime():
     """Reap Shiri netns/macvlan leftovers from a previous daemon run."""
     log.info("Checking for stale Shiri runtime state...")
 
     stale_namespaces = set()
-    stale_group_dirs = set()
+    namespace_group_dirs = {}
     for line in _netns_list_output().splitlines():
         parts = line.split()
         if not parts:
             continue
         ns = parts[0]
-        if ns.startswith("owntone_") or ns.startswith("shiri_rx_") or ns == OWNTONE_SENDER_NS:
+        if ns.startswith("shiri_rx_") or ns == OWNTONE_SENDER_NS:
             stale_namespaces.add(ns)
 
-    for path in glob.glob(os.path.join(BASE_DIR, "groups", "*", "state", "owntone_netns.txt")):
-        ns = _read_text(path)
-        if ns.startswith("owntone_"):
-            stale_namespaces.add(ns)
-            stale_group_dirs.add(os.path.dirname(os.path.dirname(path)))
-    for path in glob.glob(os.path.join(BASE_DIR, "groups", "*", "state", "receiver_netns.txt")):
-        ns = _read_text(path)
-        if ns.startswith("shiri_rx_"):
-            stale_namespaces.add(ns)
-            stale_group_dirs.add(os.path.dirname(os.path.dirname(path)))
-    if _read_text(_sender_state("netns.txt")) == OWNTONE_SENDER_NS:
-        stale_namespaces.add(OWNTONE_SENDER_NS)
+    groups_root = os.path.join(BASE_DIR, "groups")
+    if os.path.isdir(groups_root):
+        for zone_id in os.listdir(groups_root):
+            grp_dir = os.path.join(groups_root, zone_id)
+            state_dir = os.path.join(grp_dir, "state")
+            ns = _read_text(os.path.join(state_dir, "receiver_netns.txt"))
+            if ns.startswith("shiri_rx_"):
+                stale_namespaces.add(ns)
+                namespace_group_dirs.setdefault(ns, set()).add(grp_dir)
 
     for ns in sorted(stale_namespaces):
-        zone_id = _zone_id_from_netns(ns)
-        grp_dir = os.path.join(BASE_DIR, "groups", zone_id) if zone_id else BASE_DIR
-        if zone_id:
-            stale_group_dirs.add(grp_dir)
+        if ns == OWNTONE_SENDER_NS:
+            continue
         if not _netns_exists(ns):
             continue
 
         log.info("Cleaning stale namespace %s", ns)
-        iface = _find_macvlan_in_netns(ns)
-        if zone_id:
-            _release_dhcp_lease(grp_dir, ns, iface)
-        elif iface:
-            _netns_exec(ns, ["dhclient", "-r", iface], timeout=3)
         _terminate_namespace_services(ns)
         time.sleep(1)
         _kill_namespace_pids(ns)
         _delete_netns(ns)
 
+    stale_group_dirs = {grp_dir for dirs in namespace_group_dirs.values() for grp_dir in dirs}
     for grp_dir in stale_group_dirs:
         _kill_pid_if_command(
             _read_pid(_state_path(grp_dir, "mixer.pid")),
             "audio_mixer.py",
             "stale mixer",
-        )
-        _kill_pid_if_command(
-            _read_pid(_state_path(grp_dir, "arecord.pid")),
-            "arecord",
-            "stale arecord",
         )
     _kill_orphaned_host_processes()
     for grp_dir in stale_group_dirs:
@@ -898,7 +880,7 @@ def cleanup_stale_runtime():
         if len(parts) < 2:
             continue
         iface = parts[1].split("@")[0]
-        if iface.startswith("ot_") or iface == OWNTONE_API_HOST_IFACE or iface.startswith("rx"):
+        if iface.startswith("ot_") or iface.startswith("otlan") or iface == OWNTONE_API_HOST_IFACE or iface.startswith("rx"):
             _delete_host_link(iface)
 
     _teardown_owntone_sender(force=True)
@@ -908,7 +890,6 @@ def cleanup_stale_runtime():
 
 # ---------------------------------------------------------------------------
 # Zone START sequence
-# Follows the exact same sequence as dual_zone_demo.sh's main()
 # ---------------------------------------------------------------------------
 
 def start_zone_thread(zone, cleanup_fn):
@@ -917,11 +898,10 @@ def start_zone_thread(zone, cleanup_fn):
     1. Allocate loopback subdevice
     2. Setup directories & FIFOs
     3. Generate configs
-    4. Start Shairport + OwnTone on host-network ports
+    4. Start Shairport and OwnTone in their AP2 timing namespaces
     5. Wait for OwnTone, rescan library, verify pipe
     6. Start mixer on host
-    7. Start pause bridge on host
-    8. Restore saved speaker selections
+    7. Restore saved speaker selections
     """
     from zone import Zone  # Import here to avoid circular import
 
@@ -943,7 +923,6 @@ def start_zone_thread(zone, cleanup_fn):
             return
 
         _launch_host_processes(zone)
-        _read_shairport_pid(zone)
         _restore_speakers(zone)
 
         zone._set_status(Zone.STATUS_RUNNING)
@@ -960,22 +939,17 @@ def _allocate_resources(zone):
     """Step 1-2: Allocate loopback subdevice and setup directories."""
     from zone import Zone
 
-    # Step 1: Allocate loopback subdevice
-    # Same file-locking as allocate_loopback_subdevice() in demo.sh
     subdev = allocate_loopback_subdevice()
     if subdev is None:
         zone._set_status(Zone.STATUS_ERROR, "No free loopback subdevices")
         raise RuntimeError("No free loopback subdevices")
     zone.allocated_subdevice = subdev
 
-    # Step 2: Setup directories & FIFOs
-    # Same as setup_directories() in demo.sh
     setup_directories(zone)
 
 
 def _generate_configs(zone):
     """Step 3: Generate all config files from templates."""
-    # Same templates as generate_shairport_config() and generate_owntone_config()
     generate_shairport_config(zone)
     generate_owntone_config(zone)
 
@@ -1028,35 +1002,19 @@ def _saved_master_volume(zone):
         return None
 
 
+def _real_speaker_outputs(outputs, excluded_names):
+    excluded = {str(name) for name in excluded_names if str(name)}
+    return [
+        output
+        for output in outputs
+        if str(output.get("type") or "") in {"AirPlay 2", "ALSA"}
+        and str(output.get("name") or "") not in excluded
+    ]
+
+
 def _launch_host_processes(zone):
-    """Step 6-7: Start mixer and pause bridge on host."""
-    # OwnTone receives the mixed PCM stream continuously. The old AirPlay 1
-    # pause bridge muted OwnTone to hide a large sender buffer, but with AP2/PTP
-    # it causes false mutes and volume jumps.
+    """Step 6: Start the host mixer that feeds OwnTone's pipe input."""
     _start_mixer(zone)
-
-
-def _read_shairport_pid(zone):
-    """Ensure shairport-sync runtime metadata is populated."""
-    if zone.shairport_pid:
-        zone.shairport_ip = zone.shairport_ip or _host_ipv4_for_interface(zone.interface)
-        time.sleep(2)
-        return
-
-    shairport_pid_file = os.path.join(zone.grp_dir, "state", "shairport.pid")
-    for _ in range(10):
-        if os.path.exists(shairport_pid_file):
-            with open(shairport_pid_file) as f:
-                pid_str = f.read().strip()
-            if pid_str:
-                zone.shairport_pid = int(pid_str)
-                log.info("shairport-sync for %s running on host (pid %d)",
-                         zone.zone_id, zone.shairport_pid)
-                break
-        time.sleep(1)
-
-    zone.shairport_ip = _host_ipv4_for_interface(zone.interface)
-    time.sleep(2)
 
 
 def _restore_speakers(zone):
@@ -1077,7 +1035,10 @@ def _restore_speakers(zone):
     for attempt in range(10):
         try:
             time.sleep(2)
-            available_outputs = zone.owntone_api.get_outputs()
+            available_outputs = _real_speaker_outputs(
+                zone.owntone_api.get_outputs(),
+                getattr(zone, "excluded_airplay_names", []),
+            )
             available_by_name = {o.get("name"): o.get("id") for o in available_outputs}
             available_by_id = {str(o.get("id")): o.get("id") for o in available_outputs}
             
@@ -1120,11 +1081,10 @@ def _restore_speakers(zone):
 
 # ---------------------------------------------------------------------------
 # Zone STOP sequence
-# Same cleanup sequence as cleanup() in dual_zone_demo.sh
 # ---------------------------------------------------------------------------
 
 def stop_zone_thread(zone, cleanup_fn):
-    """Full zone cleanup — same order as cleanup() in dual_zone_demo.sh."""
+    """Run full zone cleanup in the stop worker."""
     from zone import Zone
 
     try:
@@ -1142,8 +1102,7 @@ def cleanup_zone(zone):
     Zone cleanup sequence:
     1. Stop host-side audio helpers
     2. Stop Shairport and OwnTone
-    3. Reap stale legacy namespace state if present
-    4. Release loopback subdevice after all users are gone
+    3. Release loopback subdevice after all users are gone
     """
     log.info("Cleaning up zone %s...", zone.zone_id)
 
@@ -1151,7 +1110,6 @@ def cleanup_zone(zone):
     # 1. Stop host-side audio helpers.
     _kill_pid(zone.mixer_pid, f"mixer supervisor ({zone.zone_id})")
     _kill_pid(_read_pid(_state_path(grp_dir, "mixer.pid")), f"mixer ({zone.zone_id})")
-    _kill_pid_if_command(_read_pid(_state_path(grp_dir, "arecord.pid")), "arecord", f"legacy arecord ({zone.zone_id})")
 
     zone.mixer_pid = None
 
@@ -1172,19 +1130,7 @@ def cleanup_zone(zone):
     zone.owntone_pid = None
     _teardown_owntone_sender()
 
-    # 3. Legacy cleanup only: remove stale namespaces from older macvlan builds.
-    legacy_ns = _read_text(_state_path(grp_dir, "owntone_netns.txt"))
-    legacy_if = _read_text(_state_path(grp_dir, "macvlan_if.txt"))
-    if legacy_ns.startswith("owntone_") and _netns_exists(legacy_ns):
-        legacy_if = _find_macvlan_in_netns(legacy_ns, legacy_if) or legacy_if
-        _release_dhcp_lease(grp_dir, legacy_ns, legacy_if)
-        _terminate_namespace_services(legacy_ns)
-        time.sleep(1)
-        _kill_namespace_pids(legacy_ns)
-        _delete_netns(legacy_ns)
-        _delete_host_link(legacy_if)
-
-    # 4. Release loopback subdevice only after all processes that could touch it
+    # 3. Release loopback subdevice only after all processes that could touch it
     # have been stopped.
     release_loopback_subdevice(zone.allocated_subdevice)
     zone.allocated_subdevice = None
@@ -1201,22 +1147,6 @@ def cleanup_zone(zone):
     log.info("Zone %s cleanup complete", zone.zone_id)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers — host process launching
-# ---------------------------------------------------------------------------
-
-def _host_ipv4_for_interface(iface):
-    if not iface:
-        return "127.0.0.1"
-    result = _run(["ip", "-4", "-o", "addr", "show", "dev", iface])
-    for line in (result.stdout or "").splitlines():
-        parts = line.split()
-        if "inet" in parts:
-            cidr = parts[parts.index("inet") + 1]
-            return cidr.split("/", 1)[0]
-    return "127.0.0.1"
-
-
 def _start_zone_airplay2_netns(zone):
     """Start Shairport and OwnTone in their AirPlay 2 timing namespaces."""
     grp_dir = zone.grp_dir
@@ -1231,7 +1161,6 @@ def _start_zone_airplay2_netns(zone):
 
     _write_text(_state_path(grp_dir, "owntone_api_ip.txt"), api_ip)
     _write_text(_state_path(grp_dir, "owntone_bridge_ip.txt"), bridge_ip)
-    _write_text(_state_path(grp_dir, "owntone_ip.txt"), api_ip)
     _write_text(_state_path(grp_dir, "owntone_port.txt"), owntone_port)
     _write_text(_state_path(grp_dir, "owntone_netns.txt"), OWNTONE_SENDER_NS)
     _write_text(_state_path(grp_dir, "shairport_ip.txt"), shairport_ip)
@@ -1262,21 +1191,17 @@ def _start_zone_airplay2_netns(zone):
     log.info("Started OwnTone for %s in %s port %d api %s bridge %s (pid %d)",
              zone.zone_id, OWNTONE_SENDER_NS, owntone_port, api_ip, bridge_ip, owntone_proc.pid)
 
+
 def _wait_for_owntone(zone, timeout=60):
-    """
-    Same as wait_for_owntone() in dual_zone_demo.sh.
-    Waits for IP file, then polls API.
-    """
+    """Wait for the generated OwnTone API endpoint, then poll the API."""
     ip_file = os.path.join(zone.grp_dir, "state", "owntone_api_ip.txt")
-    legacy_ip_file = os.path.join(zone.grp_dir, "state", "owntone_ip.txt")
 
     log.info("Waiting for OwnTone %s to get IP...", zone.zone_id)
     for _ in range(timeout):
         if zone._stop_event.is_set():
             return False
-        readable_ip_file = ip_file if os.path.exists(ip_file) else legacy_ip_file
-        if os.path.exists(readable_ip_file):
-            with open(readable_ip_file, "r") as f:
+        if os.path.exists(ip_file):
+            with open(ip_file, "r") as f:
                 ip = f.read().strip()
             if ip:
                 zone.owntone_ip = ip

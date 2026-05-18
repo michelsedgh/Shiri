@@ -3,7 +3,7 @@
 app.py — Main Shiri daemon.
 
 Serves the web UI and REST API on port 8080.
-Orchestrates zone lifecycle using the existing shell scripts.
+Orchestrates the Shairport receiver, mixer, and OwnTone sender lifecycle.
 
 Run with: sudo python3 app.py
 """
@@ -385,7 +385,7 @@ def _log_severity(line):
 
 
 def _log_category(log_type, line):
-    if log_type in {"mixer", "arecord"} or "tts" in line.lower():
+    if log_type == "mixer" or "tts" in line.lower():
         return "tts"
     if log_type == "shairport":
         return "airplay"
@@ -522,8 +522,10 @@ def create_zone():
             latency_offset = float(latency_offset)
         except (ValueError, TypeError):
             return jsonify({"error": "latency_offset must be a number"}), 400
-        if latency_offset < -10 or latency_offset > 5:
-            return jsonify({"error": "latency_offset should be between -10 and +5 seconds"}), 400
+        if abs(latency_offset) > MAX_SHAIRPORT_LATENCY_OFFSET:
+            return jsonify({
+                "error": f"latency_offset should be between -{MAX_SHAIRPORT_LATENCY_OFFSET} and +{MAX_SHAIRPORT_LATENCY_OFFSET} seconds"
+            }), 400
 
     zone = zone_manager.create_zone(
         name=name,
@@ -734,7 +736,6 @@ def _tts_debug_payload(zone):
             "timing_owner": "Shiri mixer PCM FIFO",
         },
         "mixer_log_tail": _read_log_tail(zone.zone_id, "mixer", lines=80),
-        "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=20),
     }
 
 # ---------------------------------------------------------------------------
@@ -924,14 +925,12 @@ def startup():
     if not zone_manager.setup_alsa_loopback():
         log.error("Failed to setup ALSA loopback — some features may not work")
 
-    # Reap legacy namespaces/macvlans/leases left by older daemon versions.
+    # Reap Shiri-owned processes and old namespace leftovers from unclean exits.
     zone_manager.cleanup_stale_runtime()
-
-    # Start the shared host nqptp used by all Shairport instances.
-    zone_manager.start_host_nqptp()
 
     # Load saved zones from config
     zone_manager.load_saved_zones()
+    zone_manager.cleanup_orphaned_group_dirs()
 
     # Auto-start zones that have auto_start=True
     for zone in zone_manager.list_zones():

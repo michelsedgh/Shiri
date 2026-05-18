@@ -79,7 +79,6 @@ class GstZoneMixer:
         self.tts_rate = int(tts_rate or DEFAULT_TTS_RATE)
         self.tts_channels = int(tts_channels or DEFAULT_TTS_CHANNELS)
         self.mixer_pid_path = grp_dir / "state" / "mixer.pid"
-        self.legacy_arecord_pid_path = grp_dir / "state" / "arecord.pid"
 
         self.Gst = None
         self.pipeline = None
@@ -108,7 +107,6 @@ class GstZoneMixer:
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT, self._handle_stop)
         self.mixer_pid_path.write_text(str(os.getpid()))
-        safe_unlink(self.legacy_arecord_pid_path)
 
         log.info(
             "Starting GStreamer %s mixer capture_dev=%s tts_pcm_pipe=%s rate=%d channels=%d grp_dir=%s",
@@ -142,7 +140,6 @@ class GstZoneMixer:
             self._stop = True
             self._stop_pipeline()
             safe_unlink(self.mixer_pid_path)
-            safe_unlink(self.legacy_arecord_pid_path)
             log.info("GStreamer mixer stopped")
 
     def _handle_stop(self, _signum: int, _frame: object) -> None:

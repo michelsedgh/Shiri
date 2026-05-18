@@ -12,6 +12,7 @@ import logging
 import os
 import json
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -40,7 +41,6 @@ DEFAULT_REDUCTION_PCT = 72
 DEFAULT_DUCK_GAIN = 1.0 - (DEFAULT_REDUCTION_PCT / 100.0)
 MIN_REDUCTION_PCT = 0
 MAX_REDUCTION_PCT = 95
-LEGACY_ZONE_CONFIG_KEYS = {"network_mode", "netns_name", "macvlan_if"}
 
 
 def _slugify_room_id(value):
@@ -97,10 +97,7 @@ def _normalize_tts_policy(raw=None):
 
 
 def _sanitize_zone_config(raw):
-    config = sanitize_audio_settings(raw)
-    for key in LEGACY_ZONE_CONFIG_KEYS:
-        config.pop(key, None)
-    return config
+    return sanitize_audio_settings(raw)
 
 
 def _settings_to_mix(settings):
@@ -159,6 +156,7 @@ class Zone:
         self.owntone_port = None
         self.tts_pcm_pipe = None
         self.owntone_api = None  # OwnToneAPI instance
+        self.excluded_airplay_names = []
         self._grp_dir = None
         self._stop_event = threading.Event()
 
@@ -221,16 +219,14 @@ class ZoneManager:
         self.socketio = socketio
         self.zones = {}  # zone_id -> Zone
         self._lock = threading.Lock()
-        self._host_nqptp_pid = None
         self._alsa_ready = False
 
     # -------------------------------------------------------------------------
-    # System-level setup (same as dual_zone_demo.sh top-level functions)
+    # System-level setup
     # -------------------------------------------------------------------------
 
     def setup_alsa_loopback(self):
         """
-        Same as setup_alsa_loopback() in dual_zone_demo.sh.
         Load snd-aloop with 16 subdevices if not already loaded.
         """
         # Check if already loaded
@@ -262,31 +258,12 @@ class ZoneManager:
         self._alsa_ready = True
         return True
 
-    def start_host_nqptp(self):
-        """
-        Shiri runs nqptp inside each receiver namespace.
-        Stop any old host-shared nqptp left from the previous host-port runtime.
-        """
-        result = _run(["pgrep", "-x", "nqptp"])
-        if result.returncode == 0 and result.stdout.strip():
-            for pid_str in result.stdout.split():
-                try:
-                    _kill_pid(int(pid_str), "legacy host nqptp")
-                except ValueError:
-                    pass
-        self._host_nqptp_pid = None
-        log.info("Host nqptp disabled; receiver namespaces start their own nqptp")
-        return True
-
     def cleanup_stale_runtime(self):
         """Remove stale Shiri namespaces/processes left by an unclean daemon exit."""
         cleanup_stale_runtime()
 
     def get_network_interfaces(self):
-        """
-        Same as select_parent_interface() listing logic in dual_zone_demo.sh.
-        Returns list of interface names (excluding lo).
-        """
+        """Return list of interface names excluding loopback."""
         try:
             result = _run(["ip", "-o", "link", "show"])
         except OSError as exc:
@@ -369,6 +346,7 @@ class ZoneManager:
             self.zones.pop(zone_id, None)
         
         self.config_store.delete_zone(zone_id)
+        shutil.rmtree(zone.grp_dir, ignore_errors=True)
         if self.socketio:
             self.socketio.emit("zone_deleted", {"zone_id": zone_id})
         log.info("Deleted zone %s", zone_id)
@@ -437,6 +415,18 @@ class ZoneManager:
             with self._lock:
                 self.zones[zone_id] = zone
             log.info("Loaded saved zone: %s (%s)", zone_id, config.get("name"))
+
+    def cleanup_orphaned_group_dirs(self):
+        """Remove runtime directories for zones that are no longer configured."""
+        saved_zone_ids = set(self.config_store.list_zones().keys())
+        groups_root = os.path.join(BASE_DIR, "groups")
+        if not os.path.isdir(groups_root):
+            return
+        for name in os.listdir(groups_root):
+            path = os.path.join(groups_root, name)
+            if os.path.isdir(path) and name not in saved_zone_ids:
+                shutil.rmtree(path, ignore_errors=True)
+                log.info("Removed orphaned runtime group directory: %s", path)
 
     # -------------------------------------------------------------------------
     # Room routing
@@ -693,7 +683,8 @@ class ZoneManager:
         return [
             output
             for output in outputs
-            if not self._is_shiri_airplay_output(output)
+            if str(output.get("type") or "") in {"AirPlay 2", "ALSA"}
+            and not self._is_shiri_airplay_output(output)
         ]
 
     def _external_speaker_ids(self, outputs):
@@ -752,7 +743,7 @@ class ZoneManager:
 
         outputs = zone.owntone_api.get_outputs()
         if str(speaker_id) not in self._external_speaker_ids(outputs):
-            return False, "Refusing to select Shiri virtual AirPlay output"
+            return False, "Only real speaker outputs can be selected"
 
         if enabled:
             zone.owntone_api.enable_output(speaker_id)
@@ -874,6 +865,7 @@ class ZoneManager:
         if zone.status != Zone.STATUS_STOPPED:
             return False
 
+        zone.excluded_airplay_names = sorted(self._shiri_airplay_output_names())
         zone._set_status(Zone.STATUS_STARTING)
         t = threading.Thread(
             target=start_zone_thread, args=(zone, cleanup_zone),

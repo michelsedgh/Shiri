@@ -43,8 +43,8 @@ SCRIPT_DIR = os.path.join(_THIS_DIR, "scripts")
 MIXER_SCRIPT = os.path.join(_THIS_DIR, "audio_mixer.py")
 
 # Shairport Sync documents this as a small hardware-output compensation knob.
-# Large negative values make AP2 timing unstable, so old pipeline-delay offsets
-# are normalized away when configs are loaded or generated.
+# Large offsets make AP2 timing unstable, so stored pipeline-delay offsets are
+# normalized away when configs are loaded or generated.
 DEFAULT_LATENCY_OFFSET = 0.0
 MAX_SHAIRPORT_LATENCY_OFFSET = 0.25
 
@@ -171,18 +171,17 @@ def _write_file(path, content, executable=False):
 
 def setup_directories(zone):
     """
-    Same as setup_directories() in dual_zone_demo.sh.
-    Creates dirs, clears stale state, creates FIFOs.
+    Create per-zone runtime directories, clear generated files, and create FIFOs.
     """
     grp_dir = zone.grp_dir
     for subdir in ["pipes", "config", "logs", "state"]:
         os.makedirs(os.path.join(grp_dir, subdir), exist_ok=True)
         os.chmod(os.path.join(grp_dir, subdir), 0o755)
 
-    # Clear generated runtime files from the last daemon run. The config
-    # directory is generated too; clearing it prevents old hook scripts from
-    # lingering after pipeline changes.
-    for subdir in ["state", "logs", "config"]:
+    # Clear generated runtime files from the last daemon run. Config and pipe
+    # directories are generated too, so removed hooks or scan files cannot
+    # linger after pipeline changes.
+    for subdir in ["state", "logs", "config", "pipes"]:
         for f in os.listdir(os.path.join(grp_dir, subdir)):
             path = os.path.join(grp_dir, subdir, f)
             try:
@@ -194,24 +193,22 @@ def setup_directories(zone):
                 pass
     shutil.rmtree(os.path.join(grp_dir, "tts_streams"), ignore_errors=True)
 
-    # Create FIFOs (same as demo.sh). Keep the private TTS FIFO out of the
-    # OwnTone-scanned media directory so OwnTone cannot index/read it as a track.
+    # Keep the private TTS FIFO out of the OwnTone-scanned media directory so
+    # OwnTone cannot index/read it as a track.
     audio_pipe = os.path.join(grp_dir, "pipes", "audio.pipe")
     tts_pipe = os.path.join(grp_dir, "state", MIXER_TTS_PCM_PIPE_NAME)
-    legacy_tts_pipe = os.path.join(grp_dir, "pipes", MIXER_TTS_PCM_PIPE_NAME)
-    legacy_tts_meta_pipe = os.path.join(grp_dir, "pipes", f"{MIXER_TTS_PCM_PIPE_NAME}.metadata")
+    stale_tts_pipe = os.path.join(grp_dir, "pipes", MIXER_TTS_PCM_PIPE_NAME)
+    stale_tts_meta_pipe = os.path.join(grp_dir, "pipes", f"{MIXER_TTS_PCM_PIPE_NAME}.metadata")
     meta_pipe = os.path.join(grp_dir, "pipes", "audio.pipe.metadata")
     shairport_meta_pipe = os.path.join(grp_dir, "pipes", "shairport.metadata")
-    format_file = os.path.join(grp_dir, "pipes", "audio.pipe.format")
 
     for pipe in [
         audio_pipe,
         tts_pipe,
-        legacy_tts_pipe,
-        legacy_tts_meta_pipe,
+        stale_tts_pipe,
+        stale_tts_meta_pipe,
         meta_pipe,
         shairport_meta_pipe,
-        format_file,
     ]:
         try:
             os.remove(pipe)
@@ -222,10 +219,6 @@ def setup_directories(zone):
         os.mkfifo(pipe, 0o666)
         os.chmod(pipe, 0o666)
 
-    # Format file — OwnTone REQUIRES this to know the pipe's audio format
-    with open(format_file, "w") as f:
-        f.write("16,48000,2\n")
-
     log.info("Created directories and FIFOs for %s", zone.zone_id)
 
 
@@ -235,7 +228,6 @@ def setup_directories(zone):
 
 def allocate_loopback_subdevice():
     """
-    Same as allocate_loopback_subdevice() in dual_zone_demo.sh.
     File-based locking in /var/lib/shiri/loopback/.
     """
     with _LOOPBACK_ALLOC_LOCK:
@@ -245,7 +237,6 @@ def allocate_loopback_subdevice():
         for i in range(16):
             lock_file = os.path.join(LOOPBACK_LOCK_DIR, f"subdev_{i}.lock")
             try:
-                # Try exclusive create (same as set -o noclobber in bash)
                 fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.write(fd, my_pid.encode())
                 os.close(fd)
@@ -300,8 +291,7 @@ def release_loopback_subdevice(subdevice):
 
 def generate_shairport_config(zone):
     """
-    Same as generate_shairport_config() in dual_zone_demo.sh.
-    Generates the EXACT SAME config template with the same parameters.
+    Generate the per-zone Shairport Sync receiver config.
     """
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
@@ -351,10 +341,12 @@ def generate_shairport_config(zone):
             log.error("  -> Config verification FAILED: latency offset NOT in config!")
 
 
+def _owntone_quoted(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def generate_owntone_config(zone):
-    """
-    Same as generate_owntone_config() in dual_zone_demo.sh.
-    """
+    """Generate the per-zone OwnTone sender config."""
     grp_dir = zone.grp_dir
     conf_path = os.path.join(grp_dir, "config", "owntone.conf")
     subdev = zone.allocated_subdevice
@@ -368,13 +360,23 @@ def generate_owntone_config(zone):
     os.makedirs(os.path.join(grp_dir, "state", "cache"), exist_ok=True)
 
     template = _read_template("owntone.conf")
+    excluded_names = sorted({
+        str(name)
+        for name in getattr(zone, "excluded_airplay_names", [])
+        if str(name).strip()
+    })
+    airplay_blocks = "\n".join(
+        f'airplay "{_owntone_quoted(name)}" {{\n\texclude = true\n}}\n'
+        for name in excluded_names
+    )
     content = (template
                .replace("%%ZONE_ID%%", zone.zone_id)
                .replace("%%DISPLAY_NAME%%", zone.display_name)
                .replace("%%GRP_DIR%%", grp_dir)
                .replace("%%OWNTONE_PORT%%", str(owntone_port))
                .replace("%%OWNTONE_WEBSOCKET_PORT%%", str(websocket_port))
-               .replace("%%OWNTONE_MPD_PORT%%", str(mpd_port)))
+               .replace("%%OWNTONE_MPD_PORT%%", str(mpd_port))
+               .replace("%%AIRPLAY_DEVICE_BLOCKS%%", airplay_blocks))
     _write_file(conf_path, content)
 
     log.info("Generated OwnTone config for %s", zone.zone_id)
