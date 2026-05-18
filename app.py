@@ -688,17 +688,17 @@ def set_room_tts_policy(room_id):
 # TTS routing API
 # ---------------------------------------------------------------------------
 
-@app.route("/api/rooms/<room_id>/tts-websocket", methods=["POST"])
-def prepare_tts_websocket_for_room(room_id):
-    result, error = _prepare_tts_websocket(default_room_id=room_id)
+@app.route("/api/rooms/<room_id>/tts-rtp", methods=["POST"])
+def prepare_tts_rtp_for_room(room_id):
+    result, error = _prepare_tts_rtp(default_room_id=room_id)
     if error:
         return jsonify({"error": error}), 400
     return jsonify(result), 201
 
 
-@app.route("/api/zones/<zone_id>/tts-websocket", methods=["POST"])
-def prepare_tts_websocket_for_zone(zone_id):
-    result, error = _prepare_tts_websocket(zone_id=zone_id)
+@app.route("/api/zones/<zone_id>/tts-rtp", methods=["POST"])
+def prepare_tts_rtp_for_zone(zone_id):
+    result, error = _prepare_tts_rtp(zone_id=zone_id)
     if error:
         return jsonify({"error": error}), 400
     return jsonify(result), 201
@@ -720,7 +720,7 @@ def tts_debug_for_zone(zone_id):
     return jsonify(_tts_debug_payload(zone))
 
 
-def _prepare_tts_websocket(default_room_id=None, zone_id=None):
+def _prepare_tts_rtp(default_room_id=None, zone_id=None):
     data = request.args.to_dict()
     if request.is_json:
         data.update(request.get_json(silent=True) or {})
@@ -736,10 +736,10 @@ def _prepare_tts_websocket(default_room_id=None, zone_id=None):
         if error:
             return None, error
 
-    result, error = zone_manager.prepare_tts_websocket(
+    result, error = zone_manager.prepare_tts_rtp(
         resolved_zone.zone_id,
         request_id=data.get("request_id") or uuid.uuid4().hex,
-        audio_format=data.get("format") or data.get("audio_format") or "pcm_s16le",
+        audio_format=data.get("format") or data.get("audio_format") or "rtp_l16",
         sample_rate=data.get("sample_rate") or 24000,
         channels=data.get("channels") or 1,
         sample_width=data.get("sample_width") or 2,
@@ -749,19 +749,37 @@ def _prepare_tts_websocket(default_room_id=None, zone_id=None):
     )
     if error:
         return None, error
-    result["websocket_url"] = _mixer_websocket_url(result["tts_ws_port"])
-    result["transport"] = "websocket"
+    host = _request_hostname()
+    result["rtp"] = {
+        "host": host,
+        "port": result["tts_rtp_port"],
+        "payload_type": result["payload_type"],
+        "encoding_name": result["encoding_name"],
+        "clock_rate": result["sample_rate"],
+        "channels": result["channels"],
+        "sample_format": result["sample_format"],
+        "packet_time_ms": 20,
+    }
+    result["sender_contract"] = {
+        "pace": "realtime",
+        "rtp_timestamp_clock": result["sample_rate"],
+        "payload_bytes": "16-bit signed big-endian PCM",
+        "note": "If VibeVoice produces S16LE PCM, convert to S16BE before rtpL16pay.",
+    }
+    result["sender_gstreamer_sink"] = (
+        f"audio/x-raw,format=S16BE,layout=interleaved,rate={result['sample_rate']},"
+        f"channels={result['channels']} ! rtpL16pay pt={result['payload_type']} "
+        f"ptime-multiple=20000000 ! udpsink host={host} "
+        f"port={result['tts_rtp_port']} sync=true async=false"
+    )
     return result, None
 
 
-def _mixer_websocket_url(port):
+def _request_hostname():
     host = request.headers.get("X-Forwarded-Host") or request.host
     if host.startswith("["):
-        hostname = host.split("]", 1)[0] + "]"
-    else:
-        hostname = host.split(":", 1)[0]
-    scheme = "wss" if request.is_secure else "ws"
-    return f"{scheme}://{hostname}:{int(port)}/tts"
+        return host.split("]", 1)[0].strip("[]")
+    return host.split(":", 1)[0]
 
 
 def _tts_debug_payload(zone):
@@ -772,8 +790,8 @@ def _tts_debug_payload(zone):
         "room_id": zone.room_id,
         "room_name": zone.room_name,
         "grp_dir": zone.grp_dir,
-        "tts_transport": "websocket",
-        "tts_ws_port": zone.tts_ws_port,
+        "tts_transport": "rtp_l16",
+        "tts_rtp_port": zone.tts_rtp_port,
         "mixer_log_tail": _read_log_tail(zone.zone_id, "mixer", lines=80),
         "arecord_log_tail": _read_log_tail(zone.zone_id, "arecord", lines=20),
     }

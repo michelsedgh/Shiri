@@ -698,6 +698,7 @@ def cleanup_zone(zone):
     zone.owntone_ip = None
     zone.shairport_port = None
     zone.owntone_port = None
+    zone.tts_rtp_port = None
     zone.owntone_api = None
     zone.owntone_pid = None
 

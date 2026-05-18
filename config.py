@@ -23,7 +23,11 @@ _LOOPBACK_ALLOC_LOCK = threading.Lock()
 OWNTONE_PORT_BASE = 3869
 OWNTONE_WEBSOCKET_PORT_BASE = 3868
 OWNTONE_MPD_PORT_BASE = 6700
-MIXER_TTS_WS_PORT_BASE = 9090
+MIXER_TTS_RTP_PORT_BASE = 10000
+MIXER_TTS_RTP_PAYLOAD_TYPE = 96
+MIXER_TTS_RTP_RATE = 24000
+MIXER_TTS_RTP_CHANNELS = 1
+MIXER_TTS_RTP_JITTER_MS = 80
 
 # Resolve paths relative to this file's location
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -346,14 +350,18 @@ def generate_mixer_supervisor(zone):
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
     capture_dev = f"hw:Loopback,1,{subdev}"
-    tts_ws_port = MIXER_TTS_WS_PORT_BASE + subdev
-    zone.tts_ws_port = tts_ws_port
+    tts_rtp_port = MIXER_TTS_RTP_PORT_BASE + subdev
+    zone.tts_rtp_port = tts_rtp_port
 
     script_path = os.path.join(grp_dir, "config", "mixer_supervisor.sh")
     template = _read_template("mixer_supervisor.sh")
     content = (template
                .replace("%%CAPTURE_DEV%%", capture_dev)
-               .replace("%%TTS_WS_PORT%%", str(tts_ws_port))
+               .replace("%%TTS_RTP_PORT%%", str(tts_rtp_port))
+               .replace("%%TTS_RTP_PAYLOAD_TYPE%%", str(MIXER_TTS_RTP_PAYLOAD_TYPE))
+               .replace("%%TTS_RTP_RATE%%", str(MIXER_TTS_RTP_RATE))
+               .replace("%%TTS_RTP_CHANNELS%%", str(MIXER_TTS_RTP_CHANNELS))
+               .replace("%%TTS_RTP_JITTER_MS%%", str(MIXER_TTS_RTP_JITTER_MS))
                .replace("%%GRP_DIR%%", grp_dir)
                .replace("%%MIXER_SCRIPT%%", MIXER_SCRIPT))
     _write_file(script_path, content, executable=True)

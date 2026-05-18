@@ -20,6 +20,9 @@ import uuid
 from config import (
     BASE_DIR,
     DEFAULT_LATENCY_OFFSET,
+    MIXER_TTS_RTP_CHANNELS,
+    MIXER_TTS_RTP_PAYLOAD_TYPE,
+    MIXER_TTS_RTP_RATE,
 )
 from zone_lifecycle import (
     _run,
@@ -33,6 +36,7 @@ from zone_lifecycle import (
 log = logging.getLogger("shiri.zone")
 
 DEFAULT_REDUCTION_PCT = 72
+DEFAULT_DUCK_GAIN = 1.0 - (DEFAULT_REDUCTION_PCT / 100.0)
 MIN_REDUCTION_PCT = 0
 MAX_REDUCTION_PCT = 95
 LEGACY_ZONE_CONFIG_KEYS = {"network_mode", "netns_name", "macvlan_if"}
@@ -55,6 +59,14 @@ def _safe_request_id(value):
 def _clamp_int(value, minimum, maximum, default):
     try:
         parsed = int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, minimum), maximum)
+
+
+def _clamp_float(value, minimum, maximum, default):
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         return default
     return min(max(parsed, minimum), maximum)
@@ -142,7 +154,7 @@ class Zone:
         self.owntone_ip = None
         self.shairport_port = None
         self.owntone_port = None
-        self.tts_ws_port = None
+        self.tts_rtp_port = None
         self.owntone_api = None  # OwnToneAPI instance
         self._grp_dir = None
         self._stop_event = threading.Event()
@@ -186,7 +198,7 @@ class Zone:
             "owntone_ip": self.owntone_ip,
             "shairport_port": self.shairport_port,
             "owntone_port": self.owntone_port,
-            "tts_ws_port": self.tts_ws_port,
+            "tts_rtp_port": self.tts_rtp_port,
             "allocated_subdevice": self.allocated_subdevice,
             "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
             "room_id": self.room_id,
@@ -551,11 +563,11 @@ class ZoneManager:
     # TTS stream routing
     # -------------------------------------------------------------------------
 
-    def prepare_tts_websocket(self, zone_id, *, request_id=None, audio_format="pcm_s16le",
-                              sample_rate=24000, channels=1, sample_width=2,
-                              text=None,
-                              speaker_id=None, speaker_name=None):
-        """Resolve room policy and return the live mixer WebSocket target."""
+    def prepare_tts_rtp(self, zone_id, *, request_id=None, audio_format="rtp_l16",
+                        sample_rate=MIXER_TTS_RTP_RATE, channels=MIXER_TTS_RTP_CHANNELS,
+                        sample_width=2, text=None,
+                        speaker_id=None, speaker_name=None):
+        """Resolve room policy and return the permanent RTP/L16 mixer target."""
         zone = self.get_zone(zone_id)
         if not zone:
             return None, "Zone not found"
@@ -567,9 +579,9 @@ class ZoneManager:
             except Exception as e:
                 log.debug("Could not nudge OwnTone play state before TTS: %s", e)
 
-        fmt = (audio_format or "pcm_s16le").lower().strip(".")
-        if fmt not in {"pcm_s16le", "raw"}:
-            return None, "Only raw signed 16-bit PCM streams are currently supported"
+        fmt = (audio_format or "rtp_l16").lower().strip(".")
+        if fmt not in {"rtp_l16", "l16", "pcm_s16le", "raw"}:
+            return None, "Only RTP L16 streams are currently supported"
         try:
             parsed_rate = int(sample_rate)
             parsed_channels = int(channels)
@@ -580,8 +592,10 @@ class ZoneManager:
             return None, "sample_rate and channels must be positive"
         if parsed_width != 2:
             return None, "Only 16-bit PCM streams are currently supported"
-        if not zone.tts_ws_port:
-            return None, "Zone mixer WebSocket port is not ready"
+        if parsed_rate != MIXER_TTS_RTP_RATE or parsed_channels != MIXER_TTS_RTP_CHANNELS:
+            return None, f"RTP TTS must be {MIXER_TTS_RTP_RATE} Hz, {MIXER_TTS_RTP_CHANNELS} channel"
+        if not zone.tts_rtp_port:
+            return None, "Zone mixer RTP port is not ready"
 
         effective = self._effective_tts_mix(
             zone,
@@ -589,7 +603,8 @@ class ZoneManager:
             speaker_name=speaker_name,
         )
         safe_id = _safe_request_id(request_id)
-        log.info("Prepared TTS websocket %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
+        self._write_tts_rtp_control(zone, request_id=safe_id, duck_gain=effective["duck_gain"])
+        log.info("Prepared TTS RTP %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
         return {
             "ok": True,
             "request_id": safe_id,
@@ -598,15 +613,33 @@ class ZoneManager:
             "zone_id": zone.zone_id,
             "effective_policy": effective,
             "duck_gain": effective["duck_gain"],
-            "format": "pcm_s16le",
+            "transport": "rtp_l16",
+            "format": "rtp_l16",
+            "encoding_name": "L16",
+            "sample_format": "s16be",
             "sample_rate": parsed_rate,
             "channels": parsed_channels,
             "sample_width": parsed_width,
-            "tts_ws_port": zone.tts_ws_port,
+            "payload_type": MIXER_TTS_RTP_PAYLOAD_TYPE,
+            "tts_rtp_port": zone.tts_rtp_port,
             "text": text,
             "speaker_id": speaker_id,
             "speaker_name": speaker_name,
         }, None
+
+    def _write_tts_rtp_control(self, zone, *, request_id, duck_gain):
+        state_dir = os.path.join(zone.grp_dir, "state")
+        os.makedirs(state_dir, exist_ok=True)
+        path = os.path.join(state_dir, "tts_rtp_control.json")
+        tmp_path = f"{path}.tmp"
+        payload = {
+            "request_id": request_id,
+            "duck_gain": _clamp_float(duck_gain, 0.0, 1.0, DEFAULT_DUCK_GAIN),
+            "updated_at": time.time(),
+        }
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
 
     def _known_speakers(self, zone):
         outputs = []
