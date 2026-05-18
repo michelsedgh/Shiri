@@ -37,14 +37,14 @@ OUTPUT_CAPS = (
 DEFAULT_TTS_RATE = 24000
 DEFAULT_TTS_CHANNELS = 1
 DEFAULT_RTP_PAYLOAD_TYPE = 96
-DEFAULT_RTP_JITTER_MS = 80
+DEFAULT_RTP_JITTER_MS = 240
 
 DEFAULT_DUCK_GAIN = 0.28
 DUCK_ATTACK_SECONDS = 0.08
 DUCK_RELEASE_SECONDS = 0.45
 DUCK_UPDATE_SECONDS = 0.02
-TTS_IDLE_RELEASE_SECONDS = 0.55
-TTS_DUCK_TAIL_SECONDS = 0.20
+TTS_IDLE_RELEASE_SECONDS = 1.50
+TTS_DUCK_TAIL_SECONDS = 0.50
 
 PIPE_RETRY_SECONDS = 0.4
 PIPE_LOG_INTERVAL_SECONDS = 5.0
@@ -89,6 +89,8 @@ class GstZoneMixer:
         self.mixer = None
         self.pipe_fd: int | None = None
         self.music_volume = None
+        self.tts_jitter = None
+        self._tts_jitter_start_stats = None
 
         self._stop = False
         self._duck_level = 1.0
@@ -100,7 +102,7 @@ class GstZoneMixer:
 
         self._tts_duck_gain = clamp_float(tts_duck_gain, 0.0, 1.0, DEFAULT_DUCK_GAIN)
         self._tts_active = False
-        self._tts_last_packet_at = 0.0
+        self._tts_last_activity_at = 0.0
         self._tts_request_id = ""
         self._control_mtime_ns = 0
         self._last_control_poll = 0.0
@@ -241,27 +243,26 @@ class GstZoneMixer:
 
         jitter = make_element(Gst, "rtpjitterbuffer", "tts_jitter")
         jitter.set_property("latency", self.rtp_jitter_ms)
-        set_property_if_present(jitter, "faststart-min-packets", 2)
         set_property_if_present(jitter, "do-lost", True)
         set_property_if_present(jitter, "post-drop-messages", True)
         set_property_if_present(jitter, "drop-on-latency", False)
+        self.tts_jitter = jitter
 
         depay = make_element(Gst, "rtpL16depay", "tts_depay")
         convert = make_element(Gst, "audioconvert", "tts_convert")
         resample = make_element(Gst, "audioresample", "tts_resample")
         caps = make_element(Gst, "capsfilter", "tts_output_caps")
         caps.set_property("caps", Gst.Caps.from_string(OUTPUT_CAPS))
+        level = make_element(Gst, "level", "tts_level")
+        set_property_if_present(level, "interval", 100_000_000)
+        set_property_if_present(level, "post-messages", True)
         queue = make_element(Gst, "queue", "tts_queue")
         set_property_if_present(queue, "max-size-time", int(1.0 * 1_000_000_000))
         set_property_if_present(queue, "max-size-bytes", 0)
         set_property_if_present(queue, "max-size-buffers", 0)
 
-        self._add_and_link([src, jitter, depay, convert, resample, caps, queue])
+        self._add_and_link([src, jitter, depay, convert, resample, caps, level, queue])
         self._link_to_mixer(queue, mixer)
-
-        src_pad = src.get_static_pad("src")
-        if src_pad is not None:
-            src_pad.add_probe(Gst.PadProbeType.BUFFER, self._tts_rtp_packet_probe)
         log.info(
             "TTS RTP receiver listening on 0.0.0.0:%d payload=%d L16/%d/%d jitter_ms=%d",
             self.tts_rtp_port,
@@ -305,17 +306,14 @@ class GstZoneMixer:
         if sink_pad is None or src_pad is None or src_pad.link(sink_pad) != self.Gst.PadLinkReturn.OK:
             raise RuntimeError(f"Could not link {src_element.get_name()} to audiomixer")
 
-    def _tts_rtp_packet_probe(self, _pad, info):
-        if not (info.type & self.Gst.PadProbeType.BUFFER):
-            return self.Gst.PadProbeReturn.OK
-        now = time.monotonic()
+    def _mark_tts_activity(self, now: float) -> None:
         if not self._tts_active:
             label = f" request_id={self._tts_request_id}" if self._tts_request_id else ""
             log.info("TTS RTP audio active%s", label)
+            self._tts_jitter_start_stats = self._read_tts_jitter_stats()
         self._tts_active = True
-        self._tts_last_packet_at = now
+        self._tts_last_activity_at = now
         self._duck_target = self._tts_duck_gain
-        return self.Gst.PadProbeReturn.OK
 
     def _run_pipeline_loop(self) -> None:
         while not self._stop and self.pipeline is not None:
@@ -347,6 +345,14 @@ class GstZoneMixer:
                 raise PipelineRestart("unexpected pipeline EOS")
             elif msg.type == Gst.MessageType.ELEMENT:
                 structure = msg.get_structure()
+                if (
+                    structure is not None
+                    and structure.has_name("level")
+                    and msg.src is not None
+                    and msg.src.get_name() == "tts_level"
+                ):
+                    self._mark_tts_activity(time.monotonic())
+                    continue
                 if structure is not None and "drop" in structure.get_name().lower():
                     log.warning("GStreamer element message from %s: %s", msg.src.get_name(), structure.to_string())
 
@@ -380,7 +386,7 @@ class GstZoneMixer:
         if not self._tts_active:
             return
         now = time.monotonic()
-        if now - self._tts_last_packet_at < TTS_IDLE_RELEASE_SECONDS:
+        if now - self._tts_last_activity_at < TTS_IDLE_RELEASE_SECONDS:
             self._duck_target = self._tts_duck_gain
             return
         self._tts_active = False
@@ -389,6 +395,45 @@ class GstZoneMixer:
         self._duck_hold_gain = min(self._duck_hold_gain, self._tts_duck_gain)
         label = f" request_id={self._tts_request_id}" if self._tts_request_id else ""
         log.info("TTS RTP audio idle%s", label)
+        self._log_tts_jitter_stats()
+
+    def _log_tts_jitter_stats(self) -> None:
+        current = self._read_tts_jitter_stats()
+        if current is None:
+            return
+        start = self._tts_jitter_start_stats or {}
+        pushed = current.get("num-pushed", 0) - start.get("num-pushed", 0)
+        lost = current.get("num-lost", 0) - start.get("num-lost", 0)
+        late = current.get("num-late", 0) - start.get("num-late", 0)
+        duplicates = current.get("num-duplicates", 0) - start.get("num-duplicates", 0)
+        log.info(
+            "TTS RTP jitterbuffer stats request_id=%s pushed=%d lost=%d late=%d duplicates=%d avg_jitter_ns=%d",
+            self._tts_request_id or "-",
+            pushed,
+            lost,
+            late,
+            duplicates,
+            current.get("avg-jitter", 0),
+        )
+        self._tts_jitter_start_stats = None
+
+    def _read_tts_jitter_stats(self) -> dict | None:
+        if self.tts_jitter is None or self.tts_jitter.find_property("stats") is None:
+            return None
+        try:
+            stats = self.tts_jitter.get_property("stats")
+        except Exception:
+            log.debug("Could not read TTS RTP jitter stats", exc_info=True)
+            return None
+        if stats is None:
+            return None
+        values = {}
+        for key in ("num-pushed", "num-lost", "num-late", "num-duplicates", "avg-jitter"):
+            try:
+                values[key] = int(stats.get_value(key) or 0)
+            except Exception:
+                values[key] = 0
+        return values
 
     def _update_ducking(self) -> None:
         if self.music_volume is None:
@@ -420,6 +465,8 @@ class GstZoneMixer:
         self.bus = None
         self.mixer = None
         self.music_volume = None
+        self.tts_jitter = None
+        self._tts_jitter_start_stats = None
         if self.pipe_fd is not None:
             try:
                 os.close(self.pipe_fd)

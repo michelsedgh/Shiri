@@ -763,15 +763,37 @@ def _prepare_tts_rtp(default_room_id=None, zone_id=None):
     result["sender_contract"] = {
         "pace": "realtime",
         "rtp_timestamp_clock": result["sample_rate"],
-        "payload_bytes": "16-bit signed big-endian PCM",
-        "note": "If VibeVoice produces S16LE PCM, convert to S16BE before rtpL16pay.",
+        "payload_bytes": "RTP/L16 16-bit signed big-endian PCM",
+        "appsrc_input": "Feed VibeVoice S16LE PCM bytes to appsrc; do not build RTP packets in Python.",
+        "timing_owner": "GStreamer rawaudioparse/rtpL16pay/udpsink owns timestamps and pacing.",
+        "lifecycle": (
+            "Prefer one long-lived sender pipeline per Shiri RTP target. If creating a pipeline per utterance, "
+            "call appsrc end-of-stream and wait for the GStreamer bus EOS before setting the pipeline to NULL."
+        ),
+        "tail_flush": "Pad the final PCM chunk to a 20 ms boundary, or EOS+wait, so rtpL16pay flushes the tail packet.",
+        "do_not": [
+            "Do not time.sleep between audio chunks.",
+            "Do not set RTP timestamps or sequence numbers in Python.",
+            "Do not set buffer PTS/duration when using the appsrc+rawaudioparse pipeline.",
+            "Do not send UDP packets directly from Python.",
+            "Do not stop the sender pipeline immediately after the last push-buffer.",
+        ],
     }
-    result["sender_gstreamer_sink"] = (
+    result["sender_gstreamer_appsrc_pipeline"] = (
+        "appsrc name=tts_src is-live=true format=bytes do-timestamp=false "
+        "block=true max-bytes=9600 "
+        f"caps=audio/x-unaligned-raw,format=S16LE,layout=interleaved,rate={result['sample_rate']},"
+        f"channels={result['channels']} ! "
+        "rawaudioparse use-sink-caps=true ! "
+        "queue max-size-time=200000000 max-size-bytes=0 max-size-buffers=0 ! "
+        "audioconvert ! audioresample ! "
         f"audio/x-raw,format=S16BE,layout=interleaved,rate={result['sample_rate']},"
-        f"channels={result['channels']} ! rtpL16pay pt={result['payload_type']} "
+        f"channels={result['channels']} ! "
+        f"rtpL16pay pt={result['payload_type']} "
         f"ptime-multiple=20000000 ! udpsink host={host} "
         f"port={result['tts_rtp_port']} sync=true async=false"
     )
+    result["sender_gstreamer_sink"] = result["sender_gstreamer_appsrc_pipeline"]
     return result, None
 
 
