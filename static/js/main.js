@@ -1,17 +1,17 @@
 import { Api, ApiError } from './api.js';
 import {
-    activityText,
+    bindingText,
     clampNumber,
     debounce,
     escapeHtml,
-    roomLabel,
     selectedSpeakerText,
     statusClass,
+    zoneLabel,
 } from './utils.js';
 
 const state = {
     dashboard: null,
-    activeRoomId: null,
+    activeZoneId: null,
     activeDrawerTab: 'setup',
     diagnosticsOpen: false,
     logsPaused: false,
@@ -59,16 +59,12 @@ function bindElements() {
         'log-feed',
         'settings-panel',
         'settings-form',
-        'lionos-base-url',
         'settings-zones',
         'refresh-settings',
         'create-zone-form',
         'new-zone-name',
-        'new-zone-room-id',
-        'new-zone-room-name',
         'new-zone-interface',
         'new-zone-autostart',
-        'new-zone-default',
         'close-settings',
         'toast',
     ]) {
@@ -82,7 +78,7 @@ function bindEvents() {
     els.closeSettings.addEventListener('click', closeSettings);
     els.openDiagnostics.addEventListener('click', openDiagnostics);
     els.closeDiagnostics.addEventListener('click', closeDiagnostics);
-    els.closeRoomDrawer.addEventListener('click', closeRoomDrawer);
+    els.closeRoomDrawer.addEventListener('click', closeZoneDrawer);
     els.refreshLogs.addEventListener('click', loadLogs);
     els.toggleLiveLogs.addEventListener('click', toggleLiveLogs);
     els.diagRoomFilter.addEventListener('change', loadLogs);
@@ -91,9 +87,9 @@ function bindEvents() {
     els.settingsForm.addEventListener('submit', onSaveSettings);
     els.createZoneForm.addEventListener('submit', onCreateZone);
 
-    els.roomList.addEventListener('click', onRoomListClick);
+    els.roomList.addEventListener('click', onZoneListClick);
     els.roomList.addEventListener('input', onRangeInput);
-    els.roomList.addEventListener('change', onRoomListChange);
+    els.roomList.addEventListener('change', onZoneListChange);
 
     els.roomDrawer.addEventListener('click', onDrawerClick);
     els.roomDrawer.addEventListener('input', onRangeInput);
@@ -101,7 +97,7 @@ function bindEvents() {
 
     document.addEventListener('keydown', (event) => {
         if (event.key !== 'Escape') return;
-        closeRoomDrawer();
+        closeZoneDrawer();
         closeDiagnostics();
         closeSettings();
     });
@@ -112,7 +108,7 @@ async function loadDashboard({ quiet = false } = {}) {
         const dashboard = await Api.dashboard();
         state.dashboard = dashboard;
         renderDashboard();
-        if (state.activeRoomId) renderRoomDrawer();
+        if (state.activeZoneId) renderZoneDrawer();
         if (state.diagnosticsOpen) renderDiagnosticsFilters();
         if (!quiet) showToast('Dashboard refreshed');
     } catch (error) {
@@ -123,30 +119,21 @@ async function loadDashboard({ quiet = false } = {}) {
 function renderDashboard() {
     const dashboard = state.dashboard;
     if (!dashboard) return;
-    const rooms = dashboard.rooms || [];
+    const zones = dashboard.zones || [];
     const running = dashboard.system?.running_zones ?? 0;
     const total = dashboard.system?.zone_count ?? 0;
 
-    els.roomCount.textContent = `${rooms.length} room${rooms.length === 1 ? '' : 's'}`;
+    els.roomCount.textContent = `${zones.length} zone${zones.length === 1 ? '' : 's'}`;
     els.consoleSubtitle.textContent = `Updated ${new Date((dashboard.generated_at || Date.now() / 1000) * 1000).toLocaleTimeString()}`;
     renderStatusPill(els.shiriStatus, total ? `${running}/${total} zones running` : 'No zones', total ? (running ? 'good' : 'warn') : 'bad');
-    renderLionosStatus();
-    renderDefaultRoom();
+    renderStatusPill(els.lionosStatus, 'LionOS owns rooms', 'good');
+    renderDefaultBinding();
+    els.globalError.hidden = true;
+    els.globalError.textContent = '';
 
-    const lionError = dashboard.lionos?.online ? '' : dashboard.lionos?.error;
-    if (lionError && !dashboard.lionos?.cached) {
-        els.globalError.hidden = false;
-        els.globalError.textContent = `LionOS offline: ${lionError}`;
-    } else {
-        els.globalError.hidden = true;
-        els.globalError.textContent = '';
-    }
-
-    if (!rooms.length) {
-        els.roomList.innerHTML = '<div class="empty-state">No rooms or zones found</div>';
-        return;
-    }
-    els.roomList.innerHTML = rooms.map(renderRoomRow).join('');
+    els.roomList.innerHTML = zones.length
+        ? zones.map(renderZoneRow).join('')
+        : '<div class="empty-state">No zones found</div>';
 }
 
 function renderStatusPill(el, text, tone) {
@@ -154,72 +141,55 @@ function renderStatusPill(el, text, tone) {
     el.innerHTML = `<span class="dot"></span><span>${escapeHtml(text)}</span>`;
 }
 
-function renderLionosStatus() {
-    const lionos = state.dashboard?.lionos || {};
-    if (lionos.online) {
-        renderStatusPill(els.lionosStatus, 'LionOS online', 'good');
-    } else if (lionos.cached) {
-        renderStatusPill(els.lionosStatus, 'LionOS cached', 'warn');
-    } else {
-        renderStatusPill(els.lionosStatus, 'LionOS offline', 'bad');
-    }
+function renderDefaultBinding() {
+    const roomId = state.dashboard?.default_lionos_room_id;
+    const zone = (state.dashboard?.zones || []).find((item) => item.lionos_room_id === roomId);
+    els.defaultRoom.className = `status-pill ${zone ? 'good' : 'muted'}`;
+    els.defaultRoom.innerHTML = `<span>${zone ? `Default: ${escapeHtml(zoneLabel(zone))}` : 'No default binding'}</span>`;
 }
 
-function renderDefaultRoom() {
-    const roomId = state.dashboard?.default_room_id;
-    const room = findRoom(roomId);
-    els.defaultRoom.className = `status-pill ${room ? 'good' : 'muted'}`;
-    els.defaultRoom.innerHTML = `<span>${room ? `Default: ${escapeHtml(roomLabel(room))}` : 'Default room unset'}</span>`;
-}
-
-function renderRoomRow(room) {
-    const binding = room.binding;
-    const policy = policyFor(room);
-    const roomSettings = policy.room || {};
-    const volume = binding?.volume ?? binding?.player?.volume ?? 50;
-    const isRunning = binding?.status === 'running';
-    const disabled = !binding || !isRunning;
-    const status = binding?.status || 'unbound';
-    const speakers = binding?.speakers || [];
+function renderZoneRow(zone) {
+    const policy = policyForZone(zone);
+    const zoneSettings = policy.zone || {};
+    const volume = zone.volume ?? zone.player?.volume ?? 50;
+    const isRunning = zone.status === 'running';
     const volumeValue = clampNumber(volume, 0, 100, 50);
-    const reduction = clampNumber(roomSettings.reduction_pct, 0, 95, 72);
-    const activity = activityText(room);
-    const duckDisabled = !binding || !isRunning;
+    const reduction = clampNumber(zoneSettings.reduction_pct, 0, 95, 72);
 
     return `
-        <article class="room-row ${binding ? '' : 'unbound'}" data-room-id="${escapeHtml(room.room_id)}">
+        <article class="room-row ${zone.lionos_room_id ? '' : 'unbound'}" data-zone-id="${escapeHtml(zone.zone_id)}">
             <div class="room-cell">
                 <div class="room-title">
-                    <h3 title="${escapeHtml(roomLabel(room))}">${escapeHtml(roomLabel(room))}</h3>
-                    <span class="source-badge">${room.source === 'lionos' ? 'LionOS' : 'Shiri'}</span>
+                    <h3 title="${escapeHtml(zoneLabel(zone))}">${escapeHtml(zoneLabel(zone))}</h3>
+                    <span class="source-badge">Zone</span>
                 </div>
                 <div class="room-meta">
-                    <span>${escapeHtml(activity)}</span>
-                    <span>${escapeHtml(room.room_id)}</span>
+                    <span>${escapeHtml(zone.zone_id)}</span>
+                    <span>${escapeHtml(bindingText(zone))}</span>
                 </div>
             </div>
             <div class="room-cell">
                 <div class="route-line">
-                    <span class="state-badge ${statusClass(status)}">${escapeHtml(status)}</span>
-                    <strong title="${escapeHtml(binding?.zone_name || 'Unbound')}">${escapeHtml(binding?.zone_name || 'Unbound')}</strong>
+                    <span class="state-badge ${statusClass(zone.status)}">${escapeHtml(zone.status)}</span>
+                    <strong title="${escapeHtml(zone.interface || 'No interface')}">${escapeHtml(zone.interface || 'No interface')}</strong>
                 </div>
-                <div class="speaker-summary" title="${escapeHtml(selectedSpeakerText(speakers))}">
-                    ${escapeHtml(selectedSpeakerText(speakers))}
+                <div class="speaker-summary" title="${escapeHtml(selectedSpeakerText(zone.speakers || []))}">
+                    ${escapeHtml(selectedSpeakerText(zone.speakers || []))}
                 </div>
             </div>
             <div class="room-cell">
                 <div class="control-bank">
                     <div class="control">
-                        <label for="vol-${escapeHtml(room.room_id)}">Playback</label>
+                        <label for="vol-${escapeHtml(zone.zone_id)}">Playback</label>
                         <div class="range-line">
-                            <input id="vol-${escapeHtml(room.room_id)}" type="range" min="0" max="100" value="${volumeValue}" data-action="room-volume" data-room-id="${escapeHtml(room.room_id)}" ${disabled ? 'disabled' : ''}>
+                            <input id="vol-${escapeHtml(zone.zone_id)}" type="range" min="0" max="100" value="${volumeValue}" data-action="zone-volume" data-zone-id="${escapeHtml(zone.zone_id)}" ${isRunning ? '' : 'disabled'}>
                             <output>${volumeValue}%</output>
                         </div>
                     </div>
                     <div class="control">
-                        <label for="duck-${escapeHtml(room.room_id)}">Reduce playing audio</label>
+                        <label for="duck-${escapeHtml(zone.zone_id)}">Reduce playing audio</label>
                         <div class="range-line">
-                            <input id="duck-${escapeHtml(room.room_id)}" type="range" min="0" max="95" value="${reduction}" data-action="room-reduction" data-room-id="${escapeHtml(room.room_id)}" ${duckDisabled ? 'disabled' : ''}>
+                            <input id="duck-${escapeHtml(zone.zone_id)}" type="range" min="0" max="95" value="${reduction}" data-action="zone-reduction" data-zone-id="${escapeHtml(zone.zone_id)}" ${isRunning ? '' : 'disabled'}>
                             <output>${reduction}%</output>
                         </div>
                     </div>
@@ -227,9 +197,9 @@ function renderRoomRow(room) {
             </div>
             <div class="room-cell">
                 <div class="row-actions">
-                    <button class="small-btn" data-action="zone-start" data-zone-id="${escapeHtml(binding?.zone_id || '')}" ${binding?.can_start ? '' : 'disabled'}>Start</button>
-                    <button class="small-btn" data-action="zone-stop" data-zone-id="${escapeHtml(binding?.zone_id || '')}" ${binding?.can_stop ? '' : 'disabled'}>Stop</button>
-                    <button class="small-btn" data-action="room-details" data-room-id="${escapeHtml(room.room_id)}">Details</button>
+                    <button class="small-btn" data-action="zone-start" data-zone-id="${escapeHtml(zone.zone_id)}" ${zone.can_start ? '' : 'disabled'}>Start</button>
+                    <button class="small-btn" data-action="zone-stop" data-zone-id="${escapeHtml(zone.zone_id)}" ${zone.can_stop ? '' : 'disabled'}>Stop</button>
+                    <button class="small-btn" data-action="zone-details" data-zone-id="${escapeHtml(zone.zone_id)}">Details</button>
                 </div>
             </div>
         </article>
@@ -245,7 +215,7 @@ function onRangeInput(event) {
     if (output) output.textContent = `${event.target.value}%`;
 }
 
-async function onRoomListClick(event) {
+async function onZoneListClick(event) {
     const button = event.target.closest('button[data-action]');
     if (!button) return;
     const action = button.dataset.action;
@@ -258,24 +228,24 @@ async function onRoomListClick(event) {
             await Api.stopZone(button.dataset.zoneId);
             showToast('Zone stopping');
             refreshSoon();
-        } else if (action === 'room-details') {
-            openRoomDrawer(button.dataset.roomId);
+        } else if (action === 'zone-details') {
+            openZoneDrawer(button.dataset.zoneId);
         }
     } catch (error) {
         showError(error);
     }
 }
 
-async function onRoomListChange(event) {
+async function onZoneListChange(event) {
     const input = event.target;
     if (input.type !== 'range') return;
-    const roomId = input.dataset.roomId;
+    const zoneId = input.dataset.zoneId;
     try {
-        if (input.dataset.action === 'room-volume') {
-            await Api.setRoomVolume(roomId, clampNumber(input.value, 0, 100, 50));
+        if (input.dataset.action === 'zone-volume') {
+            await Api.setZoneVolume(zoneId, clampNumber(input.value, 0, 100, 50));
             showToast('Playback volume saved');
-        } else if (input.dataset.action === 'room-reduction') {
-            await saveRoomPolicyFromRow(roomId);
+        } else if (input.dataset.action === 'zone-reduction') {
+            await saveZonePolicyFromRow(zoneId);
         }
         refreshSoon();
     } catch (error) {
@@ -283,40 +253,39 @@ async function onRoomListChange(event) {
     }
 }
 
-async function saveRoomPolicyFromRow(roomId) {
-    const room = findRoom(roomId);
-    const row = els.roomList.querySelector(`[data-room-id="${cssEscape(roomId)}"]`);
-    if (!room || !row) return;
+async function saveZonePolicyFromRow(zoneId) {
+    const row = els.roomList.querySelector(`[data-zone-id="${cssEscape(zoneId)}"]`);
+    if (!row) return;
     const policy = {
-        mode: 'room',
-        room: {
-            reduction_pct: clampNumber(row.querySelector('[data-action="room-reduction"]')?.value, 0, 95, 72),
+        mode: 'zone',
+        zone: {
+            reduction_pct: clampNumber(row.querySelector('[data-action="zone-reduction"]')?.value, 0, 95, 72),
         },
         speakers: {},
     };
-    await Api.setRoomTtsPolicy(roomId, policy);
+    await Api.setZoneTtsPolicy(zoneId, policy);
     showToast('Ducking saved');
 }
 
-function openRoomDrawer(roomId) {
-    state.activeRoomId = roomId;
+function openZoneDrawer(zoneId) {
+    state.activeZoneId = zoneId;
     state.activeDrawerTab = 'setup';
     els.roomDrawer.classList.add('open');
     els.roomDrawer.setAttribute('aria-hidden', 'false');
-    renderRoomDrawer();
+    renderZoneDrawer();
 }
 
-function closeRoomDrawer() {
-    state.activeRoomId = null;
+function closeZoneDrawer() {
+    state.activeZoneId = null;
     els.roomDrawer.classList.remove('open');
     els.roomDrawer.setAttribute('aria-hidden', 'true');
 }
 
-function renderRoomDrawer() {
-    const room = findRoom(state.activeRoomId);
-    if (!room) return;
-    els.drawerRoomName.textContent = roomLabel(room);
-    els.drawerRoomSource.textContent = room.source === 'lionos' ? 'LionOS room' : 'Shiri room';
+function renderZoneDrawer() {
+    const zone = findZone(state.activeZoneId);
+    if (!zone) return;
+    els.drawerRoomName.textContent = zoneLabel(zone);
+    els.drawerRoomSource.textContent = 'Shiri zone';
 
     els.roomDrawer.querySelectorAll('.tab').forEach((tab) => {
         tab.classList.toggle('active', tab.dataset.drawerTab === state.activeDrawerTab);
@@ -324,58 +293,53 @@ function renderRoomDrawer() {
     for (const key of ['setup', 'speakers', 'advanced']) {
         els[`drawer${capitalize(key)}`].hidden = key !== state.activeDrawerTab;
     }
-    renderDrawerSetup(room);
-    renderDrawerSpeakers(room);
-    renderDrawerAdvanced(room);
+    renderDrawerSetup(zone);
+    renderDrawerSpeakers(zone);
+    renderDrawerAdvanced(zone);
 }
 
-function renderDrawerSetup(room) {
-    const zones = state.dashboard?.zones || [];
-    const selectedZoneId = room.binding?.zone_id || '';
+function renderDrawerSetup(zone) {
     els.drawerSetup.innerHTML = `
         <div class="drawer-stack">
             <div class="drawer-block">
                 <label class="field">
-                    <span>Bound Shiri zone</span>
-                    <select id="binding-zone">
-                        <option value="">Select zone</option>
-                        ${zones.map((zone) => `<option value="${escapeHtml(zone.zone_id)}" ${zone.zone_id === selectedZoneId ? 'selected' : ''}>${escapeHtml(zone.zone_name)} (${escapeHtml(zone.status)})</option>`).join('')}
-                    </select>
+                    <span>LionOS room id</span>
+                    <input id="binding-lionos-room-id" type="text" value="${escapeHtml(zone.lionos_room_id || '')}" autocomplete="off">
+                </label>
+                <label class="field">
+                    <span>LionOS room name</span>
+                    <input id="binding-lionos-room-name" type="text" value="${escapeHtml(zone.lionos_room_name || '')}" autocomplete="off">
                 </label>
                 <label class="check-field">
-                    <input id="binding-default-room" type="checkbox" ${room.binding?.default_room ? 'checked' : ''}>
-                    <span>Default TTS room</span>
+                    <input id="binding-default-zone" type="checkbox" ${zone.default_lionos_room ? 'checked' : ''}>
+                    <span>Default LionOS audio binding</span>
                 </label>
-                <button class="primary-btn" data-action="save-binding" data-room-id="${escapeHtml(room.room_id)}">Save Binding</button>
+                <div class="row-actions">
+                    <button class="primary-btn" data-action="save-binding" data-zone-id="${escapeHtml(zone.zone_id)}">Save Binding</button>
+                    <button class="small-btn" data-action="clear-binding" data-zone-id="${escapeHtml(zone.zone_id)}" ${zone.lionos_room_id ? '' : 'disabled'}>Clear</button>
+                </div>
             </div>
             <div class="drawer-block">
                 <div class="advanced-row">
                     <div>
-                        <strong>Room id</strong>
-                        <span>${escapeHtml(room.room_id)}</span>
+                        <strong>Zone id</strong>
+                        <span>${escapeHtml(zone.zone_id)}</span>
                     </div>
-                    <span class="mode-badge">${escapeHtml(room.source)}</span>
+                    <span class="mode-badge">${escapeHtml(zone.status)}</span>
                 </div>
                 <div class="advanced-row">
                     <div>
-                        <strong>Presence</strong>
-                        <span>${escapeHtml(activityText(room))}</span>
+                        <strong>Binding owner</strong>
+                        <span>LionOS writes this metadata; Shiri plays by zone id.</span>
                     </div>
-                    <span>${room.activities?.length || 0}</span>
                 </div>
             </div>
         </div>
     `;
 }
 
-function renderDrawerSpeakers(room) {
-    const binding = room.binding;
-    if (!binding) {
-        els.drawerSpeakers.innerHTML = '<div class="empty-state">Bind a Shiri zone first</div>';
-        return;
-    }
-    const speakers = binding.speakers || [];
-    const policy = policyFor(room);
+function renderDrawerSpeakers(zone) {
+    const speakers = zone.speakers || [];
     if (!speakers.length) {
         els.drawerSpeakers.innerHTML = '<div class="empty-state">No speakers discovered or saved</div>';
         return;
@@ -389,15 +353,15 @@ function renderDrawerSpeakers(room) {
                     <span class="mode-badge">${enabledSpeakers.length}/${speakers.length} enabled</span>
                 </div>
                 <div class="speaker-route-list">
-                    ${speakers.map((speaker) => renderSpeakerRouteRow(binding, speaker)).join('')}
+                    ${speakers.map((speaker) => renderSpeakerRouteRow(zone, speaker)).join('')}
                 </div>
-                <button class="primary-btn" data-action="save-speakers" data-zone-id="${escapeHtml(binding.zone_id)}">Save Routing</button>
+                <button class="primary-btn" data-action="save-speakers" data-zone-id="${escapeHtml(zone.zone_id)}">Save Routing</button>
             </div>
         </div>
     `;
 }
 
-function renderSpeakerRouteRow(binding, speaker) {
+function renderSpeakerRouteRow(zone, speaker) {
     const speakerId = String(speaker.id ?? '');
     const volume = clampNumber(speaker.volume, 0, 100, 100);
     const selected = !!speaker.selected;
@@ -414,7 +378,7 @@ function renderSpeakerRouteRow(binding, speaker) {
             ${selected ? `
                 <div class="speaker-controls">
                     <span>Volume</span>
-                    <input type="range" min="0" max="100" value="${volume}" data-action="speaker-volume" data-zone-id="${escapeHtml(binding.zone_id)}" data-speaker-id="${escapeHtml(speakerId)}" ${binding.status === 'running' ? '' : 'disabled'}>
+                    <input type="range" min="0" max="100" value="${volume}" data-action="speaker-volume" data-zone-id="${escapeHtml(zone.zone_id)}" data-speaker-id="${escapeHtml(speakerId)}" ${zone.status === 'running' ? '' : 'disabled'}>
                     <output>${volume}%</output>
                 </div>
             ` : ''}
@@ -422,50 +386,45 @@ function renderSpeakerRouteRow(binding, speaker) {
     `;
 }
 
-function renderDrawerAdvanced(room) {
-    const binding = room.binding;
-    if (!binding) {
-        els.drawerAdvanced.innerHTML = '<div class="empty-state">Bind a Shiri zone first</div>';
-        return;
-    }
+function renderDrawerAdvanced(zone) {
     const interfaces = state.dashboard?.system?.interfaces || [];
-    const ownTonePort = binding.owntone_port ?? 3689;
+    const ownTonePort = zone.owntone_port ?? 3689;
     els.drawerAdvanced.innerHTML = `
         <div class="drawer-stack">
             <label class="field">
                 <span>AirPlay name</span>
-                <input id="advanced-zone-name" type="text" value="${escapeHtml(binding.zone_name)}">
+                <input id="advanced-zone-name" type="text" value="${escapeHtml(zone.zone_name)}">
             </label>
             <label class="field">
                 <span>Network interface</span>
                 <select id="advanced-zone-interface">
-                    ${interfaces.map((iface) => `<option value="${escapeHtml(iface)}" ${iface === binding.interface ? 'selected' : ''}>${escapeHtml(iface)}</option>`).join('')}
+                    ${interfaces.map((iface) => `<option value="${escapeHtml(iface)}" ${iface === zone.interface ? 'selected' : ''}>${escapeHtml(iface)}</option>`).join('')}
                 </select>
             </label>
             <label class="field">
                 <span>Latency offset</span>
-                <input id="advanced-zone-latency" type="number" min="-0.25" max="0.25" step="0.01" value="${escapeHtml(binding.latency_offset ?? 0)}">
+                <input id="advanced-zone-latency" type="number" min="-0.25" max="0.25" step="0.01" value="${escapeHtml(zone.latency_offset ?? 0)}">
             </label>
             <label class="check-field">
-                <input id="advanced-zone-autostart" type="checkbox" ${binding.auto_start ? 'checked' : ''}>
+                <input id="advanced-zone-autostart" type="checkbox" ${zone.auto_start ? 'checked' : ''}>
                 <span>Auto-start</span>
             </label>
-            <button class="primary-btn" data-action="save-zone-advanced" data-zone-id="${escapeHtml(binding.zone_id)}" data-room-id="${escapeHtml(room.room_id)}">Save Zone</button>
+            <button class="primary-btn" data-action="save-zone-advanced" data-zone-id="${escapeHtml(zone.zone_id)}">Save Zone</button>
             <div class="advanced-row">
                 <div>
                     <strong>OwnTone</strong>
-                    <span>${binding.owntone_ip ? `${escapeHtml(binding.owntone_ip)}:${escapeHtml(ownTonePort)}` : 'not running'}</span>
+                    <span>${zone.owntone_ip ? `${escapeHtml(zone.owntone_ip)}:${escapeHtml(ownTonePort)}` : 'not running'}</span>
                 </div>
-                ${binding.owntone_ip ? `<a class="small-btn" href="http://${escapeHtml(binding.owntone_ip)}:${escapeHtml(ownTonePort)}" target="_blank" rel="noreferrer">Open</a>` : '<span></span>'}
+                ${zone.owntone_ip ? `<a class="small-btn" href="http://${escapeHtml(zone.owntone_ip)}:${escapeHtml(ownTonePort)}" target="_blank" rel="noreferrer">Open</a>` : '<span></span>'}
             </div>
             <div class="advanced-row">
                 <div>
                     <strong>Runtime</strong>
-                    <span>host ports / subdev ${escapeHtml(binding.allocated_subdevice ?? '-')}</span>
+                    <span>host ports / subdev ${escapeHtml(zone.allocated_subdevice ?? '-')}</span>
                 </div>
-                <span class="state-badge ${statusClass(binding.status)}">${escapeHtml(binding.status)}</span>
+                <span class="state-badge ${statusClass(zone.status)}">${escapeHtml(zone.status)}</span>
             </div>
-            <button class="danger-btn" data-action="delete-zone" data-zone-id="${escapeHtml(binding.zone_id)}">Delete Zone</button>
+            <button class="danger-btn" data-action="delete-zone" data-zone-id="${escapeHtml(zone.zone_id)}">Delete Zone</button>
         </div>
     `;
 }
@@ -474,7 +433,7 @@ async function onDrawerClick(event) {
     const tab = event.target.closest('[data-drawer-tab]');
     if (tab) {
         state.activeDrawerTab = tab.dataset.drawerTab;
-        renderRoomDrawer();
+        renderZoneDrawer();
         return;
     }
 
@@ -482,9 +441,10 @@ async function onDrawerClick(event) {
     if (!button) return;
     const action = button.dataset.action;
     try {
-        if (action === 'save-binding') await saveBinding(button.dataset.roomId);
+        if (action === 'save-binding') await saveBinding(button.dataset.zoneId);
+        if (action === 'clear-binding') await clearBinding(button.dataset.zoneId);
         if (action === 'save-speakers') await saveSpeakers(button.dataset.zoneId);
-        if (action === 'save-zone-advanced') await saveZoneAdvanced(button.dataset.zoneId, button.dataset.roomId);
+        if (action === 'save-zone-advanced') await saveZoneAdvanced(button.dataset.zoneId);
         if (action === 'delete-zone') await deleteZone(button.dataset.zoneId);
     } catch (error) {
         showError(error);
@@ -503,16 +463,21 @@ async function onDrawerChange(event) {
     }
 }
 
-async function saveBinding(roomId) {
-    const zoneId = document.getElementById('binding-zone')?.value;
-    if (!zoneId) throw new Error('Select a Shiri zone');
-    const room = findRoom(roomId);
-    await Api.bindRoom(roomId, {
-        zone_id: zoneId,
-        room_name: roomLabel(room),
-        default_room: document.getElementById('binding-default-room')?.checked,
+async function saveBinding(zoneId) {
+    const lionosRoomId = document.getElementById('binding-lionos-room-id')?.value?.trim();
+    if (!lionosRoomId) throw new Error('LionOS room id is required');
+    await Api.bindZone(zoneId, {
+        lionos_room_id: lionosRoomId,
+        lionos_room_name: document.getElementById('binding-lionos-room-name')?.value?.trim() || lionosRoomId,
+        default: document.getElementById('binding-default-zone')?.checked,
     });
-    showToast('Room binding saved');
+    showToast('Binding saved');
+    await loadDashboard({ quiet: true });
+}
+
+async function clearBinding(zoneId) {
+    await Api.clearZoneBinding(zoneId);
+    showToast('Binding cleared');
     await loadDashboard({ quiet: true });
 }
 
@@ -526,14 +491,12 @@ async function saveSpeakers(zoneId) {
     await loadDashboard({ quiet: true });
 }
 
-async function saveZoneAdvanced(zoneId, roomId) {
+async function saveZoneAdvanced(zoneId) {
     await Api.updateZone(zoneId, {
         name: document.getElementById('advanced-zone-name')?.value?.trim(),
         interface: document.getElementById('advanced-zone-interface')?.value,
         latency_offset: Number(document.getElementById('advanced-zone-latency')?.value),
         auto_start: document.getElementById('advanced-zone-autostart')?.checked,
-        room_id: roomId,
-        room_name: roomLabel(findRoom(roomId)),
     });
     showToast('Zone saved');
     await loadDashboard({ quiet: true });
@@ -543,7 +506,7 @@ async function deleteZone(zoneId) {
     if (!window.confirm('Delete this Shiri zone?')) return;
     await Api.deleteZone(zoneId);
     showToast('Zone deleted');
-    closeRoomDrawer();
+    closeZoneDrawer();
     await loadDashboard({ quiet: true });
 }
 
@@ -561,25 +524,20 @@ function closeSettings() {
 async function renderSettings() {
     const dashboard = state.dashboard || await Api.dashboard();
     state.dashboard = dashboard;
-    els.lionosBaseUrl.value = dashboard.settings?.lionos_base_url || '';
     await renderInterfaceOptions();
     els.settingsZones.innerHTML = (dashboard.zones || []).map((zone) => `
         <div class="settings-row">
             <div>
-                <strong>${escapeHtml(zone.zone_name)}</strong>
-                <span>${escapeHtml(zone.room_id)} / ${escapeHtml(zone.status)} / ${escapeHtml(zone.interface || 'no interface')}</span>
+                <strong>${escapeHtml(zoneLabel(zone))}</strong>
+                <span>${escapeHtml(bindingText(zone))} / ${escapeHtml(zone.status)} / ${escapeHtml(zone.interface || 'no interface')}</span>
             </div>
             <button class="small-btn" type="button" data-settings-zone="${escapeHtml(zone.zone_id)}">Open</button>
         </div>
     `).join('') || '<div class="empty-state">No zones</div>';
     els.settingsZones.querySelectorAll('[data-settings-zone]').forEach((button) => {
         button.addEventListener('click', () => {
-            const zone = (state.dashboard?.zones || []).find((item) => item.zone_id === button.dataset.settingsZone);
-            const room = (state.dashboard?.rooms || []).find((item) => item.binding?.zone_id === zone?.zone_id);
-            if (room) {
-                closeSettings();
-                openRoomDrawer(room.room_id);
-            }
+            closeSettings();
+            openZoneDrawer(button.dataset.settingsZone);
         });
     });
 }
@@ -592,13 +550,7 @@ async function renderInterfaceOptions() {
 
 async function onSaveSettings(event) {
     event.preventDefault();
-    try {
-        await Api.saveSettings({ lionos_base_url: els.lionosBaseUrl.value.trim() });
-        showToast('Settings saved');
-        await loadDashboard({ quiet: true });
-    } catch (error) {
-        showError(error);
-    }
+    showToast('Settings saved');
 }
 
 async function onCreateZone(event) {
@@ -607,10 +559,7 @@ async function onCreateZone(event) {
         await Api.createZone({
             name: els.newZoneName.value.trim(),
             interface: els.newZoneInterface.value,
-            room_id: els.newZoneRoomId.value.trim() || els.newZoneName.value.trim(),
-            room_name: els.newZoneRoomName.value.trim() || els.newZoneName.value.trim(),
             auto_start: els.newZoneAutostart.checked,
-            default_room: els.newZoneDefault.checked,
         });
         event.target.reset();
         showToast('Zone created');
@@ -640,9 +589,9 @@ function closeDiagnostics() {
 }
 
 function renderDiagnosticsFilters() {
-    const rooms = state.dashboard?.rooms || [];
+    const zones = state.dashboard?.zones || [];
     const selected = els.diagRoomFilter.value;
-    els.diagRoomFilter.innerHTML = `<option value="">All rooms</option>${rooms.map((room) => `<option value="${escapeHtml(room.room_id)}">${escapeHtml(roomLabel(room))}</option>`).join('')}`;
+    els.diagRoomFilter.innerHTML = `<option value="">All zones</option>${zones.map((zone) => `<option value="${escapeHtml(zone.zone_id)}">${escapeHtml(zoneLabel(zone))}</option>`).join('')}`;
     els.diagRoomFilter.value = selected || '';
 }
 
@@ -650,7 +599,7 @@ async function loadLogs() {
     if (!state.diagnosticsOpen) return;
     try {
         const data = await Api.logs({
-            roomId: els.diagRoomFilter.value,
+            zoneId: els.diagRoomFilter.value,
             type: els.diagTypeFilter.value,
             lines: 280,
         });
@@ -674,7 +623,7 @@ function renderLogEntry(entry) {
     return `
         <div class="log-entry ${escapeHtml(entry.severity || 'info')}">
             <span>${escapeHtml(time || entry.log_type || '')}</span>
-            <span>${escapeHtml(entry.room_name || entry.room_id || '')}</span>
+            <span>${escapeHtml(entry.zone_name || entry.zone_id || '')}</span>
             <span>${escapeHtml(entry.category || entry.log_type || '')}</span>
             <span class="log-line">${escapeHtml(entry.line || '')}</span>
         </div>
@@ -683,7 +632,7 @@ function renderLogEntry(entry) {
 
 function appendLogEntry(entry) {
     if (!state.diagnosticsOpen || state.logsPaused) return;
-    if (els.diagRoomFilter.value && entry.room_id !== els.diagRoomFilter.value) return;
+    if (els.diagRoomFilter.value && entry.zone_id !== els.diagRoomFilter.value) return;
     const filter = els.diagTypeFilter.value;
     if (filter === 'errors' && entry.severity === 'info') return;
     if (!['all', 'errors'].includes(filter) && entry.category !== filter && entry.log_type !== filter) return;
@@ -710,20 +659,20 @@ function subscribeLogs(enabled) {
     state.socket.emit(enabled ? 'subscribe_logs' : 'unsubscribe_logs', { all: true });
 }
 
-function policyFor(room) {
-    const raw = room?.binding?.tts_policy || {};
+function policyForZone(zone) {
+    const raw = zone?.tts_policy || {};
     return {
-        mode: 'room',
-        room: {
-            reduction_pct: clampNumber(raw.room?.reduction_pct, 0, 95, 72),
+        mode: 'zone',
+        zone: {
+            reduction_pct: clampNumber(raw.zone?.reduction_pct ?? raw.room?.reduction_pct, 0, 95, 72),
         },
         speakers: {},
     };
 }
 
-function findRoom(roomId) {
-    if (!roomId) return null;
-    return (state.dashboard?.rooms || []).find((room) => room.room_id === roomId) || null;
+function findZone(zoneId) {
+    if (!zoneId) return null;
+    return (state.dashboard?.zones || []).find((zone) => zone.zone_id === zoneId) || null;
 }
 
 function showError(error) {

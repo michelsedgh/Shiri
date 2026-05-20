@@ -32,9 +32,8 @@ OWNTONE_API_NS_IP = "10.211.0.2"
 OWNTONE_API_HOST_CIDR = f"{OWNTONE_API_HOST_IP}/30"
 OWNTONE_API_NS_CIDR = f"{OWNTONE_API_NS_IP}/30"
 OWNTONE_SENDER_DIR = os.path.join(BASE_DIR, "owntone-sender")
-MIXER_TTS_PCM_RATE = 24000
-MIXER_TTS_PCM_CHANNELS = 1
-MIXER_TTS_PCM_PIPE_NAME = "tts.pipe"
+MIXER_TTS_WEBRTC_SOCKET_NAME = "tts_webrtc.sock"
+LEGACY_TTS_PCM_PIPE_NAME = "tts.pipe"
 
 # Resolve paths relative to this file's location
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -193,20 +192,20 @@ def setup_directories(zone):
                 pass
     shutil.rmtree(os.path.join(grp_dir, "tts_streams"), ignore_errors=True)
 
-    # Keep the private TTS FIFO out of the OwnTone-scanned media directory so
-    # OwnTone cannot index/read it as a track.
+    # Create the active OwnTone audio FIFO. TTS terminates as WebRTC inside the
+    # zone mixer and does not create a separate transport pipe.
     audio_pipe = os.path.join(grp_dir, "pipes", "audio.pipe")
-    tts_pipe = os.path.join(grp_dir, "state", MIXER_TTS_PCM_PIPE_NAME)
-    stale_tts_pipe = os.path.join(grp_dir, "pipes", MIXER_TTS_PCM_PIPE_NAME)
-    stale_tts_meta_pipe = os.path.join(grp_dir, "pipes", f"{MIXER_TTS_PCM_PIPE_NAME}.metadata")
+    stale_tts_pipe = os.path.join(grp_dir, "pipes", LEGACY_TTS_PCM_PIPE_NAME)
+    stale_tts_meta_pipe = os.path.join(grp_dir, "pipes", f"{LEGACY_TTS_PCM_PIPE_NAME}.metadata")
+    stale_private_tts_pipe = os.path.join(grp_dir, "state", LEGACY_TTS_PCM_PIPE_NAME)
     meta_pipe = os.path.join(grp_dir, "pipes", "audio.pipe.metadata")
     shairport_meta_pipe = os.path.join(grp_dir, "pipes", "shairport.metadata")
 
     for pipe in [
         audio_pipe,
-        tts_pipe,
         stale_tts_pipe,
         stale_tts_meta_pipe,
+        stale_private_tts_pipe,
         meta_pipe,
         shairport_meta_pipe,
     ]:
@@ -215,7 +214,7 @@ def setup_directories(zone):
         except FileNotFoundError:
             pass
 
-    for pipe in [audio_pipe, tts_pipe, meta_pipe, shairport_meta_pipe]:
+    for pipe in [audio_pipe, meta_pipe, shairport_meta_pipe]:
         os.mkfifo(pipe, 0o666)
         os.chmod(pipe, 0o666)
 
@@ -391,16 +390,14 @@ def generate_mixer_supervisor(zone):
     grp_dir = zone.grp_dir
     subdev = zone.allocated_subdevice
     capture_dev = f"hw:Loopback,1,{subdev}"
-    tts_pcm_pipe = os.path.join(grp_dir, "state", MIXER_TTS_PCM_PIPE_NAME)
-    zone.tts_pcm_pipe = tts_pcm_pipe
+    tts_webrtc_socket = os.path.join(grp_dir, "state", MIXER_TTS_WEBRTC_SOCKET_NAME)
+    zone.tts_webrtc_socket = tts_webrtc_socket
 
     script_path = os.path.join(grp_dir, "config", "mixer_supervisor.sh")
     template = _read_template("mixer_supervisor.sh")
     content = (template
                .replace("%%CAPTURE_DEV%%", capture_dev)
-               .replace("%%TTS_PCM_PIPE%%", tts_pcm_pipe)
-               .replace("%%TTS_PCM_RATE%%", str(MIXER_TTS_PCM_RATE))
-               .replace("%%TTS_PCM_CHANNELS%%", str(MIXER_TTS_PCM_CHANNELS))
+               .replace("%%TTS_WEBRTC_SOCKET%%", tts_webrtc_socket)
                .replace("%%GRP_DIR%%", grp_dir)
                .replace("%%MIXER_SCRIPT%%", MIXER_SCRIPT))
     _write_file(script_path, content, executable=True)

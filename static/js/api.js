@@ -47,12 +47,13 @@ export const Api = {
     deleteZone: (zoneId) => api(`/zones/${encodeURIComponent(zoneId)}`, { method: 'DELETE' }),
     startZone: (zoneId) => api(`/zones/${encodeURIComponent(zoneId)}/start`, { method: 'POST' }),
     stopZone: (zoneId) => api(`/zones/${encodeURIComponent(zoneId)}/stop`, { method: 'POST' }),
-    bindRoom: (roomId, body) => api(`/rooms/${encodeURIComponent(roomId)}/binding`, { method: 'PUT', body }),
-    setRoomVolume: (roomId, volume) => api(`/rooms/${encodeURIComponent(roomId)}/volume`, {
+    bindZone: (zoneId, body) => api(`/zones/${encodeURIComponent(zoneId)}/binding`, { method: 'PUT', body }),
+    clearZoneBinding: (zoneId) => api(`/zones/${encodeURIComponent(zoneId)}/binding`, { method: 'DELETE' }),
+    setZoneVolume: (zoneId, volume) => api(`/zones/${encodeURIComponent(zoneId)}/volume`, {
         method: 'PUT',
         body: { volume },
     }),
-    setRoomTtsPolicy: (roomId, body) => api(`/rooms/${encodeURIComponent(roomId)}/tts-policy`, {
+    setZoneTtsPolicy: (zoneId, body) => api(`/zones/${encodeURIComponent(zoneId)}/tts-policy`, {
         method: 'PUT',
         body,
     }),
@@ -65,9 +66,8 @@ export const Api = {
         `/zones/${encodeURIComponent(zoneId)}/speakers/${encodeURIComponent(speakerId)}/volume`,
         { method: 'PUT', body: { volume } },
     ),
-    logs: ({ roomId = '', zoneId = '', type = 'all', lines = 240 } = {}) => {
+    logs: ({ zoneId = '', type = 'all', lines = 240 } = {}) => {
         const params = new URLSearchParams({ type, lines: String(lines) });
-        if (roomId) params.set('room_id', roomId);
         if (zoneId) params.set('zone_id', zoneId);
         return api(`/logs?${params.toString()}`);
     },

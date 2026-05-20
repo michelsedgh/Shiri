@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Shiri Audio Console</title>
-    <meta name="description" content="Shiri room audio routing console">
+    <meta name="description" content="Shiri zone audio routing console">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -16,7 +16,7 @@
             <div class="brand-mark">S</div>
             <div>
                 <h1>Shiri</h1>
-                <span id="room-count">Loading</span>
+                <span id="room-count">Loading zones</span>
             </div>
         </div>
         <div class="status-strip">
@@ -26,10 +26,10 @@
             </div>
             <div id="lionos-status" class="status-pill muted">
                 <span class="dot"></span>
-                <span>LionOS</span>
+                <span>LionOS owns rooms</span>
             </div>
             <div id="default-room" class="status-pill muted">
-                <span>Default room</span>
+                <span>Default binding</span>
             </div>
         </div>
         <nav class="top-actions" aria-label="Primary actions">
@@ -44,22 +44,22 @@
     <main class="shell">
         <section class="console-head">
             <div>
-                <h2>Rooms</h2>
+                <h2>Zones</h2>
                 <p id="console-subtitle">Loading</p>
             </div>
             <div id="global-error" class="global-error" hidden></div>
         </section>
 
         <section id="room-list" class="room-list" aria-live="polite">
-            <div class="empty-state">Loading rooms</div>
+            <div class="empty-state">Loading zones</div>
         </section>
     </main>
 
     <aside id="room-drawer" class="side-panel" aria-hidden="true">
         <div class="panel-head">
             <div>
-                <span id="drawer-room-source" class="eyebrow">Room</span>
-                <h2 id="drawer-room-name">Room</h2>
+                <span id="drawer-room-source" class="eyebrow">Zone</span>
+                <h2 id="drawer-room-name">Zone</h2>
             </div>
             <button id="close-room-drawer" class="icon-btn" title="Close" aria-label="Close">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
@@ -82,7 +82,7 @@
                 <h2>Event Feed</h2>
             </div>
             <div class="diagnostics-actions">
-                <select id="diag-room-filter" aria-label="Room filter"></select>
+                <select id="diag-room-filter" aria-label="Zone filter"></select>
                 <select id="diag-type-filter" aria-label="Log filter">
                     <option value="all">All</option>
                     <option value="tts">TTS</option>
@@ -118,8 +118,8 @@
 
             <form id="settings-form" class="form-grid">
                 <label class="field span-2">
-                    <span>LionOS API</span>
-                    <input id="lionos-base-url" type="url" placeholder="http://192.168.1.198:7001">
+                    <span>Ownership</span>
+                    <input type="text" value="LionOS owns rooms; Shiri exposes zones" disabled>
                 </label>
                 <button class="primary-btn" type="submit">Save Settings</button>
             </form>
@@ -143,24 +143,12 @@
                             <input id="new-zone-name" type="text" required autocomplete="off">
                         </label>
                         <label class="field">
-                            <span>Room id</span>
-                            <input id="new-zone-room-id" type="text" autocomplete="off">
-                        </label>
-                        <label class="field">
-                            <span>Room name</span>
-                            <input id="new-zone-room-name" type="text" autocomplete="off">
-                        </label>
-                        <label class="field">
                             <span>Network interface</span>
                             <select id="new-zone-interface" required></select>
                         </label>
                         <label class="check-field">
                             <input id="new-zone-autostart" type="checkbox">
                             <span>Auto-start</span>
-                        </label>
-                        <label class="check-field">
-                            <input id="new-zone-default" type="checkbox">
-                            <span>Default TTS room</span>
                         </label>
                         <button class="primary-btn" type="submit">Create Zone</button>
                     </form>

@@ -10,22 +10,18 @@ Run with: sudo python3 app.py
 
 import logging
 import os
-import json
 import signal
 import sys
 import threading
 import time
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from config import ConfigStore, MAX_SHAIRPORT_LATENCY_OFFSET
-from tts_pcm_ws import TtsPcmWebSocketServer
-from zone import ZoneManager, _slugify_room_id
+from tts_webrtc import TtsWebRtcService
+from zone import ZoneManager
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,10 +47,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 # ---------------------------------------------------------------------------
 config_store = ConfigStore()
 zone_manager = ZoneManager(config_store, socketio)
-tts_pcm_ws_server = TtsPcmWebSocketServer(
-    zone_manager,
-    port=int(os.environ.get("SHIRI_TTS_PCM_WS_PORT", "8091")),
-)
+tts_webrtc_service = TtsWebRtcService(zone_manager)
 
 # ---------------------------------------------------------------------------
 # Log streaming — single thread tails all watched zones
@@ -70,8 +63,6 @@ LOG_FILTERS = {
     "owntone": ["owntone", "owntone_wrapper"],
     "errors": LOG_TYPES,
 }
-DEFAULT_LIONOS_BASE_URL = os.environ.get("SHIRI_LIONOS_BASE_URL", "http://192.168.1.198:7001")
-LIONOS_TIMEOUT_SECONDS = float(os.environ.get("SHIRI_LIONOS_TIMEOUT", "1.5"))
 _watched_zones = set()
 _log_positions = {}
 _log_lock = threading.Lock()
@@ -117,8 +108,8 @@ def _log_watcher_loop():
                                 socketio.emit("zone_log", {
                                     "zone_id": zone_id,
                                     "zone_name": zone.display_name if zone else zone_id,
-                                    "room_id": zone.room_id if zone else None,
-                                    "room_name": zone.room_name if zone else None,
+                                    "lionos_room_id": zone.lionos_room_id if zone else None,
+                                    "lionos_room_name": zone.lionos_room_name if zone else None,
                                     "log_type": log_type,
                                     "category": _log_category(log_type, line),
                                     "severity": _log_severity(line),
@@ -140,13 +131,12 @@ def stop_log_watch(zone_id):
         _watched_zones.discard(zone_id)
 
 # ---------------------------------------------------------------------------
-# LionOS state + dashboard aggregation
+# Dashboard aggregation
 # ---------------------------------------------------------------------------
 
 def _settings():
     settings = config_store.get_settings()
     settings.setdefault("default_interface", "")
-    settings.setdefault("lionos_base_url", DEFAULT_LIONOS_BASE_URL)
     return settings
 
 
@@ -154,68 +144,7 @@ def _public_settings(settings=None):
     settings = settings or _settings()
     return {
         "default_interface": settings.get("default_interface", ""),
-        "lionos_base_url": settings.get("lionos_base_url") or DEFAULT_LIONOS_BASE_URL,
     }
-
-
-def _fetch_lionos_state():
-    settings = _settings()
-    base_url = (settings.get("lionos_base_url") or DEFAULT_LIONOS_BASE_URL).rstrip("/")
-    url = urljoin(f"{base_url}/", "api/state")
-    started_at = time.time()
-    try:
-        req = Request(url, headers={"Accept": "application/json", "User-Agent": "Shiri/room-console"})
-        with urlopen(req, timeout=LIONOS_TIMEOUT_SECONDS) as resp:
-            body = resp.read()
-        state = json.loads(body.decode("utf-8"))
-        fetched_at = time.time()
-        cache = {
-            "base_url": base_url,
-            "fetched_at": fetched_at,
-            "state": state,
-        }
-        try:
-            config_store.update_settings({"lionos_state_cache": cache})
-        except OSError as exc:
-            log.debug("Could not persist LionOS state cache: %s", exc)
-        return {
-            "online": True,
-            "base_url": base_url,
-            "state": state,
-            "cached": False,
-            "fetched_at": fetched_at,
-            "latency_ms": round((fetched_at - started_at) * 1000),
-            "error": None,
-        }
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
-        cache = settings.get("lionos_state_cache")
-        cached_state = cache.get("state") if isinstance(cache, dict) else None
-        return {
-            "online": False,
-            "base_url": base_url,
-            "state": cached_state if isinstance(cached_state, dict) else None,
-            "cached": isinstance(cached_state, dict),
-            "fetched_at": cache.get("fetched_at") if isinstance(cache, dict) else None,
-            "latency_ms": None,
-            "error": str(exc),
-        }
-
-
-def _member_names(state):
-    members = state.get("members", []) if isinstance(state, dict) else []
-    names = {}
-    for member in members if isinstance(members, list) else []:
-        if isinstance(member, dict) and member.get("id"):
-            names[str(member["id"])] = member.get("name") or str(member["id"])
-    return names
-
-
-def _zone_bound_to_room(room_id):
-    normalized = _slugify_room_id(room_id)
-    for zone in zone_manager.list_zones():
-        if _slugify_room_id(zone.room_id) == normalized:
-            return zone
-    return None
 
 
 def _zone_summary(zone):
@@ -239,9 +168,9 @@ def _zone_summary(zone):
         "zone_name": zone.display_name,
         "status": zone.status,
         "error_message": zone.error_message,
-        "room_id": zone.room_id,
-        "room_name": zone.room_name,
-        "default_room": bool(zone.config.get("default_room", False)),
+        "lionos_room_id": zone.lionos_room_id,
+        "lionos_room_name": zone.lionos_room_name,
+        "default_lionos_room": bool(zone.config.get("default_lionos_room", False)),
         "interface": zone.interface,
         "auto_start": bool(zone.config.get("auto_start", False)),
         "latency_offset": zone.config.get("latency_offset"),
@@ -262,117 +191,20 @@ def _zone_summary(zone):
     }
 
 
-def _room_activity(state, room_id):
-    if not isinstance(state, dict):
-        return {
-            "presence": [],
-            "presence_names": [],
-            "primary_member_id": None,
-            "activities": [],
-            "devices": [],
-            "agent_sessions": [],
-        }
-    names = _member_names(state)
-    presence_by_room = state.get("presence_by_room") if isinstance(state.get("presence_by_room"), dict) else {}
-    primary_by_room = state.get("primary_by_room") if isinstance(state.get("primary_by_room"), dict) else {}
-    presence = [str(item) for item in presence_by_room.get(room_id, [])]
-    activities = [
-        item for item in state.get("activities", [])
-        if isinstance(item, dict) and item.get("room_id") == room_id
-    ]
-    devices = [
-        item for item in state.get("devices", [])
-        if isinstance(item, dict) and item.get("room_id") == room_id
-    ]
-    sessions = [
-        item for item in state.get("agent_sessions", [])
-        if isinstance(item, dict) and item.get("room_id") == room_id
-    ]
-    return {
-        "presence": presence,
-        "presence_names": [names.get(member_id, member_id) for member_id in presence],
-        "primary_member_id": primary_by_room.get(room_id),
-        "activities": activities,
-        "devices": devices,
-        "agent_sessions": sessions,
-    }
-
-
-def _room_entry(room_id, room_name, *, source, lionos_room=None, lionos_state=None):
-    zone = _zone_bound_to_room(room_id)
-    activity = _room_activity(lionos_state, room_id)
-    return {
-        "room_id": room_id,
-        "room_name": room_name,
-        "source": source,
-        "lionos_room": lionos_room or None,
-        "presence": activity["presence"],
-        "presence_names": activity["presence_names"],
-        "primary_member_id": activity["primary_member_id"],
-        "activities": activity["activities"],
-        "devices": activity["devices"],
-        "agent_sessions": activity["agent_sessions"],
-        "binding": _zone_summary(zone) if zone else None,
-        "bound": zone is not None,
-    }
-
-
 def _dashboard_payload():
-    lionos = _fetch_lionos_state()
-    lionos_state = lionos.get("state") or {}
-    lionos_rooms = lionos_state.get("rooms", []) if isinstance(lionos_state, dict) else []
-    rooms = []
-    seen_room_ids = set()
-
-    if isinstance(lionos_rooms, list):
-        for room in lionos_rooms:
-            if not isinstance(room, dict) or not room.get("id"):
-                continue
-            room_id = str(room["id"])
-            seen_room_ids.add(_slugify_room_id(room_id))
-            rooms.append(_room_entry(
-                room_id,
-                room.get("name") or room_id,
-                source="lionos",
-                lionos_room=room,
-                lionos_state=lionos_state,
-            ))
-
-    for zone in zone_manager.list_zones():
-        normalized = _slugify_room_id(zone.room_id)
-        if normalized in seen_room_ids:
-            continue
-        seen_room_ids.add(normalized)
-        rooms.append(_room_entry(
-            zone.room_id,
-            zone.room_name,
-            source="shiri",
-            lionos_room=None,
-            lionos_state=lionos_state,
-        ))
-
-    rooms.sort(key=lambda item: (item["source"] != "lionos", item["room_name"].lower()))
     zones = [_zone_summary(zone) for zone in zone_manager.list_zones()]
-    default_room = next((room for room in rooms if (room.get("binding") or {}).get("default_room")), None)
     return {
         "system": zone_manager.get_system_status(),
-        "lionos": {k: v for k, v in lionos.items() if k != "state"},
         "settings": _public_settings(),
-        "rooms": rooms,
         "zones": zones,
-        "default_room_id": default_room.get("room_id") if default_room else None,
+        "default_lionos_room_id": next(
+            (zone["lionos_room_id"] for zone in zones if zone.get("default_lionos_room")),
+            None,
+        ),
         "log_types": LOG_TYPES,
         "log_filters": sorted(LOG_FILTERS.keys()),
         "generated_at": time.time(),
     }
-
-
-def _parse_volume(value):
-    try:
-        parsed = int(round(float(value)))
-    except (TypeError, ValueError):
-        return None
-    return min(max(parsed, 0), 100)
 
 
 def _log_severity(line):
@@ -396,7 +228,7 @@ def _log_category(log_type, line):
     return "system"
 
 
-def _logs_for_query(zone_id=None, room_id=None, log_filter="all", lines=200):
+def _logs_for_query(zone_id=None, log_filter="all", lines=200):
     log_filter = (log_filter or "all").lower()
     selected_types = LOG_FILTERS.get(log_filter, LOG_TYPES if log_filter == "all" else [log_filter])
     if selected_types == ["all"]:
@@ -405,10 +237,6 @@ def _logs_for_query(zone_id=None, room_id=None, log_filter="all", lines=200):
     zones = []
     if zone_id:
         zone = zone_manager.get_zone(zone_id)
-        if zone:
-            zones = [zone]
-    elif room_id:
-        zone = _zone_bound_to_room(room_id)
         if zone:
             zones = [zone]
     else:
@@ -426,8 +254,8 @@ def _logs_for_query(zone_id=None, room_id=None, log_filter="all", lines=200):
                 entries.append({
                     "zone_id": zone.zone_id,
                     "zone_name": zone.display_name,
-                    "room_id": zone.room_id,
-                    "room_name": zone.room_name,
+                    "lionos_room_id": zone.lionos_room_id,
+                    "lionos_room_name": zone.lionos_room_name,
                     "log_type": log_type,
                     "category": _log_category(log_type, line),
                     "severity": severity,
@@ -471,27 +299,11 @@ def get_settings():
 def update_settings():
     data = request.get_json() or {}
     updates = {}
-    if "lionos_base_url" in data:
-        base_url = str(data.get("lionos_base_url") or "").strip().rstrip("/")
-        if not base_url.startswith(("http://", "https://")):
-            return jsonify({"error": "lionos_base_url must start with http:// or https://"}), 400
-        updates["lionos_base_url"] = base_url
     if "default_interface" in data:
         updates["default_interface"] = str(data.get("default_interface") or "").strip()
     if updates:
         config_store.update_settings(updates)
     return jsonify({"settings": _public_settings()})
-
-@app.route("/api/lionos/status")
-def lionos_status():
-    state = _fetch_lionos_state()
-    return jsonify({k: v for k, v in state.items() if k != "state"})
-
-@app.route("/api/lionos/state")
-def lionos_state():
-    state = _fetch_lionos_state()
-    status = {k: v for k, v in state.items() if k != "state"}
-    return jsonify({"lionos": status, "state": state.get("state")})
 
 @app.route("/api/dashboard")
 def dashboard():
@@ -532,9 +344,6 @@ def create_zone():
         interface=interface,
         auto_start=data.get("auto_start", False),
         latency_offset=latency_offset,
-        room_id=data.get("room_id"),
-        room_name=data.get("room_name"),
-        default_room=bool(data.get("default_room", False)),
     )
     return jsonify(zone.to_dict()), 201
 
@@ -582,77 +391,74 @@ def stop_zone(zone_id):
     return jsonify({"error": "Cannot stop zone (not found or not running)"}), 400
 
 # ---------------------------------------------------------------------------
-# Room routing API
+# LionOS binding metadata API
 # ---------------------------------------------------------------------------
 
-@app.route("/api/rooms")
-def list_rooms():
-    return jsonify({"rooms": zone_manager.list_rooms()})
-
-@app.route("/api/rooms/<room_id>/binding", methods=["PUT"])
-def set_room_binding(room_id):
+@app.route("/api/zones/<zone_id>/binding", methods=["PUT"])
+def set_zone_binding(zone_id):
     data = request.get_json() or {}
-    zone_id = (data.get("zone_id") or "").strip()
-    if not zone_id:
-        return jsonify({"error": "zone_id is required"}), 400
-    room_name = data.get("room_name")
-    if not room_name:
-        lionos = _fetch_lionos_state()
-        state = lionos.get("state") or {}
-        rooms = state.get("rooms", []) if isinstance(state, dict) else []
-        for room in rooms if isinstance(rooms, list) else []:
-            if isinstance(room, dict) and room.get("id") == room_id:
-                room_name = room.get("name")
-                break
-    zone, error = zone_manager.set_zone_room(
+    lionos_room_id = (data.get("lionos_room_id") or "").strip()
+    if not lionos_room_id:
+        return jsonify({"error": "lionos_room_id is required"}), 400
+    zone, error = zone_manager.set_zone_binding(
         zone_id,
-        room_id,
-        room_name=room_name or room_id,
-        default_room=bool(data.get("default_room", False)),
-    )
-    if error:
-        return jsonify({"error": error}), 404
-    return jsonify({"room": _room_entry(zone.room_id, zone.room_name, source="shiri")})
-
-@app.route("/api/zones/<zone_id>/room", methods=["PUT"])
-def set_zone_room(zone_id):
-    data = request.get_json() or {}
-    room_id = (data.get("room_id") or "").strip()
-    if not room_id:
-        return jsonify({"error": "room_id is required"}), 400
-    zone, error = zone_manager.set_zone_room(
-        zone_id,
-        room_id,
-        room_name=data.get("room_name"),
-        default_room=bool(data.get("default_room", False)),
+        lionos_room_id,
+        lionos_room_name=data.get("lionos_room_name"),
+        default=bool(data.get("default", False)),
     )
     if error:
         return jsonify({"error": error}), 404
     return jsonify(zone.to_dict())
 
-@app.route("/api/rooms/<room_id>/volume")
-def get_room_volume(room_id):
-    zone = _zone_bound_to_room(room_id)
-    if not zone:
-        return jsonify({"error": "No Shiri zone bound to this room"}), 404
-    volume, error = zone_manager.get_volume(zone.zone_id)
+@app.route("/api/zones/<zone_id>/binding", methods=["DELETE"])
+def clear_zone_binding(zone_id):
+    zone, error = zone_manager.clear_zone_binding(zone_id)
     if error:
-        return jsonify({"error": error, "zone_id": zone.zone_id}), 400
-    return jsonify({"room_id": zone.room_id, "zone_id": zone.zone_id, "volume": volume})
+        return jsonify({"error": error}), 404
+    return jsonify(zone.to_dict())
 
-@app.route("/api/rooms/<room_id>/volume", methods=["PUT"])
-def set_room_volume(room_id):
-    data = request.get_json() or {}
-    volume = _parse_volume(data.get("volume"))
-    if volume is None:
-        return jsonify({"error": "volume must be a number from 0 to 100"}), 400
-    zone = _zone_bound_to_room(room_id)
+
+@app.route("/api/zones/<zone_id>/player/play", methods=["POST"])
+def play_zone(zone_id):
+    zone = zone_manager.get_zone(zone_id)
     if not zone:
-        return jsonify({"error": "No Shiri zone bound to this room"}), 404
-    ok, error = zone_manager.set_volume(zone.zone_id, volume)
-    if error:
-        return jsonify({"error": error, "zone_id": zone.zone_id}), 400
-    return jsonify({"ok": bool(ok), "room_id": zone.room_id, "zone_id": zone.zone_id, "volume": volume})
+        return jsonify({"error": "Zone not found"}), 404
+    if zone.status != zone.STATUS_RUNNING:
+        return jsonify({"error": "Zone is not running", "zone_id": zone.zone_id}), 400
+    return _play_zone_response(zone)
+
+
+def _play_zone_response(zone):
+    if not zone.owntone_api:
+        return jsonify({"error": "Zone does not have an OwnTone player", "zone_id": zone.zone_id}), 400
+    data = request.get_json(silent=True) or {}
+    response = zone.owntone_api.play()
+    return jsonify({
+        "ok": True,
+        "zone_id": zone.zone_id,
+        "playlist": data.get("playlist"),
+        "owntone_response": response,
+    })
+
+@app.route("/api/zones/<zone_id>/player/stop", methods=["POST"])
+def stop_zone_player(zone_id):
+    zone = zone_manager.get_zone(zone_id)
+    if not zone:
+        return jsonify({"error": "Zone not found"}), 404
+    if zone.status != zone.STATUS_RUNNING:
+        return jsonify({"error": "Zone is not running", "zone_id": zone.zone_id}), 400
+    return _stop_zone_player_response(zone)
+
+
+def _stop_zone_player_response(zone):
+    if not zone.owntone_api:
+        return jsonify({"error": "Zone does not have an OwnTone player", "zone_id": zone.zone_id}), 400
+    response = zone.owntone_api.stop()
+    return jsonify({
+        "ok": True,
+        "zone_id": zone.zone_id,
+        "owntone_response": response,
+    })
 
 @app.route("/api/zones/<zone_id>/tts-policy")
 def get_tts_policy(zone_id):
@@ -669,38 +475,9 @@ def set_tts_policy(zone_id):
         return jsonify({"error": error}), 404
     return jsonify(result)
 
-@app.route("/api/rooms/<room_id>/tts-policy")
-def get_room_tts_policy(room_id):
-    zone, error = zone_manager.resolve_zone_for_room(room_id, require_running=False)
-    if error:
-        return jsonify({"error": error}), 404
-    result, error = zone_manager.get_tts_policy(zone.zone_id)
-    if error:
-        return jsonify({"error": error}), 404
-    return jsonify(result)
-
-@app.route("/api/rooms/<room_id>/tts-policy", methods=["PUT"])
-def set_room_tts_policy(room_id):
-    zone, error = zone_manager.resolve_zone_for_room(room_id, require_running=False)
-    if error:
-        return jsonify({"error": error}), 404
-    data = request.get_json() or {}
-    result, error = zone_manager.set_tts_policy(zone.zone_id, data)
-    if error:
-        return jsonify({"error": error}), 404
-    return jsonify(result)
-
 # ---------------------------------------------------------------------------
 # TTS routing API
 # ---------------------------------------------------------------------------
-
-@app.route("/api/rooms/<room_id>/tts-debug")
-def tts_debug_for_room(room_id):
-    zone, error = zone_manager.resolve_zone_for_room(room_id, require_running=False)
-    if error:
-        return jsonify({"error": error}), 404
-    return jsonify(_tts_debug_payload(zone))
-
 
 @app.route("/api/zones/<zone_id>/tts-debug")
 def tts_debug_for_zone(zone_id):
@@ -708,32 +485,43 @@ def tts_debug_for_zone(zone_id):
     if not zone:
         return jsonify({"error": "Zone not found"}), 404
     return jsonify(_tts_debug_payload(zone))
-def _request_hostname():
-    host = request.headers.get("X-Forwarded-Host") or request.host
-    if host.startswith("["):
-        return host.split("]", 1)[0].strip("[]")
-    return host.split(":", 1)[0]
+
+
+@app.route("/api/zones/<zone_id>/tts/webrtc-offer", methods=["POST"])
+def tts_webrtc_offer_for_zone(zone_id):
+    zone = zone_manager.get_zone(zone_id)
+    if not zone:
+        return jsonify({"ok": False, "error": "Zone not found"}), 404
+    data = request.get_json() or {}
+    try:
+        return jsonify(tts_webrtc_service.submit_offer(zone.zone_id, data))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503
+    except Exception as exc:
+        log.exception("WebRTC TTS offer failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 def _tts_debug_payload(zone):
-    host = _request_hostname()
+    host = request.headers.get("X-Forwarded-Host") or request.host
     return {
         "ok": True,
         "zone_id": zone.zone_id,
         "zone_status": zone.status,
-        "room_id": zone.room_id,
-        "room_name": zone.room_name,
+        "lionos_room_id": zone.lionos_room_id,
+        "lionos_room_name": zone.lionos_room_name,
         "grp_dir": zone.grp_dir,
-        "tts_transport": "ws_pcm_s16le",
-        "tts_pcm_pipe": zone.tts_pcm_pipe,
-        "tts_pcm_ws": {
-            "url": f"ws://{host}:{tts_pcm_ws_server.port}/tts/rooms/{zone.room_id}/pcm",
-            "transport": "ws_pcm_s16le",
-            "format": "pcm_s16le",
-            "sample_rate": 24000,
-            "channels": 1,
-            "sample_width": 2,
-            "timing_owner": "Shiri mixer PCM FIFO",
+        "tts_transport": "webrtc",
+        "tts_webrtc_socket": zone.tts_webrtc_socket,
+        "tts_webrtc": {
+            "offer_url": f"{request.scheme}://{host}/api/zones/{zone.zone_id}/tts/webrtc-offer",
+            "transport": "webrtc",
+            "codec": "opus",
+            "session_model": "persistent_per_zone",
+            "internal_audio_target": "gstreamer-audiomixer",
+            "timing_owner": "Shiri zone mixer",
         },
         "mixer_log_tail": _read_log_tail(zone.zone_id, "mixer", lines=80),
     }
@@ -865,7 +653,6 @@ def get_combined_logs():
     lines = min(max(lines, 1), 1000)
     entries = _logs_for_query(
         zone_id=request.args.get("zone_id"),
-        room_id=request.args.get("room_id"),
         log_filter=request.args.get("type", "all"),
         lines=lines,
     )
@@ -940,7 +727,7 @@ def startup():
 
     # Start diagnostic monitor for AirPlay disconnect debugging
     zone_manager.start_diagnostic_monitor()
-    tts_pcm_ws_server.start()
+    tts_webrtc_service.start()
 
     log.info("Shiri daemon ready — UI at http://0.0.0.0:8080")
 
@@ -949,7 +736,7 @@ def shutdown_handler(signum, frame):
     """Graceful shutdown on SIGTERM/SIGINT."""
     log.info("Shutdown signal received...")
     _log_stop.set()
-    tts_pcm_ws_server.stop()
+    tts_webrtc_service.stop()
     zone_manager.shutdown()
     sys.exit(0)
 

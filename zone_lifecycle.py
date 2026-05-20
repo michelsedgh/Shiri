@@ -1141,7 +1141,7 @@ def cleanup_zone(zone):
     zone.owntone_ip = None
     zone.shairport_port = None
     zone.owntone_port = None
-    zone.tts_pcm_pipe = None
+    zone.tts_webrtc_socket = None
     zone.owntone_api = None
 
     log.info("Zone %s cleanup complete", zone.zone_id)

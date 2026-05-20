@@ -10,8 +10,8 @@ export function clampNumber(value, min, max, fallback) {
     return Math.min(Math.max(Math.round(parsed), min), max);
 }
 
-export function roomLabel(room) {
-    return room?.room_name || room?.room_id || 'Room';
+export function zoneLabel(zone) {
+    return zone?.zone_name || zone?.zone_id || 'Zone';
 }
 
 export function statusClass(status) {
@@ -28,16 +28,11 @@ export function selectedSpeakerText(speakers = []) {
     return items.map((speaker) => speaker.name || speaker.id || 'Speaker').join(', ');
 }
 
-export function activityText(room) {
-    const names = room?.presence_names || [];
-    const activities = room?.activities || [];
-    if (names.length && activities.length) {
-        const activity = activities[0]?.activity || 'present';
-        return `${names.join(', ')} - ${activity}`;
-    }
-    if (names.length) return names.join(', ');
-    if (activities.length) return activities.map((item) => item.activity || 'activity').join(', ');
-    return 'No presence';
+export function bindingText(zone) {
+    if (!zone?.lionos_room_id) return 'No LionOS binding';
+    return zone.lionos_room_name
+        ? `${zone.lionos_room_name} / ${zone.lionos_room_id}`
+        : zone.lionos_room_id;
 }
 
 export function debounce(fn, delay = 350) {

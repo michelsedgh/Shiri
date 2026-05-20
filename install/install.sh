@@ -8,6 +8,7 @@
 set -euo pipefail
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ $(id -u) -ne 0 ]]; then
   echo "Run this script as root (sudo)." >&2
@@ -33,12 +34,18 @@ apt install -y \
   automake \
   libtool \
   pkg-config \
+  python3-pip \
+  python3-venv \
   python3-gi \
   gir1.2-gstreamer-1.0 \
   gstreamer1.0-tools \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad \
   gstreamer1.0-alsa
+
+log "Installing Shiri Python packages..."
+python3 -m pip install -r "$SCRIPT_DIR/requirements.txt"
 
 log "Installing shairport-sync build dependencies..."
 apt install -y \

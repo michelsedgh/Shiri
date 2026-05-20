@@ -125,6 +125,17 @@ class OwnToneAPI:
         """Ask OwnTone to play the current pipe/queue."""
         return self._api("/api/player/play", method="PUT")
 
+    def pause(self):
+        """Ask OwnTone to pause playback."""
+        return self._api("/api/player/pause", method="PUT")
+
+    def stop(self):
+        """Ask OwnTone to stop playback, falling back to pause if needed."""
+        result = self._api("/api/player/stop", method="PUT")
+        if result is not None:
+            return result
+        return self.pause()
+
     # -- Library --
 
     def rescan_library(self):

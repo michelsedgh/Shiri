@@ -21,10 +21,9 @@ import uuid
 from config import (
     BASE_DIR,
     DEFAULT_LATENCY_OFFSET,
-    MIXER_TTS_PCM_CHANNELS,
-    MIXER_TTS_PCM_RATE,
     normalize_latency_offset,
     sanitize_audio_settings,
+    MIXER_TTS_WEBRTC_SOCKET_NAME,
 )
 from zone_lifecycle import (
     _run,
@@ -41,10 +40,11 @@ DEFAULT_REDUCTION_PCT = 72
 DEFAULT_DUCK_GAIN = 1.0 - (DEFAULT_REDUCTION_PCT / 100.0)
 MIN_REDUCTION_PCT = 0
 MAX_REDUCTION_PCT = 95
+LEGACY_ZONE_CONFIG_KEYS = {"network_mode", "netns_name", "macvlan_if"}
 
 
-def _slugify_room_id(value):
-    """Return a stable LionOS-style room id."""
+def _slugify_lionos_room_id(value):
+    """Return a stable LionOS room id for zone binding metadata."""
     text = str(value or "").strip().lower()
     text = re.sub(r"[^a-z0-9]+", "_", text)
     text = re.sub(r"_+", "_", text).strip("_")
@@ -88,16 +88,38 @@ def _level_settings(raw=None, fallback=None):
 
 def _normalize_tts_policy(raw=None):
     raw = raw if isinstance(raw, dict) else {}
-    room = _level_settings(raw.get("room", raw))
+    zone = _level_settings(raw.get("zone", raw.get("room", raw)))
     return {
-        "mode": "room",
-        "room": room,
+        "mode": "zone",
+        "zone": zone,
         "speakers": {},
     }
 
 
 def _sanitize_zone_config(raw):
-    return sanitize_audio_settings(raw)
+    config = sanitize_audio_settings(raw)
+    for key in LEGACY_ZONE_CONFIG_KEYS:
+        config.pop(key, None)
+    legacy_room_id = config.pop("room_id", None)
+    legacy_room_name = config.pop("room_name", None)
+    legacy_default_room = config.pop("default_room", None)
+    if legacy_room_id and "lionos_room_id" not in config:
+        config["lionos_room_id"] = legacy_room_id
+    if legacy_room_name and "lionos_room_name" not in config:
+        config["lionos_room_name"] = legacy_room_name
+    if legacy_default_room is not None and "default_lionos_room" not in config:
+        config["default_lionos_room"] = bool(legacy_default_room)
+    if "lionos_room_id" in config:
+        room_id = _slugify_lionos_room_id(config.get("lionos_room_id"))
+        if room_id == "default":
+            config.pop("lionos_room_id", None)
+            config.pop("lionos_room_name", None)
+            config["default_lionos_room"] = False
+        else:
+            config["lionos_room_id"] = room_id
+    if "lionos_room_name" in config and not config.get("lionos_room_name"):
+        config.pop("lionos_room_name", None)
+    return config
 
 
 def _settings_to_mix(settings):
@@ -154,7 +176,7 @@ class Zone:
         self.owntone_ip = None
         self.shairport_port = None
         self.owntone_port = None
-        self.tts_pcm_pipe = None
+        self.tts_webrtc_socket = None
         self.owntone_api = None  # OwnToneAPI instance
         self.excluded_airplay_names = []
         self._grp_dir = None
@@ -171,12 +193,13 @@ class Zone:
         return self.config.get("name", f"Shiri {self.zone_id}")
 
     @property
-    def room_id(self):
-        return self.config.get("room_id") or _slugify_room_id(self.display_name)
+    def lionos_room_id(self):
+        room_id = self.config.get("lionos_room_id")
+        return _slugify_lionos_room_id(room_id) if room_id else None
 
     @property
-    def room_name(self):
-        return self.config.get("room_name") or self.display_name
+    def lionos_room_name(self):
+        return self.config.get("lionos_room_name") or self.lionos_room_id
 
     @property
     def interface(self):
@@ -199,11 +222,12 @@ class Zone:
             "owntone_ip": self.owntone_ip,
             "shairport_port": self.shairport_port,
             "owntone_port": self.owntone_port,
-            "tts_pcm_pipe": self.tts_pcm_pipe,
+            "tts_webrtc_socket": self.tts_webrtc_socket,
             "allocated_subdevice": self.allocated_subdevice,
             "latency_offset": self.config.get("latency_offset", DEFAULT_LATENCY_OFFSET),
-            "room_id": self.room_id,
-            "room_name": self.room_name,
+            "lionos_room_id": self.lionos_room_id,
+            "lionos_room_name": self.lionos_room_name,
+            "default_lionos_room": bool(self.config.get("default_lionos_room", False)),
             "tts_policy": _normalize_tts_policy(self.config.get("tts_policy")),
         }
 
@@ -296,8 +320,7 @@ class ZoneManager:
     # Zone CRUD
     # -------------------------------------------------------------------------
 
-    def create_zone(self, name, interface, auto_start=False, latency_offset=None,
-                    room_id=None, room_name=None, default_room=False):
+    def create_zone(self, name, interface, auto_start=False, latency_offset=None):
         """Create a new zone (does not start it)."""
         zone_id = f"zone_{uuid.uuid4().hex[:8]}"
         config = {
@@ -305,12 +328,8 @@ class ZoneManager:
             "interface": interface,
             "auto_start": auto_start,
             "speakers": [],
-            "room_id": _slugify_room_id(room_id or name),
-            "room_name": room_name or name,
             "tts_policy": _normalize_tts_policy(),
         }
-        if default_room:
-            config["default_room"] = True
         if latency_offset is not None:
             config["latency_offset"] = normalize_latency_offset(latency_offset)
         zone = Zone(zone_id, config, on_status_change=self._emit_zone_status)
@@ -366,10 +385,8 @@ class ZoneManager:
                 return None, False
             
             sanitized = _sanitize_zone_config(updates)
-            if "room_id" in sanitized:
-                sanitized["room_id"] = _slugify_room_id(sanitized.get("room_id"))
-            if "room_name" in sanitized and not sanitized.get("room_name"):
-                sanitized["room_name"] = sanitized.get("name") or zone.display_name
+            for binding_key in ("lionos_room_id", "lionos_room_name", "default_lionos_room"):
+                sanitized.pop(binding_key, None)
             if "tts_policy" in sanitized:
                 sanitized["tts_policy"] = _normalize_tts_policy(sanitized.get("tts_policy"))
             zone.config.update(sanitized)
@@ -429,35 +446,50 @@ class ZoneManager:
                 log.info("Removed orphaned runtime group directory: %s", path)
 
     # -------------------------------------------------------------------------
-    # Room routing
+    # LionOS binding metadata
     # -------------------------------------------------------------------------
 
-    def list_rooms(self):
-        """Return room-to-zone mappings for LionOS."""
-        rooms = []
-        for zone in self.list_zones():
-            rooms.append({
-                "room_id": zone.room_id,
-                "room_name": zone.room_name,
-                "zone_id": zone.zone_id,
-                "zone_name": zone.display_name,
-                "status": zone.status,
-                "default_room": bool(zone.config.get("default_room", False)),
-                "speakers": zone.config.get("speaker_names", []),
-                "tts_policy": _normalize_tts_policy(zone.config.get("tts_policy")),
-            })
-        return rooms
-
-    def set_zone_room(self, zone_id, room_id, room_name=None, default_room=False):
-        """Bind a Shiri zone to a LionOS room id."""
+    def set_zone_binding(self, zone_id, lionos_room_id, lionos_room_name=None, default=False):
+        """Bind a Shiri audio zone to one canonical LionOS room id."""
         zone = self.get_zone(zone_id)
         if not zone:
             return None, "Zone not found"
 
-        zone.config["room_id"] = _slugify_room_id(room_id)
-        zone.config["room_name"] = room_name or zone.config.get("room_name") or zone.display_name
-        zone.config["default_room"] = bool(default_room)
-        self.config_store.save_zone(zone_id, zone.config)
+        normalized = _slugify_lionos_room_id(lionos_room_id)
+        if normalized == "default":
+            return None, "lionos_room_id is required"
+        with self._lock:
+            for existing_zone_id, existing in self.zones.items():
+                if existing_zone_id == zone_id:
+                    continue
+                if existing.lionos_room_id == normalized:
+                    existing.config.pop("lionos_room_id", None)
+                    existing.config.pop("lionos_room_name", None)
+                    existing.config["default_lionos_room"] = False
+                    self.config_store.save_zone(existing_zone_id, existing.config)
+                    self._emit_zone_status(existing)
+                elif default and existing.config.get("default_lionos_room"):
+                    existing.config["default_lionos_room"] = False
+                    self.config_store.save_zone(existing_zone_id, existing.config)
+                    self._emit_zone_status(existing)
+
+            zone.config["lionos_room_id"] = normalized
+            zone.config["lionos_room_name"] = lionos_room_name or zone.config.get("lionos_room_name") or normalized
+            zone.config["default_lionos_room"] = bool(default)
+            self.config_store.save_zone(zone_id, zone.config)
+        self._emit_zone_status(zone)
+        return zone, None
+
+    def clear_zone_binding(self, zone_id):
+        """Remove LionOS room binding metadata from a zone."""
+        zone = self.get_zone(zone_id)
+        if not zone:
+            return None, "Zone not found"
+        with self._lock:
+            zone.config.pop("lionos_room_id", None)
+            zone.config.pop("lionos_room_name", None)
+            zone.config["default_lionos_room"] = False
+            self.config_store.save_zone(zone_id, zone.config)
         self._emit_zone_status(zone)
         return zone, None
 
@@ -470,15 +502,15 @@ class ZoneManager:
         speakers = self._known_speakers(zone)
         return {
             "zone_id": zone.zone_id,
-            "room_id": zone.room_id,
-            "room_name": zone.room_name,
+            "lionos_room_id": zone.lionos_room_id,
+            "lionos_room_name": zone.lionos_room_name,
             "policy": policy,
             "effective": self._effective_tts_mix(zone, policy=policy),
             "speakers": speakers,
         }, None
 
     def set_tts_policy(self, zone_id, policy_updates):
-        """Persist room/per-speaker ducking settings."""
+        """Persist zone-level ducking settings."""
         zone = self.get_zone(zone_id)
         if not zone:
             return None, "Zone not found"
@@ -486,15 +518,15 @@ class ZoneManager:
         incoming = policy_updates if isinstance(policy_updates, dict) else {}
         if isinstance(incoming.get("policy"), dict):
             incoming = incoming["policy"]
-        room_update = incoming.get("room", current["room"])
-        if not isinstance(room_update, dict):
-            room_update = current["room"]
+        zone_update = incoming.get("zone", incoming.get("room", current["zone"]))
+        if not isinstance(zone_update, dict):
+            zone_update = current["zone"]
         speaker_updates = incoming.get("speakers", current["speakers"])
         if not isinstance(speaker_updates, dict):
             speaker_updates = current["speakers"]
         merged = {
             "mode": incoming.get("mode", current["mode"]),
-            "room": room_update,
+            "zone": zone_update,
             "speakers": speaker_updates,
         }
         policy = _normalize_tts_policy(merged)
@@ -503,129 +535,58 @@ class ZoneManager:
         self._emit_zone_status(zone)
         return {
             "zone_id": zone.zone_id,
-            "room_id": zone.room_id,
-            "room_name": zone.room_name,
+            "lionos_room_id": zone.lionos_room_id,
+            "lionos_room_name": zone.lionos_room_name,
             "policy": policy,
             "effective": self._effective_tts_mix(zone, policy=policy),
             "speakers": self._known_speakers(zone),
         }, None
 
-    def resolve_zone_for_room(self, room_id=None, require_running=True):
-        """
-        Find the zone that should speak for a room. With one zone, "default"
-        resolves to that zone so early LionOS integration stays simple.
-        """
-        zones = self.list_zones()
-        candidates = []
-        normalized = _slugify_room_id(room_id) if room_id else None
-
-        if normalized and normalized != "default":
-            for zone in zones:
-                aliases = {
-                    zone.zone_id,
-                    zone.room_id,
-                    _slugify_room_id(zone.display_name),
-                    _slugify_room_id(zone.room_name),
-                }
-                if normalized in aliases:
-                    candidates.append(zone)
-        else:
-            candidates = [z for z in zones if z.config.get("default_room")]
-            if not candidates:
-                candidates = zones
-
-        if require_running:
-            running = [z for z in candidates if z.status == Zone.STATUS_RUNNING]
-            if running:
-                return running[0], None
-            if candidates:
-                return None, "Matched room, but its Shiri zone is not running"
-            return None, "No Shiri zone found for room"
-
-        if candidates:
-            return candidates[0], None
-        return None, "No Shiri zone found for room"
-
     # -------------------------------------------------------------------------
     # TTS stream routing
     # -------------------------------------------------------------------------
 
-    def prepare_tts_pcm(self, zone_id, *, request_id=None, audio_format="pcm_s16le",
-                        sample_rate=MIXER_TTS_PCM_RATE, channels=MIXER_TTS_PCM_CHANNELS,
-                        sample_width=2, text=None,
-                        speaker_id=None, speaker_name=None):
-        """Resolve room policy and return the permanent PCM mixer pipe target."""
+    def prepare_tts_webrtc(self, zone_id, *, request_id=None, session_id=None, text=None,
+                           speaker_id=None, speaker_name=None):
+        """Return the persistent WebRTC mixer target for one Shiri zone."""
         zone = self.get_zone(zone_id)
         if not zone:
             return None, "Zone not found"
         if zone.status != Zone.STATUS_RUNNING:
-            return None, "Zone must be running before TTS can be streamed"
+            return None, "Zone is not running"
         if zone.owntone_api:
             try:
                 zone.owntone_api.play()
             except Exception as e:
                 log.debug("Could not nudge OwnTone play state before TTS: %s", e)
-
-        fmt = (audio_format or "pcm_s16le").lower().strip(".")
-        if fmt not in {"pcm_s16le", "raw", "s16le"}:
-            return None, "Only PCM S16LE streams are currently supported"
-        try:
-            parsed_rate = int(sample_rate)
-            parsed_channels = int(channels)
-            parsed_width = int(sample_width)
-        except (TypeError, ValueError):
-            return None, "sample_rate, channels, and sample_width must be integers"
-        if parsed_rate <= 0 or parsed_channels <= 0:
-            return None, "sample_rate and channels must be positive"
-        if parsed_width != 2:
-            return None, "Only 16-bit PCM streams are currently supported"
-        if parsed_rate != MIXER_TTS_PCM_RATE or parsed_channels != MIXER_TTS_PCM_CHANNELS:
-            return None, f"TTS PCM must be {MIXER_TTS_PCM_RATE} Hz, {MIXER_TTS_PCM_CHANNELS} channel"
-        if not zone.tts_pcm_pipe:
-            return None, "Zone mixer PCM pipe is not ready"
+        if not zone.tts_webrtc_socket:
+            zone.tts_webrtc_socket = os.path.join(zone.grp_dir, "state", MIXER_TTS_WEBRTC_SOCKET_NAME)
 
         effective = self._effective_tts_mix(
             zone,
             speaker_id=speaker_id,
             speaker_name=speaker_name,
         )
-        safe_id = _safe_request_id(request_id)
-        self._write_tts_pcm_control(zone, request_id=safe_id, duck_gain=effective["duck_gain"])
-        log.info("Prepared TTS PCM %s for room=%s zone=%s", safe_id, zone.room_id, zone.zone_id)
+        safe_request = _safe_request_id(request_id)
+        safe_session = _safe_request_id(session_id or f"zone_{zone.zone_id}")
+        log.info("Prepared WebRTC TTS %s session=%s zone=%s", safe_request, safe_session, zone.zone_id)
         return {
             "ok": True,
-            "request_id": safe_id,
-            "room_id": zone.room_id,
-            "room_name": zone.room_name,
+            "request_id": safe_request,
+            "session_id": safe_session,
             "zone_id": zone.zone_id,
+            "lionos_room_id": zone.lionos_room_id,
+            "lionos_room_name": zone.lionos_room_name,
             "effective_policy": effective,
             "duck_gain": effective["duck_gain"],
-            "transport": "ws_pcm_s16le",
-            "format": "pcm_s16le",
-            "encoding_name": "PCM",
-            "sample_format": "s16le",
-            "sample_rate": parsed_rate,
-            "channels": parsed_channels,
-            "sample_width": parsed_width,
-            "tts_pcm_pipe": zone.tts_pcm_pipe,
+            "transport": "webrtc",
+            "codec": "opus",
+            "internal_audio_target": "gstreamer-audiomixer",
+            "tts_webrtc_socket": zone.tts_webrtc_socket,
             "text": text,
             "speaker_id": speaker_id,
             "speaker_name": speaker_name,
         }, None
-
-    def _write_tts_pcm_control(self, zone, *, request_id, duck_gain):
-        state_dir = os.path.join(zone.grp_dir, "state")
-        os.makedirs(state_dir, exist_ok=True)
-        path = os.path.join(state_dir, "tts_pcm_control.json")
-        tmp_path = f"{path}.tmp"
-        payload = {
-            "request_id": request_id,
-            "duck_gain": _clamp_float(duck_gain, 0.0, 1.0, DEFAULT_DUCK_GAIN),
-            "updated_at": time.time(),
-        }
-        with open(tmp_path, "w") as f:
-            json.dump(payload, f)
-        os.replace(tmp_path, path)
 
     def _known_speakers(self, zone):
         outputs = []
@@ -654,10 +615,10 @@ class ZoneManager:
     def _effective_tts_mix(self, zone, *, speaker_id=None, speaker_name=None, policy=None):
         del speaker_id, speaker_name
         policy = policy or _normalize_tts_policy(zone.config.get("tts_policy"))
-        mix = _settings_to_mix(policy["room"])
+        mix = _settings_to_mix(policy["zone"])
         mix.update({
-            "mode": "room",
-            "source": "room",
+            "mode": "zone",
+            "source": "zone",
             "speaker_ids": [],
         })
         return mix

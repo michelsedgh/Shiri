@@ -29,6 +29,8 @@ The web UI listens on `http://<host-ip>:8080`.
 - Shiri uses macvlan, not ipvlan. macvlan gives each namespace a stable Shiri MAC; ipvlan shares the host MAC and can confuse DHCP/router state on this VM.
 - Shiri installs `/etc/dhcp/dhclient-script` from `scripts/dhclient_namespace.sh` so namespace DHCP does not run host DNS/time hooks.
 - The pause bridge and play-start reset hook are intentionally gone.
+- Shiri receives TTS through WebRTC signaling/control and terminates audio inside
+  the zone mixer.
 
 ## Troubleshooting
 
