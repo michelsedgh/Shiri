@@ -1,0 +1,31 @@
+name: Checks
+on:
+  push:
+  pull_request:
+jobs:
+  control-and-audio:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Linux audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-venv python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-alsa
+      - name: Enable ALSA loopback when the runner kernel provides it
+        run: sudo modprobe snd-aloop || echo 'This runner lacks snd-aloop; the ALSA bridge check will explicitly skip.'
+      - name: Install project and verification tools
+        run: |
+          /usr/bin/python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install -e '.[audio,test]'
+          .venv/bin/python -m playwright install --with-deps chromium
+      - name: Python validation and real PCM mixer
+        env:
+          SHIRI_LINUX_AUDIO_TESTS: '1'
+        run: |
+          .venv/bin/ruff check shiri tests
+          .venv/bin/pytest -q
+      - name: Browser and frontend validation
+        env:
+          SHIRI_BROWSER_TESTS: '1'
+        run: node --test tests/web/*.test.mjs

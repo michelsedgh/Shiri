@@ -1,0 +1,2 @@
+# Unified patches contain upstream context markers, including blank lines.
+install/patches/*.patch -whitespace

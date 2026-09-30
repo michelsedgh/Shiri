@@ -1,0 +1,29 @@
+[Unit]
+Description=Shiri rootless room control API
+Requires=shiri-runtime.service
+After=shiri-runtime.service
+
+[Service]
+Type=simple
+User=shiri
+Group=shiri
+EnvironmentFile=/etc/shiri/shiri.env
+ExecStart=@PREFIX@/venv/bin/python -m shiri.cli serve
+UMask=0007
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/shiri
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

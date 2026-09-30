@@ -1,0 +1,330 @@
+diff --git a/configure.ac b/configure.ac
+index 4dcd6438..d4cae852 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3])
++AC_INIT([owntone], [29.3-shiri-swvol1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index b311abd3..28a8d6c9 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -30,7 +30,7 @@ PAIR_AP_SRC = \
+ AM_CPPFLAGS += -DCONFIG_GCRYPT
+ 
+ if COND_ALSA
+-ALSA_SRC=outputs/alsa.c
++ALSA_SRC=outputs/alsa.c outputs/pcm_volume.h
+ endif
+ 
+ if COND_PULSEAUDIO
+diff --git a/src/conffile.c b/src/conffile.c
+index f1976165..473172fa 100644
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -144,6 +144,7 @@ static cfg_opt_t sec_audio[] =
+     CFG_STR("card", "default", CFGF_NONE),
+     CFG_STR("mixer", NULL, CFGF_NONE),
+     CFG_STR("mixer_device", NULL, CFGF_NONE),
++    CFG_BOOL("software_volume", cfg_false, CFGF_NONE),
+     CFG_BOOL("sync_disable", cfg_false, CFGF_NONE),
+     CFG_INT("offset", 0, CFGF_DEPRECATED),
+     CFG_INT("offset_ms", 0, CFGF_DEPRECATED),
+@@ -159,6 +160,7 @@ static cfg_opt_t sec_alsa[] =
+     CFG_STR("nickname", NULL, CFGF_NONE),
+     CFG_STR("mixer", NULL, CFGF_NONE),
+     CFG_STR("mixer_device", NULL, CFGF_NONE),
++    CFG_BOOL("software_volume", cfg_false, CFGF_NONE),
+     CFG_INT("offset_ms", 0, CFGF_DEPRECATED),
+     // Hidden options
+     CFG_BOOL("exclusive", cfg_false, CFGF_NONE),
+diff --git a/src/outputs/alsa.c b/src/outputs/alsa.c
+index 20bc8fae..37f8a038 100644
+--- a/src/outputs/alsa.c
++++ b/src/outputs/alsa.c
+@@ -35,6 +35,7 @@
+ #include <stdint.h>
+ #include <inttypes.h>
+ #include <math.h>
++#include <limits.h>
+ 
+ #include <alsa/asoundlib.h>
+ 
+@@ -43,6 +44,7 @@
+ #include "logger.h"
+ #include "player.h"
+ #include "outputs.h"
++#include "pcm_volume.h"
+ 
+ 
+ // For setting volume, treat everything below this as linear scale
+@@ -93,6 +95,9 @@ struct alsa_mixer
+ struct alsa_playback_session
+ {
+   snd_pcm_t *pcm;
++  struct alsa_session *session;
++  uint8_t *volume_buf;
++  size_t volume_bufsize;
+ 
+   int buffer_nsamp;
+ 
+@@ -127,6 +132,7 @@ struct alsa_extra
+   const char *card_name;
+   const char *mixer_name;
+   const char *mixer_device_name;
++  bool software_volume;
+ };
+ 
+ struct alsa_session
+@@ -141,6 +147,8 @@ struct alsa_session
+   const char *mixer_device_name;
+ 
+   struct alsa_mixer mixer;
++  bool software_volume;
++  int volume;
+ 
+   uint64_t delay_ms;
+ 
+@@ -676,6 +684,7 @@ playback_session_free(struct alsa_playback_session *pb)
+   ringbuffer_free(&pb->prebuf, 1);
+ 
+   free(pb->latency_history);
++  free(pb->volume_buf);
+   free(pb);
+ }
+ 
+@@ -729,6 +738,7 @@ playback_session_add(struct alsa_session *as, struct media_quality *quality, str
+ 
+   CHECK_NULL(L_LAUDIO, pb = calloc(1, sizeof(struct alsa_playback_session)));
+   CHECK_NULL(L_LAUDIO, pb->latency_history = calloc(alsa_latency_history_size, sizeof(double)));
++  pb->session = as;
+ 
+   ret = pcm_open(&pb->pcm, as->devname, quality);
+   if (ret == ALSA_ERROR_DEVICE_BUSY)
+@@ -796,6 +806,47 @@ playback_session_add(struct alsa_session *as, struct media_quality *quality, str
+   return -1;
+ }
+ 
++/* Keep every buffered block raw until submission. Gain changes neither the
++ * source buffer nor frame counts, timestamps, queue state or synchronization.
++ */
++static snd_pcm_sframes_t
++pcm_write(struct alsa_playback_session *pb, const uint8_t *buf, snd_pcm_sframes_t nsamp)
++{
++  struct alsa_session *as = pb->session;
++  uint8_t *allocated;
++  ssize_t bytes;
++  size_t frame_bytes;
++
++  if (!as->software_volume)
++    return snd_pcm_writei(pb->pcm, buf, nsamp);
++  if (nsamp < 0 || pb->quality.channels <= 0
++      || (pb->quality.bits_per_sample != 16 && pb->quality.bits_per_sample != 24
++          && pb->quality.bits_per_sample != 32))
++    return -EINVAL;
++  if (nsamp == 0)
++    return 0;
++  if ((size_t)pb->quality.channels > SIZE_MAX / (pb->quality.bits_per_sample / 8))
++    return -EINVAL;
++  frame_bytes = (size_t)(pb->quality.bits_per_sample / 8) * pb->quality.channels;
++  if ((uint64_t)nsamp > (uint64_t)SSIZE_MAX / frame_bytes)
++    return -EINVAL;
++  bytes = snd_pcm_frames_to_bytes(pb->pcm, nsamp);
++  if (bytes < 0 || (size_t)bytes != (size_t)nsamp * frame_bytes)
++    return -EINVAL;
++  if ((size_t)bytes > pb->volume_bufsize)
++    {
++      allocated = realloc(pb->volume_buf, bytes);
++      if (!allocated)
++        return -ENOMEM;
++      pb->volume_buf = allocated;
++      pb->volume_bufsize = bytes;
++    }
++  if (pcm_volume_scale_copy(pb->volume_buf, buf, bytes, pb->quality.bits_per_sample, as->volume) < 0)
++    return -EINVAL;
++
++  return snd_pcm_writei(pb->pcm, pb->volume_buf, nsamp);
++}
++
+ // This function writes the sample buf into either the prebuffer or directly to
+ // ALSA, depending on how much room there is in ALSA, and whether we are
+ // prebuffering or not. It also transfers from the the prebuffer to ALSA, if
+@@ -834,7 +885,7 @@ buffer_write(struct alsa_playback_session *pb, struct output_data *odata, snd_pc
+ 
+       nsamp = snd_pcm_bytes_to_frames(pb->pcm, bufsize);
+ 
+-      ret = snd_pcm_writei(pb->pcm, buf, nsamp);
++      ret = pcm_write(pb, buf, nsamp);
+       if (ret < 0)
+ 	return ret;
+ 
+@@ -856,7 +907,7 @@ buffer_write(struct alsa_playback_session *pb, struct output_data *odata, snd_pc
+ 
+   nsamp = snd_pcm_bytes_to_frames(pb->pcm, odata->bufsize);
+ 
+-  ret = snd_pcm_writei(pb->pcm, odata->buffer, nsamp);
++  ret = pcm_write(pb, odata->buffer, nsamp);
+   if (ret < 0)
+     return ret;
+ 
+@@ -1030,7 +1081,7 @@ playback_drain(struct alsa_playback_session *pb)
+ 
+   nsamp = snd_pcm_bytes_to_frames(pb->pcm, bufsize);
+ 
+-  ret = snd_pcm_writei(pb->pcm, buf, nsamp);
++  ret = pcm_write(pb, buf, nsamp);
+ 
+   return ((ret < 0) ? ALSA_ERROR_SESSION : 0);
+ }
+@@ -1114,7 +1165,8 @@ alsa_session_free(struct alsa_session *as)
+ 
+   playback_session_remove_all(as);
+ 
+-  mixer_close(&as->mixer, as->mixer_device_name);
++  if (!as->software_volume)
++    mixer_close(&as->mixer, as->mixer_device_name);
+ 
+   free(as);
+ }
+@@ -1166,18 +1218,23 @@ alsa_session_make(struct output_device *device, int callback_id)
+   as->devname = ae->card_name;
+   as->mixer_name = ae->mixer_name;
+   as->mixer_device_name = ae->mixer_device_name;
++  as->software_volume = ae->software_volume;
++  as->volume = pcm_volume_clamp(device->volume);
+ 
+   as->delay_ms = outputs_buffer_duration_ms_get();
+-  if (as->delay_ms + device->offset_ms < 0)
++  if (device->offset_ms < 0 && as->delay_ms < (uint64_t)(-(int64_t)device->offset_ms))
+     DPRINTF(E_LOG, L_LAUDIO, "'%s' configured with invalid start time (delay=%" PRIu64 ", offset=%d)\n", device->name, as->delay_ms, device->offset_ms);
+   else
+     as->delay_ms += device->offset_ms;
+ 
+-  ret = mixer_open(&as->mixer, as->mixer_device_name, as->mixer_name);
+-  if (ret < 0)
++  if (!as->software_volume)
+     {
+-      DPRINTF(E_LOG, L_LAUDIO, "Could not open mixer '%s' ('%s')\n", as->mixer_device_name, as->mixer_name);
+-      goto error_free_session;
++      ret = mixer_open(&as->mixer, as->mixer_device_name, as->mixer_name);
++      if (ret < 0)
++        {
++          DPRINTF(E_LOG, L_LAUDIO, "Could not open mixer '%s' ('%s')\n", as->mixer_device_name, as->mixer_name);
++          goto error_free_session;
++        }
+     }
+ 
+   as->state = OUTPUT_STATE_CONNECTED;
+@@ -1216,7 +1273,8 @@ alsa_device_start(struct output_device *device, int callback_id)
+   if (!as)
+     return -1;
+ 
+-  volume_set(&as->mixer, device->volume);
++  if (!as->software_volume)
++    volume_set(&as->mixer, device->volume);
+ 
+   as->state = OUTPUT_STATE_CONNECTED;
+   alsa_status(as);
+@@ -1273,7 +1331,9 @@ alsa_device_volume_set(struct output_device *device, int callback_id)
+   if (!as)
+     return 0;
+ 
+-  volume_set(&as->mixer, device->volume);
++  as->volume = pcm_volume_clamp(device->volume);
++  if (!as->software_volume)
++    volume_set(&as->mixer, device->volume);
+ 
+   as->callback_id = callback_id;
+   alsa_status(as);
+@@ -1394,6 +1454,7 @@ alsa_device_add(cfg_t* cfg_audio, int id)
+   ae->mixer_device_name = cfg_getstr(cfg_audio, "mixer_device");
+   if (!ae->mixer_device_name || strlen(ae->mixer_device_name) == 0)
+     ae->mixer_device_name = ae->card_name;
++  ae->software_volume = cfg_getbool(cfg_audio, "software_volume");
+ 
+   offset_ms = cfg_getint(cfg_audio, "offset_ms");
+   if (abs(offset_ms) > 1000)
+diff --git a/src/outputs/pcm_volume.h b/src/outputs/pcm_volume.h
+new file mode 100644
+index 00000000..3ac5a64d
+--- /dev/null
++++ b/src/outputs/pcm_volume.h
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef OWNTONE_PCM_VOLUME_H
++#define OWNTONE_PCM_VOLUME_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++static inline int
++pcm_volume_clamp(int volume)
++{
++  return volume < 0 ? 0 : volume > 100 ? 100 : volume;
++}
++
++/* Copy interleaved signed LE PCM to private storage, with cubic percent gain.
++ * The caller owns the byte capacities. Reject overlap and incomplete samples;
++ * neither the shared output nor the raw prebuffer is ever scaled in place.
++ */
++static inline int
++pcm_volume_scale_copy(uint8_t *dst, const uint8_t *src, size_t bytes,
++                      unsigned int bits, int volume)
++{
++  uintptr_t dst_addr = (uintptr_t)dst;
++  uintptr_t src_addr = (uintptr_t)src;
++  uint64_t raw, encoded;
++  int64_t sample, scaled;
++  int64_t gain;
++  size_t offset;
++  unsigned int width, byte;
++
++  if (bits != 16 && bits != 24 && bits != 32)
++    return -1;
++  width = bits / 8;
++  if (bytes % width != 0)
++    return -1;
++  if (bytes == 0)
++    return 0;
++  if (!dst || !src || bytes > UINTPTR_MAX - dst_addr || bytes > UINTPTR_MAX - src_addr)
++    return -1;
++  if (dst_addr < src_addr + bytes && src_addr < dst_addr + bytes)
++    return -1;
++
++  volume = pcm_volume_clamp(volume);
++  if (volume == 100)
++    {
++      memcpy(dst, src, bytes);
++      return 0;
++    }
++  if (volume == 0)
++    {
++      memset(dst, 0, bytes);
++      return 0;
++    }
++
++  gain = (int64_t)volume * volume * volume;
++  for (offset = 0; offset < bytes; offset += width)
++    {
++      raw = 0;
++      for (byte = 0; byte < width; byte++)
++        raw |= (uint64_t)src[offset + byte] << (byte * 8);
++      sample = (raw & (UINT64_C(1) << (bits - 1)))
++        ? (int64_t)raw - (INT64_C(1) << bits) : (int64_t)raw;
++      /* int32 extrema times 100^3 fit int64. Division truncates toward zero. */
++      scaled = sample * gain / INT64_C(1000000);
++      encoded = (uint64_t)scaled;
++      for (byte = 0; byte < width; byte++)
++        dst[offset + byte] = (uint8_t)(encoded >> (byte * 8));
++    }
++  return 0;
++}
++
++#endif

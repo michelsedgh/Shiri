@@ -1,134 +1,64 @@
 #!/usr/bin/env bash
-###############################################################################
-# install.sh
-#
-# Installs all system dependencies needed for Shiri on Ubuntu.
-# Run with: sudo ./install.sh
-###############################################################################
+# Install the package into a root-owned venv. Service activation is explicit.
 set -euo pipefail
-
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-if [[ $(id -u) -ne 0 ]]; then
-  echo "Run this script as root (sudo)." >&2
-  exit 1
-fi
-
-log "Updating package lists..."
-apt update
-
-log "Installing base packages..."
-apt install -y \
-  iproute2 \
-  isc-dhcp-client \
-  util-linux \
-  dbus \
-  avahi-daemon \
-  jq \
-  curl \
-  coreutils \
-  build-essential \
-  git \
-  autoconf \
-  automake \
-  libtool \
-  pkg-config \
-  python3-pip \
-  python3-venv \
-  python3-gi \
-  gir1.2-gstreamer-1.0 \
-  gstreamer1.0-tools \
-  gstreamer1.0-plugins-base \
-  gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad \
-  gstreamer1.0-alsa
-
-log "Installing Shiri Python packages..."
-python3 -m pip install -r "$SCRIPT_DIR/requirements.txt"
-
-log "Installing shairport-sync build dependencies..."
-apt install -y \
-  libpopt-dev \
-  libconfig-dev \
-  libssl-dev \
-  libavahi-client-dev \
-  libsoxr-dev \
-  libpulse-dev \
-  libasound2-dev \
-  libavcodec-dev \
-  libavformat-dev \
-  libavutil-dev \
-  libgcrypt20-dev \
-  libsodium-dev \
-  libplist-dev \
-  xxd
-
-# Check if nqptp is installed
-if ! command -v nqptp &>/dev/null; then
-  log "Building and installing nqptp (required for AirPlay 2)..."
-  TMPDIR=$(mktemp -d)
-  cd "$TMPDIR"
-  git clone https://github.com/mikebrady/nqptp.git
-  cd nqptp
-  autoreconf -fi
-  ./configure
-  make -j"$(nproc)"
-  make install
-  cd /
-  rm -rf "$TMPDIR"
-  log "nqptp installed."
-else
-  log "nqptp already installed."
-fi
-
-# Check if shairport-sync is installed with AirPlay 2 support
-if ! command -v shairport-sync &>/dev/null; then
-  log "Building and installing shairport-sync (AirPlay 2 build)..."
-  TMPDIR=$(mktemp -d)
-  cd "$TMPDIR"
-  git clone https://github.com/mikebrady/shairport-sync.git
-  cd shairport-sync
-  autoreconf -fi
-  ./configure --sysconfdir=/etc \
-    --with-avahi \
-    --with-ssl=openssl \
-    --with-airplay-2 \
-    --with-soxr \
-    --with-pipe \
-    --with-metadata
-  make -j"$(nproc)"
-  make install
-  cd /
-  rm -rf "$TMPDIR"
-  log "shairport-sync installed."
-else
-  log "shairport-sync already installed. Verify it has AirPlay 2 + pipe support."
-fi
-
-# Install OwnTone
-if ! command -v owntone &>/dev/null; then
-  log "Installing OwnTone from package repository..."
-  # Try the official PPA or package
-  if apt-cache show owntone-server &>/dev/null; then
-    apt install -y owntone-server
-  else
-    log "owntone-server package not found in repos."
-    log "You may need to build from source: https://owntone.github.io/owntone-server/installation/"
-    log "Or add the OwnTone PPA."
+umask 022
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset PYTHONPATH PYTHONHOME LD_LIBRARY_PATH LD_PRELOAD
+SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREFIX="${SHIRI_INSTALL_PREFIX:-/opt/shiri}"
+[[ "$PREFIX" == /* && "$PREFIX" != / ]] || { echo "Use an absolute installation prefix" >&2; exit 2; }
+[[ $(id -u) == 0 && $(uname -s) == Linux ]] || { echo "Run as root on Ubuntu/Debian" >&2; exit 1; }
+/usr/bin/python3 -I "$SOURCE/install/validate_installation.py" --create "$PREFIX"
+case "${1:-}" in
+  --with-backends) SHIRI_INSTALL_PREFIX="$PREFIX" "$SOURCE/install/build_backends.sh" ;;
+  "") ;;
+  *) echo "Usage: $0 [--with-backends]" >&2; exit 2 ;;
+esac
+apt-get update
+apt-get install -y python3-venv python3-pip python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+  iproute2 isc-dhcp-client iputils-ping util-linux coreutils dbus avahi-daemon alsa-utils \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-alsa
+mkdir -p "$PREFIX"
+/usr/bin/python3 -I -m venv --system-site-packages "$PREFIX/venv"
+/usr/bin/python3 -I "$SOURCE/install/validate_installation.py" "$PREFIX"
+"$PREFIX/venv/bin/python" -m pip install --require-hashes -r "$SOURCE/install/requirements.lock"
+"$PREFIX/venv/bin/python" -m pip install --no-deps "$SOURCE"
+/usr/bin/python3 -I "$SOURCE/install/validate_installation.py" "$PREFIX"
+"$PREFIX/venv/bin/python" - <<'PY'
+import gi
+import aiortc
+import av
+import numpy
+gi.require_version("Gst", "1.0")
+gi.require_version("GstAudio", "1.0")
+from gi.repository import Gst, GstAudio
+Gst.init(None)
+GstAudio.AudioInfo()
+for factory in ("alsasrc", "alsasink", "audiomixer", "audioconvert", "audioresample", "appsrc", "appsink"):
+    if Gst.ElementFactory.find(factory) is None:
+        raise SystemExit("Missing GStreamer factory: " + factory)
+PY
+install -d -m 0755 /etc/dhcp/shiri
+install -m 0755 "$SOURCE/shiri/runtime/dhclient_hook.py" /etc/dhcp/shiri/dhclient-script
+if [[ -f /etc/apparmor.d/sbin.dhclient ]]; then
+  install -d -m 0755 /etc/apparmor.d/local
+  touch /etc/apparmor.d/local/sbin.dhclient
+  RULE='  /etc/dhcp/shiri/dhclient-script Uxr,'
+  if ! awk -v rule="$RULE" '$0==rule { found=1 } END { exit !found }' /etc/apparmor.d/local/sbin.dhclient; then
+    printf '%s\n' "$RULE" >> /etc/apparmor.d/local/sbin.dhclient
   fi
-else
-  log "OwnTone already installed."
+  if command -v apparmor_parser >/dev/null; then apparmor_parser -r /etc/apparmor.d/sbin.dhclient; fi
 fi
-
-log ""
-log "=========================================="
-log "  Dependency installation complete!"
-log "=========================================="
-log ""
-log "Verify installations:"
-echo "  nqptp:          $(command -v nqptp || echo 'NOT FOUND')"
-echo "  shairport-sync: $(command -v shairport-sync || echo 'NOT FOUND')"
-echo "  owntone:        $(command -v owntone || echo 'NOT FOUND')"
-echo ""
-log "You can now run: sudo /home/ubuntu/Shiri/scripts/shiri_service.sh start"
+modprobe snd-aloop
+if [[ "${SHIRI_INSTALL_BLUETOOTH:-0}" == 1 ]]; then
+  # Pairing remains an operator action; never take over host sound/pairing state.
+  apt-cache show bluez-alsa-utils >/dev/null 2>&1 || {
+    echo "This distro has no bluez-alsa-utils package; install a supported BlueALSA adapter first" >&2; exit 1;
+  }
+  apt-get install -y bluez bluez-alsa-utils
+fi
+install -d -m 0755 /etc/modules-load.d
+printf '%s\n' snd-aloop > /etc/modules-load.d/shiri.conf
+printf '%s\n' "Package installed in $PREFIX/venv. Run deploy/install_services.sh to configure services."
+printf '%s\n' "Existing audio services and host DHCP hooks remain in place."

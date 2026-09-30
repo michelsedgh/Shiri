@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Room audio and speakers for your home">
+  <meta name="color-scheme" content="light">
+  <title>Shiri · House audio</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Shiri home"><span class="brand-mark" aria-hidden="true">S</span><span>Shiri<small>House audio</small></span></a>
+    <div id="system-status" class="system-status" role="status">Connecting…</div>
+    <div class="header-actions">
+      <button id="refresh" class="button quiet" type="button">Refresh</button>
+      <button id="sign-out" class="button quiet" type="button" hidden>Sign out</button>
+    </div>
+  </header>
+
+  <main class="page">
+    <noscript><p class="notice error">Enable JavaScript to manage rooms and speakers.</p></noscript>
+    <section id="pairing" class="pairing" hidden aria-labelledby="pairing-title">
+      <span class="eyebrow">Your home, your audio</span>
+      <h1 id="pairing-title">Connect to Shiri</h1>
+      <p>Pair this browser using the access token from your Shiri setup.</p>
+      <form id="pairing-form">
+        <label class="field" for="pairing-token">Access token</label>
+        <input id="pairing-token" type="password" autocomplete="off" spellcheck="false" required>
+        <p id="pairing-error" class="notice error" role="alert" hidden></p>
+        <button class="button primary" type="submit">Connect</button>
+      </form>
+    </section>
+
+    <section id="dashboard" aria-labelledby="page-title">
+      <div class="page-heading">
+        <div><span class="eyebrow">A place for every sound</span><h1 id="page-title">Your rooms</h1><p id="room-summary">Loading your home…</p></div>
+        <button id="add-room" class="button primary" type="button" disabled><span aria-hidden="true">＋</span> Add room</button>
+      </div>
+      <div id="connection-error" class="notice error" role="alert" hidden></div>
+      <div id="mode-notice" class="notice" hidden></div>
+      <section id="room-grid" class="room-grid" aria-label="Rooms" aria-live="polite"><div class="empty-state"><span class="loading-dot" aria-hidden="true"></span><p>Finding your rooms…</p></div></section>
+      <section class="capabilities" aria-label="Audio compatibility">
+        <div><strong>Room audio, made clear</strong><p>Choose speakers for each room. Use its AirPlay name for music and its Nobly room ID for targeted spoken replies.</p></div>
+        <details><summary>Which devices can I use?</summary><div id="capability-details"><p>Checking available audio support…</p></div></details>
+      </section>
+      <details id="diagnostics" class="diagnostics"><summary>Activity &amp; diagnostics</summary><div class="diagnostics-toolbar"><p>Recent service events help explain room and network changes.</p><button id="refresh-events" class="button quiet" type="button">Refresh activity</button></div><div id="events-error" class="notice error" role="alert" hidden></div><ol id="event-list" class="event-list"></ol></details>
+    </section>
+  </main>
+
+  <dialog id="room-dialog" class="side-sheet" aria-labelledby="room-dialog-title">
+    <div class="sheet-heading"><div><span class="eyebrow" id="room-dialog-eyebrow">Room setup</span><h2 id="room-dialog-title">Add a room</h2></div><button class="close-button" data-close="room" type="button" aria-label="Close room setup">×</button></div>
+    <form id="room-form" class="sheet-body">
+      <p class="form-intro">One room, one speaker group. Give it a name and tell Shiri where to send its audio.</p>
+      <label class="field" for="room-name">Room name</label><input id="room-name" type="text" maxlength="128" autocomplete="off" placeholder="Living room" required>
+      <label class="field" for="airplay-name">AirPlay name <span class="optional">optional</span></label><input id="airplay-name" type="text" maxlength="50" autocomplete="off" placeholder="Same as room name"><p class="hint">The name you choose when playing music from an Apple device.</p>
+      <label class="field" for="nobly-room-id">Nobly room ID <span class="optional">optional</span></label><input id="nobly-room-id" type="text" maxlength="128" autocomplete="off" placeholder="Use the room ID from Nobly"><p class="hint">This mapping lets Nobly address the right room. It does not confirm a connection to Nobly.</p>
+      <label class="field" for="room-interface">Speaker network</label><select id="room-interface" required></select><p class="hint">Choose the network interface that reaches this room’s speakers.</p>
+      <label class="field" for="local-audio-device">Local or Bluetooth audio device <span class="optional">optional</span></label><input id="local-audio-device" type="text" maxlength="128" autocomplete="off" placeholder="Leave blank for network speakers"><p class="hint">For a configured ALSA output, such as <code>hw:CARD=USB,DEV=0</code>. Bluetooth needs a paired adapter and a BlueALSA device, such as <code>bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp</code>. Leave blank to disable local output.</p>
+      <label class="field" for="room-duck">Music reduction during speech</label><div class="range-control"><input id="room-duck" type="range" min="0" max="100" step="1" value="72"><output id="room-duck-value" for="room-duck">72%</output></div><p class="hint">Lower the music while a spoken reply plays, then restore it.</p>
+      <p id="room-form-error" class="notice error" role="alert" hidden></p>
+      <button id="reload-room-draft" class="button quiet" type="button" hidden>Reload current room settings</button>
+      <div class="sheet-footer"><button class="button quiet" data-close="room" type="button">Cancel</button><button id="save-room" class="button primary" type="submit">Create room</button></div>
+      <details id="room-connection-details" class="room-connection-details" hidden><summary>Room connection details</summary><p id="room-connection-status" class="hint"></p><a id="room-owntone" class="button quiet" target="_blank" rel="noopener noreferrer" hidden>Open OwnTone</a></details>
+      <div id="delete-room-block" class="danger-zone" hidden><p id="delete-room-help">Turn the room off before deleting it. Deleting removes its saved speaker assignments.</p><button id="delete-room" class="button danger" type="button">Delete room</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="speaker-dialog" class="side-sheet" aria-labelledby="speaker-dialog-title">
+    <div class="sheet-heading"><div><span class="eyebrow">Speaker selection</span><h2 id="speaker-dialog-title">Room speakers</h2></div><button class="close-button" data-close="speakers" type="button" aria-label="Close speaker selection">×</button></div>
+    <form id="speaker-form" class="sheet-body">
+      <p class="form-intro">Checked speakers receive this room’s music and spoken replies. A speaker belongs to one room at a time.</p>
+      <div id="speaker-discovery-status" class="notice" role="status"></div>
+      <div id="speaker-options" class="speaker-options"></div>
+      <p class="hint">AirPlay outputs can synchronize through OwnTone. Cast timing is approximate; mixing protocols does not guarantee synchronization. Bluetooth requires a paired local audio output.</p>
+      <p id="speaker-form-error" class="notice error" role="alert" hidden></p>
+      <button id="reload-speaker-draft" class="button quiet" type="button" hidden>Reload current speaker selection</button>
+      <div class="sheet-footer"><button id="refresh-speakers" class="button quiet" type="button">Refresh discovery</button><button id="save-speakers" class="button primary" type="submit">Save speakers</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
