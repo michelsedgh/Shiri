@@ -36,6 +36,7 @@ from aiortc import AudioStreamTrack, RTCConfiguration, RTCPeerConnection, RTCRtp
 from av import AudioFrame
 
 from shiri.domain import Room, SpeakerRef
+from shiri.runtime.audio import AudioWorker
 from shiri.runtime.backend import OwnToneClient
 from shiri.runtime.broker import Broker, REQUIRED_OWNTONE_VERSION
 from shiri.runtime.configuration import quote, write_private
@@ -58,6 +59,12 @@ MAX_INNER_SECONDS = 330
 
 def stamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def speech_request(session_id, action, **fields):
+    payload = {**fields, "session_id": session_id, "request_id": "network-"+uuid4().hex, "action": action}
+    AudioWorker.identity(payload)
+    return payload
 
 
 def log_tail(path):
@@ -144,6 +151,7 @@ class Rig:
         self.room = self.target = self.source_target = self.queue_id = None
         self.stable_units = None
         self.fixture_sender_reserved = False
+        self.speech_cleanup_errors = []
 
     def identity(self, processes):
         # Unit invocation+cgroup ownership is authoritative; PID is diagnostic.
@@ -166,6 +174,7 @@ class Rig:
         # cannot be reopened through /dev/stdout, so retain both bounded logs.
         extra["source"]["owntone_file"] = log_tail(self.root/"source/state/owntone.log")
         record["fixture_logs"] = extra
+        record["fixture_speech_cleanup_errors"] = self.speech_cleanup_errors[-8:]
         return record
 
     async def healthy(self, *, stable=True):
@@ -403,6 +412,28 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
             return None
         return await eventually(observe, label, timeout=timeout)
 
+    async def close_speech(self, session, peer):
+        errors = []
+        try:
+            try:
+                result = await self.broker.speech(self.room, speech_request(session, "close"))
+                require(result.get("ok") is True, "Speech worker did not acknowledge exact close")
+            except Exception as exc:
+                errors.append(f"worker {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                await peer.close()
+            except Exception as exc:
+                errors.append(f"peer {type(exc).__name__}: {exc}")
+        if errors:
+            # Retain the exact peer for the final cleanup retry. A rejected
+            # close must never turn into a successful fixture receipt.
+            failure = "Speech fixture close failed: "+"; ".join(errors)
+            self.speech_cleanup_errors.append({"session_id": session, "error": failure})
+            self.speech_cleanup_errors[:] = self.speech_cleanup_errors[-8:]
+            raise RuntimeFailure(failure)
+        self.peers.pop(session, None)
+
     async def speech(self, *, label, paused=False, baseline=None):
         peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         tone, session = SpeechTone(), "network-"+uuid4().hex
@@ -415,8 +446,8 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
         source_before = await self.source_client.request("GET", "/api/player")
         try:
             await peer.setLocalDescription(await peer.createOffer())
-            answer = await self.broker.speech(self.room, {"session_id": session, "action": "offer",
-                        "sdp": peer.localDescription.sdp, "type": peer.localDescription.type})
+            answer = await self.broker.speech(self.room, speech_request(session, "offer",
+                        sdp=peer.localDescription.sdp, type=peer.localDescription.type))
             await peer.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
             start = time.monotonic_ns()
             async def voice():
@@ -455,10 +486,13 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
                     "native_blocks_after": after.get("native_blocks"), "paused": paused}
         finally:
             tone.audible = False
-            with suppress(Exception):
-                await self.broker.speech(self.room, {"session_id": session, "action": "close"})
-            await peer.close()
-            self.peers.pop(session, None)
+            primary = sys.exc_info()[1]
+            try:
+                await self.close_speech(session, peer)
+            except Exception as exc:
+                if primary is not None:
+                    raise primary from exc
+                raise
 
     async def release(self):
         await self.source_client.request("PUT", "/api/player/stop")
@@ -476,9 +510,10 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
     async def close(self):
         errors = []
         for session, peer in list(self.peers.items()):
-            with suppress(Exception):
-                await self.broker.speech(self.room, {"session_id": session, "action": "close"})
-            await peer.close()
+            try:
+                await self.close_speech(session, peer)
+            except Exception as exc:
+                errors.append(f"speech {session}: {type(exc).__name__}: {exc}")
         if self.source_client:
             await self.source_client.close()
         for owner, processes in [(self.source_id, self.source_processes),

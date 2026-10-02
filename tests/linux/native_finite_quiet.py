@@ -17,6 +17,7 @@ from shiri.runtime.system import RuntimeFailure
 RATE = 48000
 BASELINE_FRAMES = QUIET_FRAMES = 9600
 RESTORE_FRAMES = RATE//4
+DUCK_FRAMES = RATE*40//1000
 DUCK_GAIN = .2
 WIRE_DUCK = round(DUCK_GAIN*65536)/65536
 MAX_FRAMES = RATE*14
@@ -65,6 +66,67 @@ def freeze_carrier(data, *, first_frame, duck_gain):
     require(8190 <= amplitude <= 8193 and residual <= 4.,
             'Finite pre-offer carrier is not the declared full-volume stationary440Hz music')
     return Carrier(first_frame, tuple(float(value) for value in coefficients), hashlib.sha256(data).hexdigest(), residual)
+
+
+def subtract_declared_duck(samples, carrier, *, first_frame, voice_start, voice_frames):
+    """Admit the native40ms slope using only speech-free PRE-VOICE samples.
+
+    The carrier phase/amplitude/calendar were frozen before the offer. Neither
+    voice samples nor its level, prefix, endpoint or decoded reference enter
+    the onset fit. A single onset predicts the remaining ramp throughout the
+    entire original voice interval; no per-window subtraction is fitted.
+    """
+    require(type(carrier) is Carrier and type(first_frame) is int
+            and carrier.first_frame+BASELINE_FRAMES <= first_frame < 2**53
+            and isinstance(samples, np.ndarray) and samples.dtype == np.dtype('<i2')
+            and samples.ndim == 2 and samples.shape[1] == 2
+            and type(voice_start) is int and 0 < voice_start <= len(samples)
+            and type(voice_frames) is int and 0 < voice_frames <= MAX_FRAMES
+            and voice_start+voice_frames <= len(samples) <= MAX_FRAMES,
+            'Finite duck lost its independent bounded carrier/pre-voice calendar')
+    before = samples[:voice_start]
+    require(np.array_equal(before[:, 0], before[:, 1]),
+            'Finite pre-voice carrier changed its declared mono channels')
+    carrier_wave = basis(first_frame-carrier.first_frame, len(samples)) @ np.asarray(carrier.coefficients)
+    known = carrier_wave[:voice_start]
+    residual = before[:, 0].astype(float)-known
+    require(float(np.sqrt(np.mean(residual[-min(960, voice_start):]**2))) > 8.,
+            'Finite pre-voice carrier did not measurably begin ducking before speech')
+    positions = np.arange(voice_start, dtype=float)+1
+    def sums(values):
+        return np.r_[0., np.cumsum(values)]
+    rc, jrc = sums(residual*known), sums(positions*residual*known)
+    c2 = known*known
+    cc, jcc, jjcc = sums(c2), sums(positions*c2), sums(positions*positions*c2)
+    # Negative onsets admit an already ducked route. Require at least one
+    # measured pre-voice ramp sample: an all-full-volume prefix cannot predict
+    # when a future ramp will start and must not fabricate that fact.
+    onsets = np.arange(-DUCK_FRAMES, voice_start)
+    low = np.clip(onsets, 0, voice_start)
+    high = np.clip(np.ceil(onsets+(1-WIRE_DUCK)*DUCK_FRAMES).astype(int)-1, low, voice_start)
+    cross = (jrc[high]-jrc[low]-onsets*(rc[high]-rc[low]))/DUCK_FRAMES
+    cross += (1-WIRE_DUCK)*(rc[-1]-rc[high])
+    power = (jjcc[high]-jjcc[low]-2*onsets*(jcc[high]-jcc[low])+onsets*onsets*(cc[high]-cc[low]))/DUCK_FRAMES**2
+    power += (1-WIRE_DUCK)**2*(cc[-1]-cc[high])
+    errors = float(np.sum(residual*residual))+2*cross+power
+    onset = int(onsets[int(np.argmin(errors))])
+    gain = np.maximum(WIRE_DUCK, 1.-np.maximum(0, np.arange(voice_start+voice_frames)+1-onset)/DUCK_FRAMES)
+    require(float(gain[voice_start-1]) < 1.,
+            'Finite pre-voice samples did not admit a duck ramp before speech')
+    unexplained = before[:, 0].astype(float)-known*gain[:voice_start]
+    prevoice_rms = float(np.sqrt(np.mean(unexplained*unexplained)))
+    max_window_rms = 0.
+    for at in range(0, voice_start, 960):
+        value = float(np.sqrt(np.mean(unexplained[at:at+960]**2)))
+        max_window_rms = max(max_window_rms, value)
+        require(value <= 4., 'Finite pre-voice output is not its frozen carrier/native40ms duck slope')
+    start, end = voice_start, voice_start+voice_frames
+    voice = samples[start:end].astype(float)-carrier_wave[start:end, None]*gain[start:end, None]
+    return voice, {'duck_carrier_model': carrier.evidence(), 'duck_onset_capture_frame': onset,
+                   'duck_prevoice_frames': voice_start, 'duck_prevoice_residual_rms': prevoice_rms,
+                   'duck_prevoice_max_window_residual_rms': max_window_rms,
+                   'duck_step_per_frame': 1/DUCK_FRAMES,
+                   'duck_calibration_scope': 'One native40ms onset from original pre-voice PCM only; carrier phase/amplitude/calendar frozen before offer; no decoded voice fitted'}
 
 
 def verify_quiet(samples, carrier, *, first_frame):

@@ -7,3 +7,20 @@ Quiet subtraction uses that frozen phase/amplitude and the exact native music re
 Historical portable stationary-carrier calls with no independent contract retain their exact original oracle. Actual native measurement and supervisor replay require the new pre-offer contract and its fourth PCM artifact. Idle fixtures remain the original three artifacts and original quiet oracle.
 
 Actual72 remains a failed historical run. Byte-exact read-only replay of its original artifact showed the changing440Hz gain caused its quiet rejection: the original stationary subtraction had RMS76.735. With phase/amplitude measured independently from its first200ms of pre-voice full-volume retainedPCM, a single onset6240frames and the declared native slope explain the entire9600-frame quiet at RMS.2974, and the subsequent20160frames at RMS.3770. That is a diagnostic classification, not an actual passing rerun or a physical/phone/latency qualification.
+
+Actual124 exposed the same stationary-carrier assumption at the opening of
+speech, during the native 40 ms downward gain ramp. The retained recording
+contains the complete opening, body and codec tail. The corrected native
+oracle subtracts the independently frozen carrier with one downward-ramp
+onset measured using only pre-voice samples. Its slope and final wire gain are
+fixed by the native implementation. It then checks both channels and every
+original decoded speech window with the original correlation, residual and
+single-level limits. It does not fit music separately inside speech windows.
+
+Independent replay of all 62,400 retained decoded frames had maximum window
+residual RMS 0.289 S16. Deliberate opening, body, tail, channel and calendar
+corruption still fail. The periodic carrier cannot independently distinguish
+every calendar alias, so the original authenticated observer frame calendar
+remains mandatory. Actual124 remains a failed run; this replay is an oracle
+diagnosis, and a fresh native rerun is required. It makes no acoustic, phone
+or speech-latency qualification.

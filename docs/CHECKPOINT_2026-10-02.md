@@ -60,3 +60,31 @@ The subsequent full host suite reached 3,612 passes, 82 platform skips and one o
 - Complete the durable handoff and release documentation. Acoustic alignment, real mixed speakers and household acceptance require later physical measurements.
 
 The active goal remains open. Stop the goal only after the agreed software work and its required validation are complete.
+
+## Current validation follow-up
+
+The installed combined candidate passed the two-zone minimum-policy grouping,
+20 speech sessions per zone, and zone-worker crash isolation checks, including
+exact process, output and network cleanup. The actual lifecycle run passed
+all 50 enable/disable cycles and both broker SIGKILL recovery phases, retaining
+the installation identity and unrelated state.
+
+The finite speech run remains failed. Independent replay found its complete
+opening, body and tail in the retained recording; its stationary music
+subtraction distorted the native downward duck ramp. The corrected oracle
+uses the frozen pre-offer carrier and one onset measured only before speech.
+Its original acceptance limits remain intact, and deliberate speech and
+calendar corruption are rejected. A fresh native run is still required.
+
+The encrypted AirPlay run now passes cold decoded music, speech ducking and
+source-to-room volume. It fails reverse volume feedback: the receiver's
+initial metadata exchange waits for an acknowledgement that the OwnTone
+source never sends, occupying the optional event channel. That native
+interoperability repair and complete encrypted rerun remain release blockers.
+Cleanup passed; the failed report is preserved.
+
+The user also reported an unapplied phone-volume change on the live diagnostic
+build. Its current state and logs were retained separately. The combined
+receiver/volume implementation has not been deployed there yet, and both
+directions require verification. Do not describe the current live build as
+having the final volume repair.

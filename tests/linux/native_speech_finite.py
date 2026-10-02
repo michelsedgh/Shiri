@@ -210,6 +210,20 @@ def verify_complete(data, reference, *, start_bounds, music=False, quiet_carrier
     scores = cross/np.sqrt(np.maximum(energy*np.sum(pattern*pattern), 1.))
     start = low+int(np.argmax(scores[low:high+1]))
     captured = observed[start:start+length]
+    duck_receipt = {}
+    if quiet_carrier is not None:
+        require(music and type(capture_first_frame) is int and capture_first_frame >= 0,
+                'Finite duck carrier requires the original native capture frame calendar')
+        # Projection only proposes one voice alignment. Its20ms blocks may
+        # straddle the native40ms down-ramp and the first voice sample; such a
+        # block is not a stationary440Hz carrier. Remove the frozen carrier
+        # with the one onset measured solely BEFORE that proposed voice.
+        captured, duck_receipt = quiet_module().subtract_declared_duck(samples, quiet_carrier,
+            first_frame=capture_first_frame, voice_start=start, voice_frames=length)
+        template = np.repeat(expected.astype(float)[:, None], 2, axis=1)
+        whole_correlation = float(np.sum(captured*template)/math.sqrt(max(1., np.sum(captured*captured)*np.sum(template*template))))
+    else:
+        whole_correlation = float(scores[start])
     denominator = float(np.sum(template*template))
     require(denominator > 100*length, 'Finite emitted reference lacks measurable source energy')
     level = float(np.sum(captured*template)/denominator)
@@ -238,18 +252,18 @@ def verify_complete(data, reference, *, start_bounds, music=False, quiet_carrier
     else:
         require(capture_first_frame is None, 'Finite stationary oracle cannot relabel its capture frame origin')
         require(float(np.sqrt(np.mean(quiet*quiet))) <= 4., 'Finite utterance retained stale speech after its exact decoded tail')
-    require(float(scores[start]) >= WINDOW_CORRELATION, 'Finite whole-waveform alignment did not retain the complete utterance')
+    require(whole_correlation >= WINDOW_CORRELATION, 'Finite whole-waveform alignment did not retain the complete utterance')
     body = source['body_frames']
     return {'cold_utterance_completeness_passed': True, 'cold_utterance_completeness_status': 'finite_emitted_opus_prefix_body_tail_verified',
             'session_id': reference['session_id'], 'source': deepcopy(source),
             'payload_calendar_sha256': reference['payload_calendar_sha256'], 'decoded_pcm_sha256': reference['decoded_pcm_sha256'],
-            'alignment_start_frame': start, 'one_admitted_level': level, 'whole_correlation': float(scores[start]),
+            'alignment_start_frame': start, 'one_admitted_level': level, 'whole_correlation': whole_correlation,
             'verified_reference_frames': length, 'verified_body_frames': body, 'verified_codec_tail_frames': CODEC_TAIL_FRAMES,
             'verified_quiet_frames': QUIET_FRAMES, 'prefix_windows': records[:min(18, body//FRAMES)],
             'tail_windows': records[max(0, body//FRAMES-12):], 'all_windows': records,
             'speech_latency_performance_passed': False, 'speech_latency_performance_status': 'pending_declared_and_characterized_software_budget',
             'scope': 'Exact finite emitted-payload Opus decode vs both final digital channels; one bounded mapping; no acoustic/phone/minimum-latency claim',
-            **quiet_receipt}
+            **duck_receipt, **quiet_receipt}
 
 
 def retain_diagnostic(directory, reference, data, timings, *, music_baseline=None):
