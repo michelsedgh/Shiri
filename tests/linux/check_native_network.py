@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import stat
 import sys
 import time
 from uuid import uuid4
@@ -57,6 +58,20 @@ MAX_INNER_SECONDS = 330
 
 def stamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def log_tail(path):
+    """Read at most 8KiB from an exact regular log, without following links."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return {"read_error": "NonRegularFile"}
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell()-8192))
+            return stream.read(8192).decode(errors="replace")
+    except OSError as exc:
+        return {"read_error": type(exc).__name__}
 
 
 async def eventually(action, description, *, timeout=30, interval=0.1):
@@ -146,14 +161,10 @@ class Rig:
                                     ("source", self.source_processes), ("sender", self.broker.sender_processes)]:
             extra[category] = {}
             for name, process in processes.items():
-                try:
-                    descriptor = os.open(process.log_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-                    with os.fdopen(descriptor, "rb") as stream:
-                        stream.seek(0, os.SEEK_END)
-                        stream.seek(max(0, stream.tell()-8192))
-                        extra[category][name] = stream.read(8192).decode(errors="replace")
-                except OSError as exc:
-                    extra[category][name] = {"read_error": type(exc).__name__}
+                extra[category][name] = log_tail(process.log_path)
+        # OwnTone opens its configured logfile itself. A systemd journal socket
+        # cannot be reopened through /dev/stdout, so retain both bounded logs.
+        extra["source"]["owntone_file"] = log_tail(self.root/"source/state/owntone.log")
         record["fixture_logs"] = extra
         return record
 
@@ -225,6 +236,12 @@ class Rig:
         directory(root/"input", {"uid": 0, "gid": receiver["gid"]}, mode=0o750)
         self.observer = NativeObserver(root/"input/music.sock", receiver["uid"], receiver["gid"])
         await self.observer.start()
+        # Match production's explicit metadata FIFO. This upstream pipe-enabled
+        # build initializes metadata even when enabled=no; omitting its path
+        # would dereference NULL before the RTSP listener starts.
+        metadata = root/"input/metadata.pipe"
+        os.mkfifo(metadata, 0o600)
+        file_owner(metadata, receiver, mode=0o600, fifo=True)
         config = root/"config/shairport.conf"
         write_private(config, f'''general = {{
   name = {quote(self.terminal_name)};
@@ -241,7 +258,8 @@ class Rig:
 shiri = {{ socket = {quote(VIEW/"input/music.sock")}; peer_uid = 0;
   volume_socket = {quote(VIEW/"input/volume.sock")};
   output_rate = 48000; output_format = "S16_LE"; output_channels = 2; }};
-metadata = {{ enabled = "no"; }};
+metadata = {{ enabled = "yes"; include_cover_art = "no";
+  pipe_name = {quote(VIEW/"input/metadata.pipe")}; pipe_timeout = 100; }};
 ''')
         file_owner(config, receiver)
         self.terminal_processes.update(await b._start_namespace_services(
@@ -291,7 +309,7 @@ metadata = {{ enabled = "no"; }};
   uid = {quote(output["name"])}
   db_path = {quote(VIEW/"state/songs.db")}
   cache_dir = {quote(VIEW/"state/cache")}
-  logfile = "/dev/stdout"
+  logfile = {quote(VIEW/"state/owntone.log")}
   loglevel = debug
   admin_password = {quote(password)}
   trusted_networks = {{ {quote(sender["api_host_ip"]+"/32")}, {quote(sender["api_ip"]+"/32")} }}

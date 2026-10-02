@@ -22,6 +22,27 @@ The full host checkpoint run completed with 3,558 passes, 81 explicit platform s
 
 ## Remaining work
 
+The combined candidate is now installed in a separate Ubuntu rehearsal clone.
+Its exact wheel, native binaries, dependencies, installation identity and saved
+account map passed strict preflight. The working live phone/Sonos test remains
+on its separately verified diagnostic build until the combined gates pass.
+
+The actual Python 3.10 suite completed with 3,711 passes, 14 explicit skips and
+one GCC fixture warning failure. The retained C startup fixture now compiles
+with cancellation unwind tables; all 14 sanitized GCC startup/cancellation
+cases and the 32 focused Linux checks passed without changing native bodies or
+disabling warnings. These follow-ups do not relabel the original failed run.
+The current two-zone minimum-policy gate also passed music, targeted speech
+and exact producer/output/network cleanup. Repeated speech and the remaining
+release gates are still open.
+
+Encrypted-network rehearsal exposed two configuration errors in its new
+terminal/sender fixtures: a missing metadata FIFO caused upstream Shairport's
+NULL-path crash, and OwnTone could not reopen a systemd journal descriptor as
+`/dev/stdout`. The fixtures now use an explicit isolated metadata FIFO and an
+existing writable state log. Failed receipts and successful cleanup proofs
+remain preserved; these fixture repairs do not qualify encrypted playback.
+
 Follow-up source integration now includes the bounded atomic native transition, separate receiver volume feedback and paused-source speech. The combined OwnTone backend compiled on Ubuntu with the exact `balance1-transition1-bed1` marker. The receiver compiled with the exact `startup1-volume1` marker, retaining its real pinned Git origin. These private builds have not replaced the working live diagnostic receiver.
 
 The combined OwnTone source passed strict composed-layer guards, 44,364 actual-C paused-speech assertions, 28 real JSON parser cases and 20 real FFmpeg converter cases under sanitizers on Ubuntu. Two test-fixture portability repairs were needed for GCC's warning checks; production code was unchanged. These are native function/converter checks with controlled hardware seams, not complete encrypted network playback or acoustic acceptance. A focused actual Python 3.10 run passed 83 cases, including the real credential/packet listener path. The complete network gate remains a separate requirement.

@@ -255,7 +255,10 @@ def run_tests(*, source=None, compiler=None, sanitize=True):
     compiler = compiler or shutil.which("clang") or shutil.which("cc")
     if not compiler:
         raise RuntimeError("A C compiler is required for native startup checks")
-    flags = ["-std=c99", "-D_DARWIN_C_SOURCE=1", "-O1", "-Wall", "-Wextra", "-Werror", "-Wno-multichar"]
+    # GCC/glibc otherwise expands pthread cleanup handlers with setjmp, which
+    # reports the exact player_play result local as clobbered. Compile real
+    # cancellation unwind tables; retain the native bodies and all diagnostics.
+    flags = ["-std=c99", "-D_DARWIN_C_SOURCE=1", "-O1", "-fexceptions", "-Wall", "-Wextra", "-Werror", "-Wno-multichar"]
     if sanitize:
         flags += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
     environment = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0:halt_on_error=1", "UBSAN_OPTIONS": "halt_on_error=1"}
