@@ -25,7 +25,7 @@ jobs:
           SHIRI_LINUX_AUDIO_TESTS: '1'
         run: |
           .venv/bin/ruff check shiri tests
-          .venv/bin/pytest -q
+          .venv/bin/python -m pytest -q
       - name: Native source and volume parser checks
         run: |
           .venv/bin/python tests/native/check_source_transition.py --require-json --compiler /usr/bin/cc
