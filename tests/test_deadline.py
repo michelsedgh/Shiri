@@ -124,7 +124,7 @@ async def test_child_error_remains_primary_and_bluealsa_alias_preserves_calls():
     assert await _bounded(asyncio.sleep(0, result=7), None) == 7
 
 
-async def test_cancelled_speaker_selection_does_not_commit_saved_intent_or_follow_on_volume(tmp_path):
+async def test_cancelled_speaker_selection_does_not_commit_intent_or_continue_mutations(tmp_path):
     definition = Room(id=str(uuid4()), slot=0, name='Private room', airplay_name='Private input',
                       interface='test0', enabled=True,
                       speakers=[SpeakerRef(id='456',name='Original configured speaker',protocol='airplay2')])
@@ -137,13 +137,19 @@ async def test_cancelled_speaker_selection_does_not_commit_saved_intent_or_follo
     async def peer(request):
         nonlocal selected
         trace.append((request.method, request.url.path))
+        if request.url.path == '/api/player/shiri-volume-settings':
+            settings = json.loads(request.content)
+            assert settings == {'volume': 77, 'outputs': [{'id': '123', 'balance_percent': 100}]}
+            return httpx.Response(200, json=settings)
+        if request.url.path == '/api/player':
+            return httpx.Response(200, json={'volume': 77})
         if request.url.path == '/api/outputs/set':
             selected = True  # A cancellation cannot undo an already-applied mutation.
             asyncio.get_running_loop().call_soon(caller.cancel)
             return httpx.Response(200, json={'ok': True})
         if request.url.path == '/api/outputs':
             return httpx.Response(200, json={'outputs': [{'id': 123, 'name': 'Private speaker',
-                'type': 'AirPlay 2', 'selected': selected, 'offset_ms': 0}]})
+                'type': 'AirPlay 2', 'selected': selected, 'offset_ms': 0, 'balance_percent': 100}]})
         raise AssertionError('Cancelled update continued into '+request.url.path)
     state.client = OwnToneClient('http://not-resolved.invalid', password='in-memory-only',
                                 transport=httpx.MockTransport(peer))
@@ -155,7 +161,10 @@ async def test_cancelled_speaker_selection_does_not_commit_saved_intent_or_follo
         assert state.status == 'degraded' and state.wake.is_set()
         assert [item.id for item in state.desired.speakers] == ['456'] and not state.selected_ids
         assert service.speaker_leases[('owntone', '123')] == definition.id
-        assert trace == [('GET', '/api/outputs'), ('PUT', '/api/outputs/set')]
+        # Gains are staged under the lease before selection can start sound.
+        # Once selection is cancelled, no later mutation/readback may commit it.
+        assert trace == [('GET', '/api/outputs'), ('POST', '/api/player/shiri-volume-settings'),
+                         ('GET', '/api/player'), ('GET', '/api/outputs'), ('PUT', '/api/outputs/set')]
     finally:
         await state.client.close()
 

@@ -16,6 +16,10 @@ The actual live iPhone → Sonos test now starts and resumes normally according 
 
 The live diagnostic backend binaries and the default build recipe are not yet the final combined release. The additive live OwnTone source-transition repairs are retained separately while the bounded atomic transition is integrated. Do not deploy this checkpoint over a working house installation as a qualified release.
 
+## Checkpoint validation follow-up
+
+The full host checkpoint run completed with 3,558 passes, 81 explicit platform skips and one failing cancellation regression. That fixture still expected volume to be applied after selection; the saved-balance implementation deliberately stages exact gains under the speaker lease before selection can start sound. The fixture now verifies that order and still requires cancellation to preserve saved intent and prevent any later operation. The focused cancellation/balance follow-up passed all 22 cases; production code was unchanged. Ruff and the 31 frontend tests passed. Linux and browser results retain their separately stated scopes.
+
 ## Remaining work
 
 - Integrate and verify bounded atomic speaker preparation/FLUSH/arming, delayed output release after END, and recovery after failed setup.
