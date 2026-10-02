@@ -514,8 +514,9 @@ def test_transient_progress_cleanup_failure_preserves_primary(tmp_path, monkeypa
         unlink(temporary)
 
 
-async def run_real_soak_progress(tmp_path, monkeypatch, *, delay_progress=False, fail_progress=False):
-    """Real monotonic/asyncio pacing, real status I/O, immutable PCM; no devices."""
+async def run_real_soak_progress(tmp_path, monkeypatch, *, delay_progress=False, fail_progress=False,
+                                 delay_grant_write=False):
+    """Controlled mock handshake; real elapsed streaming/I/O, immutable PCM; no devices."""
     actual_loop = asyncio.get_running_loop()
     callbacks, closed, sent, durable, progress_sync = {}, [], [], [], []
     publication = {'active': False, 'delayed': False}
@@ -525,6 +526,17 @@ async def run_real_soak_progress(tmp_path, monkeypatch, *, delay_progress=False,
         soak.atomic_json, soak.progress_json, soak.os.replace, soak.os.fsync)
     current_begin = None
     calendar = {}
+    clock = {'origin_ns': time.monotonic_ns(), 'setup_reads': 0, 'running_since_ns': None}
+    def producer_ns():
+        if clock['running_since_ns'] is None:
+            clock['setup_reads'] += 1
+            return clock['origin_ns'] + clock['setup_reads'] * 1000
+        return clock['streaming_origin_ns'] + time.monotonic_ns() - clock['running_since_ns']
+    # The connection/grant are doubles. Startup filesystem/scheduler latency is
+    # outside this progress-I/O regression; real elapsed time starts on first send.
+    # The calendar and the original strict send bound remain unchanged thereafter.
+    monkeypatch.setattr(soak, 'time', SimpleNamespace(monotonic_ns=producer_ns,
+                        monotonic=lambda: producer_ns() / 1e9))
     class Connection:
         def setblocking(self, selected):
             assert selected is False
@@ -548,9 +560,11 @@ async def run_real_soak_progress(tmp_path, monkeypatch, *, delay_progress=False,
                 epoch=1, generation=1, flags=current_begin.flags).encode()
     def durable_write(selected, state):
         durable.append(state['stage'])
+        if delay_grant_write and state['stage'] == 'granted' and not sent:
+            time.sleep(0.2)
         original_atomic(selected, state)
         if state['stage'] == 'ready_before_begin':
-            available = time.monotonic_ns()
+            available = producer_ns()
             calendar.update(generation=2, action='begin', available_ns=available,
                             common_start_ns=available + soak.NATIVE_LEAD_NS)
             command.write_text(json.dumps(calendar))
@@ -578,16 +592,19 @@ async def run_real_soak_progress(tmp_path, monkeypatch, *, delay_progress=False,
         anchor = start + frame * 1_000_000_000 // RATE
         return soak.Packet(soak.Kind.PCM, grant.session, incarnation=grant.incarnation,
             group=group_id, epoch=grant.epoch, generation=grant.generation, sequence=sequence,
-            frame_index=frame, presentation_ns=anchor, clock_sample_ns=time.monotonic_ns(),
+            frame_index=frame, presentation_ns=anchor, clock_sample_ns=producer_ns(),
             monotonic_before_ns=1, monotonic_after_ns=2, flags=grant.flags,
             frames=960, pcm=soak.program_pcm(frame))
     async def send(loop, selected, payload, target, stats):
         assert selected is connection and loop is proxy
-        sent.append((soak.Packet.decode(payload), target, time.monotonic_ns()))
+        if not sent:
+            clock['streaming_origin_ns'] = producer_ns()
+            clock['running_since_ns'] = time.monotonic_ns()
+        sent.append((soak.Packet.decode(payload), target, producer_ns()))
         if len(sent) == 4:
             callbacks[signal.SIGTERM]()
         await asyncio.sleep(0)
-        return time.monotonic_ns() - target
+        return producer_ns() - target
     proxy = Loop()
     monkeypatch.setattr(soak, 'asyncio', SimpleNamespace(get_running_loop=lambda: proxy,
         Event=asyncio.Event, TimeoutError=asyncio.TimeoutError, sleep=asyncio.sleep))
@@ -636,8 +653,11 @@ async def test_real_progress_avoids_delayed_fsync_and_keeps_original_targets_and
 
 
 @pytest.mark.asyncio
-async def test_real_slow_transient_io_keeps_original_refusal_and_final_telemetry(tmp_path, monkeypatch):
-    primary, state, sent = await run_real_soak_progress(tmp_path, monkeypatch, delay_progress=True)
+@pytest.mark.parametrize('delay_grant_write', [False, True])
+async def test_real_slow_transient_io_keeps_original_refusal_and_final_telemetry(tmp_path, monkeypatch,
+                                                                           delay_grant_write):
+    primary, state, sent = await run_real_soak_progress(tmp_path, monkeypatch, delay_progress=True,
+                                                     delay_grant_write=delay_grant_write)
     assert isinstance(primary, RuntimeFailure) and str(primary) == 'Synthetic producer missed bounded native delivery cadence'
     assert state['frames'] == 960 and len(sent) == 1
     row = state['delivery_observation']

@@ -1,15 +1,19 @@
 # Required daemon privilege migration
 
-Status: **required production gate, combined runtime validation pending**.
-The new runtime requires fixed unprivileged daemon identities and launches
-daemons through owned systemd transient services. It has no root-daemon fallback.
-Portable tests cover account admission, unit replacement and exact cgroup
-termination. Isolated Linux proofs now cover confined launch/termination,
-filtered local PCM, receiver-listener ownership and socket publication.
-Combined native PCM, room lifecycle and crash-recovery checks with the actual
-backend/worker processes still must pass before this gate closes. Earlier
-lifecycle/audio evidence used the previous privileged launch path and does not
-establish this boundary.
+Status: **software launch, confinement and recovery boundary qualified**.
+LIVE182 runs the qualified runtime with fixed unprivileged daemon identities
+and owned systemd transient services; it has no root-daemon fallback. Combined
+native audio, lifecycle/crash recovery, manager reload, reboot and rollback
+checks passed on the admitted Ubuntu environment. After the user's successful
+iPhone playback, both volume directions and requested 40-second pause/resume,
+readback retained all nine live daemon identities and strict namespace policy.
+See [the live test handoff](LIVE_TEST_HANDOFF.md) for current installed identity
+and the remaining physical speaker/grouping/balance measurements.
+
+The staged proof records below retain their original limits and then-pending
+language. Earlier privileged launch evidence does not establish this boundary;
+current qualification uses the separated worker identities and full owned-unit
+policy. Historical failures and build identities remain recorded unchanged.
 
 This plan preserves OwnTone, Shairport and NQPTP timing. It changes service
 credentials, access boundaries and lifecycle authority; it adds no speaker clock

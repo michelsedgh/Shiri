@@ -1,5 +1,13 @@
 # One room master and AP2 sender feedback
 
+Current status: the coherent LIVE182 installation passed software qualification,
+and the user confirmed fresh iPhone playback, phone-to-speaker/web master,
+web-to-iPhone slider feedback and resume after a requested 40-second pause.
+The same nine daemon identities and strict policies survived the test. See
+[the live test handoff](LIVE_TEST_HANDOFF.md) for installed identity and remaining
+physical tests. Per-speaker balance, grouped zones, rapid competing edits and
+other phones/speakers are not established by this basic phone check.
+
 The saved room master is one integer from 0 through 100. OwnTone applies that
 master with the separately saved speaker balances. A speech duck or a speaker
 balance edit never changes the room master or creates an iPhone volume command.
@@ -70,8 +78,8 @@ remain normal phone input. A same-value human move inside that interval is
 indistinguishable from an echo. When it matches the current master, the gain is
 already the same; when a newer web edit superseded that earlier sent value, a
 human returning to it may be temporarily ignored. A sender echo outside the
-interval is indistinguishable from a later human edit. Actual
-sender/application behavior therefore needs the physical test below.
+interval is indistinguishable from a later human edit. The basic iPhone check
+above does not resolve these rapid-edit and same-value echo boundaries.
 
 The notification plist is the upstream development protocol from
 [Shairport Sync commit 9a168bf774bb](https://github.com/mikebrady/shairport-sync/blob/9a168bf774bb78d936c9a4557a44d4aa1a07cc5a/remote/remote.c):
@@ -129,14 +137,13 @@ failure retaining music, EOF and shutdown. macOS uses a fixed-message stream
 socket lifecycle seam because it has no Unix SEQPACKET; the Linux-only test
 uses the actual packet listener and SO_PEERCRED acceptance/rejection.
 
-Physical acceptance still requires: connect and play without a web-volume
-nudge; move the web master while playing and paused and observe the iPhone's
-per-zone displayed master; move the iPhone master repeatedly including mute
-and unmute; confirm per-speaker balances survive both directions; pause for
-more than 40 seconds and resume; rapidly alternate phone/web moves; switch
-sender sessions with an outstanding web edit; disconnect/reconnect after a
-failed feedback exchange. Event acknowledgement alone does not prove that an
-application rendered its slider correctly.
+The confirmed live check covers fresh playback, basic phone/web master feedback
+and the requested 40-second pause/resume. Further physical tests should exercise
+web feedback while paused, repeated mute/unmute, saved per-speaker balances in
+both directions, rapid phone/web edits, sender replacement with an outstanding
+web edit, and reconnect after a failed feedback exchange. Event acknowledgement
+alone does not prove that an application rendered its slider correctly; the
+reported iPhone slider observation is separate evidence.
 
 
 OwnTone's additional `-event1` layer accepts only complete, bounded
@@ -170,6 +177,7 @@ running the unchanged bed, transition and owner validators.
 The pinned OwnTone sender still treats `dvlc` as an unsupported media command:
 a 200 response proves event delivery, not that its player master changed.
 No synthetic sender volume implementation is added to obtain a passing test.
-The fresh encrypted pipeline, full native builds and physical iPhone slider
-acceptance remain separate requirements. The complete player/gain/timing
+The full native builds and encrypted pipeline passed software qualification;
+the actual iPhone web-to-slider result is separately confirmed above. This does
+not qualify every sender or physical setup. The complete player/gain/timing
 source, music presentation timestamps and configured buffers are unchanged.

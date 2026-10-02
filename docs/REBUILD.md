@@ -2,14 +2,20 @@
 
 ## Current candidate — October 2
 
-The repository now contains the integrated rebuild and the real iPhone startup
-and pause repairs. The user confirmed normal first playback and resume after a
-requested 40-second pause on the isolated live Sonos test. The subsequent combined
-candidate adds saved speaker balance, bounded atomic output preparation, reverse
-volume feedback and paused-source speech; its native builds and focused Linux
-checks passed, while full network and release qualification remain in progress.
-See [the checkpoint](CHECKPOINT_2026-10-02.md) for the current scope and unfinished
-work, and [live playback evidence](LIVE_PLAYBACK_REVIEW.md) for the phone result.
+The coherent rebuild completed software qualification and is installed as
+LIVE182. The user confirmed fresh iPhone playback without changing web volume,
+phone volume reaching the speakers and web room master, web volume moving the
+iPhone slider, and resume after a requested 40-second pause. The post-test
+readback retained all nine daemon identities and their strict policy, with
+running services/room and matching room/backend master. Software gates cover
+native builds, encrypted playback/speech/control, finite speech performance,
+Bluetooth's digital route, lifecycle/recovery, reboot and exact rollback.
+See [the live test handoff](LIVE_TEST_HANDOFF.md) for the current installation
+and next tests, and [the checkpoint](CHECKPOINT_2026-10-02.md) for exact evidence.
+Physical acoustic alignment, native grouped-zone phone playback, mixed
+transport speakers and per-speaker balance checks remain later measurements.
+The latest CI rerun is pending after a focused test-clock repair; that repair
+does not change the qualified production package or native binaries.
 
 Current minimum route defaults are B40/H140 for local or framed Bluetooth,
 B250/H350 for Cast or Pulse, and B500/H600 for AirPlay. A grouped program uses
@@ -18,6 +24,10 @@ below are historical review records and do not describe the current defaults.
 Chromecast input is deferred and Bluetooth input is excluded.
 
 ## Historical candidate and review evidence — October 1
+
+The entries below retain their original checkpoints, build identities, failures
+and then-pending gates. They are historical snapshots; their pending language
+does not supersede the current status or [live handoff](LIVE_TEST_HANDOFF.md).
 
 - The user explicitly deferred Chromecast input after the current open-source
   receiver review. This revised scope supersedes earlier entries below that
@@ -1328,13 +1338,13 @@ VM restart, termination or duplicate test run was attempted. Software review
 and offline preparation continue while this access limitation is investigated;
 it must not be interpreted as a successful run or a stopped VM.
 
-## Measurable release gates
+## Historical measurable release-gate snapshot
 
 The following combine the required product gates with measurable robustness
 criteria. A pending gate must acquire an actual result, environment and artifact
 before it can be marked passed. Backend limitations do not remove a requirement.
 
-| Gate | Acceptance criterion | Current status |
+| Gate | Acceptance criterion | Status at this historical checkpoint |
 | --- | --- | --- |
 | Automated regression | Full Python and web/browser suites pass for the candidate; lint and diff checks clean | Coherent348-file Mac candidate passed3146 tests/81 platform skips with Ruff and shell checks. Actual70's one-file cancellation-test repair passed the complete Ubuntu Python3.10 suite:3223 passes/four skips. Source/package/native/dependency admission and reboot passed. Later integrations require a fresh coherent suite |
 | Pinned runtime | Builder pins revisions and patch hashes; preflight requires exact reviewed fifteen-layer OwnTone build, Shairport `shiri-timed2` AirPlay2/SMI with bounded clock sampling, compatible NQPTP shared memory, verified daemon identities, confinement helpers and GI/plugins | Actual68 built and installed the fifteen-layer OwnTone backend and exact50-file package; actual70 preserved their identities through full regression and fresh reboot. Native credential/source sanitizer checks and installed broker preflight passed. Final route qualification remains open |

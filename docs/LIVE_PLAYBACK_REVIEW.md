@@ -1,8 +1,10 @@
 # Live playback review — October 2, 2026
 
-The live iPhone → Shiri receiver → Sonos Table lamp test exposed real regressions that earlier local PCM tests did not cover. This document records the failures and the required lifecycle contract. The rebuild is not production-qualified yet.
+The qualified LIVE182 rebuild is now running on the live Ubuntu VM. The user confirmed fresh iPhone playback without a web-volume nudge, phone volume reaching audible output and the web room master, web volume moving the iPhone slider, and resume after a requested 40-second pause. Post-test readback retained the same nine owned daemon identities and strict policy, with both services and the room running and no room error or pending volume. See [the live test handoff](LIVE_TEST_HANDOFF.md) for the current installed identity and next tests.
 
-## What failed
+The software qualification covers the native pipeline, targeted speech and measured digital timing, lifecycle/recovery, reboot and rollback. Physical acoustic synchronization, native multi-zone phone grouping, mixed transports and speaker balances still need actual-speaker tests. The historical iPhone → Shiri → Sonos regressions below remain recorded; software or one-phone success does not establish universal physical acceptance.
+
+## Historical live regressions
 
 1. A source FLUSH sealed the native input while OwnTone’s existing playback timer continued to tick. The tick rejected the sealed/new-generation input and aborted playback, replacing the pending speaker FLUSH callback. The source control request then timed out, and Shiri rebuilt the zone, disconnecting the phone.
 2. The first source BEGIN granted PCM while selected network speakers had only been probed. OwnTone began the full encrypted speaker connection after timed PCM arrived. In the live test, the first anchor was already 934 ms late; another attempt was 474 ms late. Increasing the audio buffer would conceal the ordering problem.
@@ -23,7 +25,7 @@ Initial volume comes from Shairport’s resolved suggested volume, with the save
 
 Each physical speaker has a persistent attenuation from 0 to 100%, independent of the room master. The applied absolute level is `floor(master × balance / 100)`. Saving balance or moving room volume must preserve the current music timeline and transport session. Preserve balances through restart, mute/unmute, removal and reassignment. Normal listening has one room volume; speaker balance is a setup adjustment.
 
-## Evidence and validation limits
+## Historical evidence and validation limits
 
 The isolated live VM retained old binaries, SQLite intent and logs before installing the first timer/phone-ACK fixes. Its OwnTone build SHA is `9516b49d9e8666eda5e61cea83abae08f251a37f8979b864f9cdf8352aadd19e`; the isolated broker SHA is `a4fafcdd8fe690190612a181c1b9722a89b6b1c69d20b364f63e388ee9cb9a0e`. These are diagnostic repair builds, not a released version.
 
@@ -31,9 +33,9 @@ The original/patched exact C regression reproduces lost FLUSH completion and ver
 
 The earlier 30-minute local PCM soak used synthetic producers and ALSA loopback. It demonstrated timing consistency for that setup but did not exercise real iPhone buffered AirPlay SETUP, Sonos connection latency or sender volume feedback. Preserve those results with their original scope.
 
-Before release, verify the complete native receiver/network-output chain, repeated cold starts, pause/resume, teardown/reconnect, music and speech volume, speaker balance persistence, and failures during setup. Run the remaining recovery, Bluetooth, installation/reboot and rollback gates against the final coherent source and native builds. Physical acoustic alignment and mixed-speaker acceptance remain separate measured tests.
+The subsequent coherent software qualification and LIVE182 deployment supersede this earlier repair stage; their current scope is recorded in [the handoff](LIVE_TEST_HANDOFF.md). Physical acoustic alignment, mixed speakers, grouped phone sessions and speaker-balance behavior remain separate measured tests.
 
-## Current live repair identity
+## Historical diagnostic repair identity
 
 The installed diagnostic OwnTone binary SHA-256 is `7d6287b7df35a5b438bca519a706b405bab41384457c893182e40d8e24a7f39c`. Its source includes the first timer repair, selected-output preparation, and pause/END cleanup. The installed Shairport binary SHA-256 is `c79ac38d768acc4b102513a7bdf70ab22ca05ca7d61e6e5fce777d728c1e1d95`; its actual Git origin is pinned `7bad231c18368dbd26f298577f6210e36e4b0797` with the timed, clock recovery, synchronous startup and retry-cleanup changes.
 
@@ -45,4 +47,4 @@ Local records, private logs, binaries, rollback files and the user's test report
 
 OwnTone explicitly supports Shairport pipe input for multiroom routing: https://owntone.github.io/owntone-server/library/#pipes-for-eg-multiroom-with-shairport-sync . Its documented multiple-instance setup is https://owntone.github.io/owntone-server/advanced/multiple-instances/ .
 
-Shairport describes source presentation timing, NQPTP and the limitations of pipe output in https://github.com/mikebrady/shairport-sync/blob/master/README.md#synchronised-audio . Its stable README currently identifies AirPlay 2 remote controls as experimental development-branch functionality; reverse sender volume needs a reviewed implementation and phone verification.
+Shairport describes source presentation timing, NQPTP and the limitations of pipe output in https://github.com/mikebrady/shairport-sync/blob/master/README.md#synchronised-audio . Shiri's reviewed bounded reverse-volume backport and actual iPhone result are recorded in [RECEIVER-VOLUME.md](RECEIVER-VOLUME.md); broader sender compatibility remains a device-test boundary.

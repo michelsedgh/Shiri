@@ -1,8 +1,15 @@
 # Software speech acceptance
 
-These limits were declared before the next qualifying runs on October 1.
-They apply to the measured software route. Phone, radio and acoustic acceptance
-remain a later phase. Historical failed or pending measurements stay unchanged.
+Software speech performance is qualified: the separately declared204 matrix
+passed all cold/warm idle/native cases at −2000, zero and +2000 ms correction,
+and the unchanged October 1 evaluator accepted all 12 rows. LIVE182 is deployed;
+the user confirmed basic iPhone playback, both master-volume directions and a
+requested 40-second pause/resume. See [the live test handoff](LIVE_TEST_HANDOFF.md).
+
+The limits below apply to the measured software route. Physical speech output,
+acoustic timing, mixed transport speakers, grouped phone sessions and speaker
+balance tests remain later measurements. Historical failed or pending results
+stay unchanged; the basic phone check does not qualify speech acoustics.
 
 | Measurement | Required limit |
 | --- | --- |
@@ -50,11 +57,11 @@ The unchanged frozen evaluator qualified all 12 rows, including full independent
 latency brackets, waveform completion and cleanup. The immutable declarations
 and original finite reports remain unchanged. Earlier200 and202 results were
 not substituted into this matrix. This establishes software speech performance;
-smaller default buffers, actual-phone behavior and physical output remain
-separate requirements.
+smaller default buffers and physical output require separate qualification.
 
 After returning to the stock generic kernel, fresh candidate182 admission205
 and encrypted playback/speech/volume/reload regression199 passed with complete
 cleanup. Both exact installation rollbacks and normal VM shutdown also passed.
-The204 latency matrix remains bound to its original boot/profile; live rollout,
-actual iPhone volume and final handoff are still pending.
+The204 latency matrix remains bound to its original boot/profile. The subsequent
+LIVE182 rollout and basic actual-iPhone volume/playback check passed; measured
+physical speech, grouped-zone timing and speaker-balance acceptance remain open.
