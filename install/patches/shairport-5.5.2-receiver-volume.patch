@@ -1,0 +1,578 @@
+diff --git a/Makefile.am b/Makefile.am
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -109,7 +109,7 @@
+ endif
+ 
+ if USE_SHIRI
+-shairport_sync_SOURCES += audio_shiri.c shiri_pcm.h shiri_timing.h
++shairport_sync_SOURCES += audio_shiri.c shiri_pcm.h shiri_timing.h shiri_volume_control.h shiri_volume_io.h shiri_volume_lane.inc shiri_ap2_volume.c
+ endif
+ 
+ if USE_DUMMY
+diff --git a/ap2_event_message_handler.c b/ap2_event_message_handler.c
+--- a/ap2_event_message_handler.c
++++ b/ap2_event_message_handler.c
+@@ -46,16 +46,16 @@
+   ssize_t result = -1; // assume a problem
+   pthread_mutex_lock(&conn->event_sender_mutex);
+   pthread_cleanup_push(mutex_unlock, &conn->event_sender_mutex);
+-  if (conn->event_channel_fd != 0) {
++  if (conn->event_channel_fd > 0 && !conn->shiri_event_volume_faulted) {
+     result = write_encrypted(conn->event_channel_fd, &conn->ap2_pairing_context.event_cipher_bundle,
+                              data, data_length);
+     if ((result != -1) && ((size_t)result == data_length)) {
+       debug(3, "Connection %d: Packet of %zu bytes successfully written on the Event Port.",
+             conn->connection_number, result);
+-      uint8_t packet[4096];
++      uint8_t packet[4097];
+       result =
+           read_encrypted(conn->event_channel_fd, &conn->ap2_pairing_context.event_cipher_bundle,
+-                         packet, sizeof(packet));
++                         packet, sizeof(packet)-1);
+       debug(3, "Connection %d: Packet of %zu bytes successfully read on the Event Port.",
+             conn->connection_number, result);
+       if (result > 0) {
+diff --git a/audio.h b/audio.h
+--- a/audio.h
++++ b/audio.h
+@@ -66,6 +66,7 @@
+   int (*configure)(int32_t encoded_output_format, char **channel_map);
+ 
+   /* Exact native player incarnation, before start. Non-Shiri backends leave these NULL. */
++  double (*room_volume)(void); // private default, protected by the backend
+   void (*session_begin)(int connection, const char *group, int group_leader, int airplay2, double volume);
+   void (*session_volume)(int connection, double volume);
+   void (*session_group)(int connection, const char *group, int group_leader);
+diff --git a/audio_shiri.c b/audio_shiri.c
+--- a/audio_shiri.c
++++ b/audio_shiri.c
+@@ -5,6 +5,8 @@
+ #include "audio.h"
+ #include "common.h"
+ #include "shiri_pcm.h"
++#include "shiri_volume_control.h"
++#include "shiri_volume_io.h"
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <math.h>
+@@ -384,8 +386,10 @@
+   pthread_setcancelstate(old_cancel, NULL);
+   return retired;
+ }
++#include "shiri_volume_lane.inc"
++
+ static int init(int argc, char **argv) {
+-  const char *path;
++  const char *path, *volume_path;
+   (void)argv;
+   if ((argc < -1 || argc > 0) || !config.cfg || !config_lookup_non_empty_string(config.cfg, "shiri.socket", &path) ||
+       !config_lookup_int(config.cfg, "shiri.peer_uid", &peer_uid) || peer_uid < 0)
+@@ -393,6 +397,8 @@
+   socket_path = strdup(path);
+   if (!socket_path || strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path))
+     die("Shiri native PCM socket path is too long.");
++  if (!config_lookup_non_empty_string(config.cfg,"shiri.volume_socket",&volume_path) || volume_init(volume_path))
++    die("Shiri backend requires a private receiver volume endpoint.");
+   config.audio_backend_buffer_desired_length = 0.15;
+   config.audio_backend_latency_offset = 0;
+   parse_audio_options("shiri", (1u << SPS_FORMAT_S16_LE), (1u << SPS_RATE_48000), (1u << 2));
+@@ -408,9 +414,9 @@
+                FORMAT_FROM_ENCODED_FORMAT(format) == SPS_FORMAT_S16_LE;
+   return configured ? 0 : EINVAL;
+ }
+-static void deinit(void) { stop(); free(socket_path); socket_path = NULL; }
++static void deinit(void) { volume_deinit(); stop(); free(socket_path); socket_path = NULL; }
+ audio_output audio_shiri = {.name="shiri", .init=init, .deinit=deinit,
+-  .get_configuration=get_configuration, .configure=configure,
++  .get_configuration=get_configuration, .configure=configure, .room_volume=room_volume,
+   .session_begin=session_begin, .session_volume=session_volume, .session_group=session_group,
+   .play_native=play_native, .session_end=session_end, .session_retired=session_retired,
+   .flush_native=flush_native, .stop=stop, .flush=flush};
+diff --git a/common.c b/common.c
+--- a/common.c
++++ b/common.c
+@@ -1951,6 +1951,7 @@
+ #ifdef CONFIG_SHIRI
+     strcat(version_string, "-shiri-timed3");
+     strcat(version_string, "-startup1");
++    strcat(version_string, "-volume1");
+ #endif
+ #ifdef CONFIG_SOXR
+     strcat(version_string, "-soxr");
+diff --git a/player.c b/player.c
+--- a/player.c
++++ b/player.c
+@@ -3337,7 +3337,7 @@
+ }
+ 
+ double suggested_volume(rtsp_conn_info *conn) {
+-  double response = config.airplay_volume;
++  double response = config.output->room_volume ? config.output->room_volume() : config.airplay_volume;
+   if ((conn != NULL) && (conn->own_airplay_volume_set != 0)) {
+     response = conn->own_airplay_volume;
+   }
+diff --git a/player.h b/player.h
+--- a/player.h
++++ b/player.h
+@@ -428,6 +428,7 @@
+   pthread_t rtp_buffered_audio_thread;
+   int rtp_ap2_control_started, rtp_realtime_audio_started, rtp_buffered_audio_started;
+   pthread_mutex_t event_sender_mutex;
++  int shiri_event_volume_faulted; // protected by event_sender_mutex
+   int event_channel_fd; // zero if closed, controlled by event_sender_mutex
+ 
+   int ap2_event_receiver_exited;
+diff --git a/shiri_ap2_volume.c b/shiri_ap2_volume.c
+new file mode 100644
+--- /dev/null
++++ b/shiri_ap2_volume.c
+@@ -0,0 +1,165 @@
++/* Compatible AP2 volume notification from upstream commit 9a168bf774bb.
++ * The event exchange here is separately bounded and never calls the pinned
++ * blocking ap2_event_port_send_message()/player_volume() wrappers. */
++#include "config.h"
++#include "common.h"
++#include "shiri_volume_control.h"
++#ifdef CONFIG_AIRPLAY_2
++#include "player.h"
++#include "rtsp.h"
++#include "shiri_volume_io.h"
++#include <inttypes.h>
++#include <stdio.h>
++extern rtsp_conn_info *principal_conn;
++extern pthread_rwlock_t principal_conn_lock;
++
++static int volume_mutex(pthread_mutex_t *mutex,uint64_t deadline,shiri_volume_fence fence,void *context) {
++  for (;;) {
++    int ret=pthread_mutex_trylock(mutex);
++    if (!ret) {
++      if (!shiri_volume_now() || shiri_volume_now()>=deadline) { pthread_mutex_unlock(mutex); return SHIRI_VOLUME_TIMEOUT; }
++      return SHIRI_VOLUME_OK;
++    }
++    if (ret!=EBUSY) return SHIRI_VOLUME_IO;
++    if (!fence(context)) return SHIRI_VOLUME_STALE;
++    if (!shiri_volume_now() || shiri_volume_now()>=deadline) return SHIRI_VOLUME_TIMEOUT;
++    poll(NULL,0,5);
++  }
++}
++static int volume_append(sized_buffer *buffer,const uint8_t *data,size_t length) {
++  uint8_t *replacement;
++  if (buffer->length>65536 || length>65536-buffer->length) return -1;
++  if (buffer->length+length>buffer->size) {
++    replacement=realloc(buffer->data,buffer->length+length);
++    if (!replacement) return -1;
++    buffer->data=replacement; buffer->size=buffer->length+length;
++  }
++  if (length) memcpy(buffer->data+buffer->length,data,length);
++  buffer->length+=length;
++  return 0;
++}
++static void volume_drain(sized_buffer *buffer,size_t length) {
++  if (length>=buffer->length) { free(buffer->data); memset(buffer,0,sizeof(*buffer)); }
++  else { memmove(buffer->data,buffer->data+length,buffer->length-length); buffer->length-=length; }
++}
++static int volume_exchange(rtsp_conn_info *conn,const char *request,size_t request_length,
++                           uint64_t revision,uint64_t deadline,shiri_volume_fence fence,void *context) {
++  pair_cipher_bundle *bundle=&conn->ap2_pairing_context.event_cipher_bundle;
++  uint8_t *encrypted=NULL,*plain=NULL, response[4096], incoming[4096];
++  size_t encrypted_length=0,plain_length=0,response_length=0;
++  int ret=SHIRI_VOLUME_UNAVAILABLE, consumed_cipher=0, complete_exchange=0;
++  if (conn->event_channel_fd<=0 || !bundle->cipher_ctx || conn->shiri_event_volume_faulted) return ret;
++  if (fence(context)!=1) return SHIRI_VOLUME_STALE;
++  /* Unidentified data left by the pinned initial updateInfo must not be
++   * mistaken for the acknowledgement of a newly issued volume command. */
++  if (bundle->plaintext_read_buffer.length || bundle->encrypted_read_buffer.length) {
++    conn->shiri_event_volume_faulted=1; return SHIRI_VOLUME_PROTOCOL;
++  }
++  consumed_cipher=1;
++  if (pair_encrypt(&encrypted,&encrypted_length,(const uint8_t *)request,request_length,bundle->cipher_ctx)<0 ||
++      !encrypted || !encrypted_length || encrypted_length>65536) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++  ret=shiri_volume_write(conn->event_channel_fd,encrypted,encrypted_length,deadline,fence,context);
++  if (ret) goto done;
++  for (;;) {
++    ssize_t n,used;
++    int complete;
++    ret=shiri_volume_wait(conn->event_channel_fd,POLLIN,deadline,fence,context);
++    if (ret) goto done;
++    n=recv(conn->event_channel_fd,incoming,sizeof(incoming),MSG_DONTWAIT);
++    if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)) continue;
++    if (n<=0) { ret=SHIRI_VOLUME_IO; goto done; }
++    if (volume_append(&bundle->encrypted_read_buffer,incoming,(size_t)n)) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++    plain_length=0;
++    free(plain); plain=NULL;
++    used=pair_decrypt(&plain,&plain_length,bundle->encrypted_read_buffer.data,
++                       bundle->encrypted_read_buffer.length,bundle->cipher_ctx);
++    if (used<0 || (size_t)used>bundle->encrypted_read_buffer.length ||
++        plain_length>sizeof(response)-response_length || (plain_length && !plain)) {
++      ret=SHIRI_VOLUME_PROTOCOL; goto done;
++    }
++    volume_drain(&bundle->encrypted_read_buffer,(size_t)used);
++    if (plain_length) memcpy(response+response_length,plain,plain_length);
++    response_length+=plain_length;
++    complete=shiri_volume_response(response,response_length,revision);
++    if (complete<0) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++    if (complete) {
++      if (bundle->encrypted_read_buffer.length) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++      complete_exchange=1;
++      while (fence(context)<0) {
++        if (!shiri_volume_now() || shiri_volume_now()>=deadline) { ret=SHIRI_VOLUME_TIMEOUT; goto done; }
++        poll(NULL,0,1);
++      }
++      if (!shiri_volume_now() || shiri_volume_now()>=deadline) { ret=SHIRI_VOLUME_TIMEOUT; goto done; }
++      if (fence(context)!=1) { ret=SHIRI_VOLUME_STALE; goto done; }
++      if (bundle->encrypted_read_buffer.length) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++      ret=SHIRI_VOLUME_OK; goto done;
++    }
++  }
++done:
++  free(encrypted); free(plain);
++  /* Cipher counters have advanced. A partial/ambiguous exchange retires only
++   * this optional feedback lane for the connection, never its music route. */
++  if (ret && consumed_cipher && !complete_exchange) conn->shiri_event_volume_faulted=1;
++  return ret;
++}
++int shiri_ap2_volume(int number,unsigned int percent,uint64_t revision,shiri_volume_fence fence,void *context) {
++  uint64_t now=shiri_volume_now(),deadline=now+UINT64_C(750000000);
++  int ret=SHIRI_VOLUME_UNAVAILABLE, locked=0;
++  rtsp_conn_info *conn=NULL;
++  plist_t root=NULL,params=NULL,type=NULL,value=NULL,top_volume=NULL,param_volume=NULL;
++  char *body=NULL,*request=NULL;
++  uint32_t body_length=0;
++  size_t request_length;
++  char header[256];
++  int header_length;
++  if (!now || percent>100 || !revision || revision>INT64_MAX || !fence) return SHIRI_VOLUME_PROTOCOL;
++  if (!fence(context)) return SHIRI_VOLUME_STALE;
++  for (;;) {
++    int result=pthread_rwlock_tryrdlock(&principal_conn_lock);
++    if (!result) {
++      if (!shiri_volume_now() || shiri_volume_now()>=deadline) { pthread_rwlock_unlock(&principal_conn_lock); return SHIRI_VOLUME_TIMEOUT; }
++      break;
++    }
++    if (result!=EBUSY && result!=EAGAIN) return SHIRI_VOLUME_IO;
++    if (!fence(context)) return SHIRI_VOLUME_STALE;
++    if (shiri_volume_now()>=deadline) return SHIRI_VOLUME_TIMEOUT;
++    poll(NULL,0,5);
++  }
++  conn=principal_conn;
++  if (!conn || conn->connection_number!=number) { ret=SHIRI_VOLUME_STALE; goto done; }
++  if (conn->airplay_type!=ap_2) { ret=SHIRI_VOLUME_UNSUPPORTED; goto done; }
++  ret=volume_mutex(&conn->event_sender_mutex,deadline,fence,context);
++  if (ret) goto done;
++  locked=1;
++  root=plist_new_dict(); params=plist_new_dict(); type=plist_new_string("sendMediaRemoteCommand");
++  value=plist_new_string("dvlc"); top_volume=plist_new_real(percent/100.0); param_volume=plist_new_real(percent/100.0);
++  if (!root || !params || !type || !value || !top_volume || !param_volume) { ret=SHIRI_VOLUME_IO; goto done; }
++  plist_dict_set_item(params,"volume",param_volume); param_volume=NULL;
++  plist_dict_set_item(root,"type",type); type=NULL;
++  plist_dict_set_item(root,"value",value); value=NULL;
++  plist_dict_set_item(root,"volume",top_volume); top_volume=NULL;
++  plist_dict_set_item(root,"params",params); params=NULL;
++  plist_to_bin(root,&body,&body_length);
++  if (!body || !body_length || body_length>4096) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++  header_length=snprintf(header,sizeof(header),"POST /command RTSP/1.0\r\nCSeq: %" PRIu64
++                         "\r\nContent-Length: %u\r\nContent-Type: application/x-apple-binary-plist\r\n\r\n",revision,body_length);
++  if (header_length<=0 || (size_t)header_length>=sizeof(header)) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++  request_length=(size_t)header_length+body_length;
++  request=malloc(request_length);
++  if (!request) { ret=SHIRI_VOLUME_IO; goto done; }
++  memcpy(request,header,(size_t)header_length); memcpy(request+header_length,body,body_length);
++  ret=volume_exchange(conn,request,request_length,revision,deadline,fence,context);
++done:
++  free(body); free(request);
++  if (root) plist_free(root); if (params) plist_free(params); if (type) plist_free(type);
++  if (value) plist_free(value); if (top_volume) plist_free(top_volume); if (param_volume) plist_free(param_volume);
++  if (locked) pthread_mutex_unlock(&conn->event_sender_mutex);
++  pthread_rwlock_unlock(&principal_conn_lock);
++  return ret;
++}
++#else
++int shiri_ap2_volume(int number,unsigned int percent,uint64_t revision,shiri_volume_fence fence,void *context) {
++  (void)number; (void)percent; (void)revision; (void)fence; (void)context;
++  return SHIRI_VOLUME_UNSUPPORTED;
++}
++#endif
+diff --git a/shiri_volume_control.h b/shiri_volume_control.h
+new file mode 100644
+--- /dev/null
++++ b/shiri_volume_control.h
+@@ -0,0 +1,41 @@
++/* Shiri receiver volume v1. Separate from the timed PCM descriptor. */
++#ifndef SHIRI_VOLUME_CONTROL_H
++#define SHIRI_VOLUME_CONTROL_H
++#include "shiri_pcm.h"
++#define SHIRI_VOLUME_BYTES 80u
++#define SHIRI_VOLUME_BIND 1u
++#define SHIRI_VOLUME_BOUND 2u
++#define SHIRI_VOLUME_SET 3u
++#define SHIRI_VOLUME_REPLY 4u
++enum { SHIRI_VOLUME_OK, SHIRI_VOLUME_STALE, SHIRI_VOLUME_UNAVAILABLE,
++       SHIRI_VOLUME_TIMEOUT, SHIRI_VOLUME_PROTOCOL, SHIRI_VOLUME_IO,
++       SHIRI_VOLUME_UNSUPPORTED };
++struct shiri_volume_message {
++  uint8_t kind, notify, incarnation[16], session[16];
++  uint64_t epoch, generation, revision;
++  uint32_t volume, status;
++};
++static inline void shiri_volume_encode(uint8_t p[SHIRI_VOLUME_BYTES], const struct shiri_volume_message *v) {
++  memset(p, 0, SHIRI_VOLUME_BYTES); memcpy(p, "SHV1", 4);
++  p[4]=v->kind; p[5]=v->notify;
++  memcpy(p+8,v->incarnation,16); memcpy(p+24,v->session,16);
++  shiri_put64(p+40,v->epoch); shiri_put64(p+48,v->generation); shiri_put64(p+56,v->revision);
++  shiri_put32(p+64,v->volume); shiri_put32(p+68,v->status);
++}
++static inline int shiri_volume_decode(struct shiri_volume_message *v, const uint8_t *p, size_t n) {
++  if (n != SHIRI_VOLUME_BYTES || memcmp(p,"SHV1",4) || p[4]<1 || p[4]>4 || p[5]>1 ||
++      !shiri_zero(p+6,2) || !shiri_zero(p+72,8)) return -1;
++  memset(v,0,sizeof(*v)); v->kind=p[4]; v->notify=p[5];
++  memcpy(v->incarnation,p+8,16); memcpy(v->session,p+24,16);
++  v->epoch=shiri_u64(p+40); v->generation=shiri_u64(p+48); v->revision=shiri_u64(p+56);
++  v->volume=shiri_u32(p+64); v->status=shiri_u32(p+68);
++  if (!v->revision || v->revision>INT64_MAX || v->epoch>INT64_MAX || v->generation>INT64_MAX ||
++      v->volume>100 || v->status>SHIRI_VOLUME_UNSUPPORTED) return -1;
++  if (shiri_zero(v->session,16) ? (v->epoch || v->generation) : (!v->epoch || !v->generation)) return -1;
++  return 0;
++}
++/* fence returns 1 for the exact source, 0 for retired, -1 temporarily busy. */
++typedef int (*shiri_volume_fence)(void *context);
++int shiri_ap2_volume(int connection, unsigned int percent, uint64_t revision,
++                     shiri_volume_fence fence, void *context);
++#endif
+diff --git a/shiri_volume_io.h b/shiri_volume_io.h
+new file mode 100644
+--- /dev/null
++++ b/shiri_volume_io.h
+@@ -0,0 +1,92 @@
++/* Bounded nonblocking AP2 event transport. No PCM callback calls this code. */
++#ifndef SHIRI_VOLUME_IO_H
++#define SHIRI_VOLUME_IO_H
++#include <errno.h>
++#include <poll.h>
++#include <stdint.h>
++#include <string.h>
++#include <strings.h>
++#include <stdlib.h>
++#include <sys/socket.h>
++#include <time.h>
++#include "shiri_volume_control.h"
++static uint64_t shiri_volume_now(void) {
++  struct timespec t;
++  if (clock_gettime(CLOCK_MONOTONIC,&t)) return 0;
++  return (uint64_t)t.tv_sec*UINT64_C(1000000000)+(uint64_t)t.tv_nsec;
++}
++static int shiri_volume_wait(int fd, short events, uint64_t deadline,
++                             shiri_volume_fence fence, void *context) {
++  for (;;) {
++    uint64_t now=shiri_volume_now();
++    struct pollfd p={fd,events,0};
++    int result, valid=fence(context), milliseconds;
++    if (!valid) return SHIRI_VOLUME_STALE;
++    if (!now || now>=deadline) return SHIRI_VOLUME_TIMEOUT;
++    milliseconds=(int)((deadline-now+999999)/1000000);
++    if (milliseconds>20) milliseconds=20;
++    if (valid<0) { poll(NULL,0,milliseconds); continue; }
++    result=poll(&p,1,milliseconds);
++    if (result<0 && errno==EINTR) continue;
++    if (result<0) return SHIRI_VOLUME_IO;
++    if (result && (p.revents&events)) return SHIRI_VOLUME_OK;
++    if (result && (p.revents&(POLLERR|POLLNVAL|POLLHUP))) return SHIRI_VOLUME_IO;
++  }
++}
++static int shiri_volume_write(int fd, const uint8_t *data, size_t length, uint64_t deadline,
++                              shiri_volume_fence fence, void *context) {
++  size_t offset=0;
++  while (offset<length) {
++    int ret=shiri_volume_wait(fd,POLLOUT,deadline,fence,context);
++    ssize_t n;
++    if (ret) return ret;
++    if (fence(context)!=1) continue;
++    n=send(fd,data+offset,length-offset,MSG_DONTWAIT|MSG_NOSIGNAL);
++    if (n<0 && (errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK)) continue;
++    if (n<=0) return SHIRI_VOLUME_IO;
++    offset+=(size_t)n;
++  }
++  return SHIRI_VOLUME_OK;
++}
++/* Complete response, bounded headers/body, exact status and optional CSeq.
++ * 0 incomplete, 1 complete success, -1 malformed/rejected/excess bytes. */
++static int shiri_volume_response(const uint8_t *data,size_t length,uint64_t revision) {
++  size_t pos=0, header=0, body=0;
++  int have_length=0, have_sequence=0;
++  if (length>4096) return -1;
++  while (pos+3<length) {
++    if (!memcmp(data+pos,"\r\n\r\n",4)) { header=pos+4; break; }
++    pos++;
++  }
++  if (!header) return length==4096 || memchr(data,0,length) ? -1 : 0;
++  if (memchr(data,0,header)) return -1;
++  if (length<14 || memcmp(data,"RTSP/1.0 200",12) || (data[12]!=' ' && data[12]!='\r')) return -1;
++  pos=0;
++  while (pos+1<header && !(data[pos]=='\r' && data[pos+1]=='\n')) pos++;
++  pos+=2;
++  while (pos+1<header && data[pos]!='\r') {
++    size_t end=pos, colon=pos, start;
++    uint64_t number=0;
++    int recognized=0;
++    while (end+1<header && !(data[end]=='\r' && data[end+1]=='\n')) end++;
++    while (colon<end && data[colon]!=':') colon++;
++    if (colon==end) return -1;
++    if (colon-pos==14 && !strncasecmp((const char *)data+pos,"Content-Length",14)) recognized=1;
++    if (colon-pos==4 && !strncasecmp((const char *)data+pos,"CSeq",4)) recognized=2;
++    if (recognized) {
++      start=colon+1; while (start<end && (data[start]==' ' || data[start]=='\t')) start++;
++      if (start==end) return -1;
++      for (;start<end;start++) {
++        if (data[start]<'0' || data[start]>'9' || number>UINT64_MAX/10 ||
++            (number==UINT64_MAX/10 && (uint64_t)(data[start]-'0')>UINT64_MAX%10)) return -1;
++        number=number*10+(uint64_t)(data[start]-'0');
++      }
++      if (recognized==1) { if (have_length++ || number>4096-header) return -1; body=(size_t)number; }
++      else { if (have_sequence++ || number!=revision) return -1; }
++    }
++    pos=end+2;
++  }
++  if (length>header+body) return -1;
++  return length==header+body ? 1 : 0;
++}
++#endif
+diff --git a/shiri_volume_lane.inc b/shiri_volume_lane.inc
+new file mode 100644
+--- /dev/null
++++ b/shiri_volume_lane.inc
+@@ -0,0 +1,135 @@
++/* Private worker feedback lane. Audio owns only the PCM fd above; this
++ * dedicated thread is the only reader/writer of its control descriptor. */
++static pthread_mutex_t volume_lock=PTHREAD_MUTEX_INITIALIZER;
++static pthread_t volume_thread;
++static int volume_started, volume_stopping;
++static char *volume_socket_path;
++static double room_default_volume;
++static uint8_t volume_incarnation[16];
++static uint64_t volume_revision;
++
++static double room_volume(void) {
++  double result;
++  pthread_mutex_lock(&volume_lock); result=room_default_volume; pthread_mutex_unlock(&volume_lock);
++  return result;
++}
++static int volume_stopped(void) {
++  int stopped;
++  pthread_mutex_lock(&volume_lock); stopped=volume_stopping; pthread_mutex_unlock(&volume_lock);
++  return stopped;
++}
++static int volume_live(void *unused) { (void)unused; return !volume_stopped(); }
++static int volume_fence(void *context) {
++  const struct shiri_volume_message *message=context;
++  int valid;
++  if (volume_stopped()) return 0;
++  if (pthread_mutex_trylock(&lock)) return -1;
++  if (shiri_zero(message->session,16)) valid=fd<0;
++  else valid=fd>=0 && !memcmp(state.session,message->session,16) &&
++              !memcmp(state.incarnation,message->incarnation,16) &&
++              state.epoch==message->epoch && state.generation==message->generation;
++  pthread_mutex_unlock(&lock);
++  return valid;
++}
++static int volume_number(const struct shiri_volume_message *message,int *number) {
++  int valid;
++  if (pthread_mutex_trylock(&lock)) return SHIRI_VOLUME_UNAVAILABLE;
++  valid=fd>=0 && !memcmp(state.session,message->session,16) &&
++        !memcmp(state.incarnation,message->incarnation,16) &&
++        state.epoch==message->epoch && state.generation==message->generation;
++  *number=connection;
++  pthread_mutex_unlock(&lock);
++  return valid ? SHIRI_VOLUME_OK : SHIRI_VOLUME_STALE;
++}
++static int volume_command(struct shiri_volume_message *message) {
++  int number=-1,ret;
++  if (memcmp(message->incarnation,volume_incarnation,16) || message->revision<volume_revision)
++    return SHIRI_VOLUME_STALE;
++  if (volume_fence(message)!=1) return SHIRI_VOLUME_STALE;
++  volume_revision=message->revision;
++  pthread_mutex_lock(&volume_lock);
++  room_default_volume=(double)message->volume*0.3-30.0;
++  pthread_mutex_unlock(&volume_lock);
++  if (!message->notify || shiri_zero(message->session,16)) return SHIRI_VOLUME_OK;
++  ret=volume_number(message,&number);
++  if (ret) return ret;
++  return shiri_ap2_volume(number,message->volume,message->revision,volume_fence,message);
++}
++static int volume_send(int control,struct shiri_volume_message *message,uint64_t deadline) {
++  uint8_t bytes[SHIRI_VOLUME_BYTES];
++  int ret=shiri_volume_wait(control,POLLOUT,deadline,volume_live,NULL);
++  if (ret) return -1;
++  shiri_volume_encode(bytes,message);
++  return send(control,bytes,sizeof(bytes),MSG_DONTWAIT|MSG_NOSIGNAL)==(ssize_t)sizeof(bytes) ? 0 : -1;
++}
++static int volume_receive(int control,struct shiri_volume_message *message,uint64_t deadline) {
++  uint8_t bytes[SHIRI_VOLUME_BYTES];
++  ssize_t n;
++  if (shiri_volume_wait(control,POLLIN,deadline,volume_live,NULL)) return -1;
++  n=recv(control,bytes,sizeof(bytes),MSG_DONTWAIT|MSG_TRUNC);
++  return n==(ssize_t)sizeof(bytes) ? shiri_volume_decode(message,bytes,sizeof(bytes)) : -1;
++}
++static int volume_connect(void) {
++  struct sockaddr_un address;
++  int control=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
++  if (control<0) return -1;
++  memset(&address,0,sizeof(address)); address.sun_family=AF_UNIX;
++  strcpy(address.sun_path,volume_socket_path);
++  if (connect(control,(struct sockaddr *)&address,sizeof(address))) goto fail;
++#ifdef SO_PEERCRED
++  {
++    struct ucred credential;
++    socklen_t length=sizeof(credential);
++    if (getsockopt(control,SOL_SOCKET,SO_PEERCRED,&credential,&length) ||
++        length!=sizeof(credential) || credential.uid!=(uid_t)peer_uid) goto fail;
++  }
++#else
++  goto fail;
++#endif
++  return control;
++fail:
++  close(control); return -1;
++}
++static void *volume_run(void *unused) {
++  (void)unused;
++  while (!volume_stopped()) {
++    int control=volume_connect();
++    struct shiri_volume_message message;
++    uint64_t deadline=shiri_volume_now()+UINT64_C(1000000000);
++    if (control<0) { poll(NULL,0,200); continue; }
++    memset(&message,0,sizeof(message)); message.kind=SHIRI_VOLUME_BIND; message.revision=1; message.volume=50;
++    if (volume_send(control,&message,deadline) || volume_receive(control,&message,deadline) ||
++        message.kind!=SHIRI_VOLUME_BOUND || shiri_zero(message.incarnation,16) || message.notify || message.status) goto retired;
++    memcpy(volume_incarnation,message.incarnation,16); volume_revision=message.revision;
++    pthread_mutex_lock(&volume_lock); room_default_volume=(double)message.volume*0.3-30.0; pthread_mutex_unlock(&volume_lock);
++    while (!volume_stopped()) {
++      struct pollfd ready={control,POLLIN,0};
++      int result=poll(&ready,1,200);
++      if (result<0 && errno==EINTR) continue;
++      if (!result) continue;
++      if (result<0 || !(ready.revents&POLLIN)) break;
++      deadline=shiri_volume_now()+UINT64_C(1000000000);
++      if (volume_receive(control,&message,deadline) || message.kind!=SHIRI_VOLUME_SET || message.status) break;
++      message.status=volume_command(&message); message.kind=SHIRI_VOLUME_REPLY;
++      if (volume_send(control,&message,deadline)) break;
++    }
++retired:
++    close(control);
++    memset(volume_incarnation,0,sizeof(volume_incarnation));
++    if (!volume_stopped()) poll(NULL,0,200);
++  }
++  return NULL;
++}
++static int volume_init(const char *path) {
++  if (!path || strlen(path)>=sizeof(((struct sockaddr_un *)0)->sun_path)) return -1;
++  volume_socket_path=strdup(path);
++  if (!volume_socket_path) return -1;
++  room_default_volume=config.airplay_volume; volume_stopping=0;
++  if (pthread_create(&volume_thread,NULL,volume_run,NULL)) { free(volume_socket_path); volume_socket_path=NULL; return -1; }
++  volume_started=1; return 0;
++}
++static void volume_deinit(void) {
++  pthread_mutex_lock(&volume_lock); volume_stopping=1; pthread_mutex_unlock(&volume_lock);
++  if (volume_started) { pthread_join(volume_thread,NULL); volume_started=0; }
++  free(volume_socket_path); volume_socket_path=NULL;
++}

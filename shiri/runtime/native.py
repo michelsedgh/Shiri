@@ -356,12 +356,14 @@ class NativeHandle:
 
 class NativeController:
     """Exact native callbacks, mixer writes and authenticated backend barrier."""
-    def __init__(self, room_id, mixer, client, *, control_revision=1):
+    def __init__(self, room_id, mixer, client, *, control_revision=1, control_volume=50):
         self.mixer, self.client = mixer, client
         self.handles = {}
         self.operation_generation = 0
         self.events = []
         self.control_revision = self._revision(control_revision)
+        from .receiver_volume import ReceiverVolume
+        self.receiver_volume = ReceiverVolume(self, control_volume)
         self._volume_changed = asyncio.Event()
         self._volume_task = None
         self.volume_bridge_error = None
@@ -381,6 +383,7 @@ class NativeController:
 
     def control_intent(self, revision):
         self.control_revision = max(self.control_revision, self._revision(revision))
+        self.receiver_volume.intent(self.control_revision)
         return {"revision": self.control_revision}
 
     def volume_event(self, token, generation, volume, base_revision):
@@ -571,6 +574,8 @@ class NativeController:
         elif packet.kind is Kind.VOLUME:
             # Capture before waiting for the ownership lock. A UI edit arriving
             # during that wait must not become the old phone event's base.
+            if self.receiver_volume.is_echo(handle.token, handle.generation, packet.frames):
+                return None
             handle.volume_base_revision = self.control_revision
             await self.actor.volume_native(handle.token, packet.frames)
         elif packet.kind is Kind.END:
@@ -668,6 +673,7 @@ class NativeController:
                 connection.setblocking(False)
                 self._start_connection(connection)
         self.server = asyncio.create_task(accept())
+        await self.receiver_volume.listen(path.with_name("volume.sock"), native_uid, mode)
 
     def health(self):
         from copy import deepcopy
@@ -676,10 +682,12 @@ class NativeController:
                 "native_ingress_fault": deepcopy(self.ingress_fault),
                 "source_operation_generation": self.operation_generation,
                 "control_revision": self.control_revision, "native_volume_bridge_error": self.volume_bridge_error,
+                "receiver_volume": deepcopy(self.receiver_volume.result),
                 **({"ready": False, "error": source["error"]} if source["error"] else {})}
 
     async def close(self):
         self.closed = True
+        await self.receiver_volume.close()
         if self._volume_task is not None:
             self._volume_task.cancel()
             await asyncio.gather(self._volume_task, return_exceptions=True)

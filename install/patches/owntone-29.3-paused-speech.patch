@@ -1,0 +1,404 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -354,10 +354,17 @@
+   struct shiri_speech_output outputs[SHIRI_SPEECH_OUTPUTS];
+   unsigned count;
+   uint64_t mixed_ns;
++  bool output_bed;
+ } shiri_last_mix;
+ static struct event *shiri_speech_setup_event;
+ static void device_shiri_speech_start_cb(struct output_device *device, enum output_device_state status);
+-static void shiri_speech_mix_ready(void);
++static void shiri_speech_mix_ready(bool output_bed);
++static bool shiri_speech_bed_tick(void);
++static int shiri_speech_bed_arm(void);
++static bool shiri_speech_bed_wanted(void);
++static void shiri_speech_bed_retire_outputs(void);
++static struct shiri_speech_request shiri_voice_request;
++static bool shiri_voice_initialized;
+ 
+ struct event_base *evbase_player;
+ 
+@@ -394,6 +401,13 @@
+ static bool pb_timer_native;
+ static bool pb_timer_native_anchored;
+ static bool pb_timer_native_waiting_for_pcm;
++/* A stopped/never-produced phone can own a valid source without a player
++ * session. Reuse the same timer for output-only speech; never create/read a
++ * program source or advance pb_session's P/counters from this mode. */
++static bool pb_timer_speech_only;
++static struct timespec shiri_output_end;
++static bool shiri_output_end_valid;
++static uint64_t shiri_output_bed_frames;
+ static uint64_t pb_timer_native_operation;
+ static struct timespec pb_timer_native_anchor;
+ static struct timespec pb_timer_native_wait_until;
+@@ -431,6 +445,9 @@
+ 
+ static int
+ pb_suspend(void);
++
++static int
++pb_timer_stop(void);
+ 
+ 
+ /* ----------------------- Misc helpers and callbacks ----------------------- */
+@@ -1383,6 +1400,18 @@
+     overrun = ret;
+ #endif /* HAVE_TIMERFD */
+ 
++  if (pb_timer_speech_only)
++    {
++      if (!shiri_speech_bed_tick())
++        {
++          /* Keep the input receiver untouched. A future actual pipe start
++           * owns pb_timer_start and replaces this output-only mode. */
++          pb_timer_stop();
++          shiri_speech_bed_retire_outputs();
++        }
++      return;
++    }
++
+   if (pb_timer_native)
+     {
+       ret = pb_timer_native_prepare();
+@@ -1393,7 +1422,12 @@
+           return;
+         }
+       if (ret == 0)
+-        return; /* Waiting/rearmed: no PCM or output effects before the anchor. */
++        {
++          /* A queued music anchor always wins; an empty paused input may
++           * supply an output-only speech bed on this same existing tick. */
++          shiri_speech_bed_tick();
++          return;
++        }
+     }
+ 
+   // We are too delayed, probably some output blocked: reset if first overrun or abort if second overrun
+@@ -1463,7 +1497,14 @@
+       shiri_speech_mix(pb_session.buffer, nbytes, nsamples, pb_session.quality.sample_rate,
+                        pb_session.quality.bits_per_sample, pb_session.quality.channels);
+       outputs_write(pb_session.buffer, nbytes, nsamples, &pb_session.quality, &pb_session.pts);
+-      shiri_speech_mix_ready();
++      {
++        struct timespec duration = { nsamples / pb_session.quality.sample_rate,
++          (long)(UINT64_C(1000000000) * (nsamples % pb_session.quality.sample_rate) /
++                 pb_session.quality.sample_rate) };
++        shiri_output_end = timespec_add(pb_session.pts, duration);
++        shiri_output_end_valid = true;
++      }
++      shiri_speech_mix_ready(false);
+ 
+       if (nbytes < pb_session.bufsize)
+ 	{
+@@ -1900,6 +1941,8 @@
+   /* Never replace a late native anchor with the receive or timer clock. */
+   if (timespec_cmp(anchor, now) <= 0)
+     return pb_timer_native_reject("anchor_late", state, operation, anchor, now);
++  if (shiri_output_end_valid && timespec_cmp(anchor, shiri_output_end) < 0)
++    return pb_timer_native_reject("anchor_overlaps_output_bed", state, operation, anchor, now);
+   tick.it_interval = player_tick_interval;
+   tick.it_value = anchor;
+ #ifdef HAVE_TIMERFD
+@@ -1936,6 +1979,7 @@
+       return -1;
+     }
+ 
++  pb_timer_speech_only = false;
+   pb_timer_native = false;
+   pb_timer_native_anchored = false;
+   pb_timer_native_waiting_for_pcm = false;
+@@ -1978,6 +2022,7 @@
+   int ret;
+ 
+   event_del(pb_timer_ev);
++  pb_timer_speech_only = false;
+   pb_timer_native = false;
+   pb_timer_native_anchored = false;
+   pb_timer_native_waiting_for_pcm = false;
+@@ -2861,7 +2906,8 @@
+ {
+   struct output_device *device;
+   unsigned index, visited = 0;
+-  if (!shiri_speech_source_matches(&shiri_speech_start.request)) return;
++  if (!shiri_zero(shiri_speech_start.request.source.owner.session, 16) ||
++      !shiri_speech_source_matches(&shiri_speech_start.request)) return;
+   for (device = outputs_list(); device && ++visited <= 1024; device = device->next)
+     for (index = 0; index < shiri_speech_start.count; ++index)
+       if (device->id == shiri_speech_start.outputs[index].id &&
+@@ -2946,7 +2992,7 @@
+   struct timeval deadline = { 5, 0 };
+   unsigned visited = 0, index;
+   int ret;
+-  if (!now || !shiri_zero(param->request.source.owner.session, 16) || !shiri_speech_source_matches(&param->request) ||
++  if (!now || !shiri_speech_source_matches(&param->request) ||
+       (player_state == PLAY_PLAYING && !pb_timer_native)) {
+     *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
+   }
+@@ -3021,6 +3067,10 @@
+   /* A lost caller cannot reserve idle transports permanently. Starting the
+    * actual bed cancels this existing finite delayed-stop mechanism. */
+   if (player_state != PLAY_PLAYING) shiri_speech_schedule_idle_stop();
++  if (!shiri_zero(param->request.source.owner.session, 16) && shiri_speech_bed_arm() < 0) {
++    shiri_speech_start.failed = true;
++    *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
++  }
+   param->reply.connected = true;
+   param->reply.prepared_ns = shiri_speech_start.prepared_ns;
+   *retval = 0; return COMMAND_END;
+@@ -3056,15 +3106,16 @@
+ }
+ 
+ static void
+-shiri_speech_mix_ready(void)
++shiri_speech_mix_ready(bool output_bed)
+ {
+   uint64_t now;
+-  if (!pb_timer_native || !pb_timer_native_anchored || player_state != PLAY_PLAYING ||
++  if ((!output_bed && (!pb_timer_native || !pb_timer_native_anchored || player_state != PLAY_PLAYING ||
+       pb_session.quality.sample_rate != 48000 || pb_session.quality.bits_per_sample != 16 ||
+-      pb_session.quality.channels != 2 || !shiri_source_state.initialized || shiri_source_state.faulted ||
++      pb_session.quality.channels != 2)) || !shiri_source_state.initialized || shiri_source_state.faulted ||
+       !(now = shiri_speech_ready_now()) || shiri_speech_last_outputs(true) < 0) return;
+   shiri_last_mix.source = shiri_source_state.last;
+   shiri_last_mix.mixed_ns = now;
++  shiri_last_mix.output_bed = output_bed;
+   if (shiri_speech_start.connected && !shiri_speech_start.failed &&
+       shiri_speech_source_matches(&shiri_speech_start.request) && shiri_speech_outputs_snapshot(false, true) == 0)
+     shiri_speech_start.mixed_ns = now;
+@@ -3083,8 +3134,11 @@
+     param->reply.connected = shiri_speech_last_outputs(false) == 0;
+     param->reply.outputs = param->reply.connected ? shiri_last_mix.count : 0;
+     param->reply.mixed_ns = shiri_last_mix.mixed_ns;
+-    param->reply.ready = now && param->reply.connected && pb_timer_native && pb_timer_native_anchored &&
+-      player_state == PLAY_PLAYING && shiri_last_mix.source.operation_generation == param->request.source.operation_generation &&
++    param->reply.ready = now && param->reply.connected &&
++      ((shiri_last_mix.output_bed && (pb_timer_speech_only ||
++          (pb_timer_native && pb_timer_native_waiting_for_pcm && !pb_timer_native_anchored))) ||
++        (pb_timer_native && pb_timer_native_anchored && player_state == PLAY_PLAYING)) &&
++      shiri_last_mix.source.operation_generation == param->request.source.operation_generation &&
+       shiri_source_owner_equal(&shiri_last_mix.source.owner, &param->request.source.owner) &&
+       shiri_last_mix.mixed_ns && shiri_last_mix.mixed_ns <= now && now-shiri_last_mix.mixed_ns < SHIRI_SPEECH_MIX_AGE_NS;
+     *retval = 0; return COMMAND_END;
+@@ -3108,18 +3162,151 @@
+   param->reply.prepared_ns = shiri_speech_start.prepared_ns;
+   param->reply.mixed_ns = shiri_speech_start.mixed_ns;
+   param->reply.outputs = shiri_speech_start.count;
+-  param->reply.ready = pb_timer_native && pb_timer_native_anchored && player_state == PLAY_PLAYING &&
++  param->reply.ready =
++    ((shiri_last_mix.output_bed && (pb_timer_speech_only ||
++        (pb_timer_native && pb_timer_native_waiting_for_pcm && !pb_timer_native_anchored))) ||
++      (pb_timer_native && pb_timer_native_anchored && player_state == PLAY_PLAYING)) &&
++    shiri_last_mix.source.operation_generation == param->request.source.operation_generation &&
++    shiri_source_owner_equal(&shiri_last_mix.source.owner, &param->request.source.owner) &&
+     param->reply.mixed_ns >= param->reply.prepared_ns && param->reply.mixed_ns <= now &&
+     now - param->reply.mixed_ns < SHIRI_SPEECH_MIX_AGE_NS;
+   *retval = 0; return COMMAND_END;
+ }
+ 
++/* Output-only voice uses OwnTone's existing output clock. It never writes
++ * a framed phone/idle packet, reads input, marks a music anchor or changes P.
++ * A prepared source/selected-session snapshot is exact and bounded; admitted
++ * media retains its own existing lease/queue across music source transitions. */
++static bool
++shiri_speech_bed_wanted(void)
++{
++  struct shiri_speech_status media;
++  uint64_t now = shiri_speech_ready_now();
++  bool prepared;
++  if (!now || !shiri_source_state.initialized || shiri_source_state.faulted) return false;
++  shiri_speech_status(&media);
++  if (shiri_voice_initialized && (media.active || media.running || media.queue_frames)) return true;
++  prepared = shiri_speech_start.initialized && shiri_speech_start.connected && !shiri_speech_start.failed &&
++    shiri_speech_source_matches(&shiri_speech_start.request) &&
++    now >= shiri_speech_start.began_ns && now-shiri_speech_start.began_ns < SHIRI_SPEECH_SETUP_NS &&
++    shiri_speech_outputs_snapshot(false, true) == 0;
++  /* A terminal admitted voice must not leave its preparation bed alive. A
++   * fresh BEGIN still gets the finite setup grace until its first FIFO control. */
++  if (prepared && shiri_voice_initialized &&
++      !memcmp(shiri_voice_request.speech, shiri_speech_start.request.speech, 16) &&
++      shiri_voice_request.action != SHIRI_SPEECH_BEGIN) return false;
++  return prepared;
++}
++
++static void
++shiri_speech_bed_retire_outputs(void)
++{
++  struct output_device *device;
++  unsigned visited = 0;
++  /* The final voice tick may have canceled END's delayed release. Restore
++   * that finite cleanup only for the exact still-idle source and sessions
++   * which this bed actually mixed; never stop a paused phone or successor. */
++  if (!shiri_source_state.initialized || shiri_source_state.faulted || shiri_speech_bed_wanted() ||
++      !shiri_zero(shiri_source_state.last.owner.session, 16) || !shiri_last_mix.mixed_ns ||
++      shiri_last_mix.source.operation_generation != shiri_source_state.last.operation_generation ||
++      !shiri_source_owner_equal(&shiri_last_mix.source.owner, &shiri_source_state.last.owner) ||
++      shiri_speech_last_outputs(false) < 0) return;
++  for (device = outputs_list(); device && ++visited <= 1024; device = device->next)
++    if (device->selected) outputs_device_stop_delayed(device, device_streaming_cb);
++}
++
++static int
++shiri_speech_bed_arm(void)
++{
++  struct itimerspec tick;
++  struct output_device *device;
++  unsigned visited = 0;
++  int ret;
++  if (!shiri_speech_bed_wanted()) return 0;
++  if (shiri_speech_last_outputs(true) < 0) return -1;
++  for (device = outputs_list(); device && ++visited <= 1024; device = device->next)
++    if (device->selected)
++      {
++        if (outputs_shiri_stop_delayed_cancel(device) < 0) return -1;
++        outputs_device_cb_set(device, device_streaming_cb);
++      }
++  if (visited > 1024) return -1;
++  if (pb_timer_native || pb_timer_speech_only) return 0;
++  if (player_state == PLAY_PLAYING) return -1; /* never take a different program's clock */
++  if (event_add(pb_timer_ev, NULL) < 0) return -1;
++  tick.it_interval = player_tick_interval;
++  tick.it_value = player_tick_interval;
++#ifdef HAVE_TIMERFD
++  ret = timerfd_settime(pb_timer_fd, 0, &tick, NULL);
++#else
++  ret = timer_settime(pb_timer, 0, &tick, NULL);
++#endif
++  if (ret < 0) { event_del(pb_timer_ev); return -1; }
++  pb_timer_speech_only = true;
++  return 0;
++}
++
++static bool
++shiri_speech_bed_tick(void)
++{
++  struct timespec tick_end, fresh, anchor, start, duration;
++  struct media_quality quality = { .sample_rate = 48000, .bits_per_sample = 16, .channels = 2 };
++  uint8_t buffer[480 * 4] = { 0 };
++  uint64_t operation, elapsed;
++  int ret, frames;
++  if (!shiri_speech_bed_wanted() ||
++      (!pb_timer_speech_only && (!pb_timer_native || !pb_timer_native_waiting_for_pcm || pb_timer_native_anchored)) ||
++      player_tick_interval.tv_sec || player_tick_interval.tv_nsec != 10000000L ||
++      input_pipe_shiri_state(&operation) != 1 || operation != shiri_source_state.last.operation_generation ||
++      shiri_speech_last_outputs(true) < 0) return false;
++  /* Reserve no future output horizon. T is captured before the empty peek:
++   * this voice-only bed represents the preceding player interval and ends
++   * no later than T. Any music P accepted as genuinely future on its later
++   * fresh native-prepare clock is therefore strictly after this bed's O_end.
++   * A packet arriving just after peek with only1ms remaining lead remains
++   * playable at its original P; neither input locks nor a new lead/buffer,
++   * sample discard or source admission change is needed. Transport timing
++   * still adds the existing output buffer B to this output-only timestamp. */
++  if (clock_gettime(CLOCK_MONOTONIC, &tick_end) < 0) return false;
++  if (!tick_end.tv_sec && tick_end.tv_nsec < 10000000L) return true;
++  ret = input_peek_sync(&anchor);
++  if (ret != 0) return false; /* genuine queued PCM/anchor always wins */
++  if (clock_gettime(CLOCK_MONOTONIC, &fresh) < 0) return false;
++  duration.tv_sec = 0; duration.tv_nsec = 10000000L;
++  if (timespec_cmp(fresh, timespec_add(tick_end, duration)) > 0)
++    return true; /* mutex/scheduling stall: retry without a stale bed write */
++  start = tick_end;
++  if (start.tv_nsec < 10000000L) { --start.tv_sec; start.tv_nsec += 1000000000L; }
++  start.tv_nsec -= 10000000L;
++  if (shiri_output_end_valid)
++    {
++      if (timespec_cmp(shiri_output_end, tick_end) >= 0) return true;
++      elapsed = (uint64_t)(tick_end.tv_sec - shiri_output_end.tv_sec) * UINT64_C(1000000000);
++      elapsed += tick_end.tv_nsec;
++      elapsed -= shiri_output_end.tv_nsec;
++      /* Preserve O/sample continuity through normal timer jitter. Following
++       * a missed tick or an intentional gap, restart only this empty output
++       * bed in the preceding interval instead of accumulating stale voice. */
++      if (elapsed <= UINT64_C(20000000)) start = shiri_output_end;
++    }
++  elapsed = (uint64_t)(tick_end.tv_sec - start.tv_sec) * UINT64_C(1000000000);
++  elapsed += tick_end.tv_nsec;
++  elapsed -= start.tv_nsec;
++  frames = elapsed >= UINT64_C(10000000) ? 480 : (int)(elapsed * 48000 / UINT64_C(1000000000));
++  if (frames <= 0) return true;
++  shiri_speech_mix(buffer, frames * 4, frames, 48000, 16, 2);
++  outputs_write(buffer, frames * 4, frames, &quality, &start);
++  duration.tv_sec = 0; duration.tv_nsec = (long)(UINT64_C(1000000000) * frames / 48000);
++  shiri_output_end = timespec_add(start, duration);
++  shiri_output_end_valid = true;
++  shiri_output_bed_frames += frames;
++  shiri_speech_mix_ready(true);
++  return true;
++}
++
+ /* Admission/retirement is independent of the source/output machinery. The
+  * complete acknowledged request fences cleanup even after music changes its
+  * source; only BEGIN requires that source to remain current and mix-ready. */
+-static struct shiri_speech_request shiri_voice_request;
+-static bool shiri_voice_initialized;
+-
+ static bool
+ shiri_speech_voice_matches(const struct shiri_speech_request *request)
+ {
+@@ -3162,6 +3349,7 @@
+     ret = action == SHIRI_SPEECH_CANCEL ? shiri_speech_cancel(param->request.speech) : shiri_speech_finish(param->request.speech);
+     if (ret) { *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END; }
+     shiri_voice_request = param->request; shiri_voice_initialized = true;
++    if (!pb_timer_native && !pb_timer_speech_only) shiri_speech_bed_retire_outputs();
+   }
+   *retval = 0; return COMMAND_END;
+ }
+@@ -3327,7 +3515,7 @@
+   /* Output FLUSH may await a network reply. Quiesce this same player timer
+    * before sealing the input, so its tick cannot abort and replace the
+    * pending output callback while the exact source barrier is in flight. */
+-  if (param->restart_timer)
++  if (param->restart_timer || pb_timer_speech_only)
+     stopped = pb_timer_stop();
+   *retval = input_pipe_shiri_seal(param->request.operation_generation);
+   if (*retval < 0 || stopped < 0 || deadline < 0)
+@@ -3337,6 +3525,7 @@
+     }
+   input_flush(NULL);
+   outputs_resampling_reset();
++  shiri_output_end_valid = false; /* output FLUSH retired the old O horizon */
+   pb_session.read_deficit = 0;
+   shiri_source_flush_failed = 0;
+   /* A first music grant must follow full selected-output START, so network
+@@ -3401,7 +3590,13 @@
+         outputs_shiri_release(device_shiri_cleanup_cb);
+       else
+         outputs_shiri_ready(device_streaming_cb);
++      {
+       shiri_source_state.faulted = false;
++      /* END can leave no music session while exact admitted voice still has
++       * a valid tail. Reuse the same timer without fabricating a pipe source. */
++      if (shiri_speech_bed_arm() < 0)
++        DPRINTF(E_WARN, L_PLAYER, "Speech-only output clock could not rearm after source transition\n");
++    }
+     }
+   return COMMAND_END;
+ }
+diff --git a/src/shiri_speech_ready_json.h b/src/shiri_speech_ready_json.h
+--- a/src/shiri_speech_ready_json.h
++++ b/src/shiri_speech_ready_json.h
+@@ -37,7 +37,7 @@
+   }
+   ret = shiri_source_parse(source, &request->source);
+   json_object_put(source);
+-  return ret < 0 || (request->action <= SHIRI_SPEECH_OBSERVE &&
+-    (shiri_zero(request->source.owner.session, 16) == (request->action == SHIRI_SPEECH_OBSERVE))) ? -1 : 0;
++  return ret < 0 || (request->action == SHIRI_SPEECH_OBSERVE &&
++    shiri_zero(request->source.owner.session, 16)) ? -1 : 0;
+ }
+ #endif

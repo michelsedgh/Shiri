@@ -75,6 +75,13 @@ def run_tests(*, shairport_source=None, compiler=None, sanitize=True):
     expected = patched_audio(tools)
     actual = ((shairport_source / "audio_shiri.c").read_text()
               if shairport_source else expected)
+    actual_sha = hashlib.sha256(actual.encode()).hexdigest()
+    if actual != expected and shairport_source is not None:
+        path = REPOSITORY / "tests/native/check_receiver_volume.py"
+        spec = importlib.util.spec_from_file_location("receiver_volume_exact_overlay", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        actual = module.preimage_audio(shairport_source)
     if actual != expected:
         raise ValueError("Actual timed3 callback differs from exact additive patch")
     if hashlib.sha256(function_body(actual, "sample_clocks").encode()).hexdigest() != SAMPLER_SHA:
@@ -113,6 +120,7 @@ def run_tests(*, shairport_source=None, compiler=None, sanitize=True):
                                 capture_output=True, text=True, timeout=30)
     return {"ok": True, "sanitized": sanitize, "result": result.stdout.strip(),
             "callback_sha256": hashlib.sha256(actual.encode()).hexdigest(),
+            "composed_callback_sha256": actual_sha,
             "original_sampler_sha256": SAMPLER_SHA, "original_inner_cases_sha256": INNER_CASES_SHA,
             "patch_sha256": hashlib.sha256(PATCH.read_bytes()).hexdigest()}
 

@@ -35,6 +35,8 @@ SHAIRPORT_CLOCK_RECOVERY_PATCH="$SOURCE/install/patches/shairport-5.5.2-clock-re
 SHAIRPORT_CLOCK_RECOVERY_SHA=c7905cca35140fd1b9e6b1de4c1a534e9f8fa47aea0a08199c96af1a3a951a56
 SHAIRPORT_STARTUP_PATCH="$SOURCE/install/patches/shairport-5.5.2-native-startup.patch"
 SHAIRPORT_STARTUP_SHA=bab272cab5764fc3ebb0f8169b6a94b8318b78f63e09fd7e368058901b9a71d8
+SHAIRPORT_VOLUME_PATCH="$SOURCE/install/patches/shairport-5.5.2-receiver-volume.patch"
+SHAIRPORT_VOLUME_SHA=26003aa1b8df99c5de6eecc21074bf259158e64baefd41a35c704145d5957bbd
 OWNTONE_TIMED_PATCH="$SOURCE/install/patches/owntone-29.3-timed-pcm.patch"
 OWNTONE_TIMED_SHA=3b02c678b171e391385ffef207371702ace9c71bfc0f1ae27d60fa11a1acb329
 OWNTONE_SOURCE_PATCH="$SOURCE/install/patches/owntone-29.3-source-transition.patch"
@@ -65,7 +67,11 @@ OWNTONE_OWNER_PATCH="$SOURCE/install/patches/owntone-29.3-speech-owner.patch"
 OWNTONE_OWNER_SHA=83962429b340c77ff55df8bf8716a0bde3ee558d56a72f6a0335248988f2771a
 OWNTONE_BALANCE_PATCH="$SOURCE/install/patches/owntone-29.3-speaker-balance.patch"
 OWNTONE_BALANCE_SHA=e61e28af5bdaefaa49d355681469ebb8cf23247b8a18e5c3a4261186d2d963a0
-for patch in "$SHAIRPORT_TIMED_PATCH:$SHAIRPORT_TIMED_SHA" "$SHAIRPORT_CLOCK_RECOVERY_PATCH:$SHAIRPORT_CLOCK_RECOVERY_SHA" "$SHAIRPORT_STARTUP_PATCH:$SHAIRPORT_STARTUP_SHA" "$OWNTONE_TIMED_PATCH:$OWNTONE_TIMED_SHA" "$OWNTONE_SOURCE_PATCH:$OWNTONE_SOURCE_SHA" "$OWNTONE_IDENTITY_PATCH:$OWNTONE_IDENTITY_SHA" "$OWNTONE_TRANSPORT_PATCH:$OWNTONE_TRANSPORT_SHA" "$OWNTONE_OFFSET_PATCH:$OWNTONE_OFFSET_SHA" "$OWNTONE_BUFFER_PATCH:$OWNTONE_BUFFER_SHA" "$OWNTONE_RESAMPLE_PATCH:$OWNTONE_RESAMPLE_SHA" "$OWNTONE_FRAMED_PATCH:$OWNTONE_FRAMED_SHA" "$OWNTONE_ALSA_PATCH:$OWNTONE_ALSA_SHA" "$OWNTONE_SPEECH_PATCH:$OWNTONE_SPEECH_SHA" "$OWNTONE_READY_PATCH:$OWNTONE_READY_SHA" "$OWNTONE_ANCHOR_PATCH:$OWNTONE_ANCHOR_SHA" "$OWNTONE_JITTER_PATCH:$OWNTONE_JITTER_SHA" "$OWNTONE_OWNER_PATCH:$OWNTONE_OWNER_SHA" "$OWNTONE_BALANCE_PATCH:$OWNTONE_BALANCE_SHA"; do
+OWNTONE_TRANSITION_PATCH="$SOURCE/install/patches/owntone-29.3-native-transition-timer.patch"
+OWNTONE_TRANSITION_SHA=912922fb7853d25fb031d0258effeb33f3332a971b84f01e01c79014a194e8a7
+OWNTONE_BED_PATCH="$SOURCE/install/patches/owntone-29.3-paused-speech.patch"
+OWNTONE_BED_SHA=eb2f9ceb0e58f3c92d82c682cd177b98d3b0a48d4848aa5b430f3761703da928
+for patch in "$SHAIRPORT_TIMED_PATCH:$SHAIRPORT_TIMED_SHA" "$SHAIRPORT_CLOCK_RECOVERY_PATCH:$SHAIRPORT_CLOCK_RECOVERY_SHA" "$SHAIRPORT_STARTUP_PATCH:$SHAIRPORT_STARTUP_SHA" "$SHAIRPORT_VOLUME_PATCH:$SHAIRPORT_VOLUME_SHA" "$OWNTONE_TIMED_PATCH:$OWNTONE_TIMED_SHA" "$OWNTONE_SOURCE_PATCH:$OWNTONE_SOURCE_SHA" "$OWNTONE_IDENTITY_PATCH:$OWNTONE_IDENTITY_SHA" "$OWNTONE_TRANSPORT_PATCH:$OWNTONE_TRANSPORT_SHA" "$OWNTONE_OFFSET_PATCH:$OWNTONE_OFFSET_SHA" "$OWNTONE_BUFFER_PATCH:$OWNTONE_BUFFER_SHA" "$OWNTONE_RESAMPLE_PATCH:$OWNTONE_RESAMPLE_SHA" "$OWNTONE_FRAMED_PATCH:$OWNTONE_FRAMED_SHA" "$OWNTONE_ALSA_PATCH:$OWNTONE_ALSA_SHA" "$OWNTONE_SPEECH_PATCH:$OWNTONE_SPEECH_SHA" "$OWNTONE_READY_PATCH:$OWNTONE_READY_SHA" "$OWNTONE_ANCHOR_PATCH:$OWNTONE_ANCHOR_SHA" "$OWNTONE_JITTER_PATCH:$OWNTONE_JITTER_SHA" "$OWNTONE_OWNER_PATCH:$OWNTONE_OWNER_SHA" "$OWNTONE_BALANCE_PATCH:$OWNTONE_BALANCE_SHA" "$OWNTONE_TRANSITION_PATCH:$OWNTONE_TRANSITION_SHA" "$OWNTONE_BED_PATCH:$OWNTONE_BED_SHA"; do
   [[ "$(/usr/bin/sha256sum "${patch%:*}" | awk '{print $1}')" == "${patch##*:}" ]] || {
     echo "A timing/source patch digest does not match the reviewed patch" >&2; exit 1;
   }
@@ -117,6 +123,9 @@ git -C "$BUILD/shairport" apply --check "$SHAIRPORT_CLOCK_RECOVERY_PATCH"
 git -C "$BUILD/shairport" apply "$SHAIRPORT_CLOCK_RECOVERY_PATCH"
 git -C "$BUILD/shairport" apply --check "$SHAIRPORT_STARTUP_PATCH"
 git -C "$BUILD/shairport" apply "$SHAIRPORT_STARTUP_PATCH"
+git -C "$BUILD/shairport" apply --check "$SHAIRPORT_VOLUME_PATCH"
+git -C "$BUILD/shairport" apply "$SHAIRPORT_VOLUME_PATCH"
+/usr/bin/python3 -I "$SOURCE/tests/native/check_receiver_volume.py" --source "$BUILD/shairport" --compiler /usr/bin/cc --sanitize
 /usr/bin/python3 -I "$SOURCE/tests/native/check_shairport_startup.py" --source "$BUILD/shairport" --compiler /usr/bin/cc
 (cd "$BUILD/shairport" && autoreconf -fi && \
   ./configure --prefix="$PREFIX" --sysconfdir="$PREFIX/etc" --with-avahi --with-ssl=openssl \
@@ -176,14 +185,21 @@ git -C "$BUILD/owntone" apply --check "$OWNTONE_BALANCE_PATCH"
 git -C "$BUILD/owntone" apply "$OWNTONE_BALANCE_PATCH"
 /usr/bin/python3 -I "$SOURCE/tests/native/check_volume_settings.py" --source "$BUILD/owntone" --compiler /usr/bin/cc
 /usr/bin/python3 -I "$SOURCE/tests/native/check_speech_owner.py" --source "$BUILD/owntone" --compiler /usr/bin/cc --require-credentials
+git -C "$BUILD/owntone" apply --check "$OWNTONE_TRANSITION_PATCH"
+git -C "$BUILD/owntone" apply "$OWNTONE_TRANSITION_PATCH"
+/usr/bin/python3 -I "$SOURCE/tests/native/check_native_transition_timer.py" --source "$BUILD/owntone" --compiler /usr/bin/cc
+git -C "$BUILD/owntone" apply --check "$OWNTONE_BED_PATCH"
+git -C "$BUILD/owntone" apply "$OWNTONE_BED_PATCH"
+/usr/bin/python3 -I "$SOURCE/tests/native/check_paused_speech_guards.py" --source "$BUILD/owntone"
+/usr/bin/python3 -I "$SOURCE/tests/native/check_paused_speech.py" --source "$BUILD/owntone" --compiler /usr/bin/cc
 (cd "$BUILD/owntone" && autoreconf -fi && \
   ./configure --prefix="$PREFIX" --sysconfdir="$PREFIX/etc" --localstatedir="$PREFIX/var" \
     --disable-install-systemd --disable-webinterface --enable-chromecast && \
   make -j"$(nproc)")
-/usr/bin/python3 -I "$SOURCE/tests/native/check_framed_resampler.py" --source "$BUILD/owntone" --compiler /usr/bin/cc
+/usr/bin/python3 -I "$SOURCE/tests/native/check_framed_resampler.py" --source "$BUILD/owntone" --compiler /usr/bin/cc --native-transition --paused-speech
 (cd "$BUILD/owntone" && make install)
 mkdir -p "$PREFIX/share/shiri"
-/usr/bin/python3 -I - "$PREFIX/share/shiri/backends.json" "$NQPTP" "$SHAIRPORT" "$AIRPTP" "$OWNTONE" "$OWNTONE_PATCH_SHA" "$AVAHI" "$AVAHI_PATCH_SHA" "$SHAIRPORT_TIMED_SHA" "$OWNTONE_TIMED_SHA" "$OWNTONE_SOURCE_SHA" "$OWNTONE_IDENTITY_SHA" "$OWNTONE_TRANSPORT_SHA" "$OWNTONE_OFFSET_SHA" "$OWNTONE_BUFFER_SHA" "$OWNTONE_RESAMPLE_SHA" "$OWNTONE_FRAMED_SHA" "$OWNTONE_ALSA_SHA" "$OWNTONE_SPEECH_SHA" "$OWNTONE_READY_SHA" "$OWNTONE_ANCHOR_SHA" "$OWNTONE_JITTER_SHA" "$OWNTONE_OWNER_SHA" "$SHAIRPORT_CLOCK_RECOVERY_SHA" "$OWNTONE_BALANCE_SHA" "$SHAIRPORT_STARTUP_SHA" <<'PY'
+/usr/bin/python3 -I - "$PREFIX/share/shiri/backends.json" "$NQPTP" "$SHAIRPORT" "$AIRPTP" "$OWNTONE" "$OWNTONE_PATCH_SHA" "$AVAHI" "$AVAHI_PATCH_SHA" "$SHAIRPORT_TIMED_SHA" "$OWNTONE_TIMED_SHA" "$OWNTONE_SOURCE_SHA" "$OWNTONE_IDENTITY_SHA" "$OWNTONE_TRANSPORT_SHA" "$OWNTONE_OFFSET_SHA" "$OWNTONE_BUFFER_SHA" "$OWNTONE_RESAMPLE_SHA" "$OWNTONE_FRAMED_SHA" "$OWNTONE_ALSA_SHA" "$OWNTONE_SPEECH_SHA" "$OWNTONE_READY_SHA" "$OWNTONE_ANCHOR_SHA" "$OWNTONE_JITTER_SHA" "$OWNTONE_OWNER_SHA" "$SHAIRPORT_CLOCK_RECOVERY_SHA" "$OWNTONE_BALANCE_SHA" "$SHAIRPORT_STARTUP_SHA" "$OWNTONE_TRANSITION_SHA" "$SHAIRPORT_VOLUME_SHA" "$OWNTONE_BED_SHA" <<'PY'
 import json
 import sys
 with open(sys.argv[1], "w") as stream:
@@ -219,6 +235,12 @@ with open(sys.argv[1], "w") as stream:
     manifest["shairport_clock_recovery_patch_file"] = "shairport-5.5.2-clock-recovery.patch"
     manifest["shairport_native_startup_patch"] = sys.argv[26]
     manifest["shairport_native_startup_patch_file"] = "shairport-5.5.2-native-startup.patch"
+    manifest["owntone_native_transition_patch"] = sys.argv[27]
+    manifest["owntone_native_transition_patch_file"] = "owntone-29.3-native-transition-timer.patch"
+    manifest["shairport_receiver_volume_patch"] = sys.argv[28]
+    manifest["shairport_receiver_volume_patch_file"] = "shairport-5.5.2-receiver-volume.patch"
+    manifest["owntone_paused_speech_patch"] = sys.argv[29]
+    manifest["owntone_paused_speech_patch_file"] = "owntone-29.3-paused-speech.patch"
     json.dump(manifest, stream, indent=2)
 PY
 /usr/bin/python3 -I "$SOURCE/install/validate_installation.py" "$PREFIX"

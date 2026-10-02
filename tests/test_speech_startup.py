@@ -403,7 +403,7 @@ async def test_connected_same_peer_quiet_bed_stays_open_independent_of_music_hor
     await native.close()
 
 
-async def test_active_native_waits_actual_first_mix_observation_without_prepare_or_program_mutation():
+async def test_recent_active_native_mix_requires_no_prepare_or_program_mutation():
     native, writer, client, overlay = await native_controller()
     handle = NativeHandle(native)
     grant = await native.begin(begin(), handle)
@@ -420,14 +420,49 @@ async def test_active_native_waits_actual_first_mix_observation_without_prepare_
     token = handle.token
     identity = object()
     prep = native.begin_speech(identity)
-    task = asyncio.create_task(native.prepare_speech(identity, prep))
-    await wait_for(lambda: len(client.requests) > 2)
-    assert not prep.idle and not overlay.sent and len(writer.packets) == 1
     client.first_mix()
-    await task
+    await native.prepare_speech(identity, prep)
+    assert not prep.idle and not prep.output_bed and not overlay.sent and len(writer.packets) == 1
     assert native.actor.owns(token) and writer.packets == [initial]
     assert all(request[2]["action"] in {"observe", "begin"} for request in client.requests[2:])
     assert sum(request[2]["action"] == "begin" for request in client.requests[2:]) == 1
+    await native.close()
+
+
+@pytest.mark.parametrize("previous_pcm", [False, True])
+async def test_paused_phone_prepares_output_bed_without_native_program_writes(previous_pcm):
+    native, writer, client, overlay = await native_controller()
+    handle = NativeHandle(native)
+    grant = await native.begin(begin(), handle)
+    if previous_pcm:
+        now = time.monotonic_ns()
+        original = replace(pcm(grant), clock_sample_ns=now - 5_000_000_000,
+                           presentation_ns=now - 4_850_000_000,
+                           monotonic_before_ns=now - 200, monotonic_after_ns=now)
+        await native.message(original, handle)
+    # Only the retained source is present: no fresh native music/mix proof.
+    native.mixer._last_native_ns = time.monotonic_ns() - 31_000_000_000
+    packets = list(writer.packets)
+    token, route, operation = handle.token, native.mixer.route, native.operation_generation
+    identity = object()
+    prep = native.begin_speech(identity)
+    task = asyncio.create_task(native.prepare_speech(identity, prep))
+    await client.prepare_entered.wait()
+    assert prep.output_bed and not prep.idle
+    native.mixer.tick(music_active=True, speech_active=False, duck_gain=0.2, elapsed=0.02)
+    assert writer.packets == packets
+    client.connect()
+    await wait_for(lambda: prep.phase == "waiting_for_mix")
+    client.first_mix()  # Hardware edge: actual backend output-only mix receipt.
+    await task
+    assert prep.phase == "ready" and native.actor.owns(token)
+    assert native.mixer.route == route and native.operation_generation == operation
+    assert writer.packets == packets and not overlay.sent
+    actions = [body["action"] for _method, path, body in client.requests if path == "/api/player/shiri-speech-ready"]
+    assert actions[0] == "observe" and "prepare" in actions and "ready" in actions and actions[-1] == "begin"
+    assert all(body["session_id"] == grant.session.hex() for _method, path, body in client.requests
+               if path == "/api/player/shiri-speech-ready")
+    native.retire_speech(identity)
     await native.close()
 
 

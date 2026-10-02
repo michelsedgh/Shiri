@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -22,7 +23,9 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGES = ["libavcodec", "libavformat", "libavfilter", "libavutil", "libswresample", "libevent", "libconfuse", "libcurl"]
 
 
-def run(source: Path, *, observe=False, compiler=None, sanitize=True):
+def run(source: Path, *, observe=False, compiler=None, sanitize=True, native_transition=False, paused_speech=False):
+    if paused_speech and not native_transition:
+        raise ValueError("Paused speech requires the exact native transition layer")
     source = source.resolve(strict=True)
     names = ["config.h", "src/player.c", "src/outputs.c", "src/transcode.c", "src/outputs/shiri_pcm_output.c",
              "src/outputs/shiri_out_wire.h", "src/outputs/pcm_volume.h"]
@@ -39,7 +42,7 @@ def run(source: Path, *, observe=False, compiler=None, sanitize=True):
         extract = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(extract)
         player = (source / "src/player.c").read_text()
-        param = extract.between(player, "struct shiri_source_param {", "\nstruct event_base *evbase_player;")
+        param = re.search(r"struct shiri_source_param \{.*?\n\};", player, re.S).group(0)
         (directory / "actual_seal_param.inc").write_text(param)
         (directory / "actual_seal_function.inc").write_text(extract.function(player, "shiri_source_seal_flush"))
         program = directory / "actual"
@@ -47,6 +50,10 @@ def run(source: Path, *, observe=False, compiler=None, sanitize=True):
                    "-O1", "-g", "-I", str(directory), "-I", str(source), "-I", str(source / "src"),
                    str(ROOT / "tests/native/test_framed_resampler.c"), str(source / "src/transcode.c"),
                    "-Wl,--gc-sections", "-o", str(program), *shlex.split(flags.stdout), "-lm"]
+        if native_transition:
+            command += ["-DSHIRI_NATIVE_TRANSITION_LAYER=1"]
+        if paused_speech:
+            command += ["-DSHIRI_PAUSED_SPEECH_LAYER=1"]
         if sanitize:
             command += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
         built = subprocess.run(command, capture_output=True, text=True, timeout=60)
@@ -70,7 +77,9 @@ if __name__ == "__main__":
     parser.add_argument("--observe", action="store_true")
     parser.add_argument("--compiler")
     parser.add_argument("--no-sanitize", action="store_true")
+    parser.add_argument("--native-transition", action="store_true")
+    parser.add_argument("--paused-speech", action="store_true")
     args = parser.parse_args()
-    result = run(args.source, observe=args.observe, compiler=args.compiler, sanitize=not args.no_sanitize)
+    result = run(args.source, observe=args.observe, compiler=args.compiler, sanitize=not args.no_sanitize, native_transition=args.native_transition, paused_speech=args.paused_speech)
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if result["ok"] or args.observe else 1)

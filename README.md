@@ -8,7 +8,7 @@ This branch is an **incomplete replacement under validation**. The candidate imp
 
 | Path | Implementation | Practical limit |
 | --- | --- | --- |
-| AirPlay input | Shairport Sync 5.5.2, one advertised receiver per enabled room | Linux, bridged LAN, working multicast and PTP |
+| AirPlay input | Pinned Shairport Sync AirPlay 2 receiver, one advertised receiver per enabled room | Linux, bridged LAN, working multicast and PTP |
 | Room-addressed speech | Authenticated WebRTC audio API, one active producer per room | Nobly is a future external client; it is not installed |
 | AirPlay output | OwnTone 29.3 | Device authorization may require setup |
 | Google Cast output | OwnTone's Cast implementation | Cross-protocol synchronization is approximate; device support varies |
@@ -19,6 +19,8 @@ This branch is an **incomplete replacement under validation**. The candidate imp
 One OwnTone instance delivers each zone's mixed program to its selected outputs. Different zones can receive different programs. When a phone selects several Shiri receivers, the patched receiver, mixer and OwnTone input preserve the common presentation timeline instead of starting each relay from its arrival time. The short synthetic Ubuntu grouped-audio check passed through final digital PCM, including speech, source takeover and end-of-stream. Stock-phone grouping, physical-speaker timing and longer playback remain acceptance gates. See [architecture](docs/ARCHITECTURE.md).
 
 OwnTone supports per-output timing offsets from −2000 to +2000 ms. Positive values add delay. Shiri preserves these profiles across deselection and verifies backend readback. Recorded calibration measures speakers within one zone or across grouped zones, retains reviewable results and applies or rolls back a correction with the target zone off. Direct administrative offset changes during playback restart that room's output session because OwnTone applies the offset when a session starts. Speech never invokes that operation. Readback confirms the setting; verification recordings confirm the measured result. See [docs/CALIBRATION.md](docs/CALIBRATION.md).
+
+Normal listening uses one room master volume. Each physical speaker also has a saved setup balance from 0 to 100%, so a louder speaker can be attenuated without changing the room master. Gain edits preserve the music source and transport. See [speaker balance](docs/VOLUME_MODEL.md) and [phone volume feedback](docs/RECEIVER-VOLUME.md) for implementation and validation boundaries. Speech during a retained phone pause uses OwnTone's existing output timer without advancing the phone's music timestamps; see [paused speech](docs/PAUSED_SPEECH.md).
 
 ## Development
 
@@ -96,6 +98,7 @@ The rootless HTTP service owns validated room intent in SQLite. A separate privi
 | `POST /api/v1/rooms` | Create a disabled room |
 | `PATCH /api/v1/rooms/{id}` | Update with `expected_revision` and `changes` |
 | `PUT /api/v1/rooms/{id}/speakers` | Assign discovered speaker IDs with a revision |
+| `PATCH /api/v1/rooms/{id}/speakers/{speaker}/balance` | Save speaker setup attenuation with a revision |
 | `PATCH /api/v1/rooms/{id}/speakers/{speaker}/offset` | Save an offset with a revision |
 | `/api/v1/rooms/{id}/calibration` | Recorded timing sessions, analysis, guarded correction and rollback |
 | `POST /api/v1/rooms/{id}/speech` | Negotiate or close explicitly identified speech |

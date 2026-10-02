@@ -1,6 +1,23 @@
 # Clean rebuild review record
 
-## Current candidate — October 1
+## Current candidate — October 2
+
+The repository now contains the integrated rebuild and the real iPhone startup
+and pause repairs. The user confirmed normal first playback and resume after a
+requested 40-second pause on the isolated live Sonos test. The subsequent combined
+candidate adds saved speaker balance, bounded atomic output preparation, reverse
+volume feedback and paused-source speech; its native builds and focused Linux
+checks passed, while full network and release qualification remain in progress.
+See [the checkpoint](CHECKPOINT_2026-10-02.md) for the current scope and unfinished
+work, and [live playback evidence](LIVE_PLAYBACK_REVIEW.md) for the phone result.
+
+Current minimum route defaults are B40/H140 for local or framed Bluetooth,
+B250/H350 for Cast or Pulse, and B500/H600 for AirPlay. A grouped program uses
+its slowest route's policy and configured offsets. Earlier four-second settings
+below are historical review records and do not describe the current defaults.
+Chromecast input is deferred and Bluetooth input is excluded.
+
+## Historical candidate and review evidence — October 1
 
 - The user explicitly deferred Chromecast input after the current open-source
   receiver review. This revised scope supersedes earlier entries below that

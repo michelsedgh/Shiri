@@ -266,6 +266,10 @@ class AudioWorker:
                 raise RpcError("invalid_request", "An exact native volume event_id is required")
             self.native.acknowledge_volume(event_id)
             return {"ok": True}
+        if operation == "receiver-master" and self.native:
+            if set(payload) != {"revision", "volume", "notify"}:
+                raise RpcError("invalid_request", "Receiver master requires exact revision, volume and notify")
+            return self.native.receiver_volume.queue(**payload)
         if operation == "control-intent" and self.native:
             if set(payload) != {"revision"}:
                 raise RpcError("invalid_request", "Control intent requires an exact room revision")
@@ -579,7 +583,7 @@ async def run(args):
             mixer = NativeMixer(fifo, speech_output=speech_output,
                                 relay_delay_ns=args.relay_delay_ms*1_000_000,
                                 output_buffer_ms=args.output_buffer_ms)
-            native = NativeController(args.room_id, mixer, client, control_revision=args.control_revision)
+            native = NativeController(args.room_id, mixer, client, control_revision=args.control_revision, control_volume=args.control_volume)
             await native.initialize()
             await native.listen(Path(args.native_socket or directory / "input" / "music.sock"),
                                 native_uid=args.native_uid, mode=0o660)
@@ -606,7 +610,7 @@ async def run(args):
     server = None
     try:
         server = await serve_rpc(args.socket, worker.dispatch, mode=0o600, allowed_uids={0, os.getuid()},
-                                 operation_uids={"control-intent": {0}})
+                                 operation_uids={"control-intent": {0}, "receiver-master": {0}})
         last = time.monotonic()
         while not stop.is_set():
             now = time.monotonic()
@@ -648,6 +652,7 @@ def main():
     parser.add_argument("--signal-socket")
     parser.add_argument("--signal-generation")
     parser.add_argument("--control-revision", type=int, default=1)
+    parser.add_argument("--control-volume", type=int, default=50)
     parser.add_argument("--signal", choices=["music-start", "music-stop"])
     parser.add_argument("--test-source", action="store_true", help="Use a test oscillator instead of ALSA")
     args = parser.parse_args()
@@ -662,6 +667,8 @@ def main():
                     or args.output_buffer_ms is None or not MINIMUM_LOCAL_OUTPUT_BUFFER_MS <= args.output_buffer_ms <= 4250
                     or args.relay_delay_ms is None or not args.output_buffer_ms <= args.relay_delay_ms <= 10000):
                 parser.error("Native mode requires exact music and speech endpoints, identities and bounded timing")
+            if not 0 <= args.control_volume <= 100:
+                parser.error("Control volume must be between zero and one hundred")
             if args.control_revision < 1 or bool(args.signal_socket) != bool(args.signal_generation):
                 parser.error("Native signals require both socket and generation, with a positive control revision")
         elif not args.capture:

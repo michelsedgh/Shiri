@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from shiri.domain import RoomCreate, RoomPatch
+from shiri.domain import RoomCreate, RoomPatch, SpeakerRef
 from shiri.rpc import RpcError
 from shiri.runtime import broker as broker_module
 from shiri.runtime.native import NativeController, NativeHandle, NativeMixer
@@ -16,6 +16,7 @@ from shiri.runtime.timing import FLAG_AIRPLAY2, Kind, Packet
 from shiri.service import RoomService
 from shiri.settings import Settings
 from shiri.store import Store
+from test_runtime_review import wait_until
 
 
 class Writer:
@@ -89,6 +90,9 @@ async def path(tmp_path, monkeypatch):
 
     async def worker_rpc(socket_path, operation, payload, *, timeout):
         assert socket_path == room.directory / 'audio.sock'
+        if operation == 'receiver-master':
+            assert timeout == 1
+            return native.receiver_volume.queue(**payload)
         assert operation == 'control-intent' and timeout == 2
         worker_calls.append(dict(payload))
         if fail_worker[0]:
@@ -217,3 +221,214 @@ async def test_replayed_native_event_is_a_receipt_not_another_volume_command(pat
     assert path.room.native_volume_receipts[saved_id] == saved
     assert path.native.control_revision == path.room.desired.revision
     assert path.backend.volume_calls == [18]
+
+
+async def test_phone_commit_updates_receiver_default_without_sender_echo_then_web_edit_notifies(path):
+    from unittest.mock import AsyncMock
+    previous = path.room.desired
+    assert (await phone(path, 18))['accepted']
+    await path.service.sync_phone_volume()
+    assert path.native.receiver_volume.volume == 18 and not path.native.receiver_volume.notify
+    assert path.room.phone_volume_revision == path.room.desired.revision
+    path.room.applied, path.room.status = previous, 'running'
+    path.room.client.volume_settings = AsyncMock()
+    task = asyncio.create_task(path.broker._room_loop(path.room))
+    try:
+        path.room.wake.set()
+        await wait_until(lambda: path.room.applied == path.room.desired)
+        assert not path.native.receiver_volume.notify
+        web = path.room.desired.model_copy(update={'volume': 69, 'revision': path.room.desired.revision+1})
+        path.room.desired, path.room.current_volume = web, web.volume
+        path.room.wake.set()
+        await wait_until(lambda: path.room.applied == path.room.desired)
+        packet = path.native.receiver_volume.packet()
+        assert packet.volume == 69 and packet.notify and packet.revision == web.revision
+    finally:
+        path.broker._closing = True
+        path.room.wake.set()
+        await task
+
+
+async def route_actor(path, monkeypatch, *, hold=None, fail_selection=False):
+    """Run the real broker actor; only discovery/gain/selection HTTP edges are held."""
+    from shiri.runtime.system import RuntimeFailure
+    original = SpeakerRef(id="1", name="Original", protocol="airplay2")
+    previous = path.room.desired.model_copy(update={"speakers": [original]})
+    path.room.desired = path.room.applied = previous
+    path.room.backend_definition = previous
+    path.room.status = "running"
+    path.room.timing = path.room.active_timing = (500, 600)
+    path.backend.gain_calls, path.backend.selection_calls = [], []
+    path.backend.master, path.backend.selected = previous.volume, [original.id]
+    path.feedback_calls = []
+    entered, allowed = asyncio.Event(), asyncio.Event()
+    observed, proceed = asyncio.Event(), asyncio.Event()
+    original_queue = path.native.receiver_volume.queue
+
+    def queue(revision, volume, notify):
+        path.feedback_calls.append((revision, volume, notify))
+        return original_queue(revision, volume, notify)
+
+    monkeypatch.setattr(path.native.receiver_volume, "queue", queue)
+
+    async def outputs(excluded):
+        await asyncio.sleep(0)  # Real discovery HTTP yields even on an immediate reply.
+        if hold == "outputs" and not entered.is_set():
+            entered.set()
+            await allowed.wait()
+        return []
+
+    async def volume_settings(volume, speakers):
+        if hold == "gain" and not entered.is_set():
+            entered.set()
+            await allowed.wait()
+        path.backend.gain_calls.append((volume, [speaker.id for speaker in speakers], path.room.applied.revision))
+        path.backend.master = volume
+
+    async def select(speakers, outputs):
+        if hold in {"selection", "outputs"} and not observed.is_set():
+            observed.set()
+            await proceed.wait()
+        path.backend.selection_calls.append([speaker.id for speaker in speakers])
+        if fail_selection and speakers:
+            raise RuntimeFailure("Held unavailable selected speaker")
+        path.backend.selected = [speaker.id for speaker in speakers]
+        return {"ok": True}
+
+    path.backend.outputs = outputs
+    path.backend.volume_settings = volume_settings
+    path.backend.select = select
+    keys = await path.broker._reserve_speakers(path.room, [original], None)
+    await path.broker._commit_speakers(path.room, keys)
+    task = asyncio.create_task(path.broker._room_loop(path.room))
+    path.room.task = task
+    return previous, task, entered, allowed, observed, proceed
+
+
+async def stop_route_actor(path, task, *events):
+    for event in events:
+        event.set()
+    path.broker._closing = True
+    path.room.wake.set()
+    await asyncio.wait_for(task, 1)
+
+
+@pytest.mark.parametrize("new_volume", [50, 69])
+async def test_acknowledged_assignment_restores_receiver_master_and_only_master_changes_notify(path, monkeypatch, new_volume):
+    previous, task, entered, allowed, observed, proceed = await route_actor(path, monkeypatch, hold="selection")
+    speaker = SpeakerRef(id="2", name="Replacement", protocol="airplay2")
+    desired = previous.model_copy(update={"speakers": [speaker], "volume": new_volume, "revision": previous.revision+1})
+    try:
+        await path.broker.reconcile({"rooms": [desired.model_dump(mode="json")]})
+        await asyncio.wait_for(observed.wait(), 1)
+        assert path.backend.master == new_volume
+        assert path.native.receiver_volume.volume == previous.volume
+        assert not path.native.receiver_volume.applied_intent and not path.feedback_calls
+        proceed.set()
+        await wait_until(lambda: path.room.applied == desired)
+        packet = path.native.receiver_volume.packet()
+        assert path.native.receiver_volume.applied_intent
+        assert packet.volume == new_volume and packet.revision == desired.revision
+        assert packet.notify is (new_volume != previous.volume)
+        assert path.backend.selected == [speaker.id]
+        assert path.feedback_calls == [(desired.revision, new_volume, new_volume != previous.volume)]
+        assert path.broker.speaker_leases == {("owntone", speaker.id): desired.id}
+    finally:
+        await stop_route_actor(path, task, allowed, proceed)
+
+
+@pytest.mark.parametrize("route", ["assignment", "gain"])
+async def test_newer_reconcile_during_backend_ack_preserves_exact_applied_intent_and_final_feedback(path, monkeypatch, route):
+    previous, task, entered, allowed, observed, proceed = await route_actor(
+        path, monkeypatch, hold="outputs" if route == "assignment" else "gain")
+    intermediate_speaker = SpeakerRef(id="2", name="Replacement", protocol="airplay2") if route == "assignment" else previous.speakers[0]
+    final_speaker = SpeakerRef(id="3", name="Latest", protocol="airplay2") if route == "assignment" else previous.speakers[0]
+    intermediate = previous.model_copy(update={"speakers": [intermediate_speaker], "volume": 69, "revision": previous.revision+1})
+    latest = intermediate.model_copy(update={"speakers": [final_speaker], "volume": 84, "revision": intermediate.revision+1})
+    try:
+        await path.broker.reconcile({"rooms": [intermediate.model_dump(mode="json")]})
+        await asyncio.wait_for(entered.wait(), 1)
+        await path.broker.reconcile({"rooms": [latest.model_dump(mode="json")]})
+        allowed.set()
+        if route == "assignment":
+            await asyncio.wait_for(observed.wait(), 1)
+            assert path.backend.gain_calls == [(69, [intermediate_speaker.id], previous.revision)]
+            assert not path.feedback_calls and not path.native.receiver_volume.applied_intent
+            proceed.set()
+        await wait_until(lambda: path.room.applied == latest)
+        assert path.backend.gain_calls == [(69, [intermediate_speaker.id], previous.revision),
+                                           (84, [final_speaker.id], intermediate.revision)]
+        assert path.backend.master == path.room.current_volume == 84
+        if route == "assignment":
+            assert path.backend.selected == [final_speaker.id]
+        packet = path.native.receiver_volume.packet()
+        assert packet.volume == 84 and packet.revision == latest.revision and packet.notify
+        assert path.feedback_calls == [(latest.revision, 84, True)]
+        assert path.broker.speaker_leases == {("owntone", final_speaker.id): latest.id}
+    finally:
+        await stop_route_actor(path, task, allowed, proceed)
+
+
+async def test_failed_assignment_does_not_publish_master_and_retry_still_notifies(path, monkeypatch):
+    previous, task, entered, allowed, observed, proceed = await route_actor(path, monkeypatch, fail_selection=True)
+    desired = previous.model_copy(update={"speakers": [SpeakerRef(id="2", name="Replacement", protocol="airplay2")],
+                                          "volume": 69, "revision": previous.revision+1})
+    try:
+        await path.broker.reconcile({"rooms": [desired.model_dump(mode="json")]})
+        await wait_until(lambda: path.room.status == "degraded")
+        assert not path.feedback_calls and not path.native.receiver_volume.applied_intent
+        assert path.room.applied == previous
+        async def recovered_select(speakers, outputs):
+            path.backend.selected = [speaker.id for speaker in speakers]
+            return {"ok": True}
+        path.backend.select = recovered_select
+        path.room.wake.set()
+        await wait_until(lambda: path.room.applied == desired)
+        assert path.native.receiver_volume.packet().notify
+        assert path.feedback_calls == [(desired.revision, 69, True)]
+    finally:
+        await stop_route_actor(path, task, allowed, proceed)
+
+
+@pytest.mark.parametrize("newer_during_restore", [False, True])
+async def test_startup_final_selection_reports_exact_acknowledged_latest_definition(path, monkeypatch, newer_during_restore):
+    previous, task, entered, allowed, observed, proceed = await route_actor(
+        path, monkeypatch, hold="outputs" if newer_during_restore else None)
+    boot_entered, boot_allowed = asyncio.Event(), asyncio.Event()
+    path.room.client = None
+    async def held_launch(room):
+        # Process/network launch is held; the production final-start intent,
+        # OwnTone selection ACK and receiver feedback orchestration are real.
+        boot_entered.set()
+        await boot_allowed.wait()
+        room.client = path.backend
+        async with room.control_lock:
+            return await path.broker._finish_start_outputs(room)
+    path.broker._start_room = held_launch
+    intermediate = previous.model_copy(update={"speakers": [SpeakerRef(id="2", name="Post-start", protocol="airplay2")],
+                                               "volume": 69, "revision": previous.revision+1})
+    latest = intermediate.model_copy(update={"speakers": [SpeakerRef(id="3", name="Latest", protocol="airplay2")],
+                                             "volume": 84, "revision": intermediate.revision+1}) if newer_during_restore else intermediate
+    try:
+        path.room.wake.set()
+        await asyncio.wait_for(boot_entered.wait(), 1)
+        await path.broker.reconcile({"rooms": [intermediate.model_dump(mode="json")]})
+        boot_allowed.set()
+        if newer_during_restore:
+            await asyncio.wait_for(entered.wait(), 1)
+            await path.broker.reconcile({"rooms": [latest.model_dump(mode="json")]})
+            allowed.set()
+            await asyncio.wait_for(observed.wait(), 1)
+            assert path.backend.gain_calls == [(69, ["2"], previous.revision)]
+            assert not path.feedback_calls
+            proceed.set()
+        await wait_until(lambda: path.room.applied == latest)
+        assert path.backend.gain_calls[0] == (69, ["2"], previous.revision)
+        if newer_during_restore:
+            assert path.backend.gain_calls[1] == (84, ["3"], intermediate.revision)
+        assert path.backend.master == latest.volume and path.backend.selected == [latest.speakers[0].id]
+        packet = path.native.receiver_volume.packet()
+        assert packet.revision == latest.revision and packet.volume == latest.volume and packet.notify
+        assert path.feedback_calls == [(latest.revision, latest.volume, True)]
+    finally:
+        await stop_route_actor(path, task, boot_allowed, allowed, proceed)

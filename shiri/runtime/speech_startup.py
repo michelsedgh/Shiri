@@ -41,6 +41,7 @@ class SpeechPreparation:
         self.error = None
         self.retired = False
         self.idle = False
+        self.output_bed = False
         self.commit_required = commit_required
         self.negotiated = asyncio.Event()
         self.backend_reply = None
@@ -156,6 +157,7 @@ class SpeechPreparation:
             "speech_startup_pending_frames": self.frames,
             "speech_startup_setup_budget_ns": round(SETUP_SECONDS * 1e9),
             "speech_startup_performance_qualified": False,
+            "speech_startup_output_bed": self.output_bed,
         }
 
 
@@ -204,7 +206,17 @@ async def complete(preparation, client, body, *, owned, bed, send, admit, interv
     try:
 
         async def run():
-            if preparation.idle:
+            observation = None
+            needs_preparation = preparation.idle
+            if not preparation.idle:
+                # A retained phone source may be paused or have never emitted
+                # PCM. Observe first so recent music needs no output setup.
+                observation = await exchange("observe")
+                needs_preparation = not observation["ready"]
+                preparation.output_bed = needs_preparation
+                if needs_preparation:
+                    observation = None
+            if needs_preparation:
                 while True:
                     if not owned():
                         preparation.fail("source_or_session_changed")
@@ -224,9 +236,10 @@ async def complete(preparation, client, body, *, owned, bed, send, admit, interv
             while True:
                 if not owned():
                     preparation.fail("source_or_session_changed")
-                reply = await exchange("ready" if preparation.idle else "observe")
+                reply = observation or await exchange("ready" if needs_preparation else "observe")
+                observation = None
                 if reply["ready"]:
-                    if preparation.idle and reply["mixed_monotonic_ns"] < reply["prepared_monotonic_ns"]:
+                    if needs_preparation and reply["mixed_monotonic_ns"] < reply["prepared_monotonic_ns"]:
                         preparation.fail("mix_predates_preparation")
                     # One owned task serializes BEGIN attempts. Only an exact
                     # not-ready echo permits bounded retry; no uncertain request

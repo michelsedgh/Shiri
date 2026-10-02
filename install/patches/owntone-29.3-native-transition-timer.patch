@@ -1,0 +1,748 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,9 +1,9 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+ AC_CONFIG_AUX_DIR([build-aux])
+ AC_CONFIG_HEADERS([config.h])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -306,11 +306,31 @@
+ static int shiri_source_start_failed;
+ struct shiri_source_param {
+   struct shiri_source_request request;
+   bool replay;
+   bool restart_outputs;
++  bool restart_timer;
+ };
++
++#define SHIRI_SOURCE_SETUP_NS UINT64_C(3000000000)
++enum shiri_source_phase { SHIRI_SOURCE_PHASE_FLUSH = 1, SHIRI_SOURCE_PHASE_START = 2 };
++static struct {
++  struct shiri_source_request request;
++  struct shiri_source_param *param;
++  struct event *event;
++  uint64_t until_ns;
++  unsigned remaining;
++  enum shiri_source_phase phase;
++  bool active, awaiting_command;
++} shiri_source_wait;
++static enum command_state shiri_source_transition_begin(void *arg, int *retval);
++static enum command_state shiri_source_continue(struct shiri_source_param *param, int *retval);
++static bool shiri_source_callback_current(enum shiri_source_phase phase, struct output_device *device);
++static void shiri_source_callback_complete(void);
++static void device_shiri_ready_cb(struct output_device *device, enum output_device_state status);
++static void device_shiri_cleanup_cb(struct output_device *device, enum output_device_state status);
++
+ 
+ 
+ /* Speech preparation owns neither a music source nor an output scheduler. */
+ struct shiri_speech_output {
+   uint64_t id;
+@@ -371,10 +391,11 @@
+ static struct timespec player_tick_interval;
+ /* Framed input retains the native presentation clock. Reuse this player timer
+  * with an absolute first tick, fenced by the exact source admission operation. */
+ static bool pb_timer_native;
+ static bool pb_timer_native_anchored;
++static bool pb_timer_native_waiting_for_pcm;
+ static uint64_t pb_timer_native_operation;
+ static struct timespec pb_timer_native_anchor;
+ static struct timespec pb_timer_native_wait_until;
+ static int pb_timer_native_prepare(void);
+ 
+@@ -1692,26 +1713,54 @@
+ }
+ 
+ static void
+ device_shiri_flush_cb(struct output_device *device, enum output_device_state status)
+ {
+-  if (!device || status == OUTPUT_STATE_FAILED)
++  if (!shiri_source_callback_current(SHIRI_SOURCE_PHASE_FLUSH, device))
++    return;
++  if (!device || status == OUTPUT_STATE_FAILED || status == OUTPUT_STATE_PASSWORD)
+     shiri_source_flush_failed = 1;
+   if (device)
+-    outputs_device_stop_delayed(device, device_streaming_cb);
+-  commands_exec_end(cmdbase, shiri_source_flush_failed ? SHIRI_SOURCE_FAILURE : 0);
+-}
++    outputs_device_stop_delayed(device, device_shiri_cleanup_cb);
++  shiri_source_callback_complete();
++}
++
+ 
+ static void
+ device_shiri_start_cb(struct output_device *device, enum output_device_state status)
+ {
+-  if (!device || status == OUTPUT_STATE_FAILED || status == OUTPUT_STATE_PASSWORD)
++  if (!shiri_source_callback_current(SHIRI_SOURCE_PHASE_START, device))
++    return;
++  if (!device || (status != OUTPUT_STATE_CONNECTED && status != OUTPUT_STATE_STREAMING))
+     shiri_source_start_failed = 1;
+   else
+-    outputs_device_cb_set(device, device_streaming_cb);
+-  commands_exec_end(cmdbase, shiri_source_start_failed ? SHIRI_SOURCE_FAILURE : 0);
+-}
++    outputs_device_cb_set(device, device_shiri_ready_cb);
++  shiri_source_callback_complete();
++}
++
++static void
++device_shiri_ready_cb(struct output_device *device, enum output_device_state status)
++{
++  if (shiri_source_wait.active)
++    {
++      if (!device || (status != OUTPUT_STATE_CONNECTED && status != OUTPUT_STATE_STREAMING))
++        shiri_source_start_failed = 1;
++      else
++        outputs_device_cb_set(device, device_shiri_ready_cb);
++      return;
++    }
++  device_streaming_cb(device, status);
++}
++
++static void
++device_shiri_cleanup_cb(struct output_device *device, enum output_device_state status)
++{
++  (void)device; (void)status;
++  /* Failed admission cleanup never completes a command or resurrects audio. */
++  status_update(player_state, LISTENER_SPEAKER | LISTENER_VOLUME);
++}
++
+ 
+ static void
+ device_shutdown_cb(struct output_device *device, enum output_device_state status)
+ {
+   int retval;
+@@ -1795,46 +1844,73 @@
+     return "unknown";
+ }
+ 
+ /* ------------------------- Internal playback routines --------------------- */
+ 
+-/* 1 means this tick may consume PCM; 0 waits on the same bounded existing
+- * timer. This function never creates an independent output scheduler. */
++/* Preserve the rejected original anchor and operation in diagnostics. */
++static int
++pb_timer_native_reject(const char *reason, int state, uint64_t operation,
++                       struct timespec anchor, struct timespec now)
++{
++  DPRINTF(E_LOG, L_PLAYER,
++          "Native anchor rejected: reason=%s state=%d operation=%" PRIu64
++          " timer_operation=%" PRIu64 " anchor=%jd.%09ld now=%jd.%09ld wait_until=%jd.%09ld\n",
++          reason, state, operation, pb_timer_native_operation,
++          (intmax_t)anchor.tv_sec, anchor.tv_nsec, (intmax_t)now.tv_sec, now.tv_nsec,
++          (intmax_t)pb_timer_native_wait_until.tv_sec, pb_timer_native_wait_until.tv_nsec);
++  return -1;
++}
++
++/* 1 means this tick may consume PCM; 0 waits on the same existing timer.
++ * Cold input admission is bounded. An accepted FLUSH may instead represent a
++ * phone pause, so an already-running source waits without aging a deadline
++ * while its exact newly armed generation contains no PCM. */
+ static int
+ pb_timer_native_prepare(void)
+ {
+   struct itimerspec tick;
+-  struct timespec now, anchor;
++  struct timespec now = { 0 }, anchor = { 0 };
+   uint64_t operation;
+   int state, ret;
+   state = input_pipe_shiri_state(&operation);
+   if (state != 1 || operation != pb_timer_native_operation)
+-    return -1;
++    return pb_timer_native_reject("source_gate", state, operation, anchor, now);
+   if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+-    return -1;
++    return pb_timer_native_reject("clock_read", state, operation, anchor, now);
+   if (pb_timer_native_anchored)
+     return timespec_cmp(now, pb_timer_native_anchor) < 0 ? 0 : 1;
+   ret = input_peek_sync(&anchor);
+   /* The input mutex can wait across the native deadline. Admit the original
+    * anchor against a fresh clock after peek, including a missing marker. */
+-  if (ret < 0 || clock_gettime(CLOCK_MONOTONIC, &now) < 0
+-      || timespec_cmp(now, pb_timer_native_wait_until) >= 0)
+-    return -1;
++  if (ret < 0)
++    return pb_timer_native_reject("anchor_peek", state, operation, anchor, now);
++  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++    return pb_timer_native_reject("anchor_clock_read", state, operation, anchor, now);
++  if (pb_timer_native_waiting_for_pcm)
++    {
++      if (!ret)
++        return 0; /* Valid paused source, not a missing cold-start anchor. */
++      pb_timer_native_waiting_for_pcm = false;
++      pb_timer_native_wait_until = now;
++      pb_timer_native_wait_until.tv_sec += 5;
++    }
++  if (timespec_cmp(now, pb_timer_native_wait_until) >= 0)
++    return pb_timer_native_reject("anchor_timeout", state, operation, anchor, now);
+   if (!ret)
+     return 0;
+   /* Never replace a late native anchor with the receive or timer clock. */
+   if (timespec_cmp(anchor, now) <= 0)
+-    return -1;
++    return pb_timer_native_reject("anchor_late", state, operation, anchor, now);
+   tick.it_interval = player_tick_interval;
+   tick.it_value = anchor;
+ #ifdef HAVE_TIMERFD
+   ret = timerfd_settime(pb_timer_fd, TFD_TIMER_ABSTIME, &tick, NULL);
+ #else
+   ret = timer_settime(pb_timer, TIMER_ABSTIME, &tick, NULL);
+ #endif
+   if (ret < 0)
+-    return -1;
++    return pb_timer_native_reject("timer_arm", state, operation, anchor, now);
+   pb_timer_native_anchor = anchor;
+   pb_timer_native_anchored = true;
+   /* Control/quality markers must not substitute CLOCK_MONOTONIC now for this
+    * first sample's anchor when the session has not read any PCM yet. */
+   pb_session.start_ts = anchor;
+@@ -1860,10 +1936,11 @@
+       return -1;
+     }
+ 
+   pb_timer_native = false;
+   pb_timer_native_anchored = false;
++  pb_timer_native_waiting_for_pcm = false;
+   pb_timer_native_operation = 0;
+   if (pb_session.reading_now && pb_session.reading_now->data_kind == DATA_KIND_PIPE)
+     {
+       ret = input_pipe_shiri_state(&pb_timer_native_operation);
+       if (ret < 0)
+@@ -1901,10 +1978,11 @@
+   int ret;
+ 
+   event_del(pb_timer_ev);
+   pb_timer_native = false;
+   pb_timer_native_anchored = false;
++  pb_timer_native_waiting_for_pcm = false;
+   pb_timer_native_operation = 0;
+ 
+   memset(&tick, 0, sizeof(struct itimerspec));
+ 
+ #ifdef HAVE_TIMERFD
+@@ -3131,33 +3209,142 @@
+   if (!status) return SHIRI_SOURCE_INVALID;
+   memset(status, 0, sizeof(*status));
+   return commands_exec_sync(cmdbase, shiri_speech_status_get, NULL, status);
+ }
+ 
++static bool
++shiri_source_wait_owned(void)
++{
++  return shiri_source_wait.active && shiri_source_state.initialized
++    && shiri_source_wait.request.operation_generation == shiri_source_state.last.operation_generation
++    && shiri_source_owner_equal(&shiri_source_wait.request.owner, &shiri_source_state.last.owner);
++}
++
++static void
++shiri_source_wait_clear(void)
++{
++  if (shiri_source_wait.event)
++    event_free(shiri_source_wait.event);
++  memset(&shiri_source_wait, 0, sizeof(shiri_source_wait));
++}
++
++static void
++shiri_source_wait_fail(void)
++{
++  if (shiri_source_wait_owned())
++    {
++      shiri_source_flush_failed = shiri_source_start_failed = 1;
++      shiri_source_state.faulted = true;
++      outputs_shiri_cancel_callbacks(device_shiri_flush_cb, device_shiri_ready_cb, device_shiri_cleanup_cb);
++      outputs_shiri_cancel_callbacks(device_shiri_start_cb, device_shiri_ready_cb, device_shiri_cleanup_cb);
++    }
++  shiri_source_wait_clear();
++}
++
++static void
++shiri_source_wait_timeout(int fd, short what, void *arg)
++{
++  struct shiri_source_param *param;
++  bool pending;
++  (void)fd; (void)what;
++  if ((uint64_t)(uintptr_t)arg != shiri_source_wait.request.operation_generation)
++    return; /* A retired timer never expires a successor source operation. */
++  if (!shiri_source_wait_owned())
++    { shiri_source_wait_clear(); return; }
++  param = shiri_source_wait.param;
++  pending = shiri_source_wait.awaiting_command;
++  DPRINTF(E_LOG, L_PLAYER, "Native source setup deadline: operation=%" PRIu64 " phase=%d pending=%u\n",
++          shiri_source_wait.request.operation_generation, shiri_source_wait.phase, shiri_source_wait.remaining);
++  shiri_source_wait_fail(); /* Retire exact callback tokens before waking the caller. */
++  if (pending)
++    commands_exec_end_if(cmdbase, shiri_source_transition_begin, param, SHIRI_SOURCE_FAILURE);
++}
++
++static int
++shiri_source_wait_begin(struct shiri_source_param *param)
++{
++  struct timeval deadline = { 3, 0 };
++  uint64_t now = shiri_speech_ready_now();
++  shiri_source_wait_clear();
++  if (!now || now > UINT64_MAX - SHIRI_SOURCE_SETUP_NS)
++    return -1;
++  shiri_source_wait.request = param->request;
++  shiri_source_wait.param = param;
++  shiri_source_wait.until_ns = now + SHIRI_SOURCE_SETUP_NS;
++  shiri_source_wait.active = true;
++  shiri_source_wait.phase = SHIRI_SOURCE_PHASE_FLUSH;
++  shiri_source_wait.event = evtimer_new(evbase_player, shiri_source_wait_timeout,
++                                      (void *)(uintptr_t)param->request.operation_generation);
++  if (!shiri_source_wait.event || evtimer_add(shiri_source_wait.event, &deadline) < 0)
++    { shiri_source_wait_clear(); return -1; }
++  return 0;
++}
++
++static bool
++shiri_source_callback_current(enum shiri_source_phase phase, struct output_device *device)
++{
++  uint64_t now;
++  if (!shiri_source_wait_owned() || shiri_source_wait.phase != phase || !shiri_source_wait.remaining)
++    return false;
++  /* deferred_cb consumed this reply's registry entry before invoking us.
++   * Retain exact cleanup ownership even when this reply arrived at expiry. */
++  if (device && device->session)
++    outputs_device_cb_set(device, device_shiri_ready_cb);
++  now = shiri_speech_ready_now();
++  if (!now || now >= shiri_source_wait.until_ns)
++    { shiri_source_wait_timeout(-1, 0, (void *)(uintptr_t)shiri_source_wait.request.operation_generation); return false; }
++  return true;
++}
++
++static void
++shiri_source_callback_complete(void)
++{
++  struct shiri_source_param *param = shiri_source_wait.param;
++  int retval;
++  if (--shiri_source_wait.remaining)
++    return;
++  if (shiri_source_continue(param, &retval) == COMMAND_END)
++    commands_exec_end_if(cmdbase, shiri_source_transition_begin, param, retval);
++}
++
+ static enum command_state
+ shiri_source_seal_flush(void *arg, int *retval)
+ {
+   struct shiri_source_param *param = arg;
+-  int result, pending;
++  int result, pending, stopped = 0, deadline;
+ 
+   result = shiri_source_check(&shiri_source_state, &param->request);
+   if (result <= 0)
+     {
+       param->replay = (result == SHIRI_SOURCE_REPLAY);
+       *retval = result;
+       return COMMAND_END;
+     }
+ 
++  param->restart_timer = (player_state == PLAY_PLAYING && pb_timer_native);
++  shiri_source_flush_failed = shiri_source_start_failed = 0;
+   shiri_source_begin(&shiri_source_state, &param->request);
++  deadline = shiri_source_wait_begin(param);
++  /* Output FLUSH may await a network reply. Quiesce this same player timer
++   * before sealing the input, so its tick cannot abort and replace the
++   * pending output callback while the exact source barrier is in flight. */
++  if (param->restart_timer)
++    stopped = pb_timer_stop();
+   *retval = input_pipe_shiri_seal(param->request.operation_generation);
+-  if (*retval < 0)
+-    return COMMAND_END;
++  if (*retval < 0 || stopped < 0 || deadline < 0)
++    {
++      *retval = SHIRI_SOURCE_FAILURE;
++      return COMMAND_END;
++    }
+   input_flush(NULL);
+   outputs_resampling_reset();
+   pb_session.read_deficit = 0;
+   shiri_source_flush_failed = 0;
+-  param->restart_outputs = (player_state == PLAY_PLAYING);
++  /* A first music grant must follow full selected-output START, so network
++   * setup cannot consume the first PCM's presentation lead after admission. */
++  param->restart_outputs = !shiri_zero(param->request.owner.session, 16);
++  /* END never reacquires a network speaker merely to retire the music source. */
+   pending = outputs_shiri_flush(device_shiri_flush_cb, &shiri_source_flush_failed);
+   outputs_metadata_purge();
+   *retval = pending > 0 ? pending : (shiri_source_flush_failed ? SHIRI_SOURCE_FAILURE : 0);
+   return pending > 0 ? COMMAND_PENDING : COMMAND_END;
+ }
+@@ -3167,11 +3354,11 @@
+ {
+   int pending;
+   (void)arg;
+   shiri_source_start_failed = 0;
+   outputs_stop_delayed_cancel();
+-  pending = outputs_shiri_start(device_shiri_start_cb, &shiri_source_start_failed);
++  pending = outputs_shiri_start(device_shiri_start_cb, device_shiri_ready_cb, &shiri_source_start_failed);
+   *retval = pending > 0 ? pending : (shiri_source_start_failed ? SHIRI_SOURCE_FAILURE : 0);
+   return pending > 0 ? COMMAND_PENDING : COMMAND_END;
+ }
+ 
+ static enum command_state
+@@ -3184,14 +3371,103 @@
+       || !shiri_source_owner_equal(&shiri_source_state.last.owner, &param->request.owner))
+     {
+       *retval = SHIRI_SOURCE_FAILURE;
+       return COMMAND_END;
+     }
++  if (!shiri_zero(param->request.owner.session, 16) && !outputs_shiri_ready(NULL))
++    { *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END; }
+   *retval = input_pipe_shiri_arm(&param->request.owner, param->request.operation_generation);
++  /* A successful running-source barrier may be a phone pause. Keep the
++   * existing pipe and warm outputs, and wait for this generation's first PCM
++   * without timing out an empty valid source. Its original P must still be
++   * future when PCM actually resumes. A user stop/pause stays stopped. */
++  if (*retval == 0 && param->restart_timer && player_state == PLAY_PLAYING)
++    {
++      if (shiri_zero(param->request.owner.session, 16))
++        pb_session_stop(); /* END leaves no running music timer waiting for PCM. */
++      else if (pb_timer_start() < 0)
++        {
++          /* event_add precedes timer arming. Remove its watch even when arming
++           * failed, and seal only this exact already-armed input binding. */
++          pb_timer_stop();
++          input_pipe_shiri_disarm(&param->request.owner, param->request.operation_generation);
++          *retval = SHIRI_SOURCE_FAILURE;
++        }
++      else
++        pb_timer_native_waiting_for_pcm = true;
++    }
+   if (*retval == 0)
+-    shiri_source_state.faulted = false;
+-  return COMMAND_END;
++    {
++      if (shiri_zero(param->request.owner.session, 16))
++        outputs_shiri_release(device_shiri_cleanup_cb);
++      else
++        outputs_shiri_ready(device_streaming_cb);
++      shiri_source_state.faulted = false;
++    }
++  return COMMAND_END;
++}
++
++/* A single logical command owns FLUSH -> START -> ARM. Backend replies are
++ * counted here, never against an unrelated command or across a lane gap. */
++static enum command_state
++shiri_source_continue(struct shiri_source_param *param, int *retval)
++{
++  enum command_state state;
++  uint64_t now = shiri_speech_ready_now();
++  if (!shiri_source_wait_owned() || shiri_source_wait.param != param
++      || !now || now >= shiri_source_wait.until_ns || shiri_source_flush_failed || shiri_source_start_failed)
++    {
++      *retval = SHIRI_SOURCE_FAILURE;
++      shiri_source_wait_fail();
++      return COMMAND_END;
++    }
++  if (shiri_source_wait.phase == SHIRI_SOURCE_PHASE_FLUSH && param->restart_outputs)
++    {
++      shiri_source_wait.phase = SHIRI_SOURCE_PHASE_START;
++      state = shiri_source_restart(NULL, retval);
++      if (state == COMMAND_PENDING)
++        {
++          shiri_source_wait.remaining = *retval;
++          shiri_source_wait.awaiting_command = true;
++          *retval = 1; /* One logical command completion, regardless of devices. */
++          return COMMAND_PENDING;
++        }
++      if (*retval < 0)
++        { shiri_source_wait_fail(); return COMMAND_END; }
++    }
++  now = shiri_speech_ready_now();
++  if (!now || now >= shiri_source_wait.until_ns)
++    { *retval = SHIRI_SOURCE_FAILURE; shiri_source_wait_fail(); return COMMAND_END; }
++  shiri_source_arm(param, retval);
++  if (*retval < 0)
++    shiri_source_wait_fail();
++  else
++    shiri_source_wait_clear();
++  return COMMAND_END;
++}
++
++static enum command_state
++shiri_source_transition_begin(void *arg, int *retval)
++{
++  struct shiri_source_param *param = arg;
++  enum command_state state = shiri_source_seal_flush(param, retval);
++  if (param->replay)
++    return COMMAND_END;
++  if (state == COMMAND_PENDING)
++    {
++      shiri_source_wait.remaining = *retval;
++      shiri_source_wait.awaiting_command = true;
++      *retval = 1;
++      return COMMAND_PENDING;
++    }
++  if (*retval < 0)
++    {
++      if (shiri_source_wait.param == param)
++        shiri_source_wait_fail();
++      return COMMAND_END;
++    }
++  return shiri_source_continue(param, retval);
+ }
+ 
+ static enum command_state
+ playback_seek(void *arg, int *retval)
+ {
+@@ -4152,15 +4428,11 @@
+   if (!request)
+     return SHIRI_SOURCE_INVALID;
+   memset(&param, 0, sizeof(param));
+   param.request = *request;
+   CHECK_ERR(L_MAIN, pthread_mutex_lock(&shiri_source_mutex));
+-  ret = commands_exec_sync(cmdbase, shiri_source_seal_flush, NULL, &param);
+-  if (ret == 0 && !param.replay && param.restart_outputs)
+-    ret = commands_exec_sync(cmdbase, shiri_source_restart, NULL, NULL);
+-  if (ret == 0 && !param.replay)
+-    ret = commands_exec_sync(cmdbase, shiri_source_arm, NULL, &param);
++  ret = commands_exec_sync(cmdbase, shiri_source_transition_begin, NULL, &param);
+   CHECK_ERR(L_MAIN, pthread_mutex_unlock(&shiri_source_mutex));
+   return ret;
+ }
+ 
+ int
+@@ -4783,10 +5055,11 @@
+  error_outputs_deinit:
+   outputs_deinit();
+  error_evbase_free:
+   commands_base_free(cmdbase);
+   shiri_speech_setup_event_clear();
++  shiri_source_wait_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+ #ifdef HAVE_TIMERFD
+   close(pb_timer_fd);
+ #else
+@@ -4829,8 +5102,9 @@
+   shiri_speech_deinit();
+   memset(&shiri_voice_request, 0, sizeof(shiri_voice_request)); shiri_voice_initialized = false;
+   free(history);
+ 
+   shiri_speech_setup_event_clear();
++  shiri_source_wait_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+ }
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -166,10 +166,11 @@
+  * after every output acknowledges that flush. Process-global, so initial idle
+  * admission is valid before a pipe input source exists. */
+ struct shiri_pcm_owner;
+ int input_pipe_shiri_seal(uint64_t operation_generation);
+ int input_pipe_shiri_arm(const struct shiri_pcm_owner *owner, uint64_t operation_generation);
++int input_pipe_shiri_disarm(const struct shiri_pcm_owner *owner, uint64_t operation_generation);
+ 
+ int input_pipe_shiri_state(uint64_t *operation_generation);
+ /* Copy, never consume, the first unread native SYNC anchor. 1 found, 0 waiting,
+  * -1 invalid/unanchored bytes. Thread-safe with the input producer. */
+ int input_peek_sync(struct timespec *timestamp);
+diff --git a/src/inputs/pipe.c b/src/inputs/pipe.c
+--- a/src/inputs/pipe.c
++++ b/src/inputs/pipe.c
+@@ -213,10 +213,30 @@
+     }
+   pthread_mutex_unlock(&shiri_gate_lock);
+   return ret;
+ }
+ 
++/* Failed timer arming may retire only its exact current input binding. */
++int
++input_pipe_shiri_disarm(const struct shiri_pcm_owner *owner, uint64_t operation_generation)
++{
++  int ret = -1;
++  if (!owner)
++    return -1;
++  pthread_mutex_lock(&shiri_gate_lock);
++  if (operation_generation == shiri_operation
++      && owner->epoch == shiri_owner.epoch && owner->generation == shiri_owner.generation
++      && !memcmp(owner->incarnation, shiri_owner.incarnation, 16)
++      && !memcmp(owner->session, shiri_owner.session, 16))
++    {
++      shiri_armed = false;
++      ret = 0;
++    }
++  pthread_mutex_unlock(&shiri_gate_lock);
++  return ret;
++}
++
+ /* Snapshot the process-global admission operation. The player uses it to fence
+  * the native timer; source transitions execute on that same player thread. */
+ int
+ input_pipe_shiri_state(uint64_t *operation_generation)
+ {
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -1339,27 +1339,91 @@
+       return true;
+   return false;
+ }
+ 
+ int
+-outputs_shiri_start(output_status_cb cb, int *failed)
++outputs_shiri_start(output_status_cb cb, output_status_cb ready_cb, int *failed)
+ {
+   struct output_device *device;
+   int ret, pending = 0;
+   *failed = 0;
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (!device->selected)
+         continue;
++      if (device->busy || device->prevent_playback)
++        { *failed = 1; continue; }
++      if (device->session)
++        {
++          if (device->state != OUTPUT_STATE_CONNECTED && device->state != OUTPUT_STATE_STREAMING)
++            *failed = 1; /* An unfinished/canceled session is not a warm ready output. */
++          else
++            outputs_device_cb_set(device, ready_cb);
++          continue;
++        }
+       ret = outputs_device_start(device, cb, false);
+       if (ret < 0)
+         *failed = 1;
+       else
+         pending += ret;
+     }
+   return pending;
+ }
++
++bool
++outputs_shiri_ready(output_status_cb cb)
++{
++  struct output_device *device;
++  unsigned count = 0;
++  for (device = outputs_device_list; device; device = device->next)
++    if (device->selected)
++      {
++        if (++count > 64 || device->busy || device->prevent_playback || !device->session
++            || (device->state != OUTPUT_STATE_CONNECTED && device->state != OUTPUT_STATE_STREAMING))
++          return false;
++      }
++  if (!count)
++    return false;
++  if (cb)
++    for (device = outputs_device_list; device; device = device->next)
++      if (device->selected)
++        outputs_device_cb_set(device, cb);
++  return true;
++}
++
++/* Retire only callbacks owned by this logical source operation. Never-used
++ * tokens fence late protocol replies before cleanup registers a new token. */
++void
++outputs_shiri_cancel_callbacks(output_status_cb pending_cb, output_status_cb ready_cb, output_status_cb cleanup_cb)
++{
++  struct output_device *device;
++  uint64_t device_id;
++  unsigned index;
++  for (index = 0; index < ARRAY_SIZE(outputs_cb_register); ++index)
++    if (outputs_cb_register[index].cb
++        && (outputs_cb_register[index].cb == pending_cb || outputs_cb_register[index].cb == ready_cb))
++      {
++        device_id = outputs_cb_register[index].device_id;
++        memset(&outputs_cb_register[index], 0, sizeof(outputs_cb_register[index]));
++        device = outputs_device_get(device_id);
++        if (device && device->session)
++          {
++            event_del(device->stop_timer);
++            outputs_device_stop(device, cleanup_cb); /* Async; owns no player command. */
++          }
++      }
++}
++
++void
++outputs_shiri_release(output_status_cb cb)
++{
++  struct output_device *device;
++  for (device = outputs_device_list; device; device = device->next)
++    if (device->session)
++      outputs_device_stop_delayed(device, cb);
++}
++
+ 
+ int
+ outputs_volume_get(void)
+ {
+   return outputs_master_volume;
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -391,11 +391,18 @@
+ outputs_shiri_callback_pending(uint64_t device_id, output_status_cb callback);
+ int
+ outputs_shiri_stop_delayed_cancel(struct output_device *device);
+ 
+ int
+-outputs_shiri_start(output_status_cb cb, int *failed);
++outputs_shiri_start(output_status_cb cb, output_status_cb ready_cb, int *failed);
++
++bool
++outputs_shiri_ready(output_status_cb cb);
++void
++outputs_shiri_cancel_callbacks(output_status_cb pending_cb, output_status_cb ready_cb, output_status_cb cleanup_cb);
++void
++outputs_shiri_release(output_status_cb cb);
+ 
+ int
+ outputs_volume_get(void);
+ 
+ int
+diff --git a/src/commands.c b/src/commands.c
+--- a/src/commands.c
++++ b/src/commands.c
+@@ -289,10 +289,21 @@
+ 
+   CHECK_ERR(L_MAIN, pthread_cond_signal(&current_cmd->cond));
+   CHECK_ERR(L_MAIN, pthread_mutex_unlock(&current_cmd->lck));
+ }
+ 
++int
++commands_exec_end_if(struct commands_base *cmdbase, command_function func, void *arg, int retvalue)
++{
++  struct command *cmd = cmdbase->current_cmd;
++  if (!cmd || cmd->func != func || cmd->arg != arg || cmd->func_bh || cmd->pending != 1)
++    return 0;
++  commands_exec_end(cmdbase, retvalue);
++  return 1;
++}
++
++
+ /*
+  * Execute the function 'func' with the given argument 'arg' in the event loop thread.
+  * Blocks the caller (thread) until the function returned.
+  *
+  * If a function 'func_bh' ("bottom half") is given, it is executed after 'func' has successfully
+diff --git a/src/commands.h b/src/commands.h
+--- a/src/commands.h
++++ b/src/commands.h
+@@ -42,10 +42,14 @@
+ commands_exec_returnvalue(struct commands_base *cmdbase);
+ 
+ void
+ commands_exec_end(struct commands_base *cmdbase, int retvalue);
+ 
++/* Complete only this exact logical pending command, on its event-loop thread. */
++int
++commands_exec_end_if(struct commands_base *cmdbase, command_function func, void *arg, int retvalue);
++
+ int
+ commands_exec_sync(struct commands_base *cmdbase, command_function func, command_function func_bh, void *arg);
+ 
+ int
+ commands_exec_async(struct commands_base *cmdbase, command_function func, void *arg);

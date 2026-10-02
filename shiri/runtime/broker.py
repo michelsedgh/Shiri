@@ -47,12 +47,12 @@ from .unix_directory import PinnedUnixDirectory
 from .system import OwnedProcess, Runner, RuntimeFailure, atomic_json, read_json, root_directory
 
 log = logging.getLogger(__name__)
-REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1"
+REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1"
 _OWNTONE_VERSION_PATTERN = re.compile(r"(?<![\w.-])" + re.escape(REQUIRED_OWNTONE_VERSION) + r"(?![\w.-])")
 # The pinned receiver appends these feature tokens after its backend marker.
 # Its sysconfdir path is removed before matching, so path text cannot qualify.
 _SHAIRPORT_TIMED_PATTERN = re.compile(
-    r"-shiri-timed3-startup1(?=$|\s|(?:-soxr)?(?:-convolution)?(?:-metadata)?(?:-mqtt)?(?:-dbus)?(?:-mpris)?$)"
+    r"-shiri-timed3-startup1-volume1(?=$|\s|(?:-soxr)?(?:-convolution)?(?:-metadata)?(?:-mqtt)?(?:-dbus)?(?:-mpris)?$)"
 )
 
 
@@ -104,6 +104,8 @@ class RuntimeRoom:
     timing: tuple[int, int] = (40, 140)
     active_timing: tuple[int, int] | None = None
     gain_pending: bool = False
+    phone_volume_revision: int | None = None
+    receiver_volume: dict | None = None
 
     def snapshot(self):
         offsets = {speaker.id: speaker.offset_ms for speaker in self.desired.speakers}
@@ -118,6 +120,7 @@ class RuntimeRoom:
             "last_health_at": self.last_health_at,
             "volume": self.current_volume,
             "volume_settings_pending": self.gain_pending,
+            "receiver_volume": self.receiver_volume,
             "phone_volume_update": self.phone_volume_update,
             "selected_ids": self.selected_ids,
             "outputs": outputs,
@@ -218,7 +221,7 @@ class Broker:
         self.versions["owntone"] = (result.stdout or result.stderr).strip()
         if not _OWNTONE_VERSION_PATTERN.search(self.versions["owntone"]):
             raise RuntimeFailure(
-                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement and saved speaker balance; "
+                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement, saved speaker balance, bounded exact source admission and paused-source speech output; "
                 "rebuild pinned backends using install/build_backends.sh"
             )
         if not DHCP_HOOK.is_file() or not os.access(DHCP_HOOK, os.X_OK):
@@ -694,7 +697,7 @@ class Broker:
             room.held_speakers = set(keys)
         if released:
             for other in self.rooms.values():
-                if other.desired.enabled and other.status == "degraded":
+                if other is not room and other.desired.enabled and other.status == "degraded":
                     other.wake.set()
 
     async def _release_speakers(self, room: RuntimeRoom):
@@ -741,26 +744,40 @@ class Broker:
                 if not self.ready:
                     room.status, room.error = "error", self.error
                     continue
+                applying = room.desired
                 material_changed = room.applied and self._material(room.applied) != self._material(
-                    room.desired
+                    applying
                 )
                 if room.client and (material_changed or room.restart_required):
                     await self._stop_room(room)
                 if not room.client:
-                    await self._start_room(room)
+                    applying = room.desired
+                    startup = await self._start_room(room)
+                    if startup is not None:
+                        applying, _master = startup
                 else:
                     async with room.control_lock:
+                        # Reconcile advances desired intent outside this lock.
+                        # Every backend ACK below belongs to this exact snapshot.
+                        applying, master = room.desired, room.current_volume
                         gain_only = bool(room.applied is not None and (room.status == "running" or room.gain_pending)
-                                         and self._output_assignment(room.applied) == self._output_assignment(room.desired))
+                                         and self._output_assignment(room.applied) == self._output_assignment(applying))
                         await self._sync_worker_intent(room)
                         if gain_only:
-                            await room.client.volume_settings(room.current_volume, room.desired.speakers)
-                            room.gain_pending = False
+                            await room.client.volume_settings(master, applying.speakers)
                             room.status, room.error = "running", None
                         else:
-                            await self._restore_outputs(room)
-                room.applied = room.desired
-                room.failures, room.retry_at, room.restart_required = 0, 0, False
+                            await self._restore_outputs(room, definition=applying, volume=master)
+                        await self._receiver_applied_master(room, applying, master)
+                if room.status == "running":
+                    room.applied = applying
+                    room.gain_pending = False
+                if room.desired == applying:
+                    room.failures, room.retry_at, room.restart_required = 0, 0, False
+                else:
+                    # Preserve the acknowledged old definition until the newer
+                    # edit converges; never label old gains as the newer intent.
+                    room.wake.set()
             except Superseded:
                 await self._stop_room(room)
                 room.wake.set()
@@ -1187,7 +1204,7 @@ class Broker:
              "--output-uid", str(output["uid"]), "--output-buffer-ms", str(output_buffer_ms),
              "--relay-delay-ms", str(relay_delay_ms),
              "--signal-socket", str(VIEW / "signals" / "events.sock"),
-             "--signal-generation", generation, "--control-revision", str(starting.revision)],
+             "--signal-generation", generation, "--control-revision", str(starting.revision), "--control-volume", str(room.current_volume)],
             room.directory, account=audio, binds=[
                 Bind(str(room.directory / "pipes"), str(VIEW / "pipes"), True),
                 Bind(str(room.directory / "control"), str(VIEW / "control"), True),
@@ -1199,6 +1216,18 @@ class Broker:
         )
         self._check_start(room, starting)
         await self._wait_worker(room, "audio", self._worker_socket(room))
+        async with room.control_lock:
+            self._check_start(room, starting)
+            prepared, master = await self._finish_start_outputs(room)
+            self._check_start(room, starting)
+            if room.desired != prepared or room.current_volume != master:
+                raise Superseded()
+            if room.status != "running":
+                raise RuntimeFailure(room.error or "Configured speaker group is unavailable before receiver startup")
+            # Empty saved routes remain available for setup/discovery. Native
+            # ARM already refuses music until at least one output is ready.
+            # Configured groups must be fully ACKed before a phone can connect.
+            room.status, room.error = "starting", None
         room.processes["shairport"] = await self._start_process(
             f"{starting.id}:shairport", "shairport",
             [self.binary("shairport-sync"), "-v", "-c", str(VIEW / "config" / "shairport.conf")],
@@ -1215,9 +1244,21 @@ class Broker:
         self._require_alive(room.processes, "after starting the AirPlay receiver")
         await self._refresh_processes(starting.id, room.processes)
         async with room.control_lock:
-            await self._restore_outputs(room)
+            self._check_start(room, starting)
+            applied = await self._finish_start_outputs(room)
         self._check_start(room, starting)
         room.last_health_at = now()
+        return applied
+
+    async def _finish_start_outputs(self, room: RuntimeRoom):
+        # Material startup checks permit newer administrative/gain intent.
+        # Return exactly the definition acknowledged by final selection, so
+        # the outer actor cannot label it with the pre-start revision.
+        definition, volume = room.desired, room.current_volume
+        await self._sync_worker_intent(room)
+        await self._restore_outputs(room, definition=definition, volume=volume)
+        await self._receiver_applied_master(room, definition, volume)
+        return definition, volume
 
     async def _wait_worker(self, room: RuntimeRoom, name: str, socket: Path):
         for _ in range(20):
@@ -1232,15 +1273,19 @@ class Broker:
                 await asyncio.sleep(0.1)
         raise RuntimeFailure(f"Room {name} worker did not become ready")
 
-    async def _restore_outputs(self, room: RuntimeRoom):
-        speakers = list(room.desired.speakers)
-        definition = room.backend_definition or room.desired
+    async def _restore_outputs(self, room: RuntimeRoom, *, definition: Room | None = None, volume: int | None = None):
+        # Startup may use the latest intent after its material startup checks.
+        # Snapshot both gains and assignment before discovery can yield.
+        definition = definition or room.desired
+        volume = room.current_volume if volume is None else volume
+        speakers = list(definition.speakers)
+        backend_definition = room.backend_definition or definition
         room.outputs = await room.client.outputs(self._receiver_names())
         try:
             keys = await self._reserve_speakers(
-                room, speakers, room.active_local_device or definition.local_audio_device
+                room, speakers, room.active_local_device or backend_definition.local_audio_device
             )
-            await room.client.volume_settings(room.current_volume, speakers)
+            await room.client.volume_settings(volume, speakers)
             await room.client.select(speakers, room.outputs)
             await self._commit_speakers(room, keys)
             room.selected_ids = [speaker.id for speaker in speakers]
@@ -1430,6 +1475,31 @@ class Broker:
                 room.phone_volume_update, room.phone_volume_next, room.current_volume = old_pending, old_next, old_volume
                 raise
 
+    async def _receiver_applied_master(self, room: RuntimeRoom, definition: Room, volume: int):
+        # A failed selection or superseded HTTP ACK cannot publish feedback
+        # under a newer worker revision or overwrite the receiver's defaults.
+        if room.status != "running" or room.desired != definition or room.current_volume != volume:
+            return
+        if room.applied == definition and room.applied.volume == volume:
+            return  # An identical wake must not erase a pending sender notification.
+        notify = bool(room.applied is not None and room.applied.volume != definition.volume
+                      and room.phone_volume_revision != definition.revision)
+        await self._receiver_master(room, notify=notify)
+
+    async def _receiver_master(self, room: RuntimeRoom, *, notify: bool):
+        # Feedback is diagnostic and cannot fail an acknowledged gain change
+        # or tear down the running music route. The worker coalesces edits and
+        # reports bounded event-channel failures separately in its health.
+        if not room.launch_generation or "audio" not in room.processes:
+            return
+        try:
+            await call_rpc(self._worker_socket(room), "receiver-master",
+                           {"revision": room.desired.revision, "volume": room.current_volume,
+                            "notify": notify}, timeout=1)
+        except (RpcError, OSError, TimeoutError):
+            room.receiver_volume = {"status": "worker_control_unavailable",
+                                    "revision": room.desired.revision, "volume": room.current_volume}
+
     async def set_volume(self, room: RuntimeRoom, value, *, pending=False):
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
             raise RpcError("invalid_request", "Volume must be an integer from 0 to 100")
@@ -1452,7 +1522,10 @@ class Broker:
                 await room.client.volume(value)
             elif not pending:
                 raise RpcError("room_not_running", "The room has stopped")
+            changed = room.current_volume != value
             room.current_volume = value
+            if not pending:
+                await self._receiver_master(room, notify=changed)
         return {"ok": True, "volume": value, "pending": not bool(room.client)}
 
     def _save_phone_volume(self, room):
@@ -1488,6 +1561,9 @@ class Broker:
             if revision is not None and revision >= room.desired.revision:
                 room.desired = room.desired.model_copy(update={"volume": volume, "revision": revision})
                 await self._sync_worker_intent(room)
+                if accepted:
+                    room.phone_volume_revision = revision
+                await self._receiver_master(room, notify=not accepted)
             room.phone_volume_update = room.phone_volume_next if accepted else None
             room.phone_volume_next = None
             if room.phone_volume_update:
@@ -1620,6 +1696,7 @@ class Broker:
                                     health.get("error") or f"Room {name} worker is not ready"
                                 )
                             if name == "audio":
+                                room.receiver_volume = dict(health.get("receiver_volume") or {})
                                 active_session = health.get("speech_session_id")
                                 for session_id, generation in observed_sessions.items():
                                     if (

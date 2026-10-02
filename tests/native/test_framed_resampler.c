@@ -71,6 +71,20 @@ static struct {unsigned read_deficit;} pb_session;
 static bool fixture_sealed,fixture_input_cleared;
 #define PLAY_PLAYING 1
 #include "actual_seal_param.inc"
+#ifdef SHIRI_NATIVE_TRANSITION_LAYER
+static bool pb_timer_native;
+static int shiri_source_start_failed;
+static int pb_timer_stop(void) { return 0; }
+static int shiri_source_wait_begin(struct shiri_source_param *param)
+{ assert(param->request.operation_generation); return 0; }
+#endif
+#ifdef SHIRI_PAUSED_SPEECH_LAYER
+/* This oracle retains actual converter/reset behavior. The additional exact
+ * player seal touches only these inert output-bed clock flags here; paused
+ * lifecycle/voice/output readiness is exercised by its own actual C fixture. */
+static bool pb_timer_speech_only, shiri_output_end_valid;
+#endif
+
 static int input_pipe_shiri_seal(uint64_t operation)
 {assert(operation);fixture_sealed=true;return 0;}
 static void input_flush(void *unused)

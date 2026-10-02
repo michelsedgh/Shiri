@@ -35,13 +35,14 @@ The OwnTone `balance1` patch enables an independent master and stages gains befo
 selection. It retains the assigned group's trims across output rediscovery and
 AirPlay protocol replacement. Native phone volume continues through the exact
 source-fenced `shiri-volume` endpoint, which uses the same master and saved trims.
-The runtime requires the matching `owner1-balance1` backend version; deploying
+The current runtime requires the matching `owner1-balance1-transition1-bed1` backend version; deploying
 the Python changes alone against the old OwnTone build is unsupported.
 
-The current pinned Shairport receiver does not provide a web-to-iPhone display
-update. Two-way display synchronization requires the separate AP2 event-channel
-backport, a bounded receiver control path, exact launch/session fences and phone
-echo suppression. A successful OwnTone volume readback proves backend intent,
+The composed Shairport candidate includes the separate AP2 event-channel
+backport and requires `startup1-volume1`. Its bounded receiver control path uses
+exact launch/session fences and phone echo suppression; see
+[receiver volume feedback](RECEIVER-VOLUME.md) for its limits and pending phone
+acceptance. A successful OwnTone volume readback proves backend intent,
 not that the iPhone slider or a physical speaker has acknowledged the change.
 
 Verification includes real SQLite migration/reopen/reassignment transactions,

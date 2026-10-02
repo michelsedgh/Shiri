@@ -237,6 +237,7 @@ def backend_configs(
     receiver_settings = (f"""shiri = {{
   socket = {quote(music_socket or view / "input" / "music.sock")};
   peer_uid = {audio_uid};
+  volume_socket = {quote((music_socket or view / "input" / "music.sock").with_name("volume.sock"))};
   output_rate = 48000;
   output_format = "S16_LE";
   output_channels = 2;
