@@ -1,0 +1,805 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,11 +1,11 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+ AC_CONFIG_AUX_DIR([build-aux])
+ AC_CONFIG_HEADERS([config.h])
+ AM_INIT_AUTOMAKE([foreign subdir-objects 1.11])
+ AM_SILENT_RULES([yes])
+diff --git a/src/Makefile.am b/src/Makefile.am
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -10,17 +10,17 @@
+ 
+ if COND_LASTFM
+ LASTFM_SRC=lastfm.c lastfm.h
+ endif
+ 
+ if COND_CHROMECAST
+ if COND_PROTOBUF_OLD
+-CHROMECAST_SRC=outputs/cast.c outputs/cast_json.h outputs/cast_channel.v0.pb-c.h outputs/cast_channel.v0.pb-c.c
++CHROMECAST_SRC=outputs/cast.c outputs/cast_channel.v0.pb-c.h outputs/cast_channel.v0.pb-c.c
+ else
+-CHROMECAST_SRC=outputs/cast.c outputs/cast_json.h outputs/cast_channel.pb-c.h outputs/cast_channel.pb-c.c
++CHROMECAST_SRC=outputs/cast.c outputs/cast_channel.pb-c.h outputs/cast_channel.pb-c.c
+ endif
+ endif
+ 
+ if COND_MPD
+ MPD_SRC=mpd.c mpd.h
+ endif
+ 
+@@ -108,15 +108,15 @@
+ 	transcode.c transcode.h \
+ 	artwork.c artwork.h \
+ 	misc.c misc.h \
+ 	misc_json.c misc_json.h \
+ 	misc_xml.c misc_xml.h \
+ 	rng.c rng.h \
+ 	smartpl_query.c smartpl_query.h \
+-	player.c player.h shiri_source.h shiri_source_json.h shiri_speech.c shiri_speech.h \
++	player.c player.h outputs/cast_json.h shiri_source.h shiri_source_json.h shiri_speech.c shiri_speech.h shiri_speech_ready.h shiri_speech_ready_json.h \
+ 	worker.c worker.h \
+ 	settings.c settings.h \
+ 	input.h input.c \
+ 	inputs/file.c inputs/http.c inputs/pipe.c inputs/shiri_pcm.h inputs/timer.c \
+ 	outputs.h outputs.c \
+ 	outputs/rtp_common.h outputs/rtp_common.c \
+ 	outputs/raop.c outputs/airplay.c $(PAIR_AP_SRC) \
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -1290,14 +1290,33 @@
+         *failed = 1;
+       else
+         pending += ret;
+     }
+   return pending;
+ }
+ 
++/* The maintained callback registry uses never-reused tokens. Once a START
++ * has been replaced by stop/volume/etc, its old backend reply is ignored. */
++int
++outputs_shiri_stop_delayed_cancel(struct output_device *device)
++{
++  if (!device || !device->selected || !device->stop_timer) return -1;
++  return event_del(device->stop_timer);
++}
++
++bool
++outputs_shiri_callback_pending(uint64_t device_id, output_status_cb callback)
++{
++  unsigned index;
++  for (index = 0; index < ARRAY_SIZE(outputs_cb_register); ++index)
++    if (outputs_cb_register[index].device_id == device_id && outputs_cb_register[index].cb == callback)
++      return true;
++  return false;
++}
++
+ int
+ outputs_shiri_start(output_status_cb cb, int *failed)
+ {
+   struct output_device *device;
+   int ret, pending = 0;
+   *failed = 0;
+   for (device = outputs_device_list; device; device = device->next)
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -380,14 +380,19 @@
+ 
+ int
+ outputs_flush(output_status_cb cb);
+ 
+ int
+ outputs_shiri_flush(output_status_cb cb, int *failed);
+ 
++bool
++outputs_shiri_callback_pending(uint64_t device_id, output_status_cb callback);
++int
++outputs_shiri_stop_delayed_cancel(struct output_device *device);
++
+ int
+ outputs_shiri_start(output_status_cb cb, int *failed);
+ 
+ int
+ outputs_volume_get(void);
+ 
+ int
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -83,14 +83,15 @@
+ 
+ // Audio and metadata outputs
+ #include "outputs.h"
+ 
+ // Audio and metadata input
+ #include "input.h"
+ #include "shiri_speech.h"
++#include "shiri_speech_ready.h"
+ 
+ // Scrobbling
+ #ifdef LASTFM
+ # include "lastfm.h"
+ #endif
+ #include "listenbrainz.h"
+ 
+@@ -304,14 +305,43 @@
+ static int shiri_source_flush_failed;
+ static int shiri_source_start_failed;
+ struct shiri_source_param {
+   struct shiri_source_request request;
+   bool replay;
+   bool restart_outputs;
+ };
++
++
++/* Speech preparation owns neither a music source nor an output scheduler. */
++struct shiri_speech_output {
++  uint64_t id;
++  int type, offset_ms;
++  void *session;
++  bool awaiting;
++};
++static struct {
++  struct shiri_speech_request request;
++  struct shiri_speech_output outputs[SHIRI_SPEECH_OUTPUTS];
++  unsigned count, pending;
++  uint64_t began_ns, prepared_ns, mixed_ns;
++  bool initialized, connected, failed;
++} shiri_speech_start;
++struct shiri_speech_param {
++  struct shiri_speech_request request;
++  struct shiri_speech_reply reply;
++};
++static struct {
++  struct shiri_source_request source;
++  struct shiri_speech_output outputs[SHIRI_SPEECH_OUTPUTS];
++  unsigned count;
++  uint64_t mixed_ns;
++} shiri_last_mix;
++static struct event *shiri_speech_setup_event;
++static void device_shiri_speech_start_cb(struct output_device *device, enum output_device_state status);
++static void shiri_speech_mix_ready(void);
+ 
+ struct event_base *evbase_player;
+ 
+ static int player_exit;
+ static pthread_t tid_player;
+ static struct commands_base *cmdbase;
+ 
+@@ -1408,14 +1438,15 @@
+       pb_session.read_deficit -= nbytes;
+ 
+       /* Mix only this player-owned PCM, before shared conversion/encoding.
+        * This changes no program position, anchor, source or output state. */
+       shiri_speech_mix(pb_session.buffer, nbytes, nsamples, pb_session.quality.sample_rate,
+                        pb_session.quality.bits_per_sample, pb_session.quality.channels);
+       outputs_write(pb_session.buffer, nbytes, nsamples, &pb_session.quality, &pb_session.pts);
++      shiri_speech_mix_ready();
+ 
+       if (nbytes < pb_session.bufsize)
+ 	{
+ 	  // How much the number of samples we got corresponds to in time (nanoseconds)
+ 	  ts.tv_sec = 0;
+ 	  ts.tv_nsec = 1000000000UL * (uint64_t)nsamples / pb_session.quality.sample_rate;
+ 
+@@ -2664,14 +2695,369 @@
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   // Otherwise we are done
+   return COMMAND_END;
+ }
+ 
++
++static uint64_t
++shiri_speech_ready_now(void)
++{
++  struct timespec ts;
++  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L ||
++      (uint64_t)ts.tv_sec > ((uint64_t)INT64_MAX - (uint64_t)ts.tv_nsec) / UINT64_C(1000000000))
++    return 0;
++  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++}
++
++static bool
++shiri_speech_source_matches(const struct shiri_speech_request *request)
++{
++  return request && shiri_speech_ids_match(request->room, request->launch)
++    && !shiri_zero(request->speech, 16)
++    && shiri_source_state.initialized && !shiri_source_state.faulted
++    && request->source.operation_generation == shiri_source_state.last.operation_generation
++    && shiri_source_owner_equal(&request->source.owner, &shiri_source_state.last.owner);
++}
++
++static bool
++shiri_speech_request_matches(const struct shiri_speech_request *request)
++{
++  return shiri_speech_start.initialized && request &&
++    !memcmp(request->speech, shiri_speech_start.request.speech, 16) &&
++    !memcmp(request->room, shiri_speech_start.request.room, 16) &&
++    !memcmp(request->launch, shiri_speech_start.request.launch, 16) &&
++    request->source.operation_generation == shiri_speech_start.request.source.operation_generation &&
++    shiri_source_owner_equal(&request->source.owner, &shiri_speech_start.request.source.owner);
++}
++
++static int
++shiri_speech_outputs_snapshot(bool capture, bool sessions)
++{
++  struct output_device *device;
++  unsigned count = 0, visited = 0, index;
++  for (device = outputs_list(); device; device = device->next) {
++    if (++visited > 1024) return -1;
++    if (!device->selected) continue;
++    if (count == SHIRI_SPEECH_OUTPUTS || device->busy || device->prevent_playback) return -1;
++    if (capture) {
++      shiri_speech_start.outputs[count].id = device->id;
++      shiri_speech_start.outputs[count].type = device->type;
++      shiri_speech_start.outputs[count].offset_ms = device->offset_ms;
++      shiri_speech_start.outputs[count].session = device->session;
++    } else {
++      for (index = 0; index < shiri_speech_start.count; ++index)
++        if (shiri_speech_start.outputs[index].id == device->id) break;
++      if (index == shiri_speech_start.count || shiri_speech_start.outputs[index].type != (int)device->type ||
++          shiri_speech_start.outputs[index].offset_ms != device->offset_ms) return -1;
++      if (sessions) {
++        if (!device->session || (device->state != OUTPUT_STATE_CONNECTED && device->state != OUTPUT_STATE_STREAMING)) return -1;
++        if (shiri_speech_start.outputs[index].session != device->session) return -1;
++      }
++    }
++    ++count;
++  }
++  if (!count || (!capture && count != shiri_speech_start.count)) return -1;
++  if (capture) shiri_speech_start.count = count;
++  return 0;
++}
++
++static void
++shiri_speech_reap_start_callbacks(void)
++{
++  unsigned index;
++  for (index = 0; index < shiri_speech_start.count; ++index)
++    if (shiri_speech_start.outputs[index].awaiting &&
++        !outputs_shiri_callback_pending(shiri_speech_start.outputs[index].id, device_shiri_speech_start_cb)) {
++      shiri_speech_start.outputs[index].awaiting = false;
++      if (shiri_speech_start.pending) --shiri_speech_start.pending;
++      shiri_speech_start.failed = true;
++    }
++}
++
++static void
++shiri_speech_schedule_idle_stop(void)
++{
++  struct output_device *device;
++  unsigned index, visited = 0;
++  if (!shiri_speech_source_matches(&shiri_speech_start.request)) return;
++  for (device = outputs_list(); device && ++visited <= 1024; device = device->next)
++    for (index = 0; index < shiri_speech_start.count; ++index)
++      if (device->id == shiri_speech_start.outputs[index].id &&
++          (int)device->type == shiri_speech_start.outputs[index].type &&
++          device->offset_ms == shiri_speech_start.outputs[index].offset_ms &&
++          device->session && device->session == shiri_speech_start.outputs[index].session)
++        outputs_device_stop_delayed(device, device_streaming_cb);
++  /* Replacing the START registry token retires its callback ownership. */
++  shiri_speech_reap_start_callbacks();
++}
++
++
++static bool
++shiri_speech_bind_session(struct output_device *device)
++{
++  unsigned index;
++  if (!device || !device->selected || !shiri_speech_source_matches(&shiri_speech_start.request)) return false;
++  for (index = 0; index < shiri_speech_start.count; ++index)
++    if (device->id == shiri_speech_start.outputs[index].id) {
++      if (shiri_speech_start.outputs[index].type != (int)device->type ||
++          shiri_speech_start.outputs[index].offset_ms != device->offset_ms ||
++          (shiri_speech_start.outputs[index].session && shiri_speech_start.outputs[index].session != device->session))
++        return false;
++      shiri_speech_start.outputs[index].session = device->session;
++      return device->session != NULL;
++    }
++  return false;
++}
++
++static void
++shiri_speech_setup_event_clear(void)
++{
++  if (shiri_speech_setup_event) {
++    event_free(shiri_speech_setup_event);
++    shiri_speech_setup_event = NULL;
++  }
++}
++
++static void
++shiri_speech_setup_timeout(int fd, short what, void *arg)
++{
++  (void)fd; (void)what; (void)arg;
++  shiri_speech_setup_event_clear();
++  /* This only expires an exact idle setup; it never ends a player command,
++   * flushes a source or stops a successor's transport session. */
++  if (!shiri_speech_start.initialized || shiri_speech_start.connected) return;
++  shiri_speech_start.failed = true;
++  shiri_speech_schedule_idle_stop();
++}
++
++static void
++device_shiri_speech_start_cb(struct output_device *device, enum output_device_state status)
++{
++  uint64_t now = shiri_speech_ready_now();
++  unsigned index;
++  if (!shiri_speech_start.initialized || !shiri_speech_start.pending) return;
++  if (!device) {
++    shiri_speech_start.failed = true;
++    --shiri_speech_start.pending;
++    return;
++  }
++  for (index = 0; index < shiri_speech_start.count; ++index)
++    if (shiri_speech_start.outputs[index].id == device->id && shiri_speech_start.outputs[index].awaiting) break;
++  if (index == shiri_speech_start.count) return;
++  shiri_speech_start.outputs[index].awaiting = false;
++  --shiri_speech_start.pending;
++  if (!shiri_speech_bind_session(device) || (status != OUTPUT_STATE_CONNECTED && status != OUTPUT_STATE_STREAMING) ||
++      !now || now < shiri_speech_start.began_ns || now - shiri_speech_start.began_ns >= SHIRI_SPEECH_SETUP_NS)
++    shiri_speech_start.failed = true;
++  else
++    outputs_device_cb_set(device, device_streaming_cb);
++  /* No commands_exec_end: a missing network callback must never retain
++   * cmdbase or complete a different command that has subsequently started. */
++}
++
++static enum command_state
++shiri_speech_prepare(void *arg, int *retval)
++{
++  struct shiri_speech_param *param = arg;
++  uint64_t now = shiri_speech_ready_now();
++  struct output_device *device;
++  struct timeval deadline = { 5, 0 };
++  unsigned visited = 0, index;
++  int ret;
++  if (!now || !shiri_zero(param->request.source.owner.session, 16) || !shiri_speech_source_matches(&param->request) ||
++      (player_state == PLAY_PLAYING && !pb_timer_native)) {
++    *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++  }
++  shiri_speech_reap_start_callbacks();
++  if (shiri_speech_request_matches(&param->request)) {
++    *retval = shiri_speech_start.failed ? SHIRI_SOURCE_FAILURE : 0;
++    return COMMAND_END;
++  }
++  /* Retain the old callback incarnation until every START has terminated.
++   * Never reinterpret a late callback as the successor speech preparation. */
++  if (shiri_speech_start.pending) {
++    *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++  }
++  shiri_speech_setup_event_clear();
++  memset(&shiri_speech_start, 0, sizeof(shiri_speech_start));
++  shiri_speech_start.request = param->request;
++  shiri_speech_start.initialized = true;
++  shiri_speech_start.began_ns = now;
++  if (shiri_speech_outputs_snapshot(true, false) < 0) {
++    shiri_speech_start.failed = true; *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
++  }
++  shiri_speech_setup_event = evtimer_new(evbase_player, shiri_speech_setup_timeout, NULL);
++  if (!shiri_speech_setup_event || evtimer_add(shiri_speech_setup_event, &deadline) < 0) {
++    shiri_speech_setup_event_clear(); shiri_speech_start.failed = true;
++    *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
++  }
++  for (device = outputs_list(); device && ++visited <= 1024; device = device->next) {
++    if (!device->selected) continue;
++    for (index = 0; index < shiri_speech_start.count; ++index)
++      if (shiri_speech_start.outputs[index].id == device->id) break;
++    if (index == shiri_speech_start.count || outputs_shiri_stop_delayed_cancel(device) < 0) {
++      shiri_speech_start.failed = true; break;
++    }
++    /* Publish exact callback ownership even if a backend completes inline. */
++    shiri_speech_start.outputs[index].awaiting = true;
++    ++shiri_speech_start.pending;
++    ret = outputs_device_start(device, device_shiri_speech_start_cb, false);
++    if (ret <= 0 && shiri_speech_start.outputs[index].awaiting) {
++      shiri_speech_start.outputs[index].awaiting = false; --shiri_speech_start.pending;
++    }
++    if (ret < 0 || !shiri_speech_bind_session(device)) shiri_speech_start.failed = true;
++  }
++  if (visited > 1024) shiri_speech_start.failed = true;
++  *retval = shiri_speech_start.failed ? SHIRI_SOURCE_FAILURE : 0;
++  return COMMAND_END; /* Always release the ordinary player command lane. */
++}
++
++static enum command_state
++shiri_speech_prepare_bh(void *arg, int *retval)
++{
++  struct shiri_speech_param *param = arg;
++  uint64_t now = shiri_speech_ready_now();
++  if (!shiri_speech_request_matches(&param->request) || !shiri_speech_source_matches(&param->request)) {
++    *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++  }
++  if (!now || now < shiri_speech_start.began_ns || now - shiri_speech_start.began_ns >= SHIRI_SPEECH_SETUP_NS ||
++      shiri_speech_start.failed) {
++    shiri_speech_start.failed = true; shiri_speech_setup_event_clear(); shiri_speech_schedule_idle_stop();
++    *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
++  }
++  shiri_speech_reap_start_callbacks();
++  if (shiri_speech_start.failed) { *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END; }
++  param->reply.outputs = shiri_speech_start.count;
++  if (shiri_speech_start.pending) { *retval = 0; return COMMAND_END; }
++  if (shiri_speech_outputs_snapshot(false, true) < 0) {
++    shiri_speech_start.failed = true; shiri_speech_setup_event_clear(); shiri_speech_schedule_idle_stop();
++    *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
++  }
++  shiri_speech_setup_event_clear();
++  if (!shiri_speech_start.connected) shiri_speech_start.prepared_ns = now;
++  shiri_speech_start.connected = true;
++  /* A lost caller cannot reserve idle transports permanently. Starting the
++   * actual bed cancels this existing finite delayed-stop mechanism. */
++  if (player_state != PLAY_PLAYING) shiri_speech_schedule_idle_stop();
++  param->reply.connected = true;
++  param->reply.prepared_ns = shiri_speech_start.prepared_ns;
++  *retval = 0; return COMMAND_END;
++}
++
++static int
++shiri_speech_last_outputs(bool capture)
++{
++  struct output_device *device;
++  unsigned count = 0, visited = 0, index;
++  for (device = outputs_list(); device; device = device->next) {
++    if (++visited > 1024) return -1;
++    if (!device->selected) continue;
++    if (count == SHIRI_SPEECH_OUTPUTS || device->busy || device->prevent_playback || !device->session ||
++        (device->state != OUTPUT_STATE_CONNECTED && device->state != OUTPUT_STATE_STREAMING)) return -1;
++    if (capture) {
++      shiri_last_mix.outputs[count].id = device->id;
++      shiri_last_mix.outputs[count].type = device->type;
++      shiri_last_mix.outputs[count].offset_ms = device->offset_ms;
++      shiri_last_mix.outputs[count].session = device->session;
++    } else {
++      for (index = 0; index < shiri_last_mix.count; ++index)
++        if (shiri_last_mix.outputs[index].id == device->id) break;
++      if (index == shiri_last_mix.count || shiri_last_mix.outputs[index].type != (int)device->type ||
++          shiri_last_mix.outputs[index].offset_ms != device->offset_ms ||
++          shiri_last_mix.outputs[index].session != device->session) return -1;
++    }
++    ++count;
++  }
++  if (!count || (!capture && count != shiri_last_mix.count)) return -1;
++  if (capture) shiri_last_mix.count = count;
++  return 0;
++}
++
++static void
++shiri_speech_mix_ready(void)
++{
++  uint64_t now;
++  if (!pb_timer_native || !pb_timer_native_anchored || player_state != PLAY_PLAYING ||
++      pb_session.quality.sample_rate != 48000 || pb_session.quality.bits_per_sample != 16 ||
++      pb_session.quality.channels != 2 || !shiri_source_state.initialized || shiri_source_state.faulted ||
++      !(now = shiri_speech_ready_now()) || shiri_speech_last_outputs(true) < 0) return;
++  shiri_last_mix.source = shiri_source_state.last;
++  shiri_last_mix.mixed_ns = now;
++  if (shiri_speech_start.connected && !shiri_speech_start.failed &&
++      shiri_speech_source_matches(&shiri_speech_start.request) && shiri_speech_outputs_snapshot(false, true) == 0)
++    shiri_speech_start.mixed_ns = now;
++}
++
++static enum command_state
++shiri_speech_ready_check(void *arg, int *retval)
++{
++  struct shiri_speech_param *param = arg;
++  uint64_t now = shiri_speech_ready_now();
++  if (param->request.action == SHIRI_SPEECH_OBSERVE) {
++    if (shiri_zero(param->request.source.owner.session, 16) || !shiri_speech_source_matches(&param->request)) {
++      *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++    }
++    /* Pure observation: no output setup or program control on music. */
++    param->reply.connected = shiri_speech_last_outputs(false) == 0;
++    param->reply.outputs = param->reply.connected ? shiri_last_mix.count : 0;
++    param->reply.mixed_ns = shiri_last_mix.mixed_ns;
++    param->reply.ready = now && param->reply.connected && pb_timer_native && pb_timer_native_anchored &&
++      player_state == PLAY_PLAYING && shiri_last_mix.source.operation_generation == param->request.source.operation_generation &&
++      shiri_source_owner_equal(&shiri_last_mix.source.owner, &param->request.source.owner) &&
++      shiri_last_mix.mixed_ns && shiri_last_mix.mixed_ns <= now && now-shiri_last_mix.mixed_ns < SHIRI_SPEECH_MIX_AGE_NS;
++    *retval = 0; return COMMAND_END;
++  }
++  if (!shiri_speech_request_matches(&param->request) || !shiri_speech_source_matches(&param->request)) {
++    *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++  }
++  if (param->request.action == SHIRI_SPEECH_RELEASE) {
++    shiri_speech_schedule_idle_stop();
++    shiri_speech_setup_event_clear();
++    if (shiri_speech_start.pending) shiri_speech_start.failed = true;
++    else memset(&shiri_speech_start, 0, sizeof(shiri_speech_start));
++    *retval = 0; return COMMAND_END;
++  }
++  if (!now || shiri_speech_start.failed || !shiri_speech_start.connected ||
++      now < shiri_speech_start.began_ns || now - shiri_speech_start.began_ns >= SHIRI_SPEECH_SETUP_NS ||
++      shiri_speech_outputs_snapshot(false, true) < 0) {
++    *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
++  }
++  param->reply.connected = true;
++  param->reply.prepared_ns = shiri_speech_start.prepared_ns;
++  param->reply.mixed_ns = shiri_speech_start.mixed_ns;
++  param->reply.outputs = shiri_speech_start.count;
++  param->reply.ready = pb_timer_native && pb_timer_native_anchored && player_state == PLAY_PLAYING &&
++    param->reply.mixed_ns >= param->reply.prepared_ns && param->reply.mixed_ns <= now &&
++    now - param->reply.mixed_ns < SHIRI_SPEECH_MIX_AGE_NS;
++  *retval = 0; return COMMAND_END;
++}
++
++int
++player_shiri_speech_ready(const struct shiri_speech_request *request, struct shiri_speech_reply *reply)
++{
++  struct shiri_speech_param param;
++  int ret;
++  if (!request || !reply || request->action < SHIRI_SPEECH_PREPARE || request->action > SHIRI_SPEECH_OBSERVE)
++    return SHIRI_SOURCE_INVALID;
++  memset(&param, 0, sizeof(param)); param.request = *request;
++  if (request->action == SHIRI_SPEECH_PREPARE) {
++    ret = commands_exec_sync(cmdbase, shiri_speech_prepare, NULL, &param);
++    /* Run the finish check even on a partial output-start failure, preserving
++     * its failure while scheduling only this same idle owner's delayed stop. */
++    if (ret <= 0) {
++      int finished = commands_exec_sync(cmdbase, shiri_speech_prepare_bh, NULL, &param);
++      if (!ret) ret = finished;
++    }
++  } else ret = commands_exec_sync(cmdbase, shiri_speech_ready_check, NULL, &param);
++  if (!ret) *reply = param.reply;
++  return ret;
++}
++
+ static enum command_state
+ shiri_source_seal_flush(void *arg, int *retval)
+ {
+   struct shiri_source_param *param = arg;
+   int result, pending;
+ 
+   result = shiri_source_check(&shiri_source_state, &param->request);
+@@ -4298,14 +4684,15 @@
+  error_input_deinit:
+   shiri_speech_deinit();
+   input_deinit();
+  error_outputs_deinit:
+   outputs_deinit();
+  error_evbase_free:
+   commands_base_free(cmdbase);
++  shiri_speech_setup_event_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+ #ifdef HAVE_TIMERFD
+   close(pb_timer_fd);
+ #else
+   timer_delete(pb_timer);
+ #endif
+@@ -4342,10 +4729,11 @@
+ 
+       return;
+     }
+ 
+   shiri_speech_deinit();
+   free(history);
+ 
++  shiri_speech_setup_event_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+ }
+diff --git a/src/player.h b/src/player.h
+--- a/src/player.h
++++ b/src/player.h
+@@ -4,14 +4,15 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+ #include "db.h"
+ #include "misc.h" // for struct media_quality
+ #include "shiri_source.h"
++#include "shiri_speech_ready.h"
+ 
+ // Maximum number of previously played songs that are remembered
+ #define MAX_HISTORY_COUNT 20
+ 
+ enum play_status {
+   PLAY_STOPPED = 2,
+   PLAY_PAUSED  = 3,
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -49,14 +49,15 @@
+ #include "library.h"
+ #include "listenbrainz.h"
+ #include "logger.h"
+ #include "misc.h"
+ #include "misc_json.h"
+ #include "player.h"
+ #include "shiri_source_json.h"
++#include "shiri_speech_ready_json.h"
+ #include "remote_pairing.h"
+ #include "settings.h"
+ #include "smartpl_query.h"
+ #ifdef SPOTIFY
+ # include "library/spotify_webapi.h"
+ # include "inputs/spotify.h"
+ #endif
+@@ -2059,14 +2060,49 @@
+       if (ret == SHIRI_SOURCE_INVALID) return HTTP_BADREQUEST;
+       return HTTP_SERVUNAVAIL;
+     }
+   /* Echo only the bounded, type-checked exact acknowledged owner/operation. */
+   reply = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
+   evbuffer_add(hreq->out_body, reply, strlen(reply));
+   json_object_put(body);
++  return HTTP_OK;
++}
++
++
++static int
++jsonapi_reply_player_shiri_speech_ready(struct httpd_request *hreq)
++{
++  struct shiri_speech_request request;
++  struct shiri_speech_reply result;
++  json_object *body;
++  const char *reply;
++  unsigned char *raw;
++  size_t length = evbuffer_get_length(hreq->in_body);
++  char text[2049];
++  int ret;
++  if (!length || length > 2048 || !(raw = evbuffer_pullup(hreq->in_body, (ssize_t)length))) return HTTP_BADREQUEST;
++  memcpy(text, raw, length); text[length] = 0;
++  if (memchr(text, 0, length)) return HTTP_BADREQUEST;
++  body = cast_json_parse(text, 2048);
++  if (shiri_speech_ready_parse(body, &request) < 0) {
++    if (body) json_object_put(body);
++    return HTTP_BADREQUEST;
++  }
++  ret = player_shiri_speech_ready(&request, &result);
++  if (ret < 0) {
++    json_object_put(body);
++    return ret == SHIRI_SOURCE_CONFLICT ? 409 : ret == SHIRI_SOURCE_INVALID ? HTTP_BADREQUEST : HTTP_SERVUNAVAIL;
++  }
++  json_object_object_add(body, "connected", json_object_new_boolean(result.connected));
++  json_object_object_add(body, "ready", json_object_new_boolean(result.ready));
++  json_object_object_add(body, "prepared_monotonic_ns", json_object_new_int64((int64_t)result.prepared_ns));
++  json_object_object_add(body, "mixed_monotonic_ns", json_object_new_int64((int64_t)result.mixed_ns));
++  json_object_object_add(body, "output_count", json_object_new_int((int)result.outputs));
++  reply = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
++  evbuffer_add(hreq->out_body, reply, strlen(reply)); json_object_put(body);
+   return HTTP_OK;
+ }
+ 
+ static int
+ jsonapi_reply_player_shiri_volume(struct httpd_request *hreq)
+ {
+   struct shiri_source_request request;
+@@ -4752,14 +4788,15 @@
+     { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
+     { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_get_byid },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
+ 
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-source$",                   jsonapi_reply_player_shiri_source },
++    { HTTPD_METHOD_POST,   "^/api/player/shiri-speech-ready$",             jsonapi_reply_player_shiri_speech_ready },
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-volume$",                   jsonapi_reply_player_shiri_volume },
+     { HTTPD_METHOD_GET,    "^/api/player$",                                jsonapi_reply_player },
+     { HTTPD_METHOD_PUT,    "^/api/player/play$",                           jsonapi_reply_player_play },
+     { HTTPD_METHOD_PUT,    "^/api/player/pause$",                          jsonapi_reply_player_pause },
+     { HTTPD_METHOD_PUT,    "^/api/player/stop$",                           jsonapi_reply_player_stop },
+     { HTTPD_METHOD_PUT,    "^/api/player/toggle$",                         jsonapi_reply_player_toggle },
+     { HTTPD_METHOD_PUT,    "^/api/player/next$",                           jsonapi_reply_player_next },
+diff --git a/src/shiri_speech.c b/src/shiri_speech.c
+--- a/src/shiri_speech.c
++++ b/src/shiri_speech.c
+@@ -349,14 +349,20 @@
+ void
+ shiri_speech_mix(void *pcm, size_t bytes, int frames, unsigned rate, unsigned bits, unsigned channels)
+ {
+   if (speech_fd >= 0)
+     speech_mix(&speech, pcm, bytes, frames, rate, bits, channels, speech_now());
+ }
+ 
++int
++shiri_speech_ids_match(const uint8_t room[16], const uint8_t launch[16])
++{
++  return speech_fd >= 0 && room && launch && !memcmp(room, speech.room, 16) && !memcmp(launch, speech.launch, 16);
++}
++
+ void
+ shiri_speech_deinit(void)
+ {
+   struct stat node;
+   if (speech_fd >= 0) close(speech_fd);
+   speech_fd = -1;
+   if (speech_directory >= 0) {
+diff --git a/src/shiri_speech.h b/src/shiri_speech.h
+--- a/src/shiri_speech.h
++++ b/src/shiri_speech.h
+@@ -7,10 +7,11 @@
+ #include <stdint.h>
+ 
+ int shiri_speech_init(const char *path, long peer_uid, const char *room,
+                       const char *launch, int framed);
+ void shiri_speech_poll(void);
+ void shiri_speech_mix(void *pcm, size_t bytes, int frames, unsigned rate,
+                      unsigned bits, unsigned channels);
++int shiri_speech_ids_match(const uint8_t room[16], const uint8_t launch[16]);
+ void shiri_speech_deinit(void);
+ 
+ #endif
+diff --git a/src/shiri_speech_ready.h b/src/shiri_speech_ready.h
+new file mode 100644
+--- /dev/null
++++ b/src/shiri_speech_ready.h
+@@ -0,0 +1,20 @@
++/* Private proposal: idle-only readiness; the existing player owns all clocks. */
++#ifndef SHIRI_SPEECH_READY_H
++#define SHIRI_SPEECH_READY_H
++#include "shiri_source.h"
++#define SHIRI_SPEECH_OUTPUTS 128
++#define SHIRI_SPEECH_SETUP_NS UINT64_C(5000000000)
++#define SHIRI_SPEECH_MIX_AGE_NS UINT64_C(100000000)
++enum shiri_speech_action { SHIRI_SPEECH_PREPARE, SHIRI_SPEECH_READY, SHIRI_SPEECH_RELEASE, SHIRI_SPEECH_OBSERVE };
++struct shiri_speech_request {
++  struct shiri_source_request source;
++  uint8_t room[16], launch[16], speech[16];
++  enum shiri_speech_action action;
++};
++struct shiri_speech_reply {
++  bool connected, ready;
++  uint64_t prepared_ns, mixed_ns;
++  unsigned outputs;
++};
++int player_shiri_speech_ready(const struct shiri_speech_request *request, struct shiri_speech_reply *reply);
++#endif
+diff --git a/src/shiri_speech_ready_json.h b/src/shiri_speech_ready_json.h
+new file mode 100644
+--- /dev/null
++++ b/src/shiri_speech_ready_json.h
+@@ -0,0 +1,39 @@
++#ifndef SHIRI_SPEECH_READY_JSON_H
++#define SHIRI_SPEECH_READY_JSON_H
++#include "shiri_speech_ready.h"
++#include "shiri_source_json.h"
++#include "outputs/cast_json.h"
++static inline int
++shiri_speech_ready_parse(json_object *body, struct shiri_speech_request *request)
++{
++  static const char *keys[] = { "incarnation", "session_id", "epoch", "generation", "operation_generation" };
++  json_object *source, *value, *room, *launch, *speech, *action;
++  const char *text;
++  unsigned index;
++  int ret;
++  if (!body || !json_object_is_type(body, json_type_object) || json_object_object_length(body) != 9 ||
++      !json_object_object_get_ex(body, "room_id", &room) || !json_object_object_get_ex(body, "launch_generation", &launch) ||
++      !json_object_object_get_ex(body, "speech_id", &speech) || !json_object_object_get_ex(body, "action", &action)) return -1;
++  memset(request, 0, sizeof(*request));
++  if (shiri_source_hex(room, request->room) < 0 || shiri_zero(request->room, 16) ||
++      shiri_source_hex(launch, request->launch) < 0 || shiri_zero(request->launch, 16) ||
++      shiri_source_hex(speech, request->speech) < 0 || shiri_zero(request->speech, 16) ||
++      !json_object_is_type(action, json_type_string)) return -1;
++  text = json_object_get_string(action);
++  if ((size_t)json_object_get_string_len(action) != strlen(text)) return -1;
++  if (!strcmp(text, "prepare")) request->action = SHIRI_SPEECH_PREPARE;
++  else if (!strcmp(text, "ready")) request->action = SHIRI_SPEECH_READY;
++  else if (!strcmp(text, "release")) request->action = SHIRI_SPEECH_RELEASE;
++  else if (!strcmp(text, "observe")) request->action = SHIRI_SPEECH_OBSERVE;
++  else return -1;
++  source = json_object_new_object();
++  if (!source) return -1;
++  for (index = 0; index < 5; ++index) {
++    if (!json_object_object_get_ex(body, keys[index], &value)) { json_object_put(source); return -1; }
++    json_object_object_add(source, keys[index], json_object_get(value));
++  }
++  ret = shiri_source_parse(source, &request->source);
++  json_object_put(source);
++  return ret < 0 || (shiri_zero(request->source.owner.session, 16) == (request->action == SHIRI_SPEECH_OBSERVE)) ? -1 : 0;
++}
++#endif

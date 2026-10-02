@@ -15,15 +15,16 @@ export class ApiClient {
     this.deadlineMs = deadlineMs;
   }
 
-  async request(path, { method = 'GET', body, deadlineMs = method === 'GET' ? this.deadlineMs : Math.max(this.deadlineMs, 45000) } = {}) {
+  async request(path, { method = 'GET', body, rawBody, contentType = 'audio/wav', deadlineMs = method === 'GET' ? this.deadlineMs : Math.max(this.deadlineMs, 45000) } = {}) {
+    if (rawBody !== undefined && body !== undefined) throw new ApiError('Choose one request body format.');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deadlineMs);
     const writing = method !== 'GET';
     try {
       const response = await this.fetcher(`/api/v1${path}`, {
         method, credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
-        headers: { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        headers: { Accept: 'application/json', ...(rawBody !== undefined ? { 'Content-Type': contentType } : body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+        ...(rawBody !== undefined ? { body: rawBody } : body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       const text = await response.text();
       let data = null;
@@ -191,9 +192,46 @@ export function safeHttpUrl(value) {
   } catch { return null; }
 }
 
+export function validLocalDeviceURI(value) {
+  return typeof value === 'string' && /^shiri:device=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+}
+
+function validDeviceLabel(value) {
+  return typeof value === 'string' && value.length > 0 && [...value].length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+const localBindingNames = { serial: 'Serial number', port: 'USB port', path: 'System device path', loopback: 'Loopback device' };
+const localBindingHelp = {
+  serial: 'Uses this speaker’s verified unique serial number. Its USB port can change.',
+  port: 'Uses this USB port. Moving the speaker to another port requires choosing and saving it again. Replacing it at this port also requires verification.',
+  path: 'Uses this device’s stable system path. A hardware change requires choosing and saving it again.',
+  loopback: 'Uses this installed Loopback device and its playback endpoint.',
+};
+
+export function validLocalDeviceInventory(value) {
+  if (!value || !Array.isArray(value.devices) || value.devices.length > 512) return false;
+  const identifiers = new Set();
+  return value.devices.every((device) => {
+    if (!device || typeof device.selection_id !== 'string' || !/^[0-9a-f]{64}$/.test(device.selection_id)
+      || identifiers.has(device.selection_id) || !validDeviceLabel(device.label)
+      || !Array.isArray(device.can_bind_by) || !device.can_bind_by.length || device.can_bind_by.length > 4
+      || new Set(device.can_bind_by).size !== device.can_bind_by.length
+      || !device.can_bind_by.every((binding) => Object.hasOwn(localBindingNames, binding))
+      || !Array.isArray(device.bindings) || device.bindings.length !== device.can_bind_by.length) return false;
+    identifiers.add(device.selection_id);
+    return device.bindings.every((binding, index) => !!binding && binding.binding === device.can_bind_by[index]
+      && (binding.device === null || validLocalDeviceURI(binding.device)));
+  });
+}
+
+export function validLocalBindingAck(value, binding, expectedDevice = null) {
+  return !!value && validLocalDeviceURI(value.device) && validDeviceLabel(value.label) && value.binding === binding
+    && (!expectedDevice || value.device === expectedDevice);
+}
+
 const client = new ApiClient();
 const store = new RoomStore(client);
-const view = { roomDraft: null, speakerDraft: null, toastTimer: null, eventsRequest: null, eventsVersion: 0, speech: new Map(), cardSignature: '', pollTimer: null };
+const view = { roomDraft: null, speakerDraft: null, calibrationDraft: null, calibrationSessions: new Map(), calibrationHistory: new Map(), toastTimer: null, eventsRequest: null, eventsVersion: 0, speech: new Map(), cardSignature: '', pollTimer: null };
 const elements = {};
 
 if (typeof document !== 'undefined') {
@@ -245,15 +283,69 @@ function bindEvents() {
   elements.roomForm.addEventListener('input', () => { if (view.roomDraft) view.roomDraft.dirty = true; });
   elements.roomForm.addEventListener('change', () => { if (view.roomDraft) view.roomDraft.dirty = true; });
   elements.roomDuck.addEventListener('input', () => { elements.roomDuckValue.textContent = `${elements.roomDuck.value}%`; });
+  elements.localSpeaker.addEventListener('change', () => {
+    const local = view.roomDraft?.local;
+    if (!local) return;
+    local.choice = elements.localSpeaker.value;
+    local.edited = true;
+    const device = local.devices.find((item) => item.selection_id === local.choice);
+    local.binding = device?.can_bind_by[0] || null;
+    renderLocalSpeaker();
+  });
+  elements.localSpeakerBinding.addEventListener('change', () => {
+    if (!view.roomDraft) return;
+    view.roomDraft.local.binding = elements.localSpeakerBinding.value;
+    view.roomDraft.local.edited = true;
+    renderLocalSpeaker();
+  });
+  elements.localAudioDevice.addEventListener('input', () => {
+    if (!view.roomDraft) return;
+    view.roomDraft.local.choice = 'advanced';
+    view.roomDraft.local.edited = true;
+    renderLocalSpeaker();
+  });
+  elements.refreshLocalSpeakers.addEventListener('click', () => loadLocalSpeakers(view.roomDraft));
   elements.deleteRoom.addEventListener('click', deleteRoom);
   elements.reloadRoomDraft.addEventListener('click', () => reloadRoom());
   elements.speakerForm.addEventListener('submit', saveSpeakers);
   elements.refreshSpeakers.addEventListener('click', async () => { await store.refresh(); renderSpeakers(); });
   elements.reloadSpeakerDraft.addEventListener('click', reloadSpeakers);
+  elements.measureTiming.addEventListener('click', () => openCalibration(view.speakerDraft?.id));
+  elements.calibrationForm.addEventListener('submit', startCalibration);
+  elements.calibrationForm.addEventListener('input', () => { if (view.calibrationDraft) view.calibrationDraft.dirty = true; });
+  elements.calibrationUpload.addEventListener('submit', uploadCalibration);
+  elements.calibrationOff.addEventListener('click', () => calibrationRoomToggle(false));
+  elements.calibrationOn.addEventListener('click', () => calibrationRoomToggle(true));
+  elements.calibrationReferenceOn.addEventListener('click', calibrationReferenceOn);
+  elements.calibrationReferenceRoom.addEventListener('change', populateCalibrationReference);
+  elements.calibrationApply.addEventListener('click', () => applyCalibration(false));
+  elements.calibrationRollback.addEventListener('click', () => applyCalibration(true));
+  elements.calibrationEnd.addEventListener('click', endCalibration);
+  elements.calibrationRefresh.addEventListener('click', refreshCalibration);
+  elements.calibrationNew.addEventListener('click', () => {
+    const draft = view.calibrationDraft;
+    if (!draft || draft.loading || store.busy.has(draft.id) || !confirmDiscard()) return;
+    view.calibrationSessions.delete(draft.id);
+    draft.newSession = true;
+    draft.dirty = false;
+    elements.calibrationUpload.reset();
+    renderCalibration();
+  });
+  elements.calibrationHistory.addEventListener('change', () => {
+    const draft = view.calibrationDraft;
+    if (!draft || draft.loading || store.busy.has(draft.id)) return;
+    const session = view.calibrationHistory.get(draft.id)?.find((item) => item.id === elements.calibrationHistory.value);
+    if (!session) return;
+    view.calibrationSessions.set(draft.id, session);
+    draft.newSession = false;
+    draft.dirty = false;
+    elements.calibrationUpload.reset();
+    renderCalibration();
+  });
   elements.refreshEvents.addEventListener('click', loadEvents);
   elements.diagnostics.addEventListener('toggle', () => { if (elements.diagnostics.open) loadEvents(); });
   for (const element of document.querySelectorAll('[data-close]')) element.addEventListener('click', () => closeSheet(element.dataset.close));
-  for (const [kind, dialog] of [['room', elements.roomDialog], ['speakers', elements.speakerDialog]]) {
+  for (const [kind, dialog] of [['room', elements.roomDialog], ['speakers', elements.speakerDialog], ['calibration', elements.calibrationDialog]]) {
     dialog.addEventListener('cancel', (event) => { event.preventDefault(); closeSheet(kind); });
   }
   document.addEventListener('visibilitychange', () => { if (!document.hidden && !store.authRequired) store.refresh(); });
@@ -296,6 +388,22 @@ function render() {
     view.speakerDraft = null;
     elements.roomDialog.close();
     elements.speakerDialog.close();
+    view.calibrationDraft = null;
+    view.calibrationSessions.clear();
+    view.calibrationHistory.clear();
+    elements.calibrationDialog.close();
+    elements.calibrationForm.reset();
+    elements.calibrationUpload.reset();
+    elements.calibrationReference.replaceChildren();
+    elements.calibrationReferenceRoom.replaceChildren();
+    elements.calibrationTarget.replaceChildren();
+    elements.calibrationHistory.replaceChildren();
+    delete elements.calibrationHistory.dataset.signature;
+    elements.calibrationTitle.textContent = 'Speaker calibration';
+    elements.calibrationApplyHelp.textContent = '';
+    elements.calibrationResult.replaceChildren();
+    elements.calibrationProbe.removeAttribute('href');
+    elements.calibrationExport.removeAttribute('href');
     for (const id of view.speech.keys()) releaseSpeech(id);
     return;
   }
@@ -320,6 +428,7 @@ function render() {
   renderCapabilities(snapshot.capabilities || {});
   renderSheetBusy();
   if (view.speakerDraft) renderSpeakers();
+  if (view.calibrationDraft) renderCalibration();
 }
 
 function renderCards() {
@@ -415,11 +524,11 @@ function renderCard(room) {
 
 function renderCapabilities(capabilities) {
   const list = node('ul');
-  list.append(node('li', '', 'Music input: AirPlay. Generic Cast receiver input is not provided.'));
+  list.append(node('li', '', 'Music input: AirPlay. Chromecast receiver input is deferred.'));
   list.append(node('li', '', 'Spoken replies: room-addressed WebRTC audio. Nobly integration uses the room ID you configure.'));
   list.append(node('li', '', 'Outputs: available OwnTone AirPlay and Cast devices; local ALSA audio when configured. Cast timing is approximate.'));
-  list.append(node('li', '', 'Bluetooth: a paired local adapter and working ALSA/BlueALSA output are required.'));
-  list.append(node('li', '', 'Saved timing offsets are applied by OwnTone and checked against its reported values. Microphone measurement and drift correction are separate steps.'));
+  list.append(node('li', '', 'Bluetooth outputs: pair the main speaker. If its speakers are linked as a group, they share this room’s music and spoken replies.'));
+  list.append(node('li', '', 'Calibration: import shared-clock stereo microphone recordings, review stable delay and jitter, then save a correction with the room off. Long-term drift and physical synchronization require further measurements.'));
   if (typeof capabilities.sync === 'string') list.append(node('li', '', capabilities.sync));
   else if (capabilities.sync?.note) list.append(node('li', '', capabilities.sync.note));
   elements.capabilityDetails.replaceChildren(list);
@@ -453,14 +562,15 @@ async function logout() {
   finally { elements.signOut.disabled = false; }
 }
 
-function draftDirty() { return !!view.roomDraft?.dirty || !!view.speakerDraft?.dirty || !!view.speakerDraft?.offsets.size; }
+function draftDirty() { return !!view.roomDraft?.dirty || !!view.speakerDraft?.dirty || !!view.speakerDraft?.offsets.size || !!view.speakerDraft?.balances.size || !!view.calibrationDraft?.dirty; }
 function confirmDiscard() { return !draftDirty() || window.confirm('Discard the unsaved room or speaker changes?'); }
 
 function closeSheet(kind, { force = false } = {}) {
-  const draft = kind === 'room' ? view.roomDraft : view.speakerDraft;
+  const draft = kind === 'room' ? view.roomDraft : kind === 'calibration' ? view.calibrationDraft : view.speakerDraft;
   if (!force && draft && store.busy.has(draft.id || 'create')) return false;
-  if (!force && (draft?.dirty || draft?.offsets?.size) && !window.confirm('Discard the unsaved changes?')) return false;
+  if (!force && (draft?.dirty || draft?.offsets?.size || draft?.balances?.size) && !window.confirm('Discard the unsaved changes?')) return false;
   if (kind === 'room') { view.roomDraft = null; elements.roomDialog.close(); }
+  else if (kind === 'calibration') { view.calibrationDraft = null; elements.calibrationDialog.close(); }
   else { view.speakerDraft = null; elements.speakerDialog.close(); }
   return true;
 }
@@ -471,12 +581,18 @@ function openRoom(id = null, { force = false } = {}) {
   closeSheet('speakers', { force: true });
   const room = id ? store.room(id) : null;
   if (id && !room) return;
-  view.roomDraft = { id, revision: room?.revision, dirty: false };
+  const savedDevice = room?.local_audio_device || null;
+  view.roomDraft = { id, revision: room?.revision, dirty: false, local: {
+    savedDevice, choice: savedDevice ? validLocalDeviceURI(savedDevice) ? 'saved' : 'advanced' : 'none',
+    binding: null, devices: [], confirmed: new Map(), edited: false, loading: false, request: 0, error: '',
+  } };
   elements.roomDialogTitle.textContent = room ? room.name : 'Add a room';
   elements.roomName.value = room?.name || '';
   elements.airplayName.value = room?.airplay_name || '';
   elements.noblyRoomId.value = room?.nobly_room_id || '';
-  elements.localAudioDevice.value = room?.local_audio_device || '';
+  elements.localAudioDevice.value = savedDevice && !validLocalDeviceURI(savedDevice) ? savedDevice : '';
+  elements.localAudioAdvanced.open = !!elements.localAudioDevice.value;
+  renderLocalSpeaker();
   const interfaces = store.snapshot?.interfaces || [];
   const options = room?.interface && !interfaces.includes(room.interface) ? [room.interface, ...interfaces] : interfaces;
   elements.roomInterface.replaceChildren(...options.map((name) => {
@@ -503,6 +619,68 @@ function openRoom(id = null, { force = false } = {}) {
   notice(elements.roomFormError, '');
   if (!elements.roomDialog.open) elements.roomDialog.showModal();
   elements.roomName.focus();
+  loadLocalSpeakers(view.roomDraft);
+}
+
+function renderLocalSpeaker() {
+  const local = view.roomDraft?.local;
+  if (!local) return;
+  const choices = [['none', 'Network speakers only']];
+  if (validLocalDeviceURI(local.savedDevice)) {
+    const saved = local.devices.find((item) => item.bindings.some((binding) => binding.device === local.savedDevice));
+    choices.push(['saved', saved ? `Keep saved local speaker · ${saved.label}` : 'Saved local speaker (not currently available)']);
+  }
+  choices.push(...local.devices.map((device) => [device.selection_id, device.label]));
+  if (!choices.some(([value]) => value === local.choice) && !['advanced', 'none'].includes(local.choice)) {
+    choices.push([local.choice, 'Selected local speaker (not currently available)']);
+  }
+  choices.push(['advanced', 'Advanced Bluetooth or existing device']);
+  elements.localSpeaker.replaceChildren(...choices.map(([value, label]) => {
+    const option = node('option', '', label); option.value = value; return option;
+  }));
+  elements.localSpeaker.value = local.choice;
+  const device = local.devices.find((item) => item.selection_id === local.choice);
+  elements.localBindingFields.hidden = !device;
+  elements.localSpeakerBinding.replaceChildren(...(device?.can_bind_by || []).map((mode) => {
+    const option = node('option', '', localBindingNames[mode]); option.value = mode; return option;
+  }));
+  elements.localSpeakerBinding.value = local.binding || '';
+  elements.localBindingHelp.textContent = localBindingHelp[local.binding] || '';
+  if (local.choice === 'advanced') elements.localAudioAdvanced.open = true;
+  const retained = validLocalDeviceURI(local.savedDevice) && local.choice === 'saved';
+  elements.localSpeakerStatus.textContent = local.loading ? 'Checking connected local speakers…'
+    : local.error ? `${local.error}${retained ? ' Your saved speaker is retained.' : ''}`
+    : retained ? 'Your saved speaker is retained. Reconnect it or choose a replacement.'
+    : device ? 'This speaker is verified when you save. Then select its local output in Room speakers.'
+    : !['none', 'advanced'].includes(local.choice) ? 'This selection is no longer available. Refresh devices and choose it again before saving.'
+    : local.devices.length ? 'Choose a connected local speaker, or use network speakers only.'
+    : 'No local speakers found. You can still use network speakers or a configured Bluetooth device.';
+}
+
+async function loadLocalSpeakers(draft) {
+  if (!draft || view.roomDraft !== draft || store.busy.has(draft.id || 'create')) return;
+  const local = draft.local;
+  const request = ++local.request;
+  local.loading = true;
+  local.error = '';
+  renderLocalSpeaker();
+  try {
+    const result = await client.request('/local-devices');
+    if (view.roomDraft !== draft || request !== local.request) return;
+    if (!validLocalDeviceInventory(result)) throw new ApiError('Shiri returned an invalid local speaker inventory. Refresh devices.');
+    local.devices = result.devices;
+    if (!local.edited && validLocalDeviceURI(local.savedDevice)) {
+      const device = local.devices.find((item) => item.bindings.some((binding) => binding.device === local.savedDevice));
+      local.choice = device?.selection_id || 'saved';
+      local.binding = device?.bindings.find((binding) => binding.device === local.savedDevice)?.binding || null;
+    }
+  } catch (error) {
+    if (view.roomDraft !== draft || request !== local.request) return;
+    if (error.status === 401) { store.requireAuth(); return; }
+    local.error = error.message;
+  } finally {
+    if (view.roomDraft === draft && request === local.request) { local.loading = false; renderLocalSpeaker(); }
+  }
 }
 
 function reloadRoom() {
@@ -527,13 +705,41 @@ async function saveRoom(event) {
   const changes = {
     name: elements.roomName.value.trim(), airplay_name: elements.airplayName.value.trim() || elements.roomName.value.trim(),
     nobly_room_id: elements.noblyRoomId.value || null, interface: elements.roomInterface.value,
-    local_audio_device: elements.localAudioDevice.value || null, duck_gain: 1 - Number(elements.roomDuck.value) / 100,
+    local_audio_device: null, duck_gain: 1 - Number(elements.roomDuck.value) / 100,
   };
   if (!changes.name || !changes.interface) { notice(elements.roomFormError, 'A room name and speaker network are required.'); return; }
-  const { duck_gain: _duckGain, ...definition } = changes;
-  const result = await store.change(draft.id || 'create', () => draft.id
-    ? client.request(`/rooms/${encodeURIComponent(draft.id)}`, { method: 'PATCH', body: { expected_revision: draft.revision, changes } })
-    : client.request('/rooms', { method: 'POST', body: definition }));
+  const local = draft.local;
+  const choice = local.choice;
+  const device = local.devices.find((item) => item.selection_id === choice);
+  const binding = local.binding;
+  const knownBinding = device?.bindings.find((item) => item.binding === binding);
+  const advancedDevice = elements.localAudioDevice.value.trim() || null;
+  if (!['none', 'saved', 'advanced'].includes(choice) && !knownBinding) {
+    notice(elements.roomFormError, 'Refresh devices and choose an available local speaker before saving.'); return;
+  }
+  const result = await store.change(draft.id || 'create', async () => {
+    if (choice === 'saved') changes.local_audio_device = local.savedDevice;
+    else if (choice === 'advanced') changes.local_audio_device = advancedDevice;
+    else if (knownBinding) {
+      const confirmedKey = `${device.selection_id}:${binding}`;
+      if (local.savedDevice && knownBinding.device === local.savedDevice) changes.local_audio_device = local.savedDevice;
+      else if (local.confirmed.has(confirmedKey)) changes.local_audio_device = local.confirmed.get(confirmedKey);
+      else {
+        const ack = await client.request('/local-devices/bind', { method: 'POST', body: {
+          selection_id: device.selection_id, binding, conversion: true,
+        } });
+        if (!validLocalBindingAck(ack, binding, knownBinding.device)) throw new ApiError('Shiri did not confirm the selected local speaker. Refresh devices before saving.');
+        changes.local_audio_device = ack.device;
+        // Keep the confirmed binding for a room-save retry without enrolling it again.
+        local.confirmed.set(confirmedKey, ack.device);
+      }
+    }
+    if (view.roomDraft !== draft) throw new ApiError('Room setup closed before saving. Open the room and review its settings.');
+    const { duck_gain: _duckGain, ...definition } = changes;
+    return draft.id
+      ? client.request(`/rooms/${encodeURIComponent(draft.id)}`, { method: 'PATCH', body: { expected_revision: draft.revision, changes } })
+      : client.request('/rooms', { method: 'POST', body: definition });
+  });
   if (result.ok) {
     closeSheet('room', { force: true });
     toast(result.data?.runtime_accepted === false ? 'Room settings saved. Audio changes are pending; check room status.' : draft.id ? 'Room settings saved' : 'Room created. Turn it on, then choose its speakers.');
@@ -556,7 +762,7 @@ function openSpeakers(id, { force = false } = {}) {
   const room = store.room(id);
   if (!room) return;
   closeSheet('room', { force: true });
-  view.speakerDraft = { id, revision: room.revision, selected: new Set(room.speakers.map((speaker) => speaker.id)), dirty: false, offsets: new Map() };
+  view.speakerDraft = { id, revision: room.revision, selected: new Set(room.speakers.map((speaker) => speaker.id)), dirty: false, offsets: new Map(), balances: new Map() };
   elements.speakerDialogTitle.textContent = room.name;
   elements.reloadSpeakerDraft.hidden = true;
   notice(elements.speakerFormError, '');
@@ -594,6 +800,8 @@ function renderSpeakers() {
   }
   elements.saveSpeakers.disabled = locked || !canSaveSelection(room, draft);
   elements.refreshSpeakers.disabled = locked;
+  elements.measureTiming.disabled = locked;
+  elements.measureTiming.title = room.speakers.length < 2 ? 'Assign at least two speakers to measure relative arrival.' : 'Measure using two microphones sharing one capture clock.';
 }
 
 function renderSpeakerOption(room, draft, output, locked) {
@@ -631,6 +839,20 @@ function renderSpeakerOption(room, draft, output, locked) {
     const reported = output.savedOnly || output.offset_ms === undefined ? 'Not reported' : `${output.offset_ms} ms`;
     timing.append(label, offset, save, node('p', 'hint', `Saved: ${output.requested_offset_ms ?? saved.offset_ms ?? 0} ms · OwnTone reported: ${reported}. Positive values add delay. Applying a delay briefly restarts playback in this room. Reported settings do not establish measured synchronization.`));
     row.append(timing);
+    const balancing = node('div', 'speaker-timing speaker-balance');
+    const balanceLabel = node('label', '', 'Saved speaker balance (%)');
+    const balance = node('input'); balance.type = 'number'; balance.min = '0'; balance.max = '100'; balance.step = '1';
+    balance.value = String(draft.balances.get(output.id) ?? saved.balance_percent ?? 100);
+    balance.disabled = locked;
+    balance.id = `balance-${room.id}-${output.id}`;
+    balanceLabel.htmlFor = balance.id;
+    balance.setAttribute('aria-label', `Saved balance for ${output.name || output.id}`);
+    const saveBalanceButton = button('Save balance', 'quiet', () => saveBalance(room.id, output.id));
+    saveBalanceButton.disabled = locked || !draft.balances.has(output.id);
+    balance.addEventListener('input', () => { draft.balances.set(output.id, balance.value); saveBalanceButton.disabled = !balance.validity.valid || store.busy.has(room.id); });
+    const reportedBalance = Number.isInteger(output.balance_percent) ? `${output.balance_percent}%` : 'Not reported';
+    balancing.append(balanceLabel, balance, saveBalanceButton, node('p', 'hint', `Saved: ${saved.balance_percent ?? 100}% · Applied: ${reportedBalance}. Set this once to balance a louder speaker. 100% keeps its full level; lower values reduce music and speech. Use Room volume for normal listening.`));
+    row.append(balancing);
   }
   return row;
 }
@@ -645,7 +867,7 @@ async function saveSpeakers(event) {
     draft.dirty = false;
     draft.revision = result.data?.room?.revision ?? store.room(draft.id)?.revision ?? draft.revision;
     toast(result.data?.runtime_accepted === false ? 'Speaker assignments saved. Playback changes are pending; check room status.' : 'Speaker assignments saved');
-    if (!draft.offsets.size) closeSheet('speakers', { force: true });
+    if (!draft.offsets.size && !draft.balances.size) closeSheet('speakers', { force: true });
     else renderSpeakers();
   } else if (!result.skipped && view.speakerDraft === draft) {
     notice(elements.speakerFormError, result.error.message);
@@ -672,6 +894,25 @@ async function saveOffset(roomId, speakerId) {
   }
 }
 
+async function saveBalance(roomId, speakerId) {
+  const draft = view.speakerDraft;
+  if (!draft || draft.id !== roomId) return;
+  const raw = draft.balances.get(speakerId);
+  const balance = Number(raw);
+  if (raw === undefined || raw === '' || !Number.isInteger(balance) || balance < 0 || balance > 100) { notice(elements.speakerFormError, 'Use a whole speaker balance between 0 and 100%.'); return; }
+  const result = await store.change(roomId, () => client.request(`/rooms/${encodeURIComponent(roomId)}/speakers/${encodeURIComponent(speakerId)}/balance`, { method: 'PATCH', body: { expected_revision: draft.revision, balance_percent: balance } }));
+  if (result.ok) {
+    draft.balances.delete(speakerId);
+    draft.revision = result.data?.room?.revision ?? store.room(roomId)?.revision ?? draft.revision;
+    notice(elements.speakerFormError, '');
+    toast(result.data?.runtime_accepted === false ? 'Speaker balance saved. Application is pending; check room status.' : 'Speaker balance saved');
+    renderSpeakers();
+  } else if (!result.skipped && view.speakerDraft === draft) {
+    notice(elements.speakerFormError, result.error.message);
+    elements.reloadSpeakerDraft.hidden = !result.conflict;
+  }
+}
+
 function renderSheetBusy() {
   for (const [draft, form, key] of [[view.roomDraft, elements.roomForm, view.roomDraft?.id || 'create'], [view.speakerDraft, elements.speakerForm, view.speakerDraft?.id]]) {
     if (!draft) continue;
@@ -682,6 +923,325 @@ function renderSheetBusy() {
       else if (control.dataset.wasDisabled !== undefined) { control.disabled = control.dataset.wasDisabled === 'true'; delete control.dataset.wasDisabled; }
     }
   }
+}
+
+export function validCalibrationSession(session, roomId) {
+  return !!session && session.room_id === roomId && typeof session.id === 'string' && session.id.length <= 128
+    && typeof session.target_id === 'string' && typeof session.reference_id === 'string'
+    && (session.target_id !== session.reference_id || typeof session.reference_room_id === 'string' && session.reference_room_id !== roomId)
+    && (session.reference_room_id === undefined || typeof session.reference_room_id === 'string'
+      && !!session.reference_configuration && Array.isArray(session.reference_configuration.speakers)
+      && Number.isSafeInteger(session.reference_revision) && session.reference_revision >= 1
+      && typeof session.playback_context === 'string' && session.playback_context.length > 0 && session.playback_context.length <= 512)
+    && Number.isSafeInteger(session.generation) && session.generation >= 1
+    && !!session.configuration && Array.isArray(session.configuration.speakers)
+    && !!session.result && ['insufficient_evidence', 'candidate_correction'].includes(session.result.status)
+    && Array.isArray(session.result.reasons) && session.result.reasons.every((reason) => typeof reason === 'string')
+    && ['insufficient_evidence', 'candidate_correction', 'offset_saved', 'measured_at_this_setup', 'verification_failed', 'rolled_back'].includes(session.status)
+    && [session.recordings, session.verification_recordings].every((records) => Array.isArray(records) && records.length <= 12
+      && records.every((record) => !!record && Array.isArray(record.markers) && record.markers.length <= 8
+        && record.markers.every((marker) => !!marker && typeof marker.accepted === 'boolean')))
+    && (session.result.status !== 'candidate_correction' || Number.isInteger(session.result.candidate_offset_ms) && Math.abs(session.result.candidate_offset_ms) <= 2000);
+}
+
+function calibrationConfiguration(configuration) {
+  const speakers = configuration.speakers.map((speaker) => {
+    const value = { ...speaker };
+    // The default balance preserves stored calibration profiles from before
+    // balance settings existed. A changed balance still invalidates evidence.
+    if (value.balance_percent === 100) delete value.balance_percent;
+    return value;
+  });
+  return { ...configuration, speakers };
+}
+
+export function calibrationMatchesRoom(room, session, referenceRoom = room) {
+  if (!room || room.id !== session?.room_id || !session.configuration) return false;
+  const expected = { ...session.configuration, speakers: session.configuration.speakers.map((speaker) => ({ ...speaker })) };
+  if (session.applied_revision !== null && session.applied_revision !== undefined && session.status !== 'rolled_back') {
+    for (const speaker of expected.speakers) if (speaker.id === session.target_id) speaker.offset_ms = session.applied_offset_ms;
+  }
+  const observed = Object.fromEntries(Object.keys(expected).map((key) => [key, room[key]]));
+  if (JSON.stringify(calibrationConfiguration(expected)) !== JSON.stringify(calibrationConfiguration(observed))) return false;
+  if ((session.reference_room_id || room.id) === room.id) return true;
+  if (!referenceRoom || referenceRoom.id !== session.reference_room_id || !session.reference_configuration) return false;
+  const referenceObserved = Object.fromEntries(Object.keys(session.reference_configuration).map((key) => [key, referenceRoom[key]]));
+  return JSON.stringify(calibrationConfiguration(referenceObserved)) === JSON.stringify(calibrationConfiguration(session.reference_configuration));
+}
+
+export function calibrationEvidenceScope(session) {
+  const recordings = Array.isArray(session?.recordings) ? session.recordings : [];
+  const verification = Array.isArray(session?.verification_recordings) ? session.verification_recordings : [];
+  const backend = Array.isArray(session?.verification_backend) ? session.verification_backend : [];
+  const observations = [...recordings, ...verification].map((record) => record?.environment_at_import);
+  observations.push(...backend);
+  // Today's runtime mode cannot change the scope of retained observations.
+  // Missing legacy observations remain unknown, even when the current runtime
+  // is real. Neither a real observation nor imported PCM certifies capture origin.
+  return {
+    simulated: observations.some((observation) => observation?.simulation === true),
+    unknown: verification.length !== backend.length
+      || session?.status === 'measured_at_this_setup' && !verification.length
+      || observations.some((observation) => typeof observation?.simulation !== 'boolean' || observation?.runtime_unavailable === true),
+  };
+}
+
+const calibrationPath = (roomId, sessionId = '') => `/rooms/${encodeURIComponent(roomId)}/calibration${sessionId ? `/${encodeURIComponent(sessionId)}` : ''}`;
+const measuredNumber = (value, suffix = ' ms') => Number.isFinite(value) ? `${value.toFixed(3)}${suffix}` : 'Not measured';
+
+async function openCalibration(roomId) {
+  if (!roomId || store.busy.has(roomId) || !confirmDiscard()) return;
+  const room = store.room(roomId);
+  if (!room) return;
+  closeSheet('speakers', { force: true });
+  closeSheet('room', { force: true });
+  view.calibrationDraft = { id: roomId, revision: room.revision, dirty: false, loading: false };
+  elements.calibrationForm.reset();
+  elements.calibrationUpload.reset();
+  const rooms = store.snapshot?.rooms || [];
+  elements.calibrationReferenceRoom.replaceChildren(...rooms.map((item) => {
+    const option = node('option', '', item.name); option.value = item.id; return option;
+  }));
+  elements.calibrationReferenceRoom.value = room.speakers.length < 2 ? (rooms.find((item) => item.id !== room.id && item.speakers.length)?.id || room.id) : room.id;
+  elements.calibrationTarget.replaceChildren(...room.speakers.map((speaker) => {
+      const option = node('option', '', speaker.name); option.value = speaker.id; return option;
+    }));
+  elements.calibrationTarget.value = room.speakers[1]?.id || room.speakers[0]?.id || '';
+  populateCalibrationReference();
+  notice(elements.calibrationError, '');
+  renderCalibration();
+  if (!elements.calibrationDialog.open) elements.calibrationDialog.showModal();
+  await refreshCalibration();
+}
+
+function populateCalibrationReference() {
+  const draft = view.calibrationDraft;
+  if (!draft) return;
+  const reference = store.room(elements.calibrationReferenceRoom.value);
+  elements.calibrationReference.replaceChildren(...(reference?.speakers || []).map((speaker) => {
+    const option = node('option', '', speaker.name); option.value = speaker.id; return option;
+  }));
+  elements.calibrationContext.required = reference?.id !== draft.id;
+}
+
+async function refreshCalibration() {
+  const draft = view.calibrationDraft;
+  if (!draft || draft.loading || store.authRequired || store.busy.has(draft.id)) return;
+  draft.loading = true;
+  renderCalibration();
+  try {
+    const previous = view.calibrationSessions.get(draft.id);
+    const data = await client.request(calibrationPath(draft.id));
+    if (view.calibrationDraft !== draft || store.authRequired) return;
+    if (!Array.isArray(data?.sessions) || data.sessions.length > 128 || data.sessions.some((item) => !validCalibrationSession(item, draft.id))) throw new ApiError('Calibration returned incomplete evidence. Refresh to check the session.');
+    view.calibrationHistory.set(draft.id, data.sessions);
+    const session = data.sessions.find((item) => item.id === previous?.id) || (!draft.newSession ? data.sessions.at(-1) : undefined);
+    if (session) view.calibrationSessions.set(draft.id, session);
+    else view.calibrationSessions.delete(draft.id);
+  } catch (error) {
+    if (error.status === 401) store.requireAuth();
+    else if (view.calibrationDraft === draft) {
+      if (error.status === 404) view.calibrationSessions.delete(draft.id);
+      notice(elements.calibrationError, error.message);
+    }
+  } finally { draft.loading = false; if (view.calibrationDraft === draft) renderCalibration(); }
+}
+
+async function startCalibration(event) {
+  event.preventDefault();
+  const draft = view.calibrationDraft;
+  if (!draft || draft.loading || view.calibrationSessions.has(draft.id)) return;
+  const body = { expected_revision: store.room(draft.id)?.revision ?? draft.revision, reference_id: elements.calibrationReference.value,
+    target_id: elements.calibrationTarget.value, capture_device: elements.calibrationDevice.value.trim(),
+    geometry: elements.calibrationGeometry.value.trim(), max_lag_ms: Number(elements.calibrationMaxLag.value),
+    geometry_correction_ms: Number(elements.calibrationGeometryCorrection.value) };
+  const reference = store.room(elements.calibrationReferenceRoom.value);
+  if (!reference) { notice(elements.calibrationError, 'Choose a currently configured reference zone.'); return; }
+  body.reference_room_id = reference.id;
+  body.expected_reference_revision = reference.revision;
+  if (elements.calibrationContext.value.trim()) body.playback_context = elements.calibrationContext.value.trim();
+  if (reference.id === draft.id && body.reference_id === body.target_id) { notice(elements.calibrationError, 'Choose two different room/speaker endpoints.'); return; }
+  const result = await store.change(draft.id, async () => {
+    const session = await client.request(calibrationPath(draft.id), { method: 'POST', body });
+    if (!validCalibrationSession(session, draft.id)) throw new ApiError('Shiri did not confirm the measurement session. Refresh before starting another.', { ambiguous: true });
+    return session;
+  });
+  if (result.ok && !store.authRequired) {
+    draft.dirty = false;
+    view.calibrationSessions.set(draft.id, result.data);
+    view.calibrationHistory.set(draft.id, [...(view.calibrationHistory.get(draft.id) || []), result.data]);
+    draft.newSession = false;
+    notice(elements.calibrationError, '');
+  } else if (!result.skipped && view.calibrationDraft === draft) notice(elements.calibrationError, result.error.message);
+  renderCalibration();
+}
+
+async function uploadCalibration(event) {
+  event.preventDefault();
+  const draft = view.calibrationDraft;
+  const session = draft && view.calibrationSessions.get(draft.id);
+  const file = elements.calibrationFile.files[0];
+  if (!session || !file || draft.loading) return;
+  if (file.size > 2 * 1024 * 1024 || !file.size) { notice(elements.calibrationError, 'Import a complete stereo PCM WAV no larger than 2 MiB.'); return; }
+  const verification = session.applied_revision !== null && session.applied_revision !== undefined;
+  if (verification && !elements.calibrationVerifyConfirm.checked) { notice(elements.calibrationError, 'Confirm this is a fresh recording made after applying the saved delay.'); return; }
+  const result = await store.change(draft.id, async () => {
+    const data = await client.request(`${calibrationPath(draft.id, session.id)}/recordings${verification ? '?verification=true' : ''}`, { method: 'POST', rawBody: file });
+    if (!validCalibrationSession(data, draft.id)) throw new ApiError('Shiri did not confirm the analysis. Refresh the session before uploading again.', { ambiguous: true });
+    return data;
+  });
+  if (result.ok && !store.authRequired) {
+    view.calibrationSessions.set(draft.id, result.data);
+    view.calibrationHistory.set(draft.id, (view.calibrationHistory.get(draft.id) || []).map((item) => item.id === result.data.id ? result.data : item));
+    notice(elements.calibrationError, '');
+    elements.calibrationUpload.reset();
+  } else if (!result.skipped && view.calibrationDraft === draft) notice(elements.calibrationError, result.error.message);
+  renderCalibration();
+}
+
+async function calibrationRoomToggle(enabled) {
+  const draft = view.calibrationDraft;
+  const room = draft && store.room(draft.id);
+  if (!room || draft.loading) return;
+  const result = await store.change(room.id, () => patchRoom(room, { enabled }));
+  if (result.ok) notice(elements.calibrationError, result.data?.runtime_accepted === false ? 'Room setting saved; runtime application is pending. Check room status.' : '', 'warning');
+  else if (!result.skipped && view.calibrationDraft === draft) notice(elements.calibrationError, result.error.message);
+  renderCalibration();
+}
+
+async function calibrationReferenceOn() {
+  const draft = view.calibrationDraft;
+  const session = draft && view.calibrationSessions.get(draft.id);
+  const reference = session && store.room(session.reference_room_id);
+  if (!reference || reference.id === draft.id) return;
+  const result = await store.change(reference.id, () => client.request(`/rooms/${encodeURIComponent(reference.id)}`, { method: 'PATCH', body: { expected_revision: reference.revision, changes: { enabled: true } } }));
+  if (result.ok) notice(elements.calibrationError, result.data?.runtime_accepted === false ? 'Reference zone setting saved; runtime application is pending.' : '', 'warning');
+  else if (!result.skipped && view.calibrationDraft === draft) notice(elements.calibrationError, result.error.message);
+  renderCalibration();
+}
+
+async function applyCalibration(rollback) {
+  const draft = view.calibrationDraft;
+  const room = draft && store.room(draft.id);
+  const session = draft && view.calibrationSessions.get(draft.id);
+  if (!room || !session || draft.loading || room.enabled) return;
+  const result = await store.change(room.id, async () => {
+    const reference = store.room(session.reference_room_id || room.id);
+    const data = await client.request(`${calibrationPath(room.id, session.id)}/${rollback ? 'rollback' : 'apply'}`, { method: 'POST', body: { expected_revision: room.revision, expected_generation: session.generation, expected_reference_revision: reference?.revision } });
+    if (!validCalibrationSession(data?.calibration, room.id)) throw new ApiError('Shiri did not confirm the timing receipt. Refresh before changing it again.', { ambiguous: true });
+    return data;
+  });
+  if (result.ok && !store.authRequired) {
+    view.calibrationSessions.set(room.id, result.data.calibration);
+    view.calibrationHistory.set(room.id, (view.calibrationHistory.get(room.id) || []).map((item) => item.id === session.id ? result.data.calibration : item));
+    notice(elements.calibrationError, '');
+    toast(rollback ? 'Previous delay saved. Enable the room to apply it.' : 'Candidate delay saved. Fresh recordings are needed to verify it.');
+  } else if (!result.skipped && view.calibrationDraft === draft) notice(elements.calibrationError, result.error.message);
+  renderCalibration();
+}
+
+async function endCalibration() {
+  const draft = view.calibrationDraft;
+  const session = draft && view.calibrationSessions.get(draft.id);
+  if (!session || draft.loading) return;
+  const result = await store.change(draft.id, () => client.request(calibrationPath(draft.id, session.id), { method: 'DELETE' }));
+  if (result.ok && !store.authRequired) {
+    view.calibrationSessions.delete(draft.id);
+    view.calibrationHistory.set(draft.id, (view.calibrationHistory.get(draft.id) || []).filter((item) => item.id !== session.id));
+    draft.newSession = true;
+    draft.revision = store.room(draft.id)?.revision;
+    notice(elements.calibrationError, 'Session evidence removed. Saved speaker delays remain unchanged.', 'warning');
+  } else if (!result.skipped && view.calibrationDraft === draft) notice(elements.calibrationError, result.error.message);
+  renderCalibration();
+}
+
+function renderCalibration() {
+  const draft = view.calibrationDraft;
+  if (!draft || store.authRequired) return;
+  const room = store.room(draft.id);
+  if (!room) { notice(elements.calibrationError, 'This room was removed. Close this panel.'); return; }
+  elements.calibrationTitle.textContent = `${room.name} · Timing`;
+  const session = view.calibrationSessions.get(draft.id);
+  const referenceRoom = session && store.room(session.reference_room_id || draft.id);
+  const busy = store.busy.has(draft.id) || store.busy.has(referenceRoom?.id) || draft.loading;
+  const canAnalyze = store.snapshot?.capabilities?.calibration_analysis !== false;
+  const history = view.calibrationHistory.get(draft.id) || [];
+  elements.calibrationHistoryControls.hidden = !history.length;
+  const signature = JSON.stringify(history.map((item) => [item.id, item.status]));
+  if (elements.calibrationHistory.dataset.signature !== signature) {
+    elements.calibrationHistory.replaceChildren(node('option', '', 'Choose a retained measurement'), ...history.map((item) => {
+      const speaker = room.speakers.find((output) => output.id === item.target_id)?.name || item.target_id;
+      const option = node('option', '', `${speaker} · ${item.status.replaceAll('_', ' ')} · ${new Date(item.created_at * 1000).toLocaleString()}`);
+      option.value = item.id; return option;
+    }));
+    elements.calibrationHistory.options[0].value = '';
+    elements.calibrationHistory.dataset.signature = signature;
+  }
+  elements.calibrationHistory.value = session?.id || '';
+  elements.calibrationHistory.disabled = elements.calibrationNew.disabled = busy;
+  elements.calibrationForm.hidden = !!session || draft.loading;
+  elements.calibrationSession.hidden = !session;
+  for (const control of elements.calibrationForm.querySelectorAll('input, select, button')) control.disabled = busy;
+  elements.calibrationStart.disabled = busy || !canAnalyze || room.speakers.length < 1;
+  if (!session && !busy && (!canAnalyze || room.speakers.length < 1)) notice(elements.calibrationError, !canAnalyze ? 'Analysis requires the optional audio dependency. Retained evidence and rollback remain available.' : 'Assign a target speaker before starting a measurement. Retained evidence remains available.', 'warning');
+  if (!session) return;
+  const applied = session.applied_revision !== null && session.applied_revision !== undefined;
+  const rolledBack = session.status === 'rolled_back';
+  const matches = calibrationMatchesRoom(room, session, referenceRoom);
+  const candidate = session.result.status === 'candidate_correction';
+  const labels = { insufficient_evidence: 'More reliable recordings needed', candidate_correction: 'Stable correction ready for review', offset_saved: 'Delay saved · Verification needed', measured_at_this_setup: 'Alignment measured at this setup', verification_failed: 'Correction did not align recorded arrivals', rolled_back: 'Previous delay restored' };
+  const simulated = store.snapshot?.runtime.simulation === true;
+  const scope = calibrationEvidenceScope(session);
+  const verifiedLabel = scope.simulated ? 'Recorded alignment verified · Simulated observations'
+    : scope.unknown ? 'Recorded alignment verified · Runtime evidence incomplete'
+    : simulated ? 'Recorded alignment verified · Current runtime simulated' : labels.measured_at_this_setup;
+  const label = !matches ? 'Settings changed · Evidence is historical' : session.status === 'measured_at_this_setup' ? verifiedLabel : labels[session.status] || 'Measurement status unavailable';
+  notice(elements.calibrationStatus, busy ? 'Checking measurement…' : label, !simulated && !scope.simulated && !scope.unknown && matches && session.status === 'measured_at_this_setup' ? 'good' : 'warning');
+  elements.calibrationProbe.href = `/api/v1${calibrationPath(room.id, session.id)}/probe.wav`;
+  elements.calibrationExport.href = `/api/v1${calibrationPath(room.id, session.id)}/export`;
+  elements.calibrationApply.disabled = busy || room.enabled || applied || !candidate || !matches;
+  elements.calibrationRollback.disabled = busy || room.enabled || !applied || rolledBack || !matches;
+  elements.calibrationOff.hidden = !room.enabled;
+  elements.calibrationOff.disabled = busy;
+  elements.calibrationOn.hidden = room.enabled || !applied || rolledBack;
+  elements.calibrationOn.disabled = busy;
+  elements.calibrationReferenceOn.hidden = !applied || rolledBack || !referenceRoom || referenceRoom.id === room.id || referenceRoom.enabled;
+  elements.calibrationReferenceOn.disabled = busy;
+  elements.calibrationRefresh.disabled = elements.calibrationEnd.disabled = busy;
+  elements.calibrationVerifyConfirm.parentElement.hidden = !applied;
+  elements.calibrationVerifyConfirm.required = applied;
+  for (const control of elements.calibrationUpload.querySelectorAll('input, button')) control.disabled = busy || !canAnalyze || rolledBack || !matches || applied && (!room.enabled || !referenceRoom?.enabled);
+  elements.calibrationImport.textContent = applied ? 'Analyze fresh verification' : 'Analyze recording';
+  const target = room.speakers.find((speaker) => speaker.id === session.target_id)?.name || session.target_id;
+  const reference = referenceRoom?.speakers.find((speaker) => speaker.id === session.reference_id)?.name || session.reference_id;
+  const crossZone = (session.reference_room_id || room.id) !== room.id;
+  elements.calibrationPlaybackHelp.textContent = crossZone ? `Play this exact WAV from one source through ${room.name} and ${referenceRoom?.name || 'the retained reference zone'}, selected together in the phone's native group. Recreate that group after re-enabling the target. Stop normal music and spoken replies for the probe. Group membership remains operator declared.` : 'Play this exact WAV through the measured room from your music source. Stop normal music and spoken replies for the probe.';
+  elements.calibrationApplyHelp.textContent = !matches ? 'Speaker settings changed. Export the evidence and start a new session; this correction is stale.' : session.status === 'verification_failed' ? 'Fresh recordings still show more than 1 ms of residual delay. Turn this room off to restore the previous delay, then export the evidence and start a new session to investigate.' : room.enabled ? 'Turn the room off before saving or restoring a delay. This stops its receiver and music connection.' : 'Timing changes save while this room is off. Re-enable it, confirm OwnTone readback, then import fresh recordings. Calibration never changes live speech or music gain.';
+  const analysis = session.verification || session.result;
+  const result = node('div');
+  if (scope.simulated) result.append(node('p', 'notice warning', 'Retained simulated observations: some runtime observations were simulated when this evidence was imported. Changing the runtime mode does not upgrade that evidence or prove physical playback or synchronization.'));
+  if (scope.unknown) result.append(node('p', 'notice warning', 'Retained runtime observations are incomplete. The imported waveforms can show recorded alignment, but this evidence does not establish physical playback or synchronization.'));
+  if (simulated) result.append(node('p', 'notice warning', 'Current runtime simulation: new speaker selection and offset readback are simulated. This does not change the scope of earlier recordings; physical playback and synchronization remain unproven.'));
+  result.append(node('h3', '', `${target}${crossZone ? ` (${room.name})` : ''} relative to ${reference}${crossZone ? ` (${referenceRoom?.name || session.reference_room_id})` : ''}`));
+  result.append(node('p', 'hint', `Playback context: ${session.playback_context || 'Same-room playback'}. Operator declared; imported audio does not certify the phone’s native grouping.`));
+  const metrics = node('dl');
+  for (const [label, value] of [['Median arrival lag', measuredNumber(analysis.median_lag_ms)], ['Arrival variation (MAD)', measuredNumber(analysis.mad_ms)], ['Observed uncertainty', measuredNumber(analysis.observed_uncertainty_ms)], ['5th / 95th percentile', `${measuredNumber(analysis.p05_ms)} / ${measuredNumber(analysis.p95_ms)}`], ['Valid steady-state markers', `${analysis.accepted_markers ?? 0} · ${analysis.rejected_markers ?? 0} rejected`], ['Lowest correlation', measuredNumber(analysis.minimum_confidence, '')]]) metrics.append(node('dt', '', label), node('dd', '', value));
+  result.append(metrics, node('p', 'hint', 'Positive arrival lag means the target is later. A positive offset delays the target. Correlation is a waveform-match score, not a probability of correct speaker identity. A constant correction cannot fix variable network jitter or clock drift.'));
+  if (candidate) result.append(node('p', '', `Reviewed candidate for ${target}: ${session.previous_offset_ms} ms → ${session.result.candidate_offset_ms} ms. ${applied ? 'Saved; compare fresh verification evidence.' : 'No offset has been changed.'}`));
+  const reasons = node('ul');
+  for (const reason of analysis.reasons || []) reasons.append(node('li', '', reason));
+  if (reasons.childElementCount) result.append(reasons);
+  for (const drift of analysis.drift_estimates || []) result.append(node('p', 'hint', `Short-window drift: ${measuredNumber(drift.ms_per_minute, ' ms/min')} ± ${measuredNumber(drift.uncertainty_ms_per_minute, ' ms/min')} over ${measuredNumber(drift.span_seconds, ' seconds')}. Long-term drift remains untested.`));
+  const details = node('details', 'room-connection-details');
+  details.append(node('summary', '', 'Recording evidence and rejected markers'));
+  for (const [index, record] of [...session.recordings, ...session.verification_recordings].entries()) {
+    const accepted = record.markers?.filter((marker) => marker.accepted).length || 0;
+    details.append(node('p', '', `Take ${index + 1}: ${record.sample_rate} Hz · ${accepted}/8 markers accepted · PCM hash ${record.pcm_sha256?.slice(0, 12) || 'unavailable'}`));
+    for (const marker of record.markers || []) if (!marker.accepted) details.append(node('p', 'hint', `Marker ${marker.marker + 1}: ${marker.reason}`));
+  }
+  const retention = Number.isFinite(session.expires_at) ? `Evidence retained until ${new Date(session.expires_at * 1000).toLocaleString()}, subject to the 128-session limit.` : 'Export evidence you need to keep.';
+  result.append(details, node('p', 'hint', `Capture: ${session.capture_device}. Geometry: ${session.geometry}. ${retention} Saved correction receipts and summaries survive API restarts. Deleting evidence also removes this session’s rollback receipt; saved delays remain unchanged. Raw recordings are not retained. Physical phone, speaker and long-term synchronization tests are still required.`));
+  elements.calibrationResult.replaceChildren(result);
 }
 
 async function loadEvents() {

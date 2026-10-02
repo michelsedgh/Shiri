@@ -1,0 +1,800 @@
+diff --git a/Makefile.am b/Makefile.am
+index 96bf0cb47c404022b62023779bf04ec1760eccbc..fd296bc47e437a684ae43e5ffb39f38bf2a013be 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -108,6 +108,10 @@ if USE_PIPE
+ shairport_sync_SOURCES += audio_pipe.c
+ endif
+ 
++if USE_SHIRI
++shairport_sync_SOURCES += audio_shiri.c shiri_pcm.h shiri_timing.h
++endif
++
+ if USE_DUMMY
+ shairport_sync_SOURCES += audio_dummy.c
+ endif
+diff --git a/audio.c b/audio.c
+index c1d273480870e122e350760e20ea2e7a55095910..1d8cef01bde7fd7a4fb7dbbcdc71fdcb3a998754 100644
+--- a/audio.c
++++ b/audio.c
+@@ -59,6 +59,9 @@ extern audio_output audio_dummy;
+ #ifdef CONFIG_PIPE
+ extern audio_output audio_pipe;
+ #endif
++#ifdef CONFIG_SHIRI
++extern audio_output audio_shiri;
++#endif
+ #ifdef CONFIG_STDOUT
+ extern audio_output audio_stdout;
+ #endif
+@@ -88,6 +91,9 @@ static audio_output *outputs[] = {
+ #ifdef CONFIG_PIPE
+     &audio_pipe,
+ #endif
++#ifdef CONFIG_SHIRI
++    &audio_shiri,
++#endif
+ #ifdef CONFIG_STDOUT
+     &audio_stdout,
+ #endif
+diff --git a/audio_shiri.c b/audio_shiri.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc14c984429402560510279452e737bb01c20b5d
+--- /dev/null
++++ b/audio_shiri.c
+@@ -0,0 +1,304 @@
++/* Private timed PCM ingress. OwnTone retains its existing output scheduler. */
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include "audio.h"
++#include "common.h"
++#include "shiri_pcm.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <math.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++static struct shiri_pcm_packet state;
++static char *socket_path;
++static int peer_uid = -1, fd = -1, connection = -1, gap;
++static unsigned int configured;
++
++static uint64_t monotonic_ns(void) {
++  struct timespec ts;
++  if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0;
++  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++}
++static uint64_t raw_ns(void) {
++#ifdef CLOCK_MONOTONIC_RAW
++  struct timespec ts;
++  /* The pinned shared get_absolute_time_in_ns() ignores clock_gettime errors.
++   * Native Linux playtime uses this exact clock; check its read here. */
++  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts)) return 0;
++  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++#else
++  return 0; /* Never substitute a different clock for native RAW playtime. */
++#endif
++}
++/* A scheduling interruption can spoil a clock bracket without spoiling the
++ * native presentation timestamp. Retry only the measured clock triple; never
++ * replace that timestamp with callback arrival time. Both limits are finite. */
++static int sample_clocks(struct shiri_pcm_packet *packet) {
++  uint64_t start = 0, previous_after = 0, previous_raw = 0;
++  unsigned int attempt;
++  for (attempt = 0; attempt < 4; attempt++) {
++    uint64_t before = monotonic_ns();
++    uint64_t raw = raw_ns();
++    uint64_t after = monotonic_ns();
++    if (!before || !raw || !after || after < before || before < previous_after || raw < previous_raw) return EIO;
++    if (!start) start = before;
++    if (after - start >= UINT64_C(5000000)) return ETIMEDOUT;
++    if (after - before <= UINT64_C(1000000)) {
++      packet->mono_before = before;
++      packet->raw_sample = raw;
++      packet->mono_after = after;
++      return 0;
++    }
++    previous_after = after;
++    previous_raw = raw;
++  }
++  return ETIMEDOUT;
++}
++static int random_session(uint8_t id[16]) {
++  int random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++  size_t filled = 0;
++  if (random_fd < 0) return -1;
++  while (filled < 16) {
++    ssize_t n = read(random_fd, id + filled, 16 - filled);
++    if (n < 0 && errno == EINTR) continue;
++    if (n <= 0) { close(random_fd); return -1; }
++    filled += (size_t)n;
++  }
++  close(random_fd);
++  id[6] = (id[6] & 15u) | 64u;
++  id[8] = (id[8] & 63u) | 128u;
++  return 0;
++}
++static void parse_group(const char *text, uint8_t id[16]) {
++  unsigned int i = 0, half = 0, value = 0;
++  memset(id, 0, 16);
++  if (!text) return;
++  for (; *text; text++) {
++    unsigned int n;
++    if (*text == '-') continue;
++    if (*text >= '0' && *text <= '9') n = (unsigned int)(*text - '0');
++    else if (*text >= 'a' && *text <= 'f') n = (unsigned int)(*text - 'a') + 10u;
++    else if (*text >= 'A' && *text <= 'F') n = (unsigned int)(*text - 'A') + 10u;
++    else goto bad;
++    if (i >= 16) goto bad;
++    if (!half) { value = n << 4; half = 1; }
++    else { id[i++] = (uint8_t)(value | n); half = 0; }
++  }
++  if (i == 16 && !half) return;
++bad:
++  memset(id, 0, 16);
++}
++static void close_route(void) {
++  if (fd >= 0) close(fd);
++  fd = -1;
++}
++static int send_control(uint8_t kind, uint32_t value, int await_grant) {
++  uint8_t header[SHIRI_PCM_HEADER];
++  struct shiri_pcm_packet message = state, answer;
++  struct pollfd pfd;
++  ssize_t n;
++  message.kind = kind;
++  message.frames = value;
++  message.payload = 0;
++  message.presentation = 0;
++  shiri_pcm_encode(header, &message);
++  pfd.fd = fd; pfd.events = POLLOUT;
++  if (fd < 0 || poll(&pfd, 1, 300) != 1 || !(pfd.revents & POLLOUT)) return -1;
++  n = send(fd, header, sizeof(header), MSG_DONTWAIT | MSG_NOSIGNAL);
++  if (n != (ssize_t)sizeof(header)) return -1;
++  if (!await_grant) return 0;
++  /* The worker's source-only flush barrier is bounded at five seconds. */
++  pfd.events = POLLIN;
++  if (poll(&pfd, 1, 6000) != 1 || !(pfd.revents & POLLIN)) return -1;
++  n = recv(fd, header, sizeof(header), MSG_DONTWAIT | MSG_TRUNC);
++  if (n != (ssize_t)sizeof(header) || shiri_pcm_decode(&answer, header, sizeof(header)) ||
++      answer.kind != SHIRI_GRANT || memcmp(answer.session, state.session, 16) ||
++      answer.generation != state.generation || shiri_zero(answer.incarnation, 16) || !answer.epoch)
++    return -1;
++  if (kind != SHIRI_BEGIN &&
++      (memcmp(answer.incarnation, state.incarnation, 16) || answer.epoch != state.epoch)) return -1;
++  memcpy(state.incarnation, answer.incarnation, 16);
++  state.epoch = answer.epoch;
++  return 0;
++}
++static unsigned int percent(double volume) {
++  if (!isfinite(volume) || volume <= -30.0) return 0;
++  if (volume >= 0.0) return 100;
++  return (unsigned int)lround((volume + 30.0) * 100.0 / 30.0);
++}
++static void session_begin(int number, const char *group, int leader, int ap2, double volume) {
++  struct sockaddr_un address;
++  int size = 16384, old_cancel;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  pthread_mutex_lock(&lock);
++  close_route();
++  memset(&state, 0, sizeof(state));
++  state.kind = SHIRI_BEGIN; state.clock = SHIRI_RAW; state.generation = 1;
++  state.flags = (ap2 ? SHIRI_PCM_AIRPLAY2 : 0) | (leader ? SHIRI_PCM_GROUP_LEADER : 0);
++  parse_group(group, state.group);
++  connection = number; gap = 0;
++  if (random_session(state.session)) goto fail;
++  fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++  if (fd < 0) goto fail;
++  memset(&address, 0, sizeof(address)); address.sun_family = AF_UNIX;
++  if (strlen(socket_path) >= sizeof(address.sun_path)) goto fail;
++  strcpy(address.sun_path, socket_path);
++  if (connect(fd, (struct sockaddr *)&address, sizeof(address))) goto fail;
++#ifdef SO_PEERCRED
++  {
++    struct ucred credential;
++    socklen_t length = sizeof(credential);
++    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential, &length) ||
++        length != sizeof(credential) || credential.uid != (uid_t)peer_uid) goto fail;
++  }
++#else
++  goto fail; /* This backend requires Linux peer credentials. */
++#endif
++  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size))) goto fail;
++  if (send_control(SHIRI_BEGIN, 0, 1) || send_control(SHIRI_VOLUME, percent(volume), 0)) goto fail;
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++  return;
++fail:
++  warn("Shiri native PCM admission failed; this exact producer remains fenced.");
++  close_route();
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++}
++static void session_group(int number, const char *group, int leader) {
++  int old_cancel;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  pthread_mutex_lock(&lock);
++  if (number == connection && fd >= 0) {
++    parse_group(group, state.group);
++    state.flags = (state.flags & ~SHIRI_PCM_GROUP_LEADER) | (leader ? SHIRI_PCM_GROUP_LEADER : 0);
++  }
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++}
++static void session_volume(int number, double volume) {
++  int old_cancel;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  pthread_mutex_lock(&lock);
++  if (number == connection && fd >= 0 && send_control(SHIRI_VOLUME, percent(volume), 0))
++    close_route();
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++}
++static int play_native(int number, void *pcm, int samples, int sample_type, uint32_t rtp, uint64_t playtime) {
++  uint8_t message[SHIRI_PCM_HEADER + SHIRI_PCM_MAX_PAYLOAD];
++  struct shiri_pcm_packet packet;
++  ssize_t n;
++  int old_cancel, ret = 0;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  pthread_mutex_lock(&lock);
++  if (number != connection) { ret = ESTALE; goto done; }
++  if (samples <= 0 || samples > (int)SHIRI_PCM_MAX_FRAMES || !configured || !pcm) { ret = EINVAL; goto done; }
++  if (fd < 0) { ret = EPIPE; goto done; }
++  if (sample_type != play_samples_are_timed || !playtime) {
++    /* Native lead-in/missing-frame silence has no anchor; don't invent one. */
++    state.sequence++;
++    state.frame_index += (uint64_t)samples; gap = 1; goto done;
++  }
++  packet = state;
++  packet.kind = SHIRI_PCM; packet.frames = (uint32_t)samples; packet.payload = (uint32_t)samples * 4u;
++  packet.rtp = rtp; packet.presentation = playtime;
++  packet.flags |= gap ? SHIRI_PCM_GAP : 0;
++  ret = sample_clocks(&packet);
++  if (ret) {
++    warn("Shiri native PCM clock sampling failed; this exact producer remains fenced.");
++    close_route();
++    goto done;
++  }
++  packet.sequence = ++state.sequence;
++  shiri_pcm_encode(message, &packet);
++  memcpy(message + SHIRI_PCM_HEADER, pcm, packet.payload);
++  n = send(fd, message, SHIRI_PCM_HEADER + packet.payload, MSG_DONTWAIT | MSG_NOSIGNAL);
++  state.frame_index += (uint64_t)samples;
++  if (n == (ssize_t)(SHIRI_PCM_HEADER + packet.payload)) gap = 0;
++  else if (n < 0 && (errno == EAGAIN || errno == ENOBUFS)) gap = 1;
++  else { ret = EPIPE; close_route(); }
++done:
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++  return ret;
++}
++static void flush_native(int number) {
++  int old_cancel;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  pthread_mutex_lock(&lock);
++  if (number == connection && fd >= 0) {
++    if (state.generation >= INT64_MAX) close_route();
++    else {
++      state.generation++; state.sequence = state.frame_index = 0; gap = 0;
++      if (send_control(SHIRI_FLUSH, 0, 1)) close_route();
++    }
++  }
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++}
++static void session_end(int number) {
++  int old_cancel;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  pthread_mutex_lock(&lock);
++  if (number == connection) {
++    if (fd >= 0) send_control(SHIRI_END, 0, 0);
++    close_route(); connection = -1;
++  }
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++}
++static void flush(void) { flush_native(connection); }
++static void stop(void) { session_end(connection); }
++static int session_retired(int number) {
++  uint8_t byte;
++  int old_cancel, retired;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  pthread_mutex_lock(&lock);
++  retired = number != connection || fd < 0;
++  if (!retired) {
++    ssize_t n = recv(fd, &byte, 1, MSG_DONTWAIT | MSG_PEEK);
++    retired = n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
++  }
++  pthread_mutex_unlock(&lock);
++  pthread_setcancelstate(old_cancel, NULL);
++  return retired;
++}
++static int init(int argc, char **argv) {
++  const char *path;
++  (void)argv;
++  if ((argc < -1 || argc > 0) || !config.cfg || !config_lookup_non_empty_string(config.cfg, "shiri.socket", &path) ||
++      !config_lookup_int(config.cfg, "shiri.peer_uid", &peer_uid) || peer_uid < 0)
++    die("Shiri backend requires a private socket and exact peer_uid.");
++  socket_path = strdup(path);
++  if (!socket_path || strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path))
++    die("Shiri native PCM socket path is too long.");
++  config.audio_backend_buffer_desired_length = 0.15;
++  config.audio_backend_latency_offset = 0;
++  parse_audio_options("shiri", (1u << SPS_FORMAT_S16_LE), (1u << SPS_RATE_48000), (1u << 2));
++  return 0;
++}
++static int32_t get_configuration(unsigned int channels, unsigned int rate, unsigned int format) {
++  (void)channels; (void)rate; (void)format;
++  return search_for_suitable_configuration(2, 48000, SPS_FORMAT_S16_LE, NULL);
++}
++static int configure(int32_t format, char **channel_map) {
++  if (channel_map) *channel_map = NULL;
++  configured = CHANNELS_FROM_ENCODED_FORMAT(format) == 2 && RATE_FROM_ENCODED_FORMAT(format) == 48000 &&
++               FORMAT_FROM_ENCODED_FORMAT(format) == SPS_FORMAT_S16_LE;
++  return configured ? 0 : EINVAL;
++}
++static void deinit(void) { stop(); free(socket_path); socket_path = NULL; }
++audio_output audio_shiri = {.name="shiri", .init=init, .deinit=deinit,
++  .get_configuration=get_configuration, .configure=configure,
++  .session_begin=session_begin, .session_volume=session_volume, .session_group=session_group,
++  .play_native=play_native, .session_end=session_end, .session_retired=session_retired,
++  .flush_native=flush_native, .stop=stop, .flush=flush};
+diff --git a/common.c b/common.c
+index f041c2265e1357babbe02a37e94ddf95683cd3c6..11c0a33cdc5ebd4fc3e38109a25fc4262734cb0a 100644
+--- a/common.c
++++ b/common.c
+@@ -1948,6 +1948,9 @@ char *get_version_string() {
+ #ifdef CONFIG_PIPE
+     strcat(version_string, "-pipe");
+ #endif
++#ifdef CONFIG_SHIRI
++    strcat(version_string, "-shiri-timed2");
++#endif
+ #ifdef CONFIG_SOXR
+     strcat(version_string, "-soxr");
+ #endif
+diff --git a/configure.ac b/configure.ac
+index 4087ea6c1d5c5c8eb52ddc84695fb60603ee9e3c..e9020a278b696b16097521cc5c757c5a2c1b63d4 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -98,6 +98,12 @@ if test "x$with_pipe" = "xyes" ; then
+ fi
+ AM_CONDITIONAL([USE_PIPE], [test "x$with_pipe" = "xyes" ])
+ 
++AC_ARG_WITH([shiri],[AS_HELP_STRING([--with-shiri],[include timestamp-preserving private Shiri PCM backend])])
++if test "x$with_shiri" = "xyes" ; then
++  AC_DEFINE([CONFIG_SHIRI], 1, [Include Shiri timed PCM backend.])
++fi
++AM_CONDITIONAL([USE_SHIRI], [test "x$with_shiri" = "xyes" ])
++
+ # Check to see if we should include the System V initscript
+ 
+ AC_ARG_WITH([systemv-startup],[AS_HELP_STRING([--with-systemv-startup],[install a System V startup script during a make install])])
+diff --git a/player.c b/player.c
+index bc991dd8ba05925ec975ed45146b6a535af48913..d330314889f488077a29b553d643091f1c5010fc 100644
+--- a/player.c
++++ b/player.c
+@@ -1,3 +1,4 @@
++#include "shiri_timing.h"
+ /*
+  * Slave-clocked ALAC stream player. This file is part of Shairport.
+  * Copyright (c) James Laird 2011, 2013
+@@ -40,6 +41,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#include <sys/socket.h>
+ #include <sys/syslog.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -108,6 +110,20 @@
+ 
+ #include "activity_monitor.h"
+ 
++static int player_output_play(rtsp_conn_info *conn, void *data, int frames, int kind,
++                              uint32_t rtp, uint64_t time) {
++  if (config.output->play_native)
++    return config.output->play_native(conn->connection_number, data, frames, kind, rtp, time);
++  return config.output->play(data, frames, kind, rtp, time);
++}
++static void player_output_flush(rtsp_conn_info *conn) {
++  if (config.output->flush_native)
++    config.output->flush_native(conn->connection_number);
++  else if (config.output->flush)
++    config.output->flush();
++}
++
++
+ const unsigned int silent_channel_index = 65;
+ const unsigned int front_mono_channel_index = 66;
+ 
+@@ -345,7 +361,7 @@ void reset_buffer(rtsp_conn_info *conn) {
+   avflush(conn);
+ #endif
+   if (config.output->flush) {
+-    config.output->flush(); // no cancellation points
++    player_output_flush(conn); // no cancellation points
+                             //            debug(1, "reset_buffer: flush output device.");
+   }
+ }
+@@ -2061,6 +2077,12 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
+   pthread_cleanup_push(buffer_get_frame_cleanup_handler,
+                        (void *)conn); // undo what's been done so far
+   do {
++    // A revoked exact music connection cannot stamp or flush its successor.
++    if (config.output->session_retired && config.output->session_retired(conn->connection_number)) {
++      conn->stop = 1;
++      shutdown(conn->fd, SHUT_RDWR);
++      pthread_exit(NULL); // Existing scoped mutex/player cleanup handlers run.
++    }
+     // debug(3, "buffer_get_frame is iterating");
+     // we must have timing information before we can do anything here
+     if ((have_timestamp_timing_information(conn)) && (conn->input_format_is_valid != 0)) {
+@@ -2096,7 +2118,7 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
+           avflush(conn);
+ #endif
+           if (config.output->flush) {
+-            config.output->flush(); // no cancellation points
++            player_output_flush(conn); // no cancellation points
+             debug(2, "flush request: flush output device.");
+           }
+         }
+@@ -2557,7 +2579,7 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
+                                 config.current_output_configuration);
+ 
+                             debug(3, "Send %" PRId64 " frames of silence.", fs);
+-                            config.output->play(silence, fs, play_samples_are_untimed, 0, 0);
++                            player_output_play(conn, silence, fs, play_samples_are_untimed, 0, 0);
+                             debug(3, "Sent %" PRId64 " frames of silence.", fs);
+                             pthread_cleanup_pop(1); // deallocate silence
+                             output_device_has_been_primed = 1;
+@@ -2612,7 +2634,7 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
+                       conn->previous_random_number = generate_zero_frames(
+                           silence, fs, conn->enable_dither, conn->previous_random_number,
+                           config.current_output_configuration);
+-                      config.output->play(silence, fs, play_samples_are_untimed, 0, 0);
++                      player_output_play(conn, silence, fs, play_samples_are_untimed, 0, 0);
+                       pthread_cleanup_pop(1); // deallocate silence
+                     }
+                     frame_gap -= fs;
+@@ -3339,7 +3361,10 @@ void player_thread_cleanup_handler(void *arg) {
+       debug(1, "ffmpeg flush at stop!");
+ #endif
+     debug(2, "Connection %d: player: stop the output backend.", conn->connection_number);
+-    config.output->stop();
++    if (config.output->session_end)
++      config.output->session_end(conn->connection_number);
++    else
++      config.output->stop();
+   }
+ 
+   int oldState;
+@@ -3616,6 +3641,16 @@ void *player_thread_func(void *arg) {
+     debug(1, "ffmpeg flush at start!");
+ #endif
+ 
++  if (config.output->session_begin) {
++#ifdef CONFIG_AIRPLAY_2
++    config.output->session_begin(conn->connection_number, conn->airplay_gid,
++                                 conn->groupContainsGroupLeader, conn->airplay_type == ap_2,
++                                 conn->own_airplay_volume);
++#else
++    config.output->session_begin(conn->connection_number, NULL, 0, 0, conn->own_airplay_volume);
++#endif
++  }
++
+   // leave this relic -- jack and soundio still use it
+   if (config.output->start != NULL)
+     config.output->start(44100, SPS_FORMAT_S16_LE);
+@@ -3792,7 +3827,7 @@ void *player_thread_func(void *arg) {
+               conn->previous_random_number = generate_zero_frames(
+                   silence, conn->frames_per_packet, conn->enable_dither,
+                   conn->previous_random_number, config.current_output_configuration);
+-              config.output->play(silence, conn->frames_per_packet, play_samples_are_untimed, 0, 0);
++              player_output_play(conn, silence, conn->frames_per_packet, play_samples_are_untimed, 0, 0);
+               free(silence);
+               frames_played += conn->frames_per_packet;
+             }
+@@ -4435,7 +4470,7 @@ void *player_thread_func(void *arg) {
+                       conn->previous_random_number = generate_zero_frames(
+                           silence, gap, conn->enable_dither, conn->previous_random_number,
+                           config.current_output_configuration);
+-                      config.output->play(silence, gap, play_samples_are_untimed, 0, 0);
++                      player_output_play(conn, silence, gap, play_samples_are_untimed, 0, 0);
+                       free(silence);
+                       frames_played += gap;
+                       // debug(1,"sent %d frames of silence.", gap);
+@@ -4813,7 +4848,7 @@ void *player_thread_func(void *arg) {
+ 
+                     // now, see if we are skipping some or all of these frames
+                     if (frames_to_skip == 0) {
+-                      config.output->play(conn->outbuf, play_samples, play_samples_are_timed,
++                      player_output_play(conn, conn->outbuf, play_samples, play_samples_are_timed,
+                                           inframe->timestamp, should_be_time);
+                       frames_played += play_samples;
+                     } else {
+@@ -4836,9 +4871,10 @@ void *player_thread_func(void *arg) {
+ 
+                         char *play_starting_point = conn->outbuf + bytes_to_skip;
+ 
+-                        config.output->play(play_starting_point, play_samples - frames_to_skip,
++                        player_output_play(conn, play_starting_point, play_samples - frames_to_skip,
+                                             play_samples_are_timed, inframe->timestamp,
+-                                            should_be_time);
++                                            shiri_skipped_time(should_be_time, frames_to_skip,
++                                              RATE_FROM_ENCODED_FORMAT(config.current_output_configuration)));
+ 
+                         debug(4, "skipping the first %u frames in a packet of %u frames.",
+                               frames_to_skip, play_samples);
+@@ -4907,7 +4943,7 @@ void *player_thread_func(void *arg) {
+                 uint64_t should_be_time;
+                 frame_to_local_time(inframe->timestamp, &should_be_time, conn);
+                 debug(3, "play frame %u.", inframe->timestamp);
+-                config.output->play(conn->outbuf, play_samples, play_samples_are_timed,
++                player_output_play(conn, conn->outbuf, play_samples, play_samples_are_timed,
+                                     inframe->timestamp, should_be_time);
+                 frames_played += play_samples;
+ #ifdef CONFIG_METADATA
+@@ -5242,6 +5278,8 @@ void player_volume_without_notification(double airplay_volume, rtsp_conn_info *c
+   config.airplay_volume = airplay_volume;
+   conn->own_airplay_volume = airplay_volume;
+   pthread_mutex_unlock(&conn->volume_control_mutex);
++  if (config.output->session_volume)
++    config.output->session_volume(conn->connection_number, airplay_volume);
+ }
+ 
+ void player_volume(double airplay_volume, rtsp_conn_info *conn) {
+diff --git a/rtsp.c b/rtsp.c
+index 303d3b490656d7f8e13004680a7973dc4a6ea74c..4b94aff301a0a8fbc6624c5d8c3246e5b96d5d6d 100644
+--- a/rtsp.c
++++ b/rtsp.c
+@@ -2524,6 +2524,9 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
+             } else {
+               debug(1, "No groupContainsGroupLeader in SETUP");
+             }
++            if (config.output->session_group)
++              config.output->session_group(conn->connection_number, conn->airplay_gid,
++                                            conn->groupContainsGroupLeader);
+ 
+             char timing_list_message[4096];
+             timing_list_message[0] = 'T';
+diff --git a/shiri_pcm.h b/shiri_pcm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..97603edd62ca0e725cdb1fd2ffeca1dc62afceeb
+--- /dev/null
++++ b/shiri_pcm.h
+@@ -0,0 +1,78 @@
++/* Shiri PCM v1: bounded provenance framing, independent of output scheduling. */
++#ifndef SHIRI_PCM_H
++#define SHIRI_PCM_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include <limits.h>
++
++#define SHIRI_PCM_HEADER 160u
++#define SHIRI_PCM_MAX_FRAMES 8192u
++#define SHIRI_PCM_RATE 48000u
++#define SHIRI_PCM_MAX_PAYLOAD (SHIRI_PCM_MAX_FRAMES * 4u)
++#define SHIRI_PCM_GAP 1u
++#define SHIRI_PCM_AIRPLAY2 2u
++#define SHIRI_PCM_GROUP_LEADER 4u
++#define SHIRI_PCM_SPEECH_ONLY 8u
++enum shiri_pcm_kind { SHIRI_BEGIN=1, SHIRI_PCM=2, SHIRI_FLUSH=3, SHIRI_END=4, SHIRI_VOLUME=5, SHIRI_GRANT=6 };
++enum shiri_pcm_clock { SHIRI_RAW=1, SHIRI_MONOTONIC=2 };
++struct shiri_pcm_owner {
++  uint8_t incarnation[16];
++  uint8_t session[16];
++  uint64_t epoch;
++  uint64_t generation;
++};
++struct shiri_pcm_packet {
++  uint8_t kind, clock;
++  uint32_t payload, frames, rtp, flags;
++  uint8_t session[16], incarnation[16], group[16];
++  uint64_t epoch, generation, sequence, frame_index, presentation;
++  uint64_t raw_sample, mono_before, mono_after;
++};
++static inline uint32_t shiri_u32(const uint8_t *p) {
++  return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
++}
++static inline uint64_t shiri_u64(const uint8_t *p) {
++  return ((uint64_t)shiri_u32(p)<<32)|shiri_u32(p+4);
++}
++static inline void shiri_put32(uint8_t *p, uint32_t n) {
++  p[0]=(uint8_t)(n>>24); p[1]=(uint8_t)(n>>16); p[2]=(uint8_t)(n>>8); p[3]=(uint8_t)n;
++}
++static inline void shiri_put64(uint8_t *p, uint64_t n) {
++  shiri_put32(p,(uint32_t)(n>>32)); shiri_put32(p+4,(uint32_t)n);
++}
++static inline int shiri_zero(const uint8_t *p, size_t n) {
++  size_t i; for(i=0;i<n;i++) if(p[i]) return 0; return 1;
++}
++/* 0 means valid header, -1 malformed. Payload is validated independently. */
++static inline int shiri_pcm_decode(struct shiri_pcm_packet *out, const uint8_t *p, size_t n) {
++  if(!out || !p || n<SHIRI_PCM_HEADER || memcmp(p,"SHRIPCM1",8) ||
++     p[8]<SHIRI_BEGIN || p[8]>SHIRI_GRANT || p[9]<SHIRI_RAW || p[9]>SHIRI_MONOTONIC ||
++     p[10] || p[11]!=1 || shiri_u32(p+12)!=SHIRI_PCM_HEADER || shiri_u32(p+20)!=SHIRI_PCM_RATE ||
++     !shiri_zero(p+148,12)) return -1;
++  memset(out,0,sizeof(*out));
++  out->kind=p[8]; out->clock=p[9]; out->payload=shiri_u32(p+16); out->frames=shiri_u32(p+24);
++  out->rtp=shiri_u32(p+28); out->flags=shiri_u32(p+32);
++  memcpy(out->session,p+36,16); memcpy(out->incarnation,p+52,16); memcpy(out->group,p+68,16);
++  out->epoch=shiri_u64(p+84); out->generation=shiri_u64(p+92); out->sequence=shiri_u64(p+100);
++  out->frame_index=shiri_u64(p+108); out->presentation=shiri_u64(p+116);
++  out->raw_sample=shiri_u64(p+124); out->mono_before=shiri_u64(p+132); out->mono_after=shiri_u64(p+140);
++  if(out->flags&~15u || !out->generation || out->generation>INT64_MAX || out->epoch>INT64_MAX ||
++     out->sequence>INT64_MAX || out->frame_index>INT64_MAX || out->presentation>INT64_MAX ||
++     out->raw_sample>INT64_MAX || out->mono_before>INT64_MAX || out->mono_after>INT64_MAX ||
++     (shiri_zero(out->session,16) && !(out->flags&SHIRI_PCM_SPEECH_ONLY))) return -1;
++  if(out->kind==SHIRI_PCM) {
++    if(!out->frames || out->frames>SHIRI_PCM_MAX_FRAMES || out->payload!=out->frames*4u || !out->presentation) return -1;
++  } else if(out->payload || out->frames>(out->kind==SHIRI_VOLUME?100u:0u)) return -1;
++  return 0;
++}
++static inline void shiri_pcm_encode(uint8_t p[SHIRI_PCM_HEADER], const struct shiri_pcm_packet *v) {
++  memset(p,0,SHIRI_PCM_HEADER); memcpy(p,"SHRIPCM1",8); p[8]=v->kind; p[9]=v->clock; p[11]=1;
++  shiri_put32(p+12,SHIRI_PCM_HEADER); shiri_put32(p+16,v->payload); shiri_put32(p+20,SHIRI_PCM_RATE);
++  shiri_put32(p+24,v->frames); shiri_put32(p+28,v->rtp); shiri_put32(p+32,v->flags);
++  memcpy(p+36,v->session,16); memcpy(p+52,v->incarnation,16); memcpy(p+68,v->group,16);
++  shiri_put64(p+84,v->epoch); shiri_put64(p+92,v->generation); shiri_put64(p+100,v->sequence);
++  shiri_put64(p+108,v->frame_index); shiri_put64(p+116,v->presentation); shiri_put64(p+124,v->raw_sample);
++  shiri_put64(p+132,v->mono_before); shiri_put64(p+140,v->mono_after);
++}
++#endif
+diff --git a/shiri_timing.h b/shiri_timing.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebb799df4ec9f3a12f8b053810ccfe094e358f9b
+--- /dev/null
++++ b/shiri_timing.h
+@@ -0,0 +1,12 @@
++/* First-sample timing after dropping actual post-conversion output frames. */
++#ifndef SHIRI_TIMING_H
++#define SHIRI_TIMING_H
++#include <stdint.h>
++#include <limits.h>
++static inline uint64_t shiri_skipped_time(uint64_t time, uint32_t skipped, uint32_t output_rate) {
++  uint64_t advance;
++  if (!output_rate) return time;
++  advance = (uint64_t)skipped * UINT64_C(1000000000) / output_rate;
++  return time > UINT64_MAX - advance ? UINT64_MAX : time + advance;
++}
++#endif
+diff --git a/audio.h b/audio.h
+index ccf6ed99e8acf2d453ded05a28a98cbad72d5114..eba36e914b99ab6cf56a399bca197a995fd21996 100644
+--- a/audio.h
++++ b/audio.h
+@@ -1,117 +1,125 @@
+ #ifndef _AUDIO_H
+ #define _AUDIO_H
+ 
+ #include <libconfig.h>
+ #include <stdint.h>
+ 
+ // clang-format off
+ // Play samples provided may be from the source, in which case they will be timed
+ // or they may be generated by Shairport Sync, in which case they will not be timed.
+ 
+ // Typically these would be samples of silence, which may be dithered, sent during the lead-in to 
+ // the start of the material, or inserted instead of a missing frame, or after a flush.
+ // clang-format on
+ 
+ typedef enum {
+   play_samples_are_untimed = 0, // typically the samples are (possibly dithered) silence
+   play_samples_are_timed,       // timed and numbered.
+ } play_samples_type;
+ 
+ typedef struct {
+   unsigned int channels;
+   unsigned int rate;
+   unsigned int format; // this contains an sps_format_t enum but "common.h" is not imported here.
+   char short_description[32]; // e.g. S32/44100/8.
+   char channel_map[128];
+ } output_configuration_t;
+ 
+ typedef struct {
+   int32_t minimum_volume_dB;
+   int32_t maximum_volume_dB;
+ } volume_range_t;
+ 
+ typedef struct {
+   volume_range_t *volume_range;
+ } output_parameters_t;
+ 
+ // backend interface
+ typedef struct {
+   // may be NULL if no implemented
+   void (*help)(void);
+   char *name;
+   // start of program
+   int (*init)(int argc, char **argv);
+   // at end of program
+   void (*deinit)(void);
+ 
+   int (*prepare)(void); // send when a play session is about to begin
+ 
+   // Get an encoded configuration for the given channels, rate and depth
+   // The response may have a different rate, format and channel count!
+   // See FROM_ENCODED_FORMAL macros in common.h for the encoding scheme
+   // An encoded configuration will always be positive.
+   // 0 if not successful
+   // may be NULL if not implemented
+   // sps_format is not typed because the definition is in common.h, which can't be included here,
+   // sigh.
+   int32_t (*get_configuration)(unsigned int channels, unsigned int rate, unsigned int sps_format);
+ 
+   // Set the output configuration
+   // Returns 0 and a channel map (if available) if successful
+   // may be NULL if not implemented.
+   // Set channel_map to NULL if you don't want it.
+   // Otherwise, a space-separated channel map string will be returned
+   // and you are responsible for freeing it.
+   // If there isn't a channel map a NULL will be returned.
+   int (*configure)(int32_t encoded_output_format, char **channel_map);
+ 
++  /* Exact native player incarnation, before start. Non-Shiri backends leave these NULL. */
++  void (*session_begin)(int connection, const char *group, int group_leader, int airplay2, double volume);
++  void (*session_volume)(int connection, double volume);
++  void (*session_group)(int connection, const char *group, int group_leader);
++  int (*session_retired)(int connection);
++  void (*session_end)(int connection);
++  void (*flush_native)(int connection);
++  int (*play_native)(int connection, void *buf, int samples, int sample_type, uint32_t timestamp, uint64_t playtime);
+   void (*start)(int sample_rate, int sample_format);
+ 
+   // block of samples
+   int (*play)(void *buf, int samples, int sample_type, uint32_t timestamp, uint64_t playtime);
+   void (*stop)(void);
+ 
+   // may be NULL if no implemented
+   int (*is_running)(
+       void); // if implemented, will return 0 if everything is okay, non-zero otherwise
+ 
+   // may be NULL if no implemented
+   void (*flush)(void);
+ 
+   // returns the delay before the next frame to be sent to the device would actually be audible.
+   // almost certainly wrong if the buffer is empty, so play silent buffers to make it busy.
+   // will change dynamically, so keep watching it.
+   // returns a negative error code if there's a problem
+   int (*delay)(long *the_delay); // snd_pcm_sframes_t is a long
+   int (*stats)(uint64_t *raw_measurement_time, uint64_t *corrected_measurement_time,
+                uint64_t *delay,
+                uint64_t *frames_sent_to_dac); // use this to get the true rate of the DAC
+ 
+   // may be NULL, in which case soft volume is applied
+   void (*volume)(double vol);
+ 
+   // may be NULL, in which case defaults are used
+   output_parameters_t *(*parameters)();
+ 
+   // may be NULL, in which case software muting is used.
+   // also, will return a 1 if it is actually using the mute facility, 0 otherwise
+   int (*mute)(int do_mute);
+ 
+ } audio_output;
+ 
+ // this looks for a suitable configuration in the right order and checks possible
+ // configurations using the check_configuration method passed in.
+ int32_t search_for_suitable_configuration(
+     unsigned int channels, unsigned int rate, unsigned int format,
+     int (*check_configuration)(unsigned int channels, unsigned int rate, unsigned int format));
+ 
+ audio_output *audio_get_output(const char *name);
+ void audio_ls_outputs(void);
+ void parse_audio_options(const char *named_stanza, uint32_t default_format_set,
+                          uint32_t default_rate_set,
+                          uint32_t default_channel_set); // look in "general" and in the named stanza
+ uint32_t get_format_settings(const char *stanza_name, const char *setting_name);
+ uint32_t get_rate_settings(const char *stanza_name, const char *setting_name);
+ uint32_t get_channel_settings(const char *stanza_name, const char *setting_name);
+ 
+ #endif //_AUDIO_H

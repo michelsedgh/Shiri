@@ -1,0 +1,699 @@
+diff --git a/configure.ac b/configure.ac
+index 42de6548..f9096f62 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 2ae19ab2..a753e0d3 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -30,7 +30,7 @@ PAIR_AP_SRC = \
+ AM_CPPFLAGS += -DCONFIG_GCRYPT
+ 
+ if COND_ALSA
+-ALSA_SRC=outputs/alsa.c outputs/pcm_volume.h
++ALSA_SRC=outputs/alsa.c outputs/pcm_volume.h outputs/pcm_identity.h
+ endif
+ 
+ if COND_PULSEAUDIO
+diff --git a/src/conffile.c b/src/conffile.c
+index 407bfb33..bb3d20d7 100644
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -139,33 +139,35 @@ static cfg_opt_t sec_library[] =
+ /* local audio section structure */
+ static cfg_opt_t sec_audio[] =
+   {
+     CFG_STR("nickname", "Computer", CFGF_NONE),
+     CFG_STR("type", NULL, CFGF_NONE),
+     CFG_STR("server", NULL, CFGF_NONE),
+     CFG_STR("card", "default", CFGF_NONE),
+     CFG_STR("mixer", NULL, CFGF_NONE),
+     CFG_STR("mixer_device", NULL, CFGF_NONE),
+     CFG_BOOL("software_volume", cfg_false, CFGF_NONE),
++    CFG_STR("pcm_identity_file", NULL, CFGF_NONE),
+     CFG_BOOL("sync_disable", cfg_false, CFGF_NONE),
+     CFG_INT("offset", 0, CFGF_DEPRECATED),
+     CFG_INT("offset_ms", 0, CFGF_DEPRECATED),
+     CFG_INT("adjust_period_seconds", 100, CFGF_NONE),
+     // Hidden options
+     CFG_BOOL("exclusive", cfg_false, CFGF_NONE),
+     CFG_END()
+   };
+ 
+ /* local ALSA audio section structure */
+ static cfg_opt_t sec_alsa[] =
+   {
+     CFG_STR("nickname", NULL, CFGF_NONE),
+     CFG_STR("mixer", NULL, CFGF_NONE),
+     CFG_STR("mixer_device", NULL, CFGF_NONE),
+     CFG_BOOL("software_volume", cfg_false, CFGF_NONE),
++    CFG_STR("pcm_identity_file", NULL, CFGF_NONE),
+     CFG_INT("offset_ms", 0, CFGF_DEPRECATED),
+     // Hidden options
+     CFG_BOOL("exclusive", cfg_false, CFGF_NONE),
+     CFG_END()
+   };
+ 
+ /* AirPlay/ApEx shared section structure */
+diff --git a/src/outputs/alsa.c b/src/outputs/alsa.c
+index 37f8a038..ae4475fd 100644
+--- a/src/outputs/alsa.c
++++ b/src/outputs/alsa.c
+@@ -1,80 +1,82 @@
+ /*
+  * Copyright (C) 2015-2019 Espen Jürgensen <espenjurgensen@gmail.com>
+  * Copyright (C) 2010 Julien BLACHE <jb@jblache.org>
+  *
+  * Copyright (c) 2010 Clemens Ladisch <clemens@ladisch.de>
+  *   from alsa-utils/alsamixer/volume_mapping.c
+  *     use_linear_dB_scale()
+  *     lrint_dir()
+  *     volume_normalized_set()
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <string.h>
+ #include <errno.h>
+ #include <stdint.h>
+ #include <inttypes.h>
+ #include <math.h>
+ #include <limits.h>
+ 
+ #include <alsa/asoundlib.h>
+ 
+ #include "misc.h"
+ #include "conffile.h"
+ #include "logger.h"
+ #include "player.h"
+ #include "outputs.h"
+ #include "pcm_volume.h"
++#include "pcm_identity.h"
+ 
+ 
+ // For setting volume, treat everything below this as linear scale
+ #define MAX_LINEAR_DB_SCALE 24
+ 
+ // We measure latency each second, and after a number of measurements determined
+ // by adjust_period_seconds we try to determine drift and latency. If both are
+ // below the two thresholds set by the below, we don't do anything. Otherwise we
+ // may attempt compensation by resampling. Latency is measured in samples, and
+ // drift is change of latency per second. Both are floats.
+ #define ALSA_MAX_LATENCY 480.0
+ #define ALSA_MAX_DRIFT 16.0
+ // If latency is jumping up and down we don't do compensation since we probably
+ // wouldn't do a good job. We use linear regression to determine the trend, but
+ // if r2 is below this value we won't attempt to correct sync.
+ #define ALSA_MAX_VARIANCE 0.3
+ 
+ // We correct latency by adjusting the sample rate in steps. However, if the
+ // latency keeps drifting we give up after reaching this step.
+ #define ALSA_RESAMPLE_STEP_MAX 8
+ // The sample rate gets adjusted by a multiple of this number. The number of
+ // multiples depends on the sample rate, i.e. a low sample rate may get stepped
+ // by 16, while high one would get stepped by 4 x 16
+ #define ALSA_RESAMPLE_STEP_MULTIPLE 2
+ 
+ #define ALSA_ERROR_WRITE -1
+ #define ALSA_ERROR_UNDERRUN -2
+ #define ALSA_ERROR_SESSION -3
+ #define ALSA_ERROR_DEVICE -4
+ #define ALSA_ERROR_DEVICE_BUSY -5
++#define ALSA_ERROR_IDENTITY -6
+ 
+ enum alsa_sync_state
+ {
+@@ -129,31 +131,33 @@ struct alsa_playback_session
+ // Info about the device, which is not required by the player, only internally
+ struct alsa_extra
+ {
+   const char *card_name;
+   const char *mixer_name;
+   const char *mixer_device_name;
++  const char *pcm_identity_file;
+   bool software_volume;
+ };
+ 
+ struct alsa_session
+ {
+   enum output_device_state state;
+ 
+   uint64_t device_id;
+   int callback_id;
+ 
+   const char *devname;
+   const char *mixer_name;
+   const char *mixer_device_name;
++  const char *pcm_identity_file;
+ 
+   struct alsa_mixer mixer;
+   bool software_volume;
+   int volume;
+ 
+   uint64_t delay_ms;
+ 
+   // A session will have multiple playback sessions when the quality changes
+   struct alsa_playback_session *pb;
+ 
+   struct alsa_session *next;
+ };
+@@ -512,99 +516,109 @@ mixer_close(struct alsa_mixer *mixer, const char *mixer_device_name)
+ }
+ 
+ static int
+-pcm_open(snd_pcm_t **pcm, const char *device_name, struct media_quality *quality)
++pcm_open(snd_pcm_t **pcm, const char *device_name, struct media_quality *quality, const char *identity_file)
+ {
+   snd_pcm_t *hdl;
+-  snd_pcm_hw_params_t *hw_params;
++  snd_pcm_hw_params_t *hw_params = NULL;
+   snd_pcm_uframes_t bufsize;
+   int ret;
+ 
+   ret = snd_pcm_open(&hdl, device_name, SND_PCM_STREAM_PLAYBACK, 0);
+   if (ret < 0)
+     {
+       if (ret == -EBUSY)
+ 	return ALSA_ERROR_DEVICE_BUSY;
+ 
+       DPRINTF(E_LOG, L_LAUDIO, "Could not open playback device '%s': %s\n", device_name, snd_strerror(ret));
+       return ALSA_ERROR_DEVICE;
+     }
+ 
++  /* snd_pcm_open can resolve a named card to a different index after hotplug.
++   * Verify the actual opened handle before configuring or submitting audio. */
++  if (pcm_identity_validate(hdl, identity_file) < 0)
++    {
++      DPRINTF(E_LOG, L_LAUDIO, "Opened ALSA PCM identity no longer matches its pinned hardware; refusing playback\n");
++      snd_pcm_close(hdl);
++      return ALSA_ERROR_IDENTITY;
++    }
++
+   // HW params
+   ret = snd_pcm_hw_params_malloc(&hw_params);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not allocate hw params: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_hw_params_any(hdl, hw_params);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not retrieve hw params: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_hw_params_set_access(hdl, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set access method: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_hw_params_set_format(hdl, hw_params, bps2format(quality->bits_per_sample));
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set format (bits per sample %d): %s\n", quality->bits_per_sample, snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_hw_params_set_channels(hdl, hw_params, quality->channels);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set stereo output: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_hw_params_set_rate(hdl, hw_params, quality->sample_rate, 0);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Hardware doesn't support %u Hz: %s\n", quality->sample_rate, snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_hw_params_get_buffer_size_max(hw_params, &bufsize);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not get max buffer size: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   // Enable this line to simulate devices with low buffer size
+   //bufsize = 32768;
+ 
+   ret = snd_pcm_hw_params_set_buffer_size_max(hdl, hw_params, &bufsize);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set buffer size to max: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_hw_params(hdl, hw_params);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set hw params in pcm_open(): %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   snd_pcm_hw_params_free(hw_params);
+ 
+   *pcm = hdl;
+ 
+   return 0;
+ 
+  out_fail:
+-  snd_pcm_hw_params_free(hw_params);
++  if (hw_params)
++    snd_pcm_hw_params_free(hw_params);
+   snd_pcm_close(hdl);
+ 
+   return ALSA_ERROR_DEVICE;
+ }
+@@ -728,84 +742,87 @@ static int
+ playback_session_add(struct alsa_session *as, struct media_quality *quality, struct timespec pts)
+ {
+   struct alsa_playback_session *pb;
+   struct alsa_playback_session *tail_pb;
+   struct timespec delay_ts;
+   size_t size;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_LAUDIO, "Adding playback session (quality %d/%d/%d) to ALSA device '%s'\n",
+     quality->sample_rate, quality->bits_per_sample, quality->channels, as->devname);
+ 
+   CHECK_NULL(L_LAUDIO, pb = calloc(1, sizeof(struct alsa_playback_session)));
+   CHECK_NULL(L_LAUDIO, pb->latency_history = calloc(alsa_latency_history_size, sizeof(double)));
+   pb->session = as;
+ 
+-  ret = pcm_open(&pb->pcm, as->devname, quality);
++  ret = pcm_open(&pb->pcm, as->devname, quality, as->pcm_identity_file);
+   if (ret == ALSA_ERROR_DEVICE_BUSY)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "ALSA device '%s' won't open due to existing session (no support for concurrent audio), truncating audio\n", as->devname);
+       playback_session_remove_all(as);
+-      ret = pcm_open(&pb->pcm, as->devname, quality);
++      ret = pcm_open(&pb->pcm, as->devname, quality, as->pcm_identity_file);
+       if (ret == ALSA_ERROR_DEVICE_BUSY)
+ 	{
+ 	  DPRINTF(E_LOG, L_LAUDIO, "ALSA device '%s' failed: Device still busy after closing previous sessions\n", as->devname);
+ 	  goto error;
+ 	}
+     }
+ 
++  if (ret == ALSA_ERROR_IDENTITY)
++    goto error; /* No fallback may bypass a failed physical identity fence. */
++
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Device '%s' does not support quality (%d/%d/%d), falling back to default\n", as->devname, quality->sample_rate, quality->bits_per_sample, quality->channels);
+-      ret = pcm_open(&pb->pcm, as->devname, &alsa_fallback_quality);
++      ret = pcm_open(&pb->pcm, as->devname, &alsa_fallback_quality, as->pcm_identity_file);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_LOG, L_LAUDIO, "ALSA device failed setting fallback quality\n");
+ 	  goto error;
+ 	}
+ 
+       pb->quality = alsa_fallback_quality;
+     }
+   else
+     pb->quality = *quality;
+ 
+   // If this fails it just means we won't get timestamps, which we can handle
+   pcm_configure(pb->pcm);
+ 
+   dump_config(pb->pcm);
+ 
+   // Time stamps used for syncing, here we set when playback should start
+   delay_ts.tv_sec = as->delay_ms / 1000;
+   delay_ts.tv_nsec = as->delay_ms % 1000 * 1000000UL;
+   pb->stamp_pts = timespec_add(pts, delay_ts);
+ 
+   // The difference between pos and start pos should match the 2 second buffer
+   // that e.g. AirPlay uses + user configured offset_ms. We will not use alsa's
+   // buffer for the initial buffering, because my sound card's start_threshold
+   // is not to be counted on. Instead we allocate our own buffer, and when it is
+   // time to play we write as much as we can to alsa's buffer.
+   pb->buffer_nsamp = as->delay_ms * pb->quality.sample_rate / 1000;
+   size = STOB(pb->buffer_nsamp, pb->quality.bits_per_sample, pb->quality.channels);
+   ringbuffer_init(&pb->prebuf, size);
+ 
+   // Add to the end of the list, because when we iterate through it in
+   // alsa_write() we want to write data from the oldest playback session first
+   if (as->pb)
+     {
+       for (tail_pb = as->pb; tail_pb->next; tail_pb = tail_pb->next)
+         ; // Fast forward
+       tail_pb->next = pb;
+     }
+   else
+     as->pb = pb;
+ 
+   return 0;
+ 
+  error:
+   playback_session_free(pb);
+ 
+   return -1;
+ }
+ 
+ /* Keep every buffered block raw until submission. Gain changes neither the
+  * source buffer nor frame counts, timestamps, queue state or synchronization.
+  */
+@@ -1198,55 +1215,56 @@ static struct alsa_session *
+ alsa_session_make(struct output_device *device, int callback_id)
+ {
+   struct alsa_session *as;
+   struct alsa_extra *ae;
+   int ret;
+ 
+   ret = outputs_quality_subscribe(&alsa_fallback_quality);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not subscribe to fallback audio quality\n");
+       return NULL;
+     }
+ 
+   ae = device->extra_device_info;
+ 
+   CHECK_NULL(L_LAUDIO, as = calloc(1, sizeof(struct alsa_session)));
+ 
+   as->device_id = device->id;
+   as->callback_id = callback_id;
+ 
+   as->devname = ae->card_name;
+   as->mixer_name = ae->mixer_name;
+   as->mixer_device_name = ae->mixer_device_name;
++  as->pcm_identity_file = ae->pcm_identity_file;
+   as->software_volume = ae->software_volume;
+   as->volume = pcm_volume_clamp(device->volume);
+ 
+   as->delay_ms = outputs_buffer_duration_ms_get();
+   if (device->offset_ms < 0 && as->delay_ms < (uint64_t)(-(int64_t)device->offset_ms))
+     DPRINTF(E_LOG, L_LAUDIO, "'%s' configured with invalid start time (delay=%" PRIu64 ", offset=%d)\n", device->name, as->delay_ms, device->offset_ms);
+   else
+     as->delay_ms += device->offset_ms;
+ 
+   if (!as->software_volume)
+     {
+       ret = mixer_open(&as->mixer, as->mixer_device_name, as->mixer_name);
+       if (ret < 0)
+         {
+           DPRINTF(E_LOG, L_LAUDIO, "Could not open mixer '%s' ('%s')\n", as->mixer_device_name, as->mixer_name);
+           goto error_free_session;
+         }
+     }
+ 
+   as->state = OUTPUT_STATE_CONNECTED;
+   as->next = sessions;
+   sessions = as;
+ 
+   // as is now the official device session
+   outputs_device_session_add(device->id, as);
+ 
+   return as;
+ 
+  error_free_session:
+   alsa_session_free(as);
+   return NULL;
+ }
+@@ -1421,50 +1439,51 @@ static void
+ alsa_device_add(cfg_t* cfg_audio, int id)
+ {
+   struct output_device *device;
+   struct alsa_extra *ae;
+   const char *nickname;
+   int offset_ms;
+   int ret;
+ 
+   if (outputs_exclusive_mode_get() && !(cfg_audio && cfg_getbool(cfg_audio, "exclusive")))
+     {
+       DPRINTF(E_INFO, L_LAUDIO, "ALSA device ignored, other speaker(s) set as exclusive\n");
+       return;
+     }
+ 
+   CHECK_NULL(L_LAUDIO, device = calloc(1, sizeof(struct output_device)));
+   CHECK_NULL(L_LAUDIO, ae = calloc(1, sizeof(struct alsa_extra)));
+ 
+   device->id = id;
+   device->type = OUTPUT_TYPE_ALSA;
+   device->type_name = outputs_name(device->type);
+   device->extra_device_info = ae;
+   device->supported_formats = MEDIA_FORMAT_PCM;
+ 
+   // The audio section will have no title, so there we get the value from the
+   // "card" option
+   ae->card_name = cfg_title(cfg_audio);
+   if (!ae->card_name)
+     ae->card_name = cfg_getstr(cfg_audio, "card");
+ 
+   nickname = cfg_getstr(cfg_audio, "nickname");
+   device->name = strdup(nickname ? nickname : ae->card_name);
+ 
+   ae->mixer_name = cfg_getstr(cfg_audio, "mixer");
+   ae->mixer_device_name = cfg_getstr(cfg_audio, "mixer_device");
+   if (!ae->mixer_device_name || strlen(ae->mixer_device_name) == 0)
+     ae->mixer_device_name = ae->card_name;
++  ae->pcm_identity_file = cfg_getstr(cfg_audio, "pcm_identity_file");
+   ae->software_volume = cfg_getbool(cfg_audio, "software_volume");
+ 
+   offset_ms = cfg_getint(cfg_audio, "offset_ms");
+   if (abs(offset_ms) > 1000)
+     DPRINTF(E_LOG, L_LAUDIO, "The ALSA offset_ms (%d) set in the configuration is out of bounds (-1000 -> 1000)\n", offset_ms);
+   else
+     device->offset_ms = offset_ms;
+ 
+   DPRINTF(E_INFO, L_LAUDIO, "Adding ALSA device '%s' with name '%s'\n", ae->card_name, device->name);
+ 
+   ret = player_device_add(device);
+   if (ret < 0)
+     outputs_device_free(device);
+ }
+diff --git a/src/outputs/pcm_identity.h b/src/outputs/pcm_identity.h
+new file mode 100644
+index 00000000..984bc5a5
+--- /dev/null
++++ b/src/outputs/pcm_identity.h
+@@ -0,0 +1,193 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later
++ * Verify the actual opened ALSA PCM, not a pre-open name/udev serial guess.
++ * Opt-in immutable root manifest; no volume or playback scheduling changes. */
++#ifndef SHIRI_PCM_IDENTITY_H
++#define SHIRI_PCM_IDENTITY_H
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <poll.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <json-c/json.h>
++#ifdef __linux__
++#include <sys/vfs.h>
++#include <linux/magic.h>
++#endif
++
++#if defined(__linux__) || defined(SHIRI_PCM_IDENTITY_TEST)
++struct pcm_identity {
++  int card, device, subdevice;
++  uint64_t sysfs_dev, sysfs_ino, node_dev, node_ino, node_rdev;
++  const char *boot, *sysfs, *node;
++};
++static bool pcm_identity_number(struct json_object *object, const char *name, uint64_t *value, bool positive) {
++  struct json_object *member;
++  int64_t number;
++  if (!json_object_object_get_ex(object,name,&member) || !json_object_is_type(member,json_type_int)) return false;
++  number=json_object_get_int64(member);
++  if (number < (positive ? 1 : 0) || json_object_get_uint64(member) > INT64_MAX) return false;
++  *value=(uint64_t)number; return true;
++}
++static const char *pcm_identity_string(struct json_object *object,const char *name) {
++  struct json_object *member;
++  const char *value;
++  if (!json_object_object_get_ex(object,name,&member) || !json_object_is_type(member,json_type_string)) return NULL;
++  value=json_object_get_string(member);
++  return value && strlen(value)==(size_t)json_object_get_string_len(member) ? value : NULL;
++}
++static bool pcm_identity_boot_valid(const char *value) {
++  size_t i;
++  if (!value || strlen(value)!=36) return false;
++  for (i=0;i<36;i++) {
++    if (i==8 || i==13 || i==18 || i==23) { if(value[i]!='-') return false; }
++    else if (!((value[i]>='0' && value[i]<='9') || (value[i]>='a' && value[i]<='f'))) return false;
++  }
++  return true;
++}
++/* json-c intentionally accepts duplicate keys. Count top-level separators in
++ * this flat, scalar-only schema too, so duplicate field corruption fails. */
++static bool pcm_identity_fields(const char *data,size_t size) {
++  size_t i,fields=0; int depth=0; bool quoted=false,escaped=false;
++  for(i=0;i<size;i++) {
++    if (quoted) {
++      if (escaped) escaped=false;
++      else if(data[i]=='\\') escaped=true;
++      else if(data[i]=='"') quoted=false;
++    } else if(data[i]=='"') quoted=true;
++    else if(data[i]=='{' || data[i]=='[') { if(++depth>1) return false; }
++    else if(data[i]=='}' || data[i]==']') depth--;
++    else if(data[i]==':' && depth==1) fields++;
++  }
++  return fields==12 && depth==0 && !quoted;
++}
++static struct json_object *pcm_identity_load(const char *path,struct pcm_identity *identity) {
++  struct stat before,after;
++  struct json_tokener *parser=NULL;
++  struct json_object *object=NULL;
++  uint64_t version,card,device,subdevice;
++  char buffer[4097],extra,expected_node[128],suffix[64];
++  ssize_t size=0,count;
++  int fd=-1;
++  size_t end;
++  fd=open(path,O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK);
++  if(fd<0 || fstat(fd,&before) || !S_ISREG(before.st_mode) || before.st_uid!=0 || before.st_nlink!=1 ||
++     (before.st_mode&022) || before.st_size<1 || before.st_size>4096) goto fail;
++  while(size<before.st_size) {
++    count=read(fd,buffer+size,(size_t)(before.st_size-size));
++    if(count<0 && errno==EINTR) continue;
++    if(count<=0) goto fail;
++    size+=count;
++  }
++  if(read(fd,&extra,1)!=0 || fstat(fd,&after) || before.st_dev!=after.st_dev || before.st_ino!=after.st_ino ||
++     before.st_size!=after.st_size || before.st_mode!=after.st_mode || before.st_uid!=after.st_uid || after.st_nlink!=1) goto fail;
++  close(fd);fd=-1;buffer[size]=0;
++  if(!pcm_identity_fields(buffer,(size_t)size)) goto fail;
++  parser=json_tokener_new_ex(4);
++  if(!parser) goto fail;
++  json_tokener_set_flags(parser,JSON_TOKENER_STRICT);
++  object=json_tokener_parse_ex(parser,buffer,(int)size);
++  end=json_tokener_get_parse_end(parser);
++  while(end<(size_t)size && (buffer[end]==' ' || buffer[end]=='\n' || buffer[end]=='\r' || buffer[end]=='\t')) end++;
++  if(json_tokener_get_error(parser)!=json_tokener_success || end!=(size_t)size ||
++     !object || !json_object_is_type(object,json_type_object) || json_object_object_length(object)!=12 ||
++     !pcm_identity_number(object,"version",&version,true) || version!=1 ||
++     !pcm_identity_number(object,"card_index",&card,false) || card>INT_MAX ||
++     !pcm_identity_number(object,"device",&device,false) || device>INT_MAX ||
++     !pcm_identity_number(object,"subdevice",&subdevice,false) || subdevice>INT_MAX ||
++     !pcm_identity_number(object,"sysfs_st_dev",&identity->sysfs_dev,true) ||
++     !pcm_identity_number(object,"sysfs_st_ino",&identity->sysfs_ino,true) ||
++     !pcm_identity_number(object,"node_st_dev",&identity->node_dev,true) ||
++     !pcm_identity_number(object,"node_st_ino",&identity->node_ino,true) ||
++     !pcm_identity_number(object,"node_st_rdev",&identity->node_rdev,true)) goto fail;
++  identity->card=(int)card;identity->device=(int)device;identity->subdevice=(int)subdevice;
++  identity->boot=pcm_identity_string(object,"boot_id");
++  identity->sysfs=pcm_identity_string(object,"sysfs_path");
++  identity->node=pcm_identity_string(object,"node_path");
++  snprintf(expected_node,sizeof(expected_node),"/dev/snd/pcmC%dD%dp",identity->card,identity->device);
++  snprintf(suffix,sizeof(suffix),"/card%d",identity->card);
++  if(!pcm_identity_boot_valid(identity->boot) || !identity->sysfs || strlen(identity->sysfs)>=PATH_MAX ||
++     strncmp(identity->sysfs,"/sys/devices/",13) || strlen(identity->sysfs)<strlen(suffix) ||
++     strcmp(identity->sysfs+strlen(identity->sysfs)-strlen(suffix),suffix) ||
++     !identity->node || strcmp(identity->node,expected_node)) goto fail;
++  json_tokener_free(parser);return object;
++ fail:
++  if(fd>=0) close(fd);
++  if(parser) json_tokener_free(parser);
++  if(object) json_object_put(object);
++  return NULL;
++}
++static bool pcm_identity_node(const struct stat *info,const struct pcm_identity *identity) {
++  return S_ISCHR(info->st_mode) && (uint64_t)info->st_dev==identity->node_dev &&
++    (uint64_t)info->st_ino==identity->node_ino && (uint64_t)info->st_rdev==identity->node_rdev;
++}
++static bool pcm_identity_paths(const struct pcm_identity *identity) {
++  struct stat info; struct statfs filesystem;
++  int fd=open(identity->sysfs,O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
++  bool valid=false;
++  if(fd<0) return false;
++  valid=!fstatfs(fd,&filesystem) && filesystem.f_type==SYSFS_MAGIC && !fstat(fd,&info) &&
++    S_ISDIR(info.st_mode) && (uint64_t)info.st_dev==identity->sysfs_dev && (uint64_t)info.st_ino==identity->sysfs_ino;
++  close(fd);
++  if(!valid) return false;
++  fd=open(identity->node,O_PATH|O_NOFOLLOW|O_CLOEXEC);
++  if(fd<0) return false;
++  valid=!fstat(fd,&info) && pcm_identity_node(&info,identity);
++  close(fd);return valid;
++}
++static bool pcm_identity_boot(const char *expected) {
++  char value[38]; ssize_t size;
++  int fd=open("/proc/sys/kernel/random/boot_id",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
++  if(fd<0) return false;
++  size=read(fd,value,sizeof(value));close(fd);
++  return size==37 && value[36]=='\n' && !memcmp(value,expected,36);
++}
++/* The root broker retains its sysfs pin for the full daemon lifetime. Opened
++ * plughw slaves must still expose this exact hardware through ALSA info/poll. */
++static int pcm_identity_validate(snd_pcm_t *pcm,const char *manifest) {
++  struct pcm_identity identity;
++  struct json_object *object=NULL;
++  snd_pcm_info_t *info=NULL;
++  struct pollfd *descriptors=NULL;
++  struct stat node;
++  int count,i,result=-1;
++  bool found=false;
++  if(!manifest) return 0;
++  object=pcm_identity_load(manifest,&identity);
++  if(!object || !pcm_identity_boot(identity.boot) || !pcm_identity_paths(&identity)) goto done;
++  if(snd_pcm_info_malloc(&info)<0 || !info || snd_pcm_info(pcm,info)<0 ||
++     snd_pcm_info_get_stream(info)!=SND_PCM_STREAM_PLAYBACK || snd_pcm_info_get_card(info)!=identity.card ||
++     snd_pcm_info_get_device(info)!=(unsigned int)identity.device || snd_pcm_info_get_subdevice(info)!=(unsigned int)identity.subdevice) goto done;
++  count=snd_pcm_poll_descriptors_count(pcm);
++  /* Supported direct hw/plughw endpoints need one PCM FD. Reject unbounded or
++   * opaque custom plugins instead of guessing their hardware provenance. */
++  if(count<1 || count>64) goto done;
++  descriptors=calloc((size_t)count,sizeof(*descriptors));
++  if(!descriptors || snd_pcm_poll_descriptors(pcm,descriptors,(unsigned int)count)!=count) goto done;
++  for(i=0;i<count;i++) {
++    if(descriptors[i].fd<0 || fstat(descriptors[i].fd,&node)) goto done;
++    if(S_ISCHR(node.st_mode)) {
++      if(!pcm_identity_node(&node,&identity)) goto done;
++      found=true;
++    }
++  }
++  if(!found || !pcm_identity_boot(identity.boot) || !pcm_identity_paths(&identity)) goto done;
++  result=0;
++ done:
++  free(descriptors);
++  if(info) snd_pcm_info_free(info);
++  if(object) json_object_put(object);
++  return result;
++}
++#else
++/* The guarded profile is Linux-only; never weaken it on another platform. */
++static int pcm_identity_validate(snd_pcm_t *pcm,const char *manifest) {
++  (void)pcm;return manifest ? -1 : 0;
++}
++#endif
++#endif

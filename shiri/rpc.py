@@ -10,6 +10,8 @@ import struct
 from collections.abc import Awaitable, Callable
 import uuid
 
+from shiri.deadline import bounded
+
 MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 MAX_CONNECTIONS = 32
 
@@ -90,15 +92,30 @@ async def call_rpc(socket_path: Path | str, operation: str, payload: dict | None
             # close()/wait_closed() may flush forever to a peer that never reads.
             writer.transport.abort()
     try:
-        return await asyncio.wait_for(exchange(), timeout=timeout)
+        return await bounded(exchange(), timeout)
     except (ValueError, UnicodeError) as exc:
         raise RpcError("invalid_response", "Audio runtime returned malformed JSON") from exc
     except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError) as exc:
         raise RpcError("runtime_unavailable", "Audio runtime is unavailable or timed out") from exc
 
 
+def peer_uid(writer) -> int:
+    """Kernel credentials, never an identity claimed in the JSON envelope."""
+    peer = writer.get_extra_info("socket")
+    _, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    return uid
+
+
 async def serve_rpc(socket_path: Path | str, handler: Callable[[str, dict], Awaitable[dict]], *,
-                    mode=0o660, allowed_uids: set[int] | None = None, socket_gid: int | None = None):
+                    mode=0o660, allowed_uids: set[int] | None = None, socket_gid: int | None = None,
+                    operation_uids: dict[str, set[int]] | None = None):
+    operation_uids = {key: frozenset(value) for key, value in (operation_uids or {}).items()}
+    if any(not isinstance(key, str) or not key or len(key) > 64
+           or any(type(uid) is not int or not 0 <= uid <= 2**32 - 1 for uid in value)
+           for key, value in operation_uids.items()):
+        raise ValueError("Invalid RPC operation credential policy")
+    if operation_uids and not hasattr(socket, "SO_PEERCRED"):
+        raise RuntimeError("RPC operation authorization requires Linux peer credentials")
     path = Path(socket_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
@@ -129,16 +146,18 @@ async def serve_rpc(socket_path: Path | str, handler: Callable[[str, dict], Awai
             if state["closed"] or slots.locked():
                 return
             async with slots:
-                if allowed_uids is not None:
-                    peer = writer.get_extra_info("socket")
-                    _, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                    if uid not in allowed_uids:
+                uid = None
+                if allowed_uids is not None or operation_uids:
+                    uid = peer_uid(writer)
+                    if allowed_uids is not None and uid not in allowed_uids:
                         raise RpcError("forbidden", "This process cannot control the runtime")
                 message = await asyncio.wait_for(read_message(reader), timeout=5)
                 request_id = message.get("id")
                 operation, payload = message.get("operation"), message.get("payload")
                 if not isinstance(request_id, str) or len(request_id) > 128 or not isinstance(operation, str) or len(operation) > 64 or not isinstance(payload, dict):
                     raise RpcError("invalid_request", "Invalid RPC envelope")
+                if operation in operation_uids and uid not in operation_uids[operation]:
+                    raise RpcError("forbidden", "This process cannot perform this runtime operation")
                 timeout_ms = message.get("timeout_ms", 15000)
                 if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 100 <= timeout_ms <= 30000:
                     raise RpcError("invalid_request", "Invalid RPC deadline")

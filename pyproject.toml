@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.26,<2"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -12,6 +12,7 @@ dependencies = [
   "uvicorn[standard]>=0.30,<1",
   "httpx>=0.27,<1",
   "pydantic>=2.9,<3",
+  "dbus-next==0.2.3",
 ]
 
 [project.optional-dependencies]

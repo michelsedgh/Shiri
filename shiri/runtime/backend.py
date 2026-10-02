@@ -5,6 +5,8 @@ from __future__ import annotations
 import httpx
 import asyncio
 
+from shiri.deadline import bounded
+
 from .system import RuntimeFailure
 
 PROTOCOLS = {
@@ -23,7 +25,10 @@ def family(protocol: str):
 
 
 def normalize_output(raw: dict, excluded_names: set[str]):
-    protocol = PROTOCOLS.get(raw.get("type"))
+    output_type = raw.get("type")
+    if not isinstance(output_type, str):
+        return None
+    protocol = PROTOCOLS.get(output_type)
     try:
         output_id = str(raw["id"])
         if not output_id.isdigit() or not 0 <= int(output_id) <= (1 << 64) - 1:
@@ -32,7 +37,21 @@ def normalize_output(raw: dict, excluded_names: set[str]):
     except (KeyError, ValueError, TypeError):
         return None
     name = raw.get("name")
-    if not isinstance(name, str) or not name:
+    if (not isinstance(name, str) or not 1 <= len(name) <= 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+        return None
+    for key in ("selected", "requires_auth", "needs_auth_key", "has_password"):
+        if key in raw and type(raw[key]) is not bool:
+            return None
+    if raw.get("volume") is not None and (type(raw["volume"]) is not int or not 0 <= raw["volume"] <= 100):
+        return None
+    if "offset_ms" in raw and (type(raw["offset_ms"]) is not int or not -2000 <= raw["offset_ms"] <= 2000):
+        return None
+    if "balance_percent" in raw and (type(raw["balance_percent"]) is not int or not 0 <= raw["balance_percent"] <= 100):
+        return None
+    formats = raw.get("supported_formats", [])
+    if (not isinstance(raw.get("format", ""), str) or not isinstance(formats, list) or len(formats) > 32
+            or any(not isinstance(value, str) or not 1 <= len(value) <= 64 for value in formats)):
         return None
     assignable = protocol is not None and name not in excluded_names
     reason = (
@@ -52,6 +71,7 @@ def normalize_output(raw: dict, excluded_names: set[str]):
         "selected": bool(raw.get("selected")),
         "volume": raw.get("volume"),
         "offset_ms": raw.get("offset_ms", 0),
+        "balance_percent": raw.get("balance_percent", 100),
         "assignable": assignable,
         "reason": reason,
         "synchronization": sync,
@@ -59,6 +79,13 @@ def normalize_output(raw: dict, excluded_names: set[str]):
         "format": raw.get("format", ""),
         "supported_formats": raw.get("supported_formats", []),
     }
+
+
+class OwnToneRejected(RuntimeFailure):
+    """Typed backend rejection; carries no credentials or response contents."""
+    def __init__(self, method: str, path: str, status_code: int):
+        self.method, self.path, self.status_code = method, path, status_code
+        super().__init__(f"OwnTone rejected {method} {path} (HTTP {status_code})")
 
 
 class OwnToneClient:
@@ -81,8 +108,8 @@ class OwnToneClient:
         # httpx read timeouts measure idle time between chunks. A slow trickle
         # must not keep a room actor or the health monitor waiting indefinitely.
         try:
-            return await asyncio.wait_for(
-                self._exchange(method, path, json=json, params=params), timeout=self.deadline
+            return await bounded(
+                self._exchange(method, path, json=json, params=params), self.deadline
             )
         except asyncio.TimeoutError as exc:
             raise RuntimeFailure("OwnTone exceeded its total control request deadline") from exc
@@ -91,7 +118,7 @@ class OwnToneClient:
         try:
             async with self.client.stream(method, path, json=json, params=params) as response:
                 if not 200 <= response.status_code < 300:
-                    raise RuntimeFailure(f"OwnTone rejected {method} {path} (HTTP {response.status_code})")
+                    raise OwnToneRejected(method, path, response.status_code)
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
                     content.extend(chunk)
@@ -115,13 +142,17 @@ class OwnToneClient:
 
     async def outputs(self, excluded_names: set[str]):
         result = await self.request("GET", "/api/outputs")
-        if not isinstance(result.get("outputs"), list):
+        rows = result.get("outputs")
+        if not isinstance(rows, list) or len(rows) > 512:
             raise RuntimeFailure("OwnTone did not return an output list")
-        return [
-            output
-            for raw in result["outputs"]
-            if isinstance(raw, dict) and (output := normalize_output(raw, excluded_names)) is not None
-        ]
+        outputs, identities = [], set()
+        for raw in rows:
+            output = normalize_output(raw, excluded_names) if isinstance(raw, dict) else None
+            if output is None or output["id"] in identities:
+                raise RuntimeFailure("OwnTone returned malformed or duplicate output identities; selection is unconfirmed")
+            identities.add(output["id"])
+            outputs.append(output)
+        return outputs
 
     async def select(self, speakers: list, outputs: list[dict]):
         by_id = {output["id"]: output for output in outputs}
@@ -173,4 +204,22 @@ class OwnToneClient:
 
     async def volume(self, value: int):
         await self.request("PUT", "/api/player/volume", params={"volume": value})
+        return {"ok": True}
+
+    async def volume_settings(self, value: int, speakers: list):
+        # Stage trims before selection, so an output cannot start at an old gain.
+        if type(value) is not int or not 0 <= value <= 100:
+            raise RuntimeFailure("Room volume must be an integer from 0 to 100")
+        body = {"volume": value, "outputs": [{"id": speaker.id, "balance_percent": speaker.balance_percent}
+                                            for speaker in speakers]}
+        reply = await self.request("POST", "/api/player/shiri-volume-settings", json=body)
+        if reply != body:
+            raise RuntimeFailure("OwnTone did not acknowledge the requested room volume and speaker balances")
+        player = await self.request("GET", "/api/player")
+        if player.get("volume") != value:
+            raise RuntimeFailure("OwnTone did not retain the requested room volume")
+        observed = {output["id"]: output for output in await self.outputs(set())}
+        if any(speaker.id not in observed or observed[speaker.id]["balance_percent"] != speaker.balance_percent
+               for speaker in speakers):
+            raise RuntimeFailure("OwnTone did not retain the requested speaker balances")
         return {"ok": True}

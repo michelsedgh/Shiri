@@ -7,12 +7,178 @@ is an unresolved production requirement, not an accepted deferred exclusion.
 See [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md) for the authoritative
 behavior and [CALIBRATION.md](CALIBRATION.md) for acoustic measurement methods.
 
-This review identifies a concrete loss of timing provenance and an experiment
-boundary. It does not establish an acoustic failure magnitude, implement an
-OwnTone fork, or prove that a proposed transport fixes grouping. Chromecast
-input remains a separate required receiver implementation and acceptance gate.
+The initial audit below identifies the timing lost by the original raw-PCM
+relay. The candidate now implements the corresponding timestamp-preserving
+Shairport/OwnTone patches, exact source ownership and native mixer; actual C
+checks and a fresh Ubuntu backend build have passed. Whole-path multi-zone
+Linux output validation is in progress. No result here establishes physical
+speaker alignment or stock-phone compatibility. Chromecast input is deferred
+by the user for this release; Chromecast speaker outputs remain in scope.
 
-## Reviewed revisions and current path
+## Candidate buffering and speaker compensation
+
+The current low-latency candidate computes each room's OwnTone buffer `B` as
+the maximum of 500 ms and each selected speaker's required lead minus its
+offset. AirPlay 1/2 use a 500 ms candidate lead; wired, Bluetooth and Cast use
+250 ms. Ordinary rooms still use B500. A selected −2000 ms correction therefore
+requires B2500 for AirPlay and B2250 for the other routes. An unused correction
+range no longer charges every room the largest buffer. Configuration rejects a
+selected correction that would leave less than its route's required lead. This preserves
+the earlier repair: a fixed 500 ms buffer silently ignored offsets below −500 ms
+in the ALSA session constructor. AirPlay's separate source guard requires the
+base to exceed 250 ms. Physical devices may impose a larger buffer even when that
+guard passes; only later device measurements can establish their minimum.
+[Pinned configuration default](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/conffile.c),
+[pinned ALSA session timing](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/alsa.c),
+[pinned AirPlay buffer interpretation](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/airplay.c)
+
+The October 1 actual-source receiver audit exposed a further boundary that
+the policy tests did not cover. OwnTone's AirPlay 2 timestamp encoders and
+the pinned Shairport PTP consumer leave `B + offset − 250 − 150` milliseconds
+for this receiver's native backend. B500/offset0 gives 100 ms; both
+B500/offset−250 and B2250/offset−2000 give −150 ms, which the consumer stores
+as a large unsigned sample count. The preceding universal 250 ms correction
+margin was therefore invalid for this route. The route-aware correction now
+retains a 100 ms window at every admitted AirPlay offset. Exhaustive extracted-C
+checks cover all 4,001 integer offsets and preserve the reproduced old-policy
+failure. Applying the same candidate lead to AirPlay 1 is conservative; it is
+not a measured device profile. Actual output measurements remain required
+before releasing negative offsets.
+The extracted C proof is retained by `/tmp/shiri-route-buffer-audit.py`;
+it exercises the maintained packet encoders and consumer statements rather
+than assuming a universal speaker buffer.
+
+For a native source frame with mapped phone presentation time `P`, the mixer
+envelope carries `P + H`. The broker freezes one common `H` for all enabled zones:
+the largest configured `B` plus 500 ms startup headroom. Ordinary zones therefore
+use a 1000 ms relay candidate, replacing the rebuild's conservative four seconds.
+The largest admitted negative correction raises H to 3000 ms for AirPlay or
+2750 ms for the other routes; it does not change ordinary rooms' buffer policy.
+The framed input supplies OwnTone's existing player with `P + H − B`; the output
+adds `B + offset`, retaining final `P + H + offset` across different room buffers.
+The first player anchor must remain in the future; a late native packet is never
+rebased to receive time. These candidate values require cold/warm final-output
+measurements before release. Administrative plan changes retire old program
+incarnations; TTS never changes this plan.
+
+Speech uses a separate room/launch/UID-bound datagram channel into OwnTone's
+player immediately before `outputs_write`, after the player has waited for the
+program anchor. It avoids the music relay queue and uses the existing output
+lead. The queue and packet age are bounded to 250 ms, gain ramps are 40 ms down
+and 250 ms up, and ordinary speech EOF drains valid queued samples. Idle speech
+starts a short timed silence bed rather than waiting through `H`. Actual cold
+device startup and any additional AirPlay, Cast, Bluetooth or hardware buffering
+remain separate measurement obligations. Speech never pauses, seeks, restarts
+music or invokes a source flush.
+
+The [actual-source regression](../tests/native/check_common_buffer.py) sends a
+timestamped packet through the patched reader using a real private pipe, then
+executes the maintained ALSA session-delay guard and final timestamp assignment.
+It derives `B` from a generated profile with a selected −2000 ms correction and
+verifies all 4001 integer offsets without a discarded correction. The exact
+unqualified 500 ms preimage fails 1500 negative
+offset cases. This is backend scheduling evidence; it does not establish
+acoustic alignment or measure a physical speaker's latency. Cast still adds its
+own 100 ms transport allowance and lacks proven precise final presentation;
+using the same base buffer does not remove transport jitter or drift.
+
+## Explicit minimum music buffer experiment
+
+A separate opt-in plan now tests a route-specific minimum instead of charging
+local outputs the AirPlay lead. The production default above and the original
+H750/B500 MUSIC experiment remain unchanged during qualification.
+
+| Selected output route | Candidate lead after its correction | Zero-offset B | Single-room H |
+| --- | ---: | ---: | ---: |
+| Pinned ALSA or private framed Bluetooth A2DP | 40 ms | 40 ms | 140 ms |
+| Cast or unqualified Pulse route | 250 ms | 250 ms | 350 ms |
+| AirPlay 1/2 | 500 ms | 500 ms | 600 ms |
+
+Forty milliseconds is two production 20ms PCM periods and four OwnTone 10ms
+playback ticks. The maintained ALSA/framed-output path does not impose the
+previous Python 500ms floor. It remains a software candidate: a Bluetooth
+speaker or a speaker group may add buffering that Shiri cannot remove. A
+vendor-linked Bluetooth group is assigned as its one A2DP output endpoint;
+its internal speaker alignment requires the later physical measurements.
+
+For each enabled room, the minimum plan selects B at least 40ms and at least
+every selected route's lead minus its saved offset. It freezes one common
+H=max(enabled B)+100ms. Mixed endpoints therefore retain their separate
+constraints; an AirPlay endpoint never inherits the local40ms allowance. A
+selected −2000ms local correction uses B2040; the same AirPlay correction
+requires B2500. Disabled rooms do not increase a running plan's horizon.
+
+With original receiver P 150ms after nominal first availability, the
+largest-buffer room's first OwnTone read anchor P+H−B has 250ms from that
+availability. Actual output START and source admission must finish before the
+original anchor. The fresh post-peek clock check refuses an equal or expired
+anchor; it never rebases P or skips the first frame. H0 is still refused and
+requires a separately proven earlier receiver delivery/preparation design.
+
+`run_native_music_minimum.py` is a distinct explicit cold H140/B40 experiment
+with its own version 2 producer profile and result artifacts. It retains the
+immutable calendar published before either BEGIN, the unchanged 150ms delivery
+lateness bound, the exact 21s lossless prefix/body/tail oracle, 2ms group/drift
+limits, independently measured absolute capture horizon, original source/unit
+ownership, advancing NPT, zero drops, and complete output/unit cleanup.
+Controlled actual OwnTone C timer/timerfd fixtures cover the 250ms admission
+boundaries; they do not measure hardware START duration. The complete Linux
+MUSIC path and later physical route measurements must pass before default
+production policy is promoted.
+
+The October 1 repeat retained both complete21-second outputs but measured a
+steady4ms relative offset with no drift. Original waveform/timestamp replay
+reproduces that failure; the2ms acceptance limit remains unchanged. OwnTone's
+existing ALSA correction leaves small fixed offsets with zero drift alone,
+so this observation does not identify which component created the first skew.
+The test instrument is being checked independently: upstream Linux5.15's
+loopback driver defaults to a jiffies timer, saves a jiffies position when each
+stream starts and rounds period scheduling to ticks. Actual kernel configuration,
+driver timer selection, cable state and monotonic playback-trigger observations
+are needed before attributing the measured offset to Shiri or the fixture.
+This is a hypothesis, not an established cause or a backend timing correction.
+[Linux5.15 loopback driver](https://github.com/torvalds/linux/blob/v5.15/sound/drivers/aloop.c)
+
+Actual68 subsequently recorded `/proc/asound/timers` with a4000µs system timer
+and all `snd_aloop` timer-source entries unset. These observations support the
+fixture's coarse-timer hypothesis; they do not explain which startup created
+the65 offset. The initial64KiB kernel-config read was explicitly rejected as
+oversized, so it provides no `CONFIG_HZ` evidence. The next read-only observer
+uses a bounded1MiB config read and retains the actual playback trigger/cable
+state without changing the original2ms waveform acceptance limit.
+
+Actual69/71 retained the unchanged current-backend H140/B40 experiment and
+original PCM/timestamps. Full, early and late waveform replay each measured
++4ms relative offset with zero drift, while the earlier65 run measured−4ms.
+The observer confirmed `CONFIG_HZ_250=y`, `CONFIG_HZ=250` and high-resolution
+timer support. Both loopback cables still used the system timer. Playback
+trigger values differed by about1ms, but their timestamp clock type was not
+reported; comparing those values directly with the source calendar would be
+unqualified. No acceptance limit or production scheduling correction changed.
+
+Linux5.15 also exposes a writable per-card `timer_source` proc entry. A new
+loopback cable selects that card's current timer source when it opens; the
+module's initial parameter alone does not describe a later proc selection.
+The external PCM-timer branch also requires matching playback and capture
+periods and checks the timer resolution against those periods. Current
+playback uses512 frames and capture uses960; a small-period dummy PCM timer
+is therefore not a drop-in replacement. No timer-source write or dummy-device
+provisioning was performed. This proposed experiment remains inadmissible
+until the period contract is resolved.
+[Linux5.15 timer-source selection](https://github.com/torvalds/linux/blob/v5.15/sound/drivers/aloop.c)
+
+An alternative isolated experiment uses the official Ubuntu ARM64 lowlatency
+kernel at the same5.15.0-194 revision. The two downloaded kernel packages match
+the previously verified signed archive index; their extracted configuration
+declares `CONFIG_HZ_1000=y`, `CONFIG_HZ=1000` and high-resolution timers. This
+could test the coarse-clock hypothesis while preserving the512/960 geometry.
+Only a private provisioning proposal exists: the VM still uses the generic
+250Hz kernel. A finer kernel does not establish synchronization; the unchanged
+2ms waveform gate, complete PCM/calendar checks and fallback/rollback checks
+must pass before any minimum policy is promoted. Local package/config evidence
+is retained in `/tmp/shiri-lowlatency-kernel-config-review-result.json`.
+
+## Reviewed revisions and original relay
 
 The reviewed OwnTone commit is
 `d6fb3edf5831de38134ebd92fcf09a730ddd37aa`. The relevant input, player, AirPlay
@@ -21,6 +187,11 @@ tag files. Shairport is pinned to
 `7bad231c18368dbd26f298577f6210e36e4b0797`. Installation pins are recorded in
 [build_backends.sh](../install/build_backends.sh); a different build requires
 rechecking these conclusions.
+
+The release API was rechecked on 2026-09-30: the latest stable releases are
+[OwnTone 29.3, published July 22](https://github.com/owntone/owntone-server/releases/tag/29.3)
+and [Shairport Sync 5.5.2, published September 14](https://github.com/mikebrady/shairport-sync/releases/tag/5.5.2).
+The candidate uses these pinned releases with reviewable local patches.
 
 ```mermaid
 flowchart LR
@@ -34,7 +205,7 @@ flowchart LR
     Receiver -. Optional timing anchors .-> Meta[Private metadata FIFO]
 ```
 
-The receiver has sender-derived timing. In the current configuration it feeds
+The original receiver has sender-derived timing. In the audited configuration it feeds
 48 kHz stereo S16LE into ALSA Loopback. The music capture source does not provide
 the mixer clock. Each worker starts its own live pipeline and uses pipeline
 running time for speech. The output callback extracts buffer bytes, discarding

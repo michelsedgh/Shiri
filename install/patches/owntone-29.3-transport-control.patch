@@ -1,0 +1,2049 @@
+diff --git a/configure.ac b/configure.ac
+index f9096f62..c208644b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index a753e0d3..2186ad21 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -14,9 +14,9 @@ endif
+ 
+ if COND_CHROMECAST
+ if COND_PROTOBUF_OLD
+-CHROMECAST_SRC=outputs/cast.c outputs/cast_channel.v0.pb-c.h outputs/cast_channel.v0.pb-c.c
++CHROMECAST_SRC=outputs/cast.c outputs/cast_json.h outputs/cast_channel.v0.pb-c.h outputs/cast_channel.v0.pb-c.c
+ else
+-CHROMECAST_SRC=outputs/cast.c outputs/cast_channel.pb-c.h outputs/cast_channel.pb-c.c
++CHROMECAST_SRC=outputs/cast.c outputs/cast_json.h outputs/cast_channel.pb-c.h outputs/cast_channel.pb-c.c
+ endif
+ endif
+ 
+diff --git a/src/outputs/cast.c b/src/outputs/cast.c
+index a385a670..d3aefbeb 100644
+--- a/src/outputs/cast.c
++++ b/src/outputs/cast.c
+@@ -1,142 +1,146 @@
+ /*
+  * Copyright (C) 2015-2019 Espen Jürgensen <espenjurgensen@gmail.com>
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <stdio.h>
++#include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <errno.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <arpa/inet.h>
+ #include <net/if.h>
+ #include <netinet/in.h>
+ #include <ifaddrs.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <limits.h>
++#include <time.h>
+ 
+ #include <gnutls/gnutls.h>
+ #include <event2/event.h>
+ #include <json.h>
+ 
+ #include "conffile.h"
+ #include "misc.h"
++#include "cast_json.h"
+ #include "mdns.h"
+ #include "transcode.h"
+ #include "logger.h"
+ #include "player.h"
+ #include "rtp_common.h"
+ #include "outputs.h"
+ #include "db.h"
+ #include "artwork.h"
+ #include "misc.h"
+ 
+ #ifdef HAVE_PROTOBUF_OLD
+ #include "cast_channel.v0.pb-c.h"
+ #else
+ #include "cast_channel.pb-c.h"
+ #endif
+ 
+ // This implementation of Chromecast uses the same mirroring app that Chromium
+ // uses. This app supports RTP-streaming, which has the advantage of quick
+ // startup and similarity with Airplay. However, I have not found much
+ // documentation for it, so the reference is Chromium itself. Here's how to
+ // start a Chromium mirroring session with verbose logging:
+ //
+ // 1) chromium --user-data-dir=~/chromium --enable-logging --v=1 ~/Music/test.mp3
+ // 2) right-click, select Cast, select device
+ // 3) log will now be in ~/chromium/chrome_debug.log
+ 
+ // Number of bytes to request from TLS connection
+ #define MAX_BUF 4096
+ // CA file location (not very portable...?)
+ #define CAFILE "/etc/ssl/certs/ca-certificates.crt"
+ 
+ // Seconds without a heartbeat from the Chromecast before we close the session
+ //#define HEARTBEAT_TIMEOUT 30
+ // Seconds to wait for a reply before making the callback requested by caller
+ #define REPLY_TIMEOUT 5
+ 
+ // ID of the audio mirroring app used by Chrome (Google Home)
+ #define CAST_APP_ID "85CDB22F"
+ // Old mirroring app (Chromecast)
+ #define CAST_APP_ID_OLD "0F5096E8"
+ 
+ // Namespaces
+ #define NS_CONNECTION "urn:x-cast:com.google.cast.tp.connection"
+ #define NS_RECEIVER "urn:x-cast:com.google.cast.receiver"
+ #define NS_HEARTBEAT "urn:x-cast:com.google.cast.tp.heartbeat"
+ #define NS_MEDIA "urn:x-cast:com.google.cast.media"
+ #define NS_WEBRTC "urn:x-cast:com.google.cast.webrtc"
+ 
+ #define USE_TRANSPORT_ID     (1 << 1)
+ #define USE_REQUEST_ID       (1 << 2)
+ #define USE_REQUEST_ID_ONLY  (1 << 3)
+ 
+ #define CALLBACK_REGISTER_SIZE 32
+ 
+ // Chromium will send OPUS encoded 10 ms packets (48kHz), about 120 bytes. We
+ // use a 20 ms packet, so 50 pkts/sec, because that's the default for ffmpeg.
+ // A 20 ms audio packet at 48000 kHz makes this number 48000 * (20 / 1000)
+ #define CAST_SAMPLES_PER_PACKET 960
+ 
+ #define CAST_QUALITY_SAMPLE_RATE_DEFAULT     48000
+ #define CAST_QUALITY_BITS_PER_SAMPLE_DEFAULT 16
+ #define CAST_QUALITY_CHANNELS_DEFAULT        2
+ 
+ // This is an arbitrary value which just needs to be kept in sync with the config
+ #define CAST_CONFIG_MAX_VOLUME 11
+ 
+ // This makes the rtp session buffer 6 seconds of audio (6 sec * 50 pkts/sec),
+ // which can be used for delayed transmission (and retransmission)
+ #define CAST_PACKET_BUFFER_SIZE 300
+ 
+ // Max number of RTP packets for one artwork image
+ #define CAST_PACKET_ARTWORK_SIZE 200
+ 
+ // Max (absolute) value the user is allowed to set offset_ms in the config file
+ #define CAST_OFFSET_MAX 1000
+ 
+ // This is just my measurement of how much extra delay is required to start at
+ // the same time as Airplay. The value was found experimentally.
+ #define CAST_DEVICE_START_DELAY_MS 100
+ 
+ // See cast_packet_header_make()
+ #define CAST_HEADER_SIZE 11
+ 
+ // These limits are from components/mirroring/service/session.cc
+ #define CAST_SSRC_AUDIO_MIN 1
+ #define CAST_SSRC_AUDIO_MAX 500000
+ #define CAST_SSRC_VIDEO_MIN 500001
+ #define CAST_SSRC_VIDEO_MAX 1000000
+ 
+ #define CAST_RTP_PAYLOADTYPE_AUDIO 127
+ #define CAST_RTP_PAYLOADTYPE_VIDEO 96
+ 
+ /* Notes
+  * OFFER/ANSWER <-webrtc
+  * RTCP/RTP
+  * XR custom receiver report
+  * Control and data on same UDP connection
+  * OPUS encoded
+  */
+ 
+ //#define DEBUG_CHROMECAST 1
+@@ -193,62 +197,70 @@ struct cast_master_session
+   struct rtp_session *rtp_artwork;
+ };
+ 
++struct cast_reply_entry
++{
++  unsigned int request_id;
++  int callback_id;
++  cast_reply_cb completion;
++  int64_t deadline_ns;
++};
++
+ struct cast_session
+ {
+   uint64_t device_id;
+   int callback_id;
+ 
+   struct cast_master_session *master_session;
+ 
+   // Current state
+   enum cast_state state;
+ 
+   // Used to register a target state if we are transitioning from one to another
+   enum cast_state wanted_state;
+ 
+   // Connection fd and session, and listener event
+   int server_fd;
+   gnutls_session_t tls_session;
+   struct event *ev;
+ 
+   char *devname;
+   char *address;
+   int family;
+   unsigned short port;
+ 
+   // ChromeCast uses a float between 0 - 1
+   float volume;
+ 
+   uint32_t ssrc_id;
+ 
+   // For initial buffering (delay playback to achieve some sort of sync).
+   struct timespec start_pts;
+   struct timespec delay_ts;
+   uint16_t seqnum_next;
+ 
+   uint16_t ack_last;
+ 
+   // Outgoing request which have the USE_REQUEST_ID flag get a new id, and a
+   // callback is registered. The callback is called when an incoming message
+   // from the peer with that request id arrives. If nothing arrives within
+   // REPLY_TIMEOUT we make the callback with a NULL payload pointer.
+   unsigned int request_id;
+-  cast_reply_cb callback_register[CALLBACK_REGISTER_SIZE];
++  struct cast_reply_entry callback_register[CALLBACK_REGISTER_SIZE];
+   struct event *reply_timeout;
+ 
+   // This is used to work around a bug where no response is given by the device.
+   // For certain requests, we will then retry, e.g. by checking status. We
+   // register our retry so that we on only retry once.
+   int retry;
+ 
+   // Session info from the Chromecast
+   char *transport_id;
+   char *session_id;
+   unsigned int media_session_id;
+ 
+   int udp_fd;
+   unsigned short udp_port;
+   struct event *rtcp_ev;
+ 
+   struct cast_session *next;
+ };
+@@ -291,12 +303,14 @@ struct cast_msg_basic
+ struct cast_msg_payload
+ {
+   enum cast_msg_types type;
+   unsigned int request_id;
+   const char *app_id;
+   const char *session_id;
+   const char *transport_id;
+   const char *player_state;
+   const char *result;
++  json_object *receiver_applications;
++  bool receiver_status_valid;
+   unsigned int media_session_id;
+   unsigned short udp_port;
+ };
+@@ -461,7 +475,7 @@ static gnutls_certificate_credentials_t tls_credentials;
+ static struct cast_session *cast_sessions;
+ static struct cast_master_session *cast_master_session;
+ //static struct timeval heartbeat_timeout = { HEARTBEAT_TIMEOUT, 0 };
+-static struct timeval reply_timeout = { REPLY_TIMEOUT, 0 };
++
+ static struct media_quality cast_quality_default = { CAST_QUALITY_SAMPLE_RATE_DEFAULT, CAST_QUALITY_BITS_PER_SAMPLE_DEFAULT, CAST_QUALITY_CHANNELS_DEFAULT, 0 };
+ 
+ 
+@@ -592,173 +606,260 @@ cast_session_shutdown(struct cast_session *cs, enum cast_state wanted_state);
+ 
+ /* --------------------------- CAST MESSAGE HANDLING ------------------------ */
+ 
++/* Exact request identities and independent monotonic deadlines. */
++static int64_t
++cast_reply_now(void)
++{
++  struct timespec now;
++  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0 || now.tv_sec < 0
++      || now.tv_nsec < 0 || now.tv_nsec >= 1000000000LL
++      || now.tv_sec > (INT64_MAX - now.tv_nsec) / 1000000000LL)
++    return -1;
++  return (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
++}
++
++static int
++cast_reply_schedule(struct cast_session *cs)
++{
++  int64_t earliest = INT64_MAX, now, delta;
++  struct timeval wait;
++  unsigned int i;
++  for (i = 0; i < CALLBACK_REGISTER_SIZE; i++)
++    if (cs->callback_register[i].completion && cs->callback_register[i].deadline_ns < earliest)
++      earliest = cs->callback_register[i].deadline_ns;
++  if (earliest == INT64_MAX)
++    return evtimer_del(cs->reply_timeout);
++  now = cast_reply_now();
++  if (now < 0)
++    return -1;
++  delta = earliest > now ? earliest - now : 1;
++  wait.tv_sec = delta / 1000000000LL;
++  wait.tv_usec = (delta % 1000000000LL + 999) / 1000;
++  if (wait.tv_usec == 1000000)
++    { wait.tv_sec++; wait.tv_usec = 0; }
++  return event_add(cs->reply_timeout, &wait);
++}
++
++static int
++cast_reply_take(struct cast_session *cs, unsigned int request_id, struct cast_reply_entry *entry)
++{
++  struct cast_reply_entry *pending = &cs->callback_register[request_id % CALLBACK_REGISTER_SIZE];
++  if (!pending->completion || pending->request_id != request_id)
++    return 0;
++  *entry = *pending;
++  memset(pending, 0, sizeof(*pending));
++  /* Reschedule before completion: it may enqueue work or destroy cs. */
++  return cast_reply_schedule(cs) < 0 ? -1 : 1;
++}
++
++
++
+ static int
+ cast_msg_send(struct cast_session *cs, enum cast_msg_types type, cast_reply_cb reply_cb)
+ {
+   Extensions__CoreApi__CastChannel__CastMessage msg = EXTENSIONS__CORE_API__CAST_CHANNEL__CAST_MESSAGE__INIT;
+   char msg_buf[MAX_BUF];
+   uint8_t buf[MAX_BUF];
+   uint32_t be;
+   size_t len;
++  struct cast_reply_entry *entry = NULL;
++  int64_t now;
+   int ret;
+ 
+ #ifdef DEBUG_CHROMECAST
+   DPRINTF(E_DBG, L_CAST, "Preparing to send message type %d to '%s'\n", type, cs->devname);
+ #endif
+ 
+   msg.source_id = "sender-0";
+   msg.namespace_ = cast_msg[type].namespace;
+ 
+   if ((cast_msg[type].flags & USE_TRANSPORT_ID) && !cs->transport_id)
+     {
+       DPRINTF(E_LOG, L_CAST, "Error, didn't get transportId for message (type %d) to '%s'\n", type, cs->devname);
+       return -1;
+     }
+ 
+   if (cast_msg[type].flags & USE_TRANSPORT_ID)
+     msg.destination_id = cs->transport_id;
+   else
+     msg.destination_id = "receiver-0";
+ 
+   if (cast_msg[type].flags & (USE_REQUEST_ID | USE_REQUEST_ID_ONLY))
+     {
+-      cs->request_id++;
++      /* JSON parsing and receiver IDs are bounded signed 32-bit integers. */
++      if (cs->request_id >= INT_MAX)
++        return -1;
+       if (reply_cb)
+-	{
+-	  cs->callback_register[cs->request_id % CALLBACK_REGISTER_SIZE] = reply_cb;
+-	  event_add(cs->reply_timeout, &reply_timeout);
+-	}
++        {
++          entry = &cs->callback_register[(cs->request_id + 1) % CALLBACK_REGISTER_SIZE];
++          now = cast_reply_now();
++          if (entry->completion || now < 0 || now > INT64_MAX - REPLY_TIMEOUT * 1000000000LL)
++            return -1;
++        }
++      cs->request_id++;
++      if (entry)
++        {
++          entry->request_id = cs->request_id;
++          entry->callback_id = cs->callback_id;
++          entry->completion = reply_cb;
++          entry->deadline_ns = now + REPLY_TIMEOUT * 1000000000LL;
++          if (cast_reply_schedule(cs) < 0)
++            goto send_error;
++        }
+     }
+ 
+   // Special handling of some message types
+   if (cast_msg[type].flags & USE_REQUEST_ID_ONLY)
+     snprintf(msg_buf, sizeof(msg_buf), cast_msg[type].payload, cs->request_id);
+   else if (type == STOP)
+     snprintf(msg_buf, sizeof(msg_buf), cast_msg[type].payload, cs->session_id, cs->request_id);
+   else if (type == OFFER)
+     snprintf(msg_buf, sizeof(msg_buf), cast_msg[type].payload, cs->request_id, cs->ssrc_id);
+   else if (type == PRESENTATION)
+     snprintf(msg_buf, sizeof(msg_buf), cast_msg[type].payload, cs->session_id, cs->request_id);
+   else if (type == SET_VOLUME)
+     snprintf(msg_buf, sizeof(msg_buf), cast_msg[type].payload, cs->volume, cs->request_id);
+   else
+     snprintf(msg_buf, sizeof(msg_buf), "%s", cast_msg[type].payload);
+ 
+   squote_to_dquote(msg_buf);
+   msg.payload_utf8 = msg_buf;
+ 
+   len = extensions__core_api__cast_channel__cast_message__get_packed_size(&msg);
+   if (len <= 0 || len >= sizeof(buf) - 4)
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not send message (type %d), invalid length: %zu\n", type, len);
+-      return -1;
++      goto send_error;
+     }
+ 
+   // The message must be prefixed with Big-Endian 32 bit length
+   be = htobe32(len);
+   memcpy(buf, &be, 4);
+ 
+   // Now add the packed message and send it
+   extensions__core_api__cast_channel__cast_message__pack(&msg, buf + 4);
+ 
+   ret = gnutls_record_send(cs->tls_session, buf, len + 4);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not send message, TLS error\n");
+-      return -1;
++      goto send_error;
+     }
+   else if (ret != len + 4)
+     {
+       DPRINTF(E_LOG, L_CAST, "BUG! Message partially sent, and we are not able to send the rest\n");
+-      return -1;
++      goto send_error;
+     }
+ 
+   if (type != PONG)
+     DPRINTF(E_DBG, L_CAST, "TX %zu %s %s %s %s\n", len, msg.source_id, msg.destination_id, msg.namespace_, msg.payload_utf8);
+ 
+   return 0;
++
++ send_error:
++  if (entry && entry->request_id == cs->request_id)
++    { memset(entry, 0, sizeof(*entry)); cast_reply_schedule(cs); }
++  return -1;
+ }
+ 
+ static void *
+ cast_msg_parse(struct cast_msg_payload *payload, char *s)
+ {
+   json_object *haystack;
+   json_object *somehay;
+   json_object *needle;
+   const char *val;
+   int i;
+ 
+-  haystack = json_tokener_parse(s);
++  haystack = cast_json_parse(s, MAX_BUF);
+   if (!haystack)
+     {
+       DPRINTF(E_LOG, L_CAST, "JSON parser returned an error\n");
+       return NULL;
+     }
+ 
+   payload->type = UNKNOWN;
+   if (json_object_object_get_ex(haystack, "type", &needle))
+     {
++      if (json_object_get_type(needle) != json_type_string
++          || (size_t)json_object_get_string_len(needle) != strlen(json_object_get_string(needle)))
++        { json_object_put(haystack); return NULL; }
+       val = json_object_get_string(needle);
+       for (i = 1; cast_msg[i].type; i++)
+ 	{
+ 	  if (cast_msg[i].tag && (strcmp(val, cast_msg[i].tag) == 0))
+ 	    {
+ 	      payload->type = cast_msg[i].type;
+ 	      break;
+ 	    }
+ 	}
+     }
+ 
+-  if (json_object_object_get_ex(haystack, "requestId", &needle))
+-    payload->request_id = json_object_get_int(needle);
+-  else if (json_object_object_get_ex(haystack, "seqNum", &needle))
+-    payload->request_id = json_object_get_int(needle);
++  if (json_object_object_get_ex(haystack, "requestId", &needle)
++      && json_object_object_get_ex(haystack, "seqNum", &somehay))
++    { json_object_put(haystack); return NULL; }
++  if (json_object_object_get_ex(haystack, "requestId", &needle)
++      || json_object_object_get_ex(haystack, "seqNum", &needle))
++    {
++      if (json_object_get_type(needle) != json_type_int
++          || json_object_get_int64(needle) <= 0 || json_object_get_int64(needle) > INT_MAX)
++        { json_object_put(haystack); return NULL; }
++      payload->request_id = (unsigned int)json_object_get_int64(needle);
++    }
+ 
+   if (json_object_object_get_ex(haystack, "answer", &somehay) &&
+       json_object_object_get_ex(somehay, "udpPort", &needle) &&
+       json_object_get_type(needle) == json_type_int )
+     payload->udp_port = json_object_get_int(needle);
+ 
+   if (json_object_object_get_ex(haystack, "result", &needle) &&
+       json_object_get_type(needle) == json_type_string )
+     payload->result = json_object_get_string(needle);
+ 
+   // Might be done now
+   if ((payload->type != RECEIVER_STATUS) && (payload->type != MEDIA_STATUS))
+     return haystack;
+ 
+   // Isn't this marvelous
+   if ( json_object_object_get_ex(haystack, "status", &needle) &&
+        (json_object_get_type(needle) == json_type_array) &&
+        (somehay = json_object_array_get_idx(needle, 0)) )
+     {
+       if ( json_object_object_get_ex(somehay, "mediaSessionId", &needle) &&
+            (json_object_get_type(needle) == json_type_int) )
+ 	payload->media_session_id = json_object_get_int(needle);
+ 
+       if ( json_object_object_get_ex(somehay, "playerState", &needle) &&
+            (json_object_get_type(needle) == json_type_string) )
+ 	payload->player_state = json_object_get_string(needle);
+     }
+ 
+ 
+-  if ( json_object_object_get_ex(haystack, "status", &somehay) &&
+-       json_object_object_get_ex(somehay, "applications", &needle) &&
+-       (json_object_get_type(needle) == json_type_array) &&
+-       (somehay = json_object_array_get_idx(needle, 0)) )
++  if (payload->type == RECEIVER_STATUS
++      && json_object_object_get_ex(haystack, "status", &somehay)
++      && json_object_get_type(somehay) == json_type_object
++      && json_object_object_get_ex(somehay, "applications", &needle)
++      && json_object_get_type(needle) == json_type_array
++      && json_object_array_length(needle) <= CALLBACK_REGISTER_SIZE)
++    {
++      payload->receiver_applications = needle;
++      payload->receiver_status_valid = true;
++    }
++
++  if (payload->receiver_applications && (somehay = json_object_array_get_idx(payload->receiver_applications, 0)))
+     {
+       if ( json_object_object_get_ex(somehay, "appId", &needle) &&
+            (json_object_get_type(needle) == json_type_string) )
+ 	payload->app_id = json_object_get_string(needle);
+ 
+       if ( json_object_object_get_ex(somehay, "sessionId", &needle) &&
+            (json_object_get_type(needle) == json_type_string) )
+ 	payload->session_id = json_object_get_string(needle);
+ 
+       if ( json_object_object_get_ex(somehay, "transportId", &needle) &&
+            (json_object_get_type(needle) == json_type_string) )
+ 	payload->transport_id = json_object_get_string(needle);
+     }
+ 
+   return haystack;
+ }
+@@ -777,134 +878,132 @@ static void
+ static void
+ cast_msg_process(struct cast_session *cs, const uint8_t *data, size_t len)
+ {
+   Extensions__CoreApi__CastChannel__CastMessage *reply;
+-  cast_reply_cb reply_cb;
++  struct cast_reply_entry entry;
++  int taken;
+   struct cast_msg_payload payload = { 0 };
+   void *hdl;
+   int unknown_session_id;
+-  int i;
++
+ 
+ #ifdef DEBUG_CHROMECAST
+   char *b64 = b64_encode(data, len);
+   if (b64)
+     {
+       DPRINTF(E_DBG, L_CAST, "Reply dump (len %zu): %s\n", len, b64);
+       free(b64);
+     }
+ #endif
+ 
+   reply = extensions__core_api__cast_channel__cast_message__unpack(NULL, len, data);
+   if (!reply)
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not unpack message!\n");
+       return;
+     }
+ 
+   hdl = cast_msg_parse(&payload, reply->payload_utf8);
+   if (!hdl)
+     {
+       DPRINTF(E_DBG, L_CAST, "Could not parse message: %s\n", reply->payload_utf8);
+       goto out_free_unpacked;
+     }
+ 
+   if (payload.type == PING)
+     {
+       cast_msg_send(cs, PONG, NULL);
+       goto out_free_parsed;
+     }
+ 
+   DPRINTF(E_DBG, L_CAST, "RX %zu %s %s %s %s\n", len, reply->source_id, reply->destination_id, reply->namespace_, reply->payload_utf8);
+ 
+   if (payload.type == UNKNOWN)
+     goto out_free_parsed;
+ 
+-  i = payload.request_id % CALLBACK_REGISTER_SIZE;
+-  if (payload.request_id && cs->callback_register[i])
++  if (payload.request_id)
+     {
+-      reply_cb = cs->callback_register[i];
+-      cs->callback_register[i] = NULL;
+-
+-      // Cancel the timeout if no pending callbacks
+-      for (i = 0; (i < CALLBACK_REGISTER_SIZE) && (!cs->callback_register[i]); i++);
+-
+-      if (i == CALLBACK_REGISTER_SIZE)
+-	evtimer_del(cs->reply_timeout);
+-
+-      reply_cb(cs, &payload);
+-
++      taken = cast_reply_take(cs, payload.request_id, &entry);
++      if (taken < 0)
++        {
++          cs->state = CAST_STATE_CONNECTED;
++          cast_session_shutdown(cs, CAST_STATE_FAILED);
++        }
++      else if (taken > 0 && entry.callback_id == cs->callback_id)
++        entry.completion(cs, &payload);
++      /* Numbered unknown/stale replies can never become unsolicited status. */
+       goto out_free_parsed;
+     }
+ 
+   // TODO Should we read volume and playerstate changes from the Chromecast?
+ 
+   if (payload.type == RECEIVER_STATUS && (cs->state & CAST_STATE_F_APP_READY))
+     {
+       unknown_session_id = payload.session_id && (strcmp(payload.session_id, cs->session_id) != 0);
+       if (unknown_session_id)
+ 	{
+ 	  DPRINTF(E_LOG, L_CAST, "Our session '%s' on '%s' was lost to session '%s'\n", cs->session_id, cs->devname, payload.session_id);
+ 
+ 	  // Downgrade state, we don't have the receiver app any more
+ 	  cs->state = CAST_STATE_CONNECTED;
+ 	  cast_session_shutdown(cs, CAST_STATE_FAILED);
+ 	  goto out_free_parsed;
+ 	}
+     }
+ 
+   if (payload.type == CLOSE && (cs->state & CAST_STATE_F_APP_READY))
+     {
+       // Downgrade state, we can't write any more
+       cs->state = CAST_STATE_CONNECTED;
+       cast_session_shutdown(cs, CAST_STATE_FAILED);
+       goto out_free_parsed;
+     }
+ 
+   if (payload.type == MEDIA_STATUS && (cs->state & CAST_STATE_F_STREAMING))
+     {
+       if (payload.player_state && (strcmp(payload.player_state, "PAUSED") == 0))
+ 	{
+ 	  DPRINTF(E_WARN, L_CAST, "Something paused our session on '%s'\n", cs->devname);
+ 
+ /*	  cs->state = CAST_STATE_APP_READY;
+ 	  // Kill the session, the player will need to restart it
+ 	  cast_session_shutdown(cs, CAST_STATE_NONE);
+ 	  goto out_free_parsed;
+ */	}
+     }
+ 
+  out_free_parsed:
+   cast_msg_parse_free(hdl);
+  out_free_unpacked:
+   extensions__core_api__cast_channel__cast_message__free_unpacked(reply, NULL);
+ }
+ 
+ 
+ /* ------------------ PREPARING AND SENDING CAST RTP PACKETS ---------------- */
+ 
+ // Makes a Cast RTP packet (source: Chromium's media/cast/net/rtp/rtp_packetizer.cc)
+ //
+ // A Cast RTP packet is made of:
+ //   RTP header (12 bytes)
+ //   Cast header (7 bytes)
+ //   Extension data (4 bytes)
+ //   Packet data
+ //
+ // The Cast header + extension (optional?) consists of:
+ //    0                   1                   2                   3
+ //    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ //   |k|r|   n_ext   |   frame_id    |          packet id            |
+ //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ //   |         max_packet_id         | ref_frame_id  |   ext_type    |
+ //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ //   |   ext_size    |      new_playout_delay_ms     |
+ //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ //
+ // k: Is the frame a key frame?
+ // r: Is there a reference frame id?
+ // n_ext: Number of Cast extensions (Chromium uses 1: Adaptive Latency)
+ // ext_type: 0x04 Adaptive Latency extension
+ // ext_size: 0x02 -> 2 bytes
+ // new_playout_delay_ms: ??
+ 
+ // OPUS encodes the rawbuf payload
+@@ -1342,18 +1441,34 @@ cast_rtcp_cb(int fd, short what, void *arg)
+ static void
+ cast_cb_stop(struct cast_session *cs, struct cast_msg_payload *payload)
+ {
+-  if (!payload)
+-    DPRINTF(E_LOG, L_CAST, "No RECEIVER_STATUS reply to our STOP - will continue anyway\n");
+-  else if (payload->type != RECEIVER_STATUS)
+-    DPRINTF(E_LOG, L_CAST, "No RECEIVER_STATUS reply to our STOP (got type: %d) - will continue anyway\n", payload->type);
+-
++  json_object *application, *session;
++  unsigned int i;
++  if (!payload || payload->type != RECEIVER_STATUS || !payload->receiver_status_valid || !cs->session_id)
++    goto error;
++  /* Every app must be well formed; old session appearing in any slot fails. */
++  for (i = 0; i < json_object_array_length(payload->receiver_applications); i++)
++    {
++      application = json_object_array_get_idx(payload->receiver_applications, i);
++      if (json_object_get_type(application) != json_type_object
++          || !json_object_object_get_ex(application, "sessionId", &session)
++          || json_object_get_type(session) != json_type_string
++          || !json_object_get_string_len(session)
++          || json_object_get_string_len(session) > 256
++          || (size_t)json_object_get_string_len(session) != strlen(json_object_get_string(session))
++          || strcmp(json_object_get_string(session), cs->session_id) == 0)
++        goto error;
++    }
+   cs->state = CAST_STATE_CONNECTED;
+-
+   if (cs->state == cs->wanted_state)
+     cast_status(cs);
+   else
+     cast_session_shutdown(cs, cs->wanted_state);
++  return;
++ error:
++  cs->state = CAST_STATE_FAILED;
++  cast_status(cs);
++  cast_session_cleanup(cs);
+ }
+ 
+ 
+ /* cast_cb_startup*: Callback chain for starting a session */
+@@ -1725,19 +1840,31 @@ cast_listen_cb(int fd, short what, void *arg)
+ static void
+ cast_reply_timeout_cb(int fd, short what, void *arg)
+ {
+-  struct cast_session *cs;
+-  int i;
+-
+-  cs = (struct cast_session *)arg;
+-  i = cs->request_id % CALLBACK_REGISTER_SIZE;
+-
+-  DPRINTF(E_LOG, L_CAST, "Request %d timed out, will run empty callback\n", i);
+-
+-  if (cs->callback_register[i])
++  struct cast_session *cs = arg;
++  struct cast_reply_entry entry;
++  int64_t now = cast_reply_now(), earliest = INT64_MAX;
++  unsigned int request_id = 0, i;
++  int taken;
++  if (now < 0)
++    goto error;
++  for (i = 0; i < CALLBACK_REGISTER_SIZE; i++)
++    if (cs->callback_register[i].completion && cs->callback_register[i].deadline_ns < earliest)
++      { earliest = cs->callback_register[i].deadline_ns; request_id = cs->callback_register[i].request_id; }
++  if (!request_id || earliest > now)
+     {
+-      cs->callback_register[i](cs, NULL);
+-      cs->callback_register[i] = NULL;
++      if (cast_reply_schedule(cs) < 0)
++        goto error;
++      return;
+     }
++  taken = cast_reply_take(cs, request_id, &entry);
++  if (taken < 0)
++    goto error;
++  if (taken > 0 && entry.callback_id == cs->callback_id)
++    entry.completion(cs, NULL);
++  return;
++ error:
++  cs->state = CAST_STATE_CONNECTED;
++  cast_session_shutdown(cs, CAST_STATE_FAILED);
+ }
+ 
+ static void
+@@ -2176,12 +2303,26 @@ static int
+ static int
+ cast_device_flush(struct output_device *device, int callback_id)
+ {
+   struct cast_session *cs = device->session;
+-
++  int ret;
++  if (!cs->session_id || cs->state < CAST_STATE_APP_LAUNCHED)
++    return -1;
++  /* Source changes stop the exact old receiver app. TTS never calls this. */
+   cs->callback_id = callback_id;
+-  cs->state = CAST_STATE_APP_READY;
+-  cast_status(cs);
+-
++  cs->wanted_state = CAST_STATE_NONE;
++  if (cs->udp_fd >= 0)
++    { cast_disconnect(cs->udp_fd); cs->udp_fd = -1; }
++  if (cs->rtcp_ev)
++    event_del(cs->rtcp_ev);
++  cs->state = CAST_STATE_APP_LAUNCHED;
++  ret = cast_msg_send(cs, STOP, cast_cb_stop);
++  /* No local state change counts as a receiver flush acknowledgment. */
++  if (ret < 0)
++    {
++      cs->state = CAST_STATE_FAILED;
++      cast_status(cs);
++      cast_session_cleanup(cs);
++    }
+   return 1;
+ }
+ 
+@@ -2196,23 +2337,22 @@ static int
+ static int
+ cast_device_volume_set(struct output_device *device, int callback_id)
+ {
+   struct cast_session *cs = device->session;
+   int ret;
+ 
+   if (!cs || !(cs->state & CAST_STATE_F_APP_READY))
+     return 0;
+ 
+   cs->volume = ((float)device->max_volume * (float)device->volume * 1.0) / (100.0 * CAST_CONFIG_MAX_VOLUME);
+ 
++  cs->callback_id = callback_id;
+   ret = cast_msg_send(cs, SET_VOLUME, cast_cb_volume);
+   if (ret < 0)
+     {
+       cast_session_shutdown(cs, CAST_STATE_FAILED);
+       return 0;
+     }
+ 
+-  // Setting it here means it will not be used for the above cast_session_shutdown
+-  cs->callback_id = callback_id;
+ 
+   return 1;
+ }
+diff --git a/src/outputs/cast_json.h b/src/outputs/cast_json.h
+new file mode 100644
+index 00000000..b6b5f586
+--- /dev/null
++++ b/src/outputs/cast_json.h
+@@ -0,0 +1,178 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef SHIRI_CAST_JSON_H
++#define SHIRI_CAST_JSON_H
++#include <json.h>
++#include <stddef.h>
++#include <string.h>
++
++/* json-c overwrites duplicate keys. Control acknowledgments must have one
++ * unambiguous interpretation, including status/applications/sessionId. */
++static void
++cast_json_space(const char **cursor)
++{
++  while (**cursor == ' ' || **cursor == '\t' || **cursor == '\r' || **cursor == '\n')
++    (*cursor)++;
++}
++
++static const char *
++cast_json_string_end(const char *cursor)
++{
++  if (*cursor++ != '"')
++    return NULL;
++  while (*cursor)
++    {
++      if (*cursor == '"')
++        return cursor + 1;
++      if (*cursor++ == '\\')
++        { if (!*cursor) return NULL; cursor++; }
++    }
++  return NULL;
++}
++
++static int
++cast_json_number(const char *cursor, const char *end)
++{
++  if (cursor < end && *cursor == '-') cursor++;
++  if (cursor == end) return -1;
++  if (*cursor == '0') cursor++;
++  else
++    {
++      if (*cursor < '1' || *cursor > '9') return -1;
++      do { cursor++; } while (cursor < end && *cursor >= '0' && *cursor <= '9');
++    }
++  if (cursor < end && *cursor == '.')
++    {
++      cursor++;
++      if (cursor == end || *cursor < '0' || *cursor > '9') return -1;
++      do { cursor++; } while (cursor < end && *cursor >= '0' && *cursor <= '9');
++    }
++  if (cursor < end && (*cursor == 'e' || *cursor == 'E'))
++    {
++      cursor++;
++      if (cursor < end && (*cursor == '+' || *cursor == '-')) cursor++;
++      if (cursor == end || *cursor < '0' || *cursor > '9') return -1;
++      do { cursor++; } while (cursor < end && *cursor >= '0' && *cursor <= '9');
++    }
++  return cursor == end ? 0 : -1;
++}
++
++static int
++cast_json_unique(const char **cursor, unsigned int depth)
++{
++  json_object *seen, *key, *old;
++  struct json_tokener *tokener;
++  const char *end, *name;
++  unsigned int fields = 0;
++  size_t length;
++  char closing;
++  int ret = -1;
++  if (depth > 32)
++    return -1;
++  cast_json_space(cursor);
++  if (**cursor == '{')
++    {
++      (*cursor)++;
++      seen = json_object_new_object();
++      if (!seen)
++        return -1;
++      cast_json_space(cursor);
++      if (**cursor == '}')
++        { (*cursor)++; ret = 0; goto object_done; }
++      for (;;)
++        {
++          end = cast_json_string_end(*cursor);
++          if (!end || ++fields > 64)
++            goto object_done;
++          length = end - *cursor;
++          tokener = json_tokener_new();
++          if (!tokener)
++            goto object_done;
++          key = json_tokener_parse_ex(tokener, *cursor, (int)length);
++          if (json_tokener_get_error(tokener) != json_tokener_success || !key)
++            { json_tokener_free(tokener); if (key) json_object_put(key); goto object_done; }
++          json_tokener_free(tokener);
++          name = json_object_get_string(key);
++          if ((size_t)json_object_get_string_len(key) != strlen(name)
++              || json_object_object_get_ex(seen, name, &old))
++            { json_object_put(key); goto object_done; }
++          if (json_object_object_add(seen, name, NULL) < 0)
++            { json_object_put(key); goto object_done; }
++          json_object_put(key);
++          *cursor = end;
++          cast_json_space(cursor);
++          if (*(*cursor)++ != ':' || cast_json_unique(cursor, depth + 1) < 0)
++            goto object_done;
++          cast_json_space(cursor);
++          if (**cursor == '}')
++            { (*cursor)++; ret = 0; goto object_done; }
++          if (*(*cursor)++ != ',')
++            goto object_done;
++          cast_json_space(cursor);
++        }
++     object_done:
++      json_object_put(seen);
++      return ret;
++    }
++  if (**cursor == '[')
++    {
++      (*cursor)++;
++      cast_json_space(cursor);
++      if (**cursor == ']')
++        { (*cursor)++; return 0; }
++      for (;;)
++        {
++          if (cast_json_unique(cursor, depth + 1) < 0)
++            return -1;
++          cast_json_space(cursor);
++          closing = *(*cursor)++;
++          if (closing == ']')
++            return 0;
++          if (closing != ',')
++            return -1;
++        }
++    }
++  if (**cursor == '"')
++    {
++      end = cast_json_string_end(*cursor);
++      if (!end)
++        return -1;
++      *cursor = end;
++      return 0;
++    }
++  end = *cursor;
++  while (**cursor && **cursor != ',' && **cursor != ']' && **cursor != '}'
++         && **cursor != ' ' && **cursor != '\t' && **cursor != '\r' && **cursor != '\n')
++    (*cursor)++;
++  length = *cursor - end;
++  if ((length == 4 && (!memcmp(end, "true", 4) || !memcmp(end, "null", 4)))
++      || (length == 5 && !memcmp(end, "false", 5)))
++    return 0;
++  return cast_json_number(end, *cursor);
++}
++
++static json_object *
++cast_json_parse(const char *text, size_t maximum)
++{
++  json_object *body;
++  struct json_tokener *tokener;
++  const char *cursor = text;
++  size_t length;
++  if (!text || !(length = strnlen(text, maximum + 1)) || length > maximum)
++    return NULL;
++  tokener = json_tokener_new_ex(32);
++  if (!tokener)
++    return NULL;
++  json_tokener_set_flags(tokener, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
++  body = json_tokener_parse_ex(tokener, text, (int)length + 1);
++  if (json_tokener_get_error(tokener) != json_tokener_success
++      || !body || json_object_get_type(body) != json_type_object)
++    { if (body) json_object_put(body); json_tokener_free(tokener); return NULL; }
++  json_tokener_free(tokener);
++  if (cast_json_unique(&cursor, 0) < 0)
++    { json_object_put(body); return NULL; }
++  cast_json_space(&cursor);
++  if (*cursor)
++    { json_object_put(body); return NULL; }
++  return body;
++}
++#endif
+diff --git a/src/outputs/raop.c b/src/outputs/raop.c
+index 89c00e94..68347d5e 100644
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -1,107 +1,109 @@
+ /*
+  * Copyright (C) 2012-2020 Espen Jürgensen <espenjurgensen@gmail.com>
+  * Copyright (C) 2010-2011 Julien BLACHE <jb@jblache.org>
+  *
+  * RAOP AirTunes v2
+  *
+  * Crypto code adapted from VideoLAN
+  *   Copyright (C) 2008 the VideoLAN team
+  *   Author: Michael Hanselmann
+  *   GPLv2+
+  *
+  * ALAC encoding adapted from raop_play
+  *   Copyright (C) 2005 Shiro Ninomiya <shiron@snino.com>
+  *   GPLv2+
+  *
+  * ALAC update to add end tags for compatibility with the FFmpeg ALAC decoder
+  *   Copyright (C) 2023 Mike Brady <4265913+mikebrady@users.noreply.github.com>
+  *   GPLv2+
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <stdio.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <stdint.h>
+ #include <inttypes.h>
+ #include <math.h>
+ #include <errno.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <netdb.h>
+ #include <fcntl.h>
+ #include <time.h>
+ #include <strings.h> // strcasecmp
++#include <sys/queue.h>
++#include <event2/keyvalq_struct.h>
+ 
+ #include <arpa/inet.h>
+ #include <net/if.h>
+ #include <netinet/in.h>
+ 
+ #include <event2/event.h>
+ #include <event2/buffer.h>
+ #include <gcrypt.h>
+ 
+ #include "evrtsp/evrtsp.h"
+ #include "conffile.h"
+ #include "logger.h"
+ #include "mdns.h"
+ #include "misc.h"
+ #include "player.h"
+ #include "db.h"
+ #include "artwork.h"
+ #include "dmap_common.h"
+ #include "rtp_common.h"
+ #include "transcode.h"
+ #include "outputs.h"
+ #include "pair_ap/pair.h"
+ 
+ #define ALAC_HEADER_LEN                      3
+ 
+ #define RAOP_QUALITY_SAMPLE_RATE_DEFAULT     44100
+ #define RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT 16
+ #define RAOP_QUALITY_CHANNELS_DEFAULT        2
+ 
+ // AirTunes v2 number of samples per packet
+ // Probably using this value because 44100/352 and 48000/352 has good 32 byte
+ // alignment, which improves performance of some encoders
+ #define RAOP_SAMPLES_PER_PACKET              352
+ 
+ #define RAOP_RTP_PAYLOADTYPE                 0x60
+ 
+ // See AIRPLAY_AUDIO_LATENCY_MS
+ #define RAOP_AUDIO_LATENCY_MS                250
+ 
+ // How many RTP packets to buffer for retransmission
+ #define RAOP_PACKET_BUFFER_SIZE    1000
+ 
+ #define RAOP_MD_DELAY_STARTUP      15360
+ #define RAOP_MD_DELAY_SWITCH       (RAOP_MD_DELAY_STARTUP * 2)
+ #define RAOP_MD_WANTS_TEXT         (1 << 0)
+ #define RAOP_MD_WANTS_ARTWORK      (1 << 1)
+ #define RAOP_MD_WANTS_PROGRESS     (1 << 2)
+ 
+ // ATV4 and Homepod disconnect for reasons that are not clear, but sending them
+ // progress metadata at regular intervals reduces the problem. The below
+ // interval was determined via testing, see:
+ // https://github.com/owntone/owntone-server/issues/734#issuecomment-622959334
+ #define RAOP_KEEP_ALIVE_INTERVAL   25
+ 
+ // This is an arbitrary value which just needs to be kept in sync with the config
+ #define RAOP_CONFIG_MAX_VOLUME     11
+@@ -184,62 +186,68 @@ struct raop_master_session
+   struct raop_master_session *next;
+ };
+ 
++/* Bounded exact request-operation contexts. */
++#define RAOP_OWNED_REQUEST_MAX 32
++struct raop_owned_request;
++
+ struct raop_session
+ {
+   uint64_t device_id;
+   int callback_id;
++  struct raop_owned_request *owned_requests;
++  unsigned int owned_request_count;
+ 
+   struct raop_master_session *master_session;
+ 
+   struct evrtsp_connection *ctrl;
+ 
+   enum raop_state state;
+ 
+   uint16_t wanted_metadata;
+   bool req_has_auth;
+   bool encrypt;
+   bool auth_quirk_itunes;
+   bool supports_post;
+   bool supports_auth_setup;
+ 
+   bool only_probe;
+ 
+   struct event *deferredev;
+ 
+   int reqs_in_flight;
+   int cseq;
+   char *session;
+   char session_url[128];
+ 
+   char *realm;
+   char *nonce;
+   const char *password;
+ 
+   char *devname;
+   char *address;
+   int family;
+ 
+   union net_sockaddr naddr;
+ 
+   int volume;
+ 
+   // device->offset_ms in samples (user config for correction of static
+   // amplifier or DSP delays)
+   int offset_samples;
+ 
+   /* AirTunes v2 */
+   unsigned short server_port;
+   unsigned short control_port;
+   unsigned short timing_port; // ATV4 has this set to 0, but it is not used by us anyway
+ 
+   /* Device verification, see pair.h */
+   struct pair_verify_context *pair_verify_ctx;
+   struct pair_setup_context *pair_setup_ctx;
+ 
+   int server_fd;
+ 
+   struct raop_service *timing_svc;
+   struct raop_service *control_svc;
+ 
+   struct raop_session *next;
+ };
+@@ -1175,6 +1183,23 @@ raop_check_cseq(struct raop_session *rs, struct evrtsp_request *req)
+   return 0;
+ }
+ 
++/* evrtsp dispatches a response to the FIFO head, without CSeq correlation.
++ * A source FLUSH acknowledgment therefore requires this exact request ID. */
++static int
++raop_check_flush_cseq(struct evrtsp_request *req)
++{
++  struct evkeyval *header;
++  const char *expected = evrtsp_find_header(req->output_headers, "CSeq");
++  const char *received = NULL;
++  unsigned int count = 0;
++  if (!expected || !*expected)
++    return -1;
++  TAILQ_FOREACH(header, req->input_headers, next)
++    if (strcasecmp(header->key, "CSeq") == 0)
++      { received = header->value; count++; }
++  return count == 1 && received && strcmp(received, expected) == 0 ? 0 : -1;
++}
++
+ static int
+ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address, int family, uint32_t session_id)
+ {
+@@ -1267,40 +1292,132 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
+  *   flight
+  */
+ 
++/* A connection teardown discards request callbacks without freeing cb_arg.
++ * Keep contexts owned by the session until completion or exact cancellation. */
++static void raop_rtsp_close_cb(struct evrtsp_connection *, void *);
++
++struct raop_owned_request
++{
++  struct raop_session *session;
++  int callback_id;
++  evrtsp_req_cb completion;
++  struct raop_owned_request *next;
++};
++
++static struct raop_owned_request *
++raop_owned_request_new(struct raop_session *rs, int callback_id, evrtsp_req_cb completion)
++{
++  struct raop_owned_request *owned;
++  if (rs->owned_request_count >= RAOP_OWNED_REQUEST_MAX)
++    return NULL;
++  owned = calloc(1, sizeof(*owned));
++  if (!owned)
++    return NULL;
++  owned->session = rs;
++  owned->callback_id = callback_id;
++  owned->completion = completion;
++  owned->next = rs->owned_requests;
++  rs->owned_requests = owned;
++  rs->owned_request_count++;
++  return owned;
++}
++
++static void
++raop_owned_request_remove(struct raop_owned_request *owned)
++{
++  struct raop_session *rs = owned->session;
++  struct raop_owned_request **link;
++  for (link = &rs->owned_requests; *link && *link != owned; link = &(*link)->next);
++  if (*link == owned)
++    {
++      *link = owned->next;
++      rs->owned_request_count--;
++    }
++  free(owned);
++}
++
++static void
++raop_owned_requests_clear(struct raop_session *rs)
++{
++  while (rs->owned_requests)
++    raop_owned_request_remove(rs->owned_requests);
++}
++
++static void
++raop_owned_request_done(struct evrtsp_request *req, void *arg)
++{
++  struct raop_owned_request *owned = arg;
++  struct raop_session *rs = owned->session;
++  evrtsp_req_cb completion = owned->completion;
++  int current = owned->callback_id == rs->callback_id;
++  /* Completion may destroy rs. Detach our context before calling it. */
++  raop_owned_request_remove(owned);
++  if (!current)
++    {
++      rs->reqs_in_flight--;
++      if (!rs->reqs_in_flight)
++        evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
++      return;
++    }
++  completion(req, rs);
++}
++
++/* The evrtsp queue can discard requests without invoking callbacks. */
++static struct evrtsp_request *
++raop_request_new(struct raop_session *rs, evrtsp_req_cb completion)
++{
++  struct raop_owned_request *owned;
++  struct evrtsp_request *req;
++  owned = raop_owned_request_new(rs, rs->callback_id, completion);
++  if (!owned)
++    return NULL;
++  req = evrtsp_request_new(raop_owned_request_done, owned);
++  if (!req)
++    raop_owned_request_remove(owned);
++  return req;
++}
++
++static void
++raop_request_free(struct evrtsp_request *req)
++{
++  raop_owned_request_remove(req->cb_arg);
++  evrtsp_request_free(req);
++}
++
+ static int
+ raop_send_req_teardown(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   struct evrtsp_request *req;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending TEARDOWN to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for TEARDOWN\n");
+ 
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_TEARDOWN);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_TEARDOWN, rs->session_url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make TEARDOWN request to '%s'\n", rs->devname);
+ 
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+ 
+   return 0;
+ }
+@@ -1308,50 +1425,50 @@ static int
+ static int
+ raop_send_req_flush(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   struct raop_master_session *rms = rs->master_session;
+   struct evrtsp_request *req;
+   char buf[64];
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending FLUSH to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for FLUSH\n");
+ 
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_FLUSH);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   /* Restart sequence */
+   ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
+   if ((ret < 0) || (ret >= sizeof(buf)))
+     {
+       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in FLUSH request\n");
+ 
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+   evrtsp_add_header(req->output_headers, "RTP-Info", buf);
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_FLUSH, rs->session_url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make FLUSH request to '%s'\n", rs->devname);
+ 
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+ 
+   return 0;
+ }
+@@ -1359,51 +1476,51 @@ static int
+ static int
+ raop_send_req_set_parameter(struct raop_session *rs, struct evbuffer *evbuf, char *ctype, char *rtpinfo, evrtsp_req_cb cb, const char *log_caller)
+ {
+   struct evrtsp_request *req;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending SET_PARAMETER to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for SET_PARAMETER\n");
+ 
+       return -1;
+     }
+ 
+   ret = evbuffer_add_buffer(req->output_buffer, evbuf);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Out of memory for SET_PARAMETER payload\n");
+ 
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_SET_PARAMETER);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   evrtsp_add_header(req->output_headers, "Content-Type", ctype);
+ 
+   if (rtpinfo)
+     evrtsp_add_header(req->output_headers, "RTP-Info", rtpinfo);
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_SET_PARAMETER, rs->session_url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make SET_PARAMETER request to '%s'\n", rs->devname);
+ 
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+ 
+   return 0;
+ }
+@@ -1411,52 +1528,52 @@ static int
+ static int
+ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   struct raop_master_session *rms = rs->master_session;
+   struct evrtsp_request *req;
+   char buf[64];
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending RECORD to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for RECORD\n");
+ 
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_RECORD);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   evrtsp_add_header(req->output_headers, "Range", "npt=0-");
+ 
+   /* Start sequence: next sequence */
+   ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
+   if ((ret < 0) || (ret >= sizeof(buf)))
+     {
+       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
+ 
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+   evrtsp_add_header(req->output_headers, "RTP-Info", buf);
+ 
+   DPRINTF(E_DBG, L_RAOP, "RTP-Info is %s\n", buf);
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_RECORD, rs->session_url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make RECORD request to '%s'\n", rs->devname);
+ 
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   return 0;
+ }
+@@ -1464,49 +1581,49 @@ static int
+ static int
+ raop_send_req_setup(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   char hdr[128];
+   struct evrtsp_request *req;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending SETUP to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for SETUP\n");
+ 
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_SETUP);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   /* Request UDP transport, AirTunes v2 streaming */
+   ret = snprintf(hdr, sizeof(hdr), "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=%u;timing_port=%u",
+ 		 rs->control_svc->port, rs->timing_svc->port);
+   if ((ret < 0) || (ret >= sizeof(hdr)))
+     {
+       DPRINTF(E_LOG, L_RAOP, "Transport header exceeds buffer length\n");
+ 
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   evrtsp_add_header(req->output_headers, "Transport", hdr);
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_SETUP, rs->session_url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make SETUP request to '%s'\n", rs->devname);
+ 
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   return 0;
+ }
+@@ -1514,121 +1631,121 @@ static int
+ static int
+ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   uint8_t challenge[16];
+   char *challenge_b64;
+   char *ptr;
+   struct evrtsp_request *req;
+   char *address;
+   char *intf;
+   unsigned short port;
+   int family;
+   uint32_t session_id;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending ANNOUNCE to '%s'\n", log_caller, rs->devname);
+ 
+   /* Determine local address, needed for SDP and session URL */
+   evrtsp_connection_get_local_address(rs->ctrl, &address, &port, &family);
+   if (!address || (port == 0))
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not determine local address\n");
+ 
+       if (address)
+ 	free(address);
+ 
+       return -1;
+     }
+ 
+   intf = strchr(address, '%');
+   if (intf)
+     {
+       *intf = '\0';
+       intf++;
+     }
+ 
+   DPRINTF(E_DBG, L_RAOP, "Local address: %s (LL: %s) port %d\n", address, (intf) ? intf : "no", port);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for ANNOUNCE\n");
+ 
+       free(address);
+       return -1;
+     }
+ 
+   /* Session ID and session URL */
+   gcry_randomize(&session_id, sizeof(session_id), GCRY_STRONG_RANDOM);
+ 
+   if (family == AF_INET)
+     ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%s/%u", address, session_id);
+   else
+     ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%s]/%u", address, session_id);
+   if ((ret < 0) || (ret >= sizeof(rs->session_url)))
+     {
+       DPRINTF(E_LOG, L_RAOP, "Session URL length exceeds 127 characters\n");
+ 
+       free(address);
+       goto cleanup_req;
+     }
+ 
+   /* SDP payload */
+   ret = raop_make_sdp(rs, req, address, family, session_id);
+   free(address);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not generate SDP payload for ANNOUNCE\n");
+ 
+       goto cleanup_req;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_ANNOUNCE);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   evrtsp_add_header(req->output_headers, "Content-Type", "application/sdp");
+ 
+   /* Challenge - but only if session is encrypted (important for ATV3 after update 6.0) */
+   if (rs->encrypt)
+     {
+       gcry_randomize(challenge, sizeof(challenge), GCRY_STRONG_RANDOM);
+       challenge_b64 = b64_encode(challenge, sizeof(challenge));
+       if (!challenge_b64)
+ 	{
+ 	  DPRINTF(E_LOG, L_RAOP, "Couldn't encode challenge\n");
+ 
+ 	  goto cleanup_req;
+ 	}
+ 
+       /* Remove base64 padding */
+       ptr = strchr(challenge_b64, '=');
+       if (ptr)
+ 	*ptr = '\0';
+ 
+       evrtsp_add_header(req->output_headers, "Apple-Challenge", challenge_b64);
+ 
+       free(challenge_b64);
+     }
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_ANNOUNCE, rs->session_url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make ANNOUNCE request to '%s'\n", rs->devname);
+ 
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   return 0;
+ 
+  cleanup_req:
+-  evrtsp_request_free(req);
++  raop_request_free(req);
+ 
+   return -1;
+ }
+ 
+ /*
+@@ -1657,42 +1774,42 @@ static int
+ static int
+ raop_send_req_auth_setup(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   struct evrtsp_request *req;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending auth-setup to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for auth-setup\n");
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_POST);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   evrtsp_add_header(req->output_headers, "Content-Type", "application/octet-stream");
+ 
+   // Flag for no encryption. 0x10 may mean encryption.
+   evbuffer_add(req->output_buffer, "\x01", 1);
+ 
+   evbuffer_add(req->output_buffer, raop_auth_setup_pubkey, sizeof(raop_auth_setup_pubkey) - 1);
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_POST, "/auth-setup");
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make auth-setup request to '%s'\n", rs->devname);
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+ 
+   return 0;
+ }
+@@ -1700,35 +1817,35 @@ static int
+ static int
+ raop_send_req_options(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   struct evrtsp_request *req;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending OPTIONS to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for OPTIONS\n");
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_OPTIONS);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_OPTIONS, "*");
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make OPTIONS request to '%s'\n", rs->devname);
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+ 
+   return 0;
+ }
+@@ -1736,43 +1853,43 @@ static int
+ static int
+ raop_send_req_pin_start(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+   struct evrtsp_request *req;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_RAOP, "%s: Sending pair-pin-start to '%s'\n", log_caller, rs->devname);
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request to '%s' for pair-pin-start\n", rs->devname);
+       return -1;
+     }
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_POST);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   DPRINTF(E_LOG, L_RAOP, "Starting device verification for '%s', go to the web interface and enter PIN\n", rs->devname);
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_POST, "/pair-pin-start");
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not make pair-pin-start request\n");
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+ 
+   return 0;
+ }
+ 
+ 
+ /* ------------------------------ Session handling -------------------------- */
+ 
+ // Maps our internal state to the generic output state and then makes a callback
+ // to the player to tell that state
+@@ -1941,29 +2058,31 @@ static void
+ static void
+ session_free(struct raop_session *rs)
+ {
+   if (!rs)
+     return;
+ 
+   if (rs->master_session)
+     master_session_cleanup(rs->master_session);
+ 
+   if (rs->ctrl)
+     {
+       evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+       evrtsp_connection_free(rs->ctrl);
+     }
+ 
++  raop_owned_requests_clear(rs);
++
+   if (rs->deferredev)
+     event_free(rs->deferredev);
+ 
+   if (rs->server_fd >= 0)
+     close(rs->server_fd);
+ 
+   free(rs->realm);
+   free(rs->nonce);
+   free(rs->session);
+   free(rs->address);
+   free(rs->devname);
+ 
+   free(rs);
+ }
+@@ -2744,22 +2863,21 @@ static int
+ static int
+ raop_set_volume_one(struct output_device *device, int callback_id)
+ {
+   struct raop_session *rs = device->session;
+   int ret;
+ 
+   if (!rs || !(rs->state & RAOP_STATE_F_CONNECTED))
+     return 0;
+ 
++  rs->callback_id = callback_id;
+   ret = raop_set_volume_internal(rs, device->volume, raop_cb_set_volume);
+   if (ret < 0)
+     {
+       session_failure(rs);
+ 
+       return 0;
+     }
+ 
+-  rs->callback_id = callback_id;
+-
+   return 1;
+ }
+ 
+@@ -2766,35 +2884,35 @@ static void
+ static void
+ raop_cb_flush(struct evrtsp_request *req, void *arg)
+ {
+   struct raop_session *rs = arg;
+   int ret;
+ 
+   rs->reqs_in_flight--;
+ 
+   if (!req)
+     goto error;
+ 
+   if (req->response_code != RTSP_OK)
+     {
+       DPRINTF(E_LOG, L_RAOP, "FLUSH request to '%s' failed: %d %s\n", rs->devname, req->response_code, req->response_code_line);
+ 
+       goto error;
+     }
+ 
+-  ret = raop_check_cseq(rs, req);
++  ret = raop_check_flush_cseq(req);
+   if (ret < 0)
+     goto error;
+ 
+   rs->state = RAOP_STATE_CONNECTED;
+ 
+   /* Let our user know */
+   raop_status(rs);
+ 
+   if (!rs->reqs_in_flight)
+     evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
+ 
+   return;
+ 
+  error:
+   session_failure(rs);
+ }
+@@ -3841,88 +3959,88 @@ static int
+ static int
+ raop_pair_request_send(int step, struct raop_session *rs, void (*cb)(struct evrtsp_request *, void *))
+ {
+   struct evrtsp_request *req;
+   uint8_t *body;
+   size_t len;
+   const char *errmsg;
+   const char *url;
+   const char *ctype;
+   int ret;
+ 
+   switch (step)
+     {
+       case 1:
+ 	body    = pair_setup_request1(&len, rs->pair_setup_ctx);
+ 	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
+ 	url     = "/pair-setup-pin";
+ 	ctype   = "application/x-apple-binary-plist";
+ 	break;
+       case 2:
+ 	body    = pair_setup_request2(&len, rs->pair_setup_ctx);
+ 	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
+ 	url     = "/pair-setup-pin";
+ 	ctype   = "application/x-apple-binary-plist";
+ 	break;
+       case 3:
+ 	body    = pair_setup_request3(&len, rs->pair_setup_ctx);
+ 	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
+ 	url     = "/pair-setup-pin";
+ 	ctype   = "application/x-apple-binary-plist";
+ 	break;
+       case 4:
+ 	body    = pair_verify_request1(&len, rs->pair_verify_ctx);
+ 	errmsg  = pair_verify_errmsg(rs->pair_verify_ctx);
+ 	url     = "/pair-verify";
+ 	ctype   = "application/octet-stream";
+ 	break;
+       case 5:
+ 	body    = pair_verify_request2(&len, rs->pair_verify_ctx);
+ 	errmsg  = pair_verify_errmsg(rs->pair_verify_ctx);
+ 	url     = "/pair-verify";
+ 	ctype   = "application/octet-stream";
+ 	break;
+       default:
+ 	body    = NULL;
+ 	errmsg  = "Bug! Bad step number";
+     }
+ 
+   if (!body)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Verification step %d request error: %s\n", step, errmsg);
+       return -1;
+     }
+ 
+-  req = evrtsp_request_new(cb, rs);
++  req = raop_request_new(rs, cb);
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for verification step %d\n", step);
+       return -1;
+     }
+ 
+   evbuffer_add(req->output_buffer, body, len);
+   free(body);
+ 
+   ret = raop_add_headers(rs, req, EVRTSP_REQ_POST);
+   if (ret < 0)
+     {
+-      evrtsp_request_free(req);
++      raop_request_free(req);
+       return -1;
+     }
+ 
+   evrtsp_add_header(req->output_headers, "Content-Type", ctype);
+ 
+   DPRINTF(E_INFO, L_RAOP, "Making verification request step %d to '%s'\n", step, rs->devname);
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_POST, url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Verification request step %d to '%s' failed\n", step, rs->devname);
+       return -1;
+     }
+ 
+   rs->reqs_in_flight++;
+ 
+   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+ 
+   return 0;
+ }
+@@ -4554,17 +4672,21 @@ static int
+ static int
+ raop_device_flush(struct output_device *device, int callback_id)
+ {
+   struct raop_session *rs = device->session;
+   int ret;
+ 
+   if (rs->state != RAOP_STATE_STREAMING)
+     return 0; // No-op, nothing to flush
+ 
++  rs->callback_id = callback_id;
+   ret = raop_send_req_flush(rs, raop_cb_flush, "flush");
+   if (ret < 0)
+-    return -1;
+-
+-  rs->callback_id = callback_id;
++    {
++      /* evrtsp may retain the failed request in its queue. Cancel the exact
++       * connection before releasing contexts; report the new operation failed. */
++      session_failure(rs);
++      return 1;
++    }
+ 
+   return 1;
+ }

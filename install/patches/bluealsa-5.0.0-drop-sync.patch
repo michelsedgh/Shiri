@@ -1,0 +1,3439 @@
+diff --git a/configure.ac b/configure.ac
+index cd413ae..ed920eb 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,187 +1,187 @@
+ # BlueALSA - configure.ac
+ # SPDX-FileCopyrightText: 2016-2026 BlueALSA developers
+ # SPDX-License-Identifier: MIT
+ 
+ AC_PREREQ([2.62])
+ AC_INIT([BlueALSA],
+-	[m4_normalize(esyscmd([test -d .git && git describe --always --dirty || echo v5.0.0]))],
++	[5.0.0-shiri-dropsync1],
+ 	[arkadiusz.bokowy@gmail.com], [bluez-alsa], [https://github.com/arkq/bluez-alsa])
+ AM_INIT_AUTOMAKE([foreign subdir-objects -Wall -Werror])
+ 
+ AC_CONFIG_SRCDIR([src/ba-config.c])
+ AC_CONFIG_HEADERS([config.h])
+ AC_CONFIG_MACRO_DIR([m4])
+ 
+ AC_USE_SYSTEM_EXTENSIONS
+ m4_version_prereq(2.70, [AC_PROG_CC], [AC_PROG_CC_C99])
+ AC_OPENMP
+ AC_PROG_INSTALL
+ AC_PROG_LN_S
+ AC_PROG_MKDIR_P
+ AM_PROG_AR
+ AM_PROG_CC_C_O
+ LT_INIT
+ 
+ # configuration should match ALSA library
+ AC_PREFIX_DEFAULT([/usr])
+ 
+ # testing presence of pkg-config
+ AC_MSG_CHECKING([pkg-config m4 macros])
+ if test m4_ifdef([PKG_CHECK_MODULES], [yes], [no]) = "yes"; then
+ 	AC_MSG_RESULT([yes]);
+ else
+ 	AC_MSG_RESULT([no]);
+ 	AC_MSG_ERROR([pkg-config is required. See pkg-config.freedesktop.org])
+ fi
+ 
+ # support for debugging
+ AC_ARG_ENABLE([debug],
+ 	AS_HELP_STRING([--enable-debug], [enable debugging support]))
+ AM_CONDITIONAL([ENABLE_DEBUG], [test "x$enable_debug" = "xyes"])
+ AM_COND_IF([ENABLE_DEBUG], [
+ 	AC_CHECK_FUNCS([gettid])
+ 	AC_CHECK_LIB([SegFault], [backtrace])
+ 	AC_DEFINE([DEBUG], [1], [Define to 1 if the debugging is enabled.])
+ ])
+ AC_ARG_ENABLE([debug-time],
+ 	AS_HELP_STRING([--enable-debug-time], [enable debug timing support]))
+ AM_CONDITIONAL([ENABLE_DEBUG_TIME], [test "x$enable_debug_time" = "xyes"])
+ AM_COND_IF([ENABLE_DEBUG_TIME], [
+ 	AC_DEFINE([DEBUG_TIME], [1], [Define to 1 if the debug timing is enabled.])
+ ])
+ 
+ # embedded test coverage
+ AC_ARG_WITH([coverage],
+ 	AS_HELP_STRING([--with-coverage], [use lcov for test coverage reporting]))
+ AM_CONDITIONAL([WITH_COVERAGE], [test "x$with_coverage" = "xyes"])
+ AM_COND_IF([WITH_COVERAGE], [
+ 	AC_PATH_PROG([LCOV], [lcov])
+ 	AS_IF([test "x$LCOV" = "x"], [AC_MSG_ERROR([[--with-coverage requires lcov]])])
+ 	AC_PATH_PROG([GENHTML], [genhtml])
+ 	AS_IF([test "x$GENHTML" = "x"], [AC_MSG_ERROR([[--with-coverage requires genhtml]])])
+ ])
+ 
+ # in-place call-stack unwinding
+ AC_ARG_WITH([libunwind],
+ 	AS_HELP_STRING([--with-libunwind], [use libunwind for call-stack unwinding]))
+ AM_CONDITIONAL([WITH_LIBUNWIND], [test "x$with_libunwind" = "xyes"])
+ AM_COND_IF([WITH_LIBUNWIND], [
+ 	PKG_CHECK_MODULES([LIBUNWIND], [libunwind >= 1.1])
+ 	AC_DEFINE([WITH_LIBUNWIND], [1], [Define to 1 if libunwind shall be used.])
+ ], [
+ 	AC_CHECK_HEADERS([execinfo.h])
+ ])
+ 
+ AC_CHECK_HEADERS([stdatomic.h],
+ 	[], [AC_MSG_ERROR([C11 atomic support not available])])
+ AC_CHECK_FUNCS([eventfd],
+ 	[], [AC_MSG_ERROR([unable to find eventfd() function])])
+ AC_CHECK_FUNCS([pipe2],
+ 	[], [AC_MSG_ERROR([unable to find pipe2() function])])
+ AC_CHECK_FUNCS([splice],
+ 	[], [AC_MSG_ERROR([unable to find splice() function])])
+ AC_SEARCH_LIBS([clock_gettime], [rt],
+ 	[], [AC_MSG_ERROR([unable to find clock_gettime() function])])
+ AC_SEARCH_LIBS([pow], [m],
+ 	[], [AC_MSG_ERROR([unable to find pow() function])])
+ AC_SEARCH_LIBS([pthread_create], [pthread],
+ 	[], [AC_MSG_ERROR([pthread library not found])])
+ 
+ PKG_CHECK_MODULES([ALSA], [alsa >= 1.0.27])
+ PKG_CHECK_MODULES([BLUEZ], [bluez >= 5.51])
+ PKG_CHECK_MODULES([DBUS1], [dbus-1 >= 1.6])
+ PKG_CHECK_MODULES([GIO2], [gio-unix-2.0])
+ PKG_CHECK_MODULES([GLIB2], [glib-2.0 >= 2.58.2])
+ PKG_CHECK_MODULES([SBC], [sbc >= 1.5])
+ 
+ AC_PATH_PROGS([GDBUS_CODEGEN], [gdbus-codegen])
+ AS_IF([test "x$GDBUS_CODEGEN" = "x"], [AC_MSG_ERROR([[gdbus-codegen not found]])])
+ 
+ PKG_CHECK_MODULES([LIBBSD], [libbsd >= 0.8],
+ 	AC_DEFINE([HAVE_LIBBSD], [1], [Define to 1 if you have the libbsd library.]), [:])
+ 
+ AM_CONDITIONAL([ALSA_1_1_2__1_1_3], [$PKG_CONFIG "alsa >= 1.1.2 alsa <= 1.1.3"])
+ AM_CONDITIONAL([ALSA_1_1_7], [$PKG_CONFIG --atleast-version=1.1.7 alsa])
+ 
+ AC_ARG_ENABLE([aac],
+ 	[AS_HELP_STRING([--enable-aac], [enable AAC support])])
+ AM_CONDITIONAL([ENABLE_AAC], [test "x$enable_aac" = "xyes"])
+ AM_COND_IF([ENABLE_AAC], [
+ 	PKG_CHECK_MODULES([AAC], [fdk-aac >= 0.1.1])
+ 	AC_DEFINE([ENABLE_AAC], [1], [Define to 1 if AAC is enabled.])
+ ])
+ 
+ AC_ARG_WITH([libopenaptx],
+ 	[AS_HELP_STRING([--with-libopenaptx], [use libopenaptx by pali.rohar for apt-X (HD)])])
+ AM_CONDITIONAL([WITH_LIBOPENAPTX], [test "x$with_libopenaptx" = "xyes"])
+ 
+ AC_ARG_WITH([libfreeaptx],
+ 	[AS_HELP_STRING([--with-libfreeaptx], [use libfreeaptx for apt-X (HD)])])
+ AM_CONDITIONAL([WITH_LIBFREEAPTX], [test "x$with_libfreeaptx" = "xyes"])
+ 
+ # one of libopenaptx or libfreeaptx have been selected
+ AM_CONDITIONAL([WITH_lIBOPENAPTX_OR_WITH_LIBFREEAPTX],
+ 	[test "x$with_libopenaptx" = "xyes" -o "x$with_libfreeaptx" = "xyes"])
+ 
+ # both libopenaptx and libfreeaptx have been selected
+ AM_CONDITIONAL([WITH_lIBOPENAPTX_AND_WITH_LIBFREEAPTX],
+ 	[test "x$with_libopenaptx" = "xyes" -a "x$with_libfreeaptx" = "xyes"])
+ AM_COND_IF([WITH_lIBOPENAPTX_AND_WITH_LIBFREEAPTX],
+ 	[AC_MSG_ERROR([select at most one of libopenaptx or libfreeaptx])])
+ 
+ AC_ARG_ENABLE([aptx],
+ 	[AS_HELP_STRING([--enable-aptx], [enable apt-X support])])
+ AM_CONDITIONAL([ENABLE_APTX], [test "x$enable_aptx" = "xyes"])
+ AM_COND_IF([ENABLE_APTX], [
+ 	AM_COND_IF([WITH_LIBOPENAPTX], [
+ 		PKG_CHECK_MODULES([APTX], [libopenaptx >= 0.2.0])
+ 		AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
+ 		AC_DEFINE([WITH_LIBOPENAPTX], [1], [Define to 1 if libopenaptx shall be used.])
+ 	], [
+ 		AM_COND_IF([WITH_LIBFREEAPTX], [
+ 			PKG_CHECK_MODULES([APTX], [libfreeaptx >= 0.1.1])
+ 			AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
+ 			AC_DEFINE([WITH_LIBFREEAPTX], [1], [Define to 1 if libfreeaptx shall be used.])
+ 		], [
+ 			PKG_CHECK_MODULES([APTX], [openaptx >= 2.0.0])
+ 			if test "$($PKG_CONFIG --variable=aptxdecoder openaptx)" = "true"; then
+ 				AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
+ 			fi
+ 		])
+ 	])
+ 	AC_DEFINE([ENABLE_APTX], [1], [Define to 1 if apt-X is enabled.])
+ ])
+ 
+ AC_ARG_ENABLE([aptx_hd],
+ 	[AS_HELP_STRING([--enable-aptx-hd], [enable apt-X HD support])])
+ AM_CONDITIONAL([ENABLE_APTX_HD], [test "x$enable_aptx_hd" = "xyes"])
+ AM_COND_IF([ENABLE_APTX_HD], [
+ 	AM_COND_IF([WITH_LIBOPENAPTX], [
+ 		PKG_CHECK_MODULES([APTX_HD], [libopenaptx >= 0.2.0])
+ 		AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
+ 		AC_DEFINE([WITH_LIBOPENAPTX], [1], [Define to 1 if libopenaptx shall be used.])
+ 	], [
+ 		AM_COND_IF([WITH_LIBFREEAPTX], [
+ 			PKG_CHECK_MODULES([APTX_HD], [libfreeaptx >= 0.1.1])
+ 			AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
+ 			AC_DEFINE([WITH_LIBFREEAPTX], [1], [Define to 1 if libfreeaptx shall be used.])
+ 		], [
+ 			PKG_CHECK_MODULES([APTX_HD], [openaptx >= 2.0.0])
+ 			if test "$($PKG_CONFIG --variable=aptxdecoder openaptx)" = "true"; then
+ 				AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
+ 			fi
+ 		])
+ 	])
+ 	AC_DEFINE([ENABLE_APTX_HD], [1], [Define to 1 if apt-X HD is enabled.])
+ ])
+ 
+ # OR-ed conditional which can be used in the Makefile.am
+ AM_CONDITIONAL([ENABLE_APTX_OR_APTX_HD],
+ 	[test "x$enable_aptx" = "xyes" -o "x$enable_aptx_hd" = "xyes"])
+ 
+ AC_ARG_ENABLE([asha],
+ 	[AS_HELP_STRING([--enable-asha], [enable ASHA G.722 support])])
+ AM_CONDITIONAL([ENABLE_ASHA], [test "x$enable_asha" = "xyes"])
+ AM_COND_IF([ENABLE_ASHA], [
+ 	PKG_CHECK_MODULES([SPANDSP], [spandsp >= 0.0.6])
+ 	AC_DEFINE([ENABLE_ASHA], [1], [Define to 1 if ASHA G.722 is enabled.])
+diff --git a/src/a2dp-sbc.c b/src/a2dp-sbc.c
+index d1c6e54..fbde97c 100644
+--- a/src/a2dp-sbc.c
++++ b/src/a2dp-sbc.c
+@@ -20,363 +20,365 @@
+ #include <sys/types.h>
+ 
+ #include <sbc/sbc.h>
+ 
+ #include "a2dp.h"
+ #include "ba-transport.h"
+ #include "ba-transport-pcm.h"
+ #include "ba-config.h"
+ #include "bluealsa-dbus.h"
+ #include "codec-sbc.h"
+ #include "error.h"
+ #include "io.h"
+ #include "rtp.h"
+ #include "shared/bluetooth-a2dp.h"
+ #include "shared/defs.h"
+ #include "shared/ffb.h"
+ #include "shared/log.h"
+ #include "shared/rt.h"
+ 
+ static const struct a2dp_bit_mapping a2dp_sbc_channels[] = {
+ 	{ SBC_CHANNEL_MODE_MONO, .ch = { 1, a2dp_channel_map_mono } },
+ 	{ SBC_CHANNEL_MODE_DUAL_CHANNEL, .ch = { 2, a2dp_channel_map_stereo } },
+ 	{ SBC_CHANNEL_MODE_STEREO, .ch = { 2, a2dp_channel_map_stereo } },
+ 	{ SBC_CHANNEL_MODE_JOINT_STEREO, .ch = { 2, a2dp_channel_map_stereo } },
+ 	{ 0 },
+ };
+ 
+ static const struct a2dp_bit_mapping a2dp_sbc_rates[] = {
+ 	{ SBC_SAMPLING_FREQ_16000, { 16000 } },
+ 	{ SBC_SAMPLING_FREQ_32000, { 32000 } },
+ 	{ SBC_SAMPLING_FREQ_44100, { 44100 } },
+ 	{ SBC_SAMPLING_FREQ_48000, { 48000 } },
+ 	{ 0 },
+ };
+ 
+ static void a2dp_sbc_caps_intersect(
+ 		void *capabilities,
+ 		const void *mask) {
+ 
+ 	const a2dp_sbc_t *caps_mask = mask;
+ 	a2dp_sbc_t *caps = capabilities;
+ 
+ 	uint8_t min = MAX(caps->min_bitpool, caps_mask->min_bitpool);
+ 	uint8_t max = MIN(caps->max_bitpool, caps_mask->max_bitpool);
+ 
+ 	a2dp_caps_bitwise_intersect(caps, caps_mask, sizeof(*caps));
+ 	caps->min_bitpool = min;
+ 	caps->max_bitpool = max;
+ 
+ }
+ 
+ static error_code_t a2dp_sbc_caps_foreach_channel_mode(
+ 		const void *capabilities,
+ 		enum a2dp_stream stream,
+ 		a2dp_bit_mapping_foreach_func func,
+ 		void *userdata) {
+ 	const a2dp_sbc_t *caps = capabilities;
+ 	if (stream == A2DP_MAIN)
+ 		return a2dp_bit_mapping_foreach(a2dp_sbc_channels, caps->channel_mode, func, userdata);
+ 	return ERROR_CODE_INVALID_STREAM;
+ }
+ 
+ static error_code_t a2dp_sbc_caps_foreach_sample_rate(
+ 		const void *capabilities,
+ 		enum a2dp_stream stream,
+ 		a2dp_bit_mapping_foreach_func func,
+ 		void *userdata) {
+ 	const a2dp_sbc_t *caps = capabilities;
+ 	if (stream == A2DP_MAIN)
+ 		return a2dp_bit_mapping_foreach(a2dp_sbc_rates, caps->sampling_freq, func, userdata);
+ 	return ERROR_CODE_INVALID_STREAM;
+ }
+ 
+ static void a2dp_sbc_caps_select_channel_mode(
+ 		void *capabilities,
+ 		enum a2dp_stream stream,
+ 		unsigned int channels) {
+ 	a2dp_sbc_t *caps = capabilities;
+ 	if (stream == A2DP_MAIN)
+ 		caps->channel_mode = a2dp_bit_mapping_lookup_value(a2dp_sbc_channels,
+ 				caps->channel_mode, channels);
+ }
+ 
+ static void a2dp_sbc_caps_select_sample_rate(
+ 		void *capabilities,
+ 		enum a2dp_stream stream,
+ 		unsigned int rate) {
+ 	a2dp_sbc_t *caps = capabilities;
+ 	if (stream == A2DP_MAIN)
+ 		caps->sampling_freq = a2dp_bit_mapping_lookup_value(a2dp_sbc_rates,
+ 				caps->sampling_freq, rate);
+ }
+ 
+ static struct a2dp_caps_helpers a2dp_sbc_caps_helpers = {
+ 	.intersect = a2dp_sbc_caps_intersect,
+ 	.has_stream = a2dp_caps_has_main_stream_only,
+ 	.foreach_channel_mode = a2dp_sbc_caps_foreach_channel_mode,
+ 	.foreach_sample_rate = a2dp_sbc_caps_foreach_sample_rate,
+ 	.select_channel_mode = a2dp_sbc_caps_select_channel_mode,
+ 	.select_sample_rate = a2dp_sbc_caps_select_sample_rate,
+ };
+ 
+ void *a2dp_sbc_enc_thread(struct ba_transport_pcm *t_pcm) {
+ 
+ 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pcm_thread_cleanup), t_pcm);
+ 
+ 	struct ba_transport *t = t_pcm->t;
+ 	struct io_poll io = { .timeout = -1 };
+ 
+ 	sbc_t sbc;
+ 	const a2dp_sbc_t * configuration = &t->media.a2dp.configuration.sbc;
+ 	if ((errno = -sbc_init_a2dp(&sbc, 0, configuration, sizeof(*configuration))) != 0) {
+ 		error("Couldn't initialize SBC codec: %s", strerror(errno));
+ 		goto fail_init;
+ 	}
+ 
+ 	ffb_t bt = { 0 };
+ 	ffb_t pcm = { 0 };
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt);
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &pcm);
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(sbc_finish), &sbc);
+ 
+ 	const size_t sbc_frame_pcm_samples = sbc_get_codesize(&sbc) / sizeof(int16_t);
+ 	const unsigned int channels = t_pcm->channels;
+ 	const unsigned int rate = t_pcm->rate;
+ 
+ 	/* initialize SBC encoder bit-pool */
+ 	sbc.bitpool = sbc_a2dp_get_bitpool(configuration, config.sbc_quality);
+ 	/* ensure libsbc uses little-endian PCM on all architectures */
+ 	sbc.endian = SBC_LE;
+ 
+ #if DEBUG
+ 	sbc_print_internals(&sbc);
+ #endif
+ 
+ 	/* Writing MTU should be big enough to contain RTP header, SBC payload
+ 	 * header and at least one SBC frame. In general, there is no constraint
+ 	 * for the MTU value, but the speed might suffer significantly. */
+ 	const size_t rtp_headers_len = RTP_HEADER_LEN + sizeof(rtp_media_header_t);
+ 	const size_t mtu_write_payload_len = t->mtu_write - rtp_headers_len;
+ 	const size_t sbc_frame_len = sbc_get_frame_length(&sbc);
+ 
+ 	size_t ffb_pcm_len = sbc_frame_pcm_samples;
+ 	if (mtu_write_payload_len / sbc_frame_len > 1)
+ 		/* account for possible SBC frames packing */
+ 		ffb_pcm_len *= mtu_write_payload_len / sbc_frame_len;
+ 
+ 	if (mtu_write_payload_len < sbc_frame_len)
+ 		warn("Writing MTU too small for one single SBC frame: %zu < %zu",
+ 				t->mtu_write, RTP_HEADER_LEN + sizeof(rtp_media_header_t) + sbc_frame_len);
+ 
+ 	if (ffb_init_int16_t(&pcm, ffb_pcm_len) == -1 ||
+ 			ffb_init_uint8_t(&bt, t->mtu_write) == -1) {
+ 		error("Couldn't create data buffers: %s", strerror(errno));
+ 		goto fail_ffb;
+ 	}
+ 
+ 	const unsigned int sbc_delay_pcm_frames = 73;
+ 	/* Get the total delay introduced by the codec. */
+ 	t_pcm->codec_delay_dms = sbc_delay_pcm_frames * 10000 / rate;
+ 	ba_transport_pcm_delay_sync(t_pcm, BA_DBUS_PCM_UPDATE_DELAY);
+ 
+ 	rtp_header_t *rtp_header;
+ 	rtp_media_header_t *rtp_media_header;
+ 
+ 	/* initialize RTP headers and get anchor for payload */
+ 	uint8_t *rtp_payload = rtp_a2dp_init(bt.data, &rtp_header,
+ 			(void **)&rtp_media_header, sizeof(*rtp_media_header));
+ 
+ 	struct rtp_state rtp = { .synced = false };
+ 	/* RTP clock frequency equal to PCM sample rate */
+ 	rtp_state_init(&rtp, rate, rate);
+ 
+ 	debug_transport_pcm_thread_loop(t_pcm, "START");
+ 	for (ba_transport_pcm_state_set_running(t_pcm);;) {
+ 
+ 		switch (io_poll_and_read_pcm(&io, t_pcm, &pcm)) {
+ 		case -1:
+ 			if (errno == ESTALE) {
+-				sbc_reinit_a2dp(&sbc, 0, configuration, sizeof(*configuration));
++				int reset_error = sbc_reinit_a2dp(&sbc, 0, configuration, sizeof(*configuration));
+ 				sbc.bitpool = sbc_a2dp_get_bitpool(configuration, config.sbc_quality);
+ 				sbc.endian = SBC_LE;
++				/* OK follows both the selected pipe/raw-buffer flush and codec reset. */
++				io_poll_drop_sync_complete(&io, t_pcm, reset_error == 0 ? 0 : EIO);
+ 				continue;
+ 			}
+ 			error("PCM poll and read error: %s", strerror(errno));
+ 			/* fall-through */
+ 		case 0:
+ 			ba_transport_stop_if_no_clients(t);
+ 			continue;
+ 		}
+ 
+ 		/* anchor for RTP payload */
+ 		bt.tail = rtp_payload;
+ 
+ 		const int16_t *input = pcm.data;
+ 		size_t input_samples = ffb_len_out(&pcm);
+ 		size_t output_len = ffb_len_in(&bt);
+ 		size_t pcm_frames = 0;
+ 		size_t sbc_frames = 0;
+ 
+ 		/* Generate as many SBC frames as possible, but less than a 4-bit media
+ 		 * header frame counter can contain. The size of the output buffer is
+ 		 * based on the socket MTU, so such transfer should be most efficient. */
+ 		while (input_samples >= sbc_frame_pcm_samples &&
+ 				output_len >= sbc_frame_len &&
+ 				/* do not overflow RTP frame counter */
+ 				sbc_frames < ((1 << 4) - 1)) {
+ 
+ 			ssize_t len;
+ 			ssize_t encoded;
+ 
+ 			if ((len = sbc_encode(&sbc, input, input_samples * sizeof(int16_t),
+ 							bt.tail, output_len, &encoded)) < 0) {
+ 				error("SBC encoding error: %s", sbc_strerror(len));
+ 				break;
+ 			}
+ 
+ 			len = len / sizeof(int16_t);
+ 			input += len;
+ 			input_samples -= len;
+ 			ffb_seek(&bt, encoded);
+ 			output_len -= encoded;
+ 			pcm_frames += len / channels;
+ 			sbc_frames++;
+ 
+ 		}
+ 
+ 		if (sbc_frames > 0) {
+ 
+ 			rtp_state_new_frame(&rtp, rtp_header);
+ 			rtp_media_header->frame_count = sbc_frames;
+ 
+ 			ssize_t len = ffb_blen_out(&bt);
+ 			if ((len = io_bt_write(t_pcm, bt.data, len)) <= 0) {
+ 				if (len == -1)
+ 					error("BT write error: %s", strerror(errno));
+ 				goto fail;
+ 			}
+ 
+ 			if (!io.initiated) {
+ 				/* Get the codec processing delay, which is a time spent in the
+ 				 * processing loop between reading PCM data and writing the first
+ 				 * encoded SBC frame. Subsequently encoded frames do not contribute
+ 				 * to the delay, because (assuming no underruns) since the first
+ 				 * frame is written, the BT sink can start decoding and playing
+ 				 * audio in a continuous fashion. */
+ 				t_pcm->processing_delay_dms = asrsync_get_dms_since_last_sync(&io.asrs);
+ 				ba_transport_pcm_delay_sync(t_pcm, BA_DBUS_PCM_UPDATE_DELAY);
+ 				io.initiated = true;
+ 			}
+ 
+ 			/* Keep data transfer at a constant bit rate. */
+ 			asrsync_sync(&io.asrs, pcm_frames);
+ 			/* move forward RTP timestamp clock */
+ 			rtp_state_update(&rtp, pcm_frames);
+ 
+ 			/* If the input buffer was not consumed (due to codesize limit), we
+ 			 * have to append new data to the existing one. Since we do not use
+ 			 * ring buffer, we will simply move unprocessed data to the front
+ 			 * of our linear buffer. */
+ 			ffb_shift(&pcm, pcm_frames * channels);
+ 
+ 		}
+ 
+ 	}
+ 
+ fail:
+ 	debug_transport_pcm_thread_loop(t_pcm, "EXIT");
+ fail_ffb:
+ 	pthread_cleanup_pop(1);
+ 	pthread_cleanup_pop(1);
+ 	pthread_cleanup_pop(1);
+ fail_init:
+ 	pthread_cleanup_pop(1);
+ 	return NULL;
+ }
+ 
+ __attribute__ ((weak))
+ void *a2dp_sbc_dec_thread(struct ba_transport_pcm *t_pcm) {
+ 
+ 	/* Cancellation should be possible only in the carefully selected place
+ 	 * in order to prevent memory leaks and resources not being released. */
+ 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pcm_thread_cleanup), t_pcm);
+ 
+ 	struct ba_transport *t = t_pcm->t;
+ 	struct io_poll io = { .timeout = -1 };
+ 
+ 	sbc_t sbc;
+ 	if ((errno = -sbc_init_a2dp(&sbc, 0, &t->media.a2dp.configuration.sbc,
+ 					sizeof(t->media.a2dp.configuration.sbc))) != 0) {
+ 		error("Couldn't initialize SBC codec: %s", strerror(errno));
+ 		goto fail_init;
+ 	}
+ 
+ 	/* ensure libsbc uses little-endian PCM on all architectures */
+ 	sbc.endian = SBC_LE;
+ 
+ 	ffb_t bt = { 0 };
+ 	ffb_t pcm = { 0 };
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(sbc_finish), &sbc);
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt);
+ 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &pcm);
+ 
+ 	const unsigned int channels = t_pcm->channels;
+ 	const unsigned int rate = t_pcm->rate;
+ 
+ 	if (ffb_init_int16_t(&pcm, sbc_get_codesize(&sbc)) == -1 ||
+ 			ffb_init_uint8_t(&bt, t->mtu_read) == -1) {
+ 		error("Couldn't create data buffers: %s", strerror(errno));
+ 		goto fail_ffb;
+ 	}
+ 
+ 	struct rtp_state rtp = { .synced = false };
+ 	/* RTP clock frequency equal to PCM sample rate */
+ 	rtp_state_init(&rtp, rate, rate);
+ 
+ #if DEBUG
+ 	uint16_t sbc_bitpool = 0;
+ #endif
+ 
+ 	debug_transport_pcm_thread_loop(t_pcm, "START");
+ 	for (ba_transport_pcm_state_set_running(t_pcm);;) {
+ 
+ 		ssize_t len;
+ 		ffb_rewind(&bt);
+ 		if ((len = io_poll_and_read_bt(&io, t_pcm, &bt)) <= 0) {
+ 			if (len == -1)
+ 				error("BT poll and read error: %s", strerror(errno));
+ 			goto fail;
+ 		}
+ 
+ 		const rtp_header_t *rtp_header = bt.data;
+ 		const rtp_media_header_t *rtp_media_header;
+ 		if ((rtp_media_header = rtp_a2dp_get_payload(rtp_header)) == NULL)
+ 			continue;
+ 
+ 		int missing_rtp_frames = 0;
+ 		rtp_state_sync_stream(&rtp, rtp_header, &missing_rtp_frames, NULL);
+ 
+ 		if (!ba_transport_pcm_is_active(t_pcm)) {
+ 			rtp.synced = false;
+ 			continue;
+ 		}
+ 
+ 		const uint8_t *rtp_payload = (uint8_t *)(rtp_media_header + 1);
+ 		size_t rtp_payload_len = len - (rtp_payload - (uint8_t *)bt.data);
+ 
+ 		/* decode retrieved SBC frames */
+ 		size_t frames = rtp_media_header->frame_count;
+ 		while (frames--) {
+ 
+ 			size_t decoded;
+ 			if ((len = sbc_decode(&sbc, rtp_payload, rtp_payload_len,
+ 							pcm.data, ffb_blen_in(&pcm), &decoded)) < 0) {
+ 				error("SBC decoding error: %s", sbc_strerror(len));
+ 				break;
+ 			}
+ 
+ #if DEBUG
+ 			if (sbc_bitpool != sbc.bitpool) {
+ 				sbc_bitpool = sbc.bitpool;
+diff --git a/src/ba-transport-pcm.c b/src/ba-transport-pcm.c
+index d869329..f74d279 100644
+--- a/src/ba-transport-pcm.c
++++ b/src/ba-transport-pcm.c
+@@ -1,718 +1,921 @@
+ /*
+  * BlueALSA - ba-transport-pcm.c
+  * SPDX-FileCopyrightText: 2016-2025 BlueALSA developers
+  * SPDX-License-Identifier: MIT
+  */
+ 
+ #include "ba-transport-pcm.h"
+ 
+ #if HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <errno.h>
++#include <fcntl.h>
++#include <time.h>
+ #include <math.h>
+ #include <sched.h>
+ #include <signal.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/param.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+ #include <gio/gio.h>
+ #include <glib.h>
+ 
+ #include "audio.h"
+ #include "ba-config.h"
+ #include "ba-device.h"
+ #include "ba-rfcomm.h"
+ #include "ba-transport.h"
+ #include "bluealsa-dbus.h"
+ #include "bluez-iface.h"
+ #include "bluez.h"
+ #include "dbus.h"
+ #include "io.h"
+ #if ENABLE_OFONO
+ # include "ofono.h"
+ #endif
+ #include "shared/bluetooth-hfp.h"
++#include "shared/bluetooth-a2dp.h"
+ #include "shared/defs.h"
+ #include "shared/log.h"
+ 
+ static const char * transport_get_dbus_path_type(
+ 		enum ba_transport_profile profile) {
+ 	switch (profile) {
+ 	case BA_TRANSPORT_PROFILE_A2DP_SOURCE:
+ 		return "a2dpsrc";
+ 	case BA_TRANSPORT_PROFILE_A2DP_SINK:
+ 		return "a2dpsnk";
+ #if ENABLE_ASHA
+ 	case BA_TRANSPORT_PROFILE_ASHA_SOURCE:
+ 		return "ashasrc";
+ 	case BA_TRANSPORT_PROFILE_ASHA_SINK:
+ 		return "ashasnk";
+ #endif
+ 	case BA_TRANSPORT_PROFILE_HFP_HF:
+ 		return "hfphf";
+ 	case BA_TRANSPORT_PROFILE_HFP_AG:
+ 		return "hfpag";
+ 	case BA_TRANSPORT_PROFILE_HSP_HS:
+ 		return "hsphs";
+ 	case BA_TRANSPORT_PROFILE_HSP_AG:
+ 		return "hspag";
+ 	default:
+ 		return NULL;
+ 	}
+ }
+ 
+ int transport_pcm_init(
+ 		struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_mode mode,
+ 		struct ba_transport *t,
+ 		bool master) {
+ 
+ 	pcm->t = t;
+ 	pcm->mode = mode;
+ 	pcm->master = master;
+ 	pcm->state = BA_TRANSPORT_PCM_STATE_TERMINATED;
+ 	pcm->fd = -1;
+ 	pcm->fd_bt = -1;
+ 	pcm->pipe[0] = -1;
+ 	pcm->pipe[1] = -1;
++	pcm->drop_sync_pipe[0] = pcm->drop_sync_pipe[1] = -1;
++	pcm->drop_sync_next = pcm->drop_sync_active = 0;
++	pcm->drop_sync_initialized = false;
++	pcm->controller_restricted = false;
++	pcm->drop_sync_fd = -1;
++	pcm->drop_sync_result = ECANCELED;
+ 
+ 	for (size_t i = 0; i < ARRAYSIZE(pcm->volume); i++) {
+ 		pcm->volume[i].level = config.volume_init_level;
+ 		ba_transport_pcm_volume_set(&pcm->volume[i], NULL, NULL, NULL);
+ 	}
+ 
+ 	pthread_mutex_init(&pcm->mutex, NULL);
+ 	pthread_mutex_init(&pcm->state_mtx, NULL);
+ 	pthread_mutex_init(&pcm->client_mtx, NULL);
+ 	pthread_cond_init(&pcm->cond, NULL);
++	int drop_error = pthread_mutex_init(&pcm->drop_sync_mtx, NULL);
++	if (drop_error != 0)
++		return errno = drop_error, -1;
++	pthread_condattr_t drop_attr;
++	drop_error = pthread_condattr_init(&drop_attr);
++	if (drop_error != 0) {
++		pthread_mutex_destroy(&pcm->drop_sync_mtx);
++		return errno = drop_error, -1;
++	}
++	drop_error = pthread_condattr_setclock(&drop_attr, CLOCK_MONOTONIC);
++	if (drop_error == 0)
++		drop_error = pthread_cond_init(&pcm->drop_sync_cond, &drop_attr);
++	pthread_condattr_destroy(&drop_attr);
++	if (drop_error != 0) {
++		pthread_mutex_destroy(&pcm->drop_sync_mtx);
++		return errno = drop_error, -1;
++	}
++	pcm->drop_sync_initialized = true;
+ 
+ 	if (pipe(pcm->pipe) == -1)
+ 		return -1;
++	if (pipe2(pcm->drop_sync_pipe, O_NONBLOCK | O_CLOEXEC) == -1)
++		return -1;
+ 
+ 	pcm->ba_dbus_path = g_strdup_printf("%s/%s/%s",
+ 			t->d->ba_dbus_path, transport_get_dbus_path_type(t->profile),
+ 			mode == BA_TRANSPORT_PCM_MODE_SOURCE ? "source" : "sink");
+ 
+ 	return 0;
+ }
+ 
+ void transport_pcm_free(
+ 		struct ba_transport_pcm *pcm) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	ba_transport_pcm_release(pcm);
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	pthread_mutex_destroy(&pcm->mutex);
+ 	pthread_mutex_destroy(&pcm->state_mtx);
+ 	pthread_mutex_destroy(&pcm->client_mtx);
+ 	pthread_cond_destroy(&pcm->cond);
++	if (pcm->drop_sync_initialized) {
++		pthread_mutex_destroy(&pcm->drop_sync_mtx);
++		pthread_cond_destroy(&pcm->drop_sync_cond);
++	}
++	if (pcm->drop_sync_pipe[0] != -1)
++		close(pcm->drop_sync_pipe[0]);
++	if (pcm->drop_sync_pipe[1] != -1)
++		close(pcm->drop_sync_pipe[1]);
+ 
+ 	if (pcm->pipe[0] != -1)
+ 		close(pcm->pipe[0]);
+ 	if (pcm->pipe[1] != -1)
+ 		close(pcm->pipe[1]);
+ 
+ 	g_free(pcm->ba_dbus_path);
+ 
+ }
+ 
+ /**
+  * Set transport PCM state.
+  *
+  * It is only allowed to set the new state according to the state machine.
+  * For details, see comments in this function body.
+  *
+  * @param pcm Transport PCM.
+  * @param state New transport PCM state.
+  * @return If state transition was successful, 0 is returned. Otherwise, -1 is
+  *   returned and errno is set to EINVAL. */
+ int ba_transport_pcm_state_set(
+ 		struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_state state) {
+ 
+ 	pthread_mutex_lock(&pcm->state_mtx);
+ 
+ 	enum ba_transport_pcm_state old_state = pcm->state;
+ 
+ 	/* Moving to the next state is always allowed. */
+ 	bool valid = state == pcm->state + 1;
+ 
+ 	/* Allow wrapping around the state machine. */
+ 	if (state == BA_TRANSPORT_PCM_STATE_IDLE &&
+ 			old_state == BA_TRANSPORT_PCM_STATE_TERMINATED)
+ 		valid = true;
+ 
+ 	/* Thread initialization failure: STARTING -> STOPPING */
+ 	if (state == BA_TRANSPORT_PCM_STATE_STOPPING &&
+ 			old_state == BA_TRANSPORT_PCM_STATE_STARTING)
+ 		valid = true;
+ 
+ 	/* Additionally, it is allowed to move to the TERMINATED state from
+ 	 * IDLE and STARTING. This transition indicates that the thread has
+ 	 * never been started or there was an error during the startup. */
+ 	if (state == BA_TRANSPORT_PCM_STATE_TERMINATED && (
+ 				old_state == BA_TRANSPORT_PCM_STATE_IDLE ||
+ 				old_state == BA_TRANSPORT_PCM_STATE_STARTING))
+ 		valid = true;
+ 
+ 	if (valid)
+ 		pcm->state = state;
+ 
+ 	pthread_mutex_unlock(&pcm->state_mtx);
+ 
+ 	if (!valid)
+ 		return errno = EINVAL, -1;
+ 
+ 	if (state != old_state && (
+ 				state == BA_TRANSPORT_PCM_STATE_RUNNING ||
+ 				old_state == BA_TRANSPORT_PCM_STATE_RUNNING)) {
+ 			bluealsa_dbus_pcm_update(pcm, BA_DBUS_PCM_UPDATE_RUNNING);
+ 	}
+ 
+ 	pthread_cond_broadcast(&pcm->cond);
+ 	return 0;
+ }
+ 
+ /**
+  * Check if transport PCM is in given state. */
+ bool ba_transport_pcm_state_check(
+ 		const struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_state state) {
+ 	pthread_mutex_lock(MUTABLE(&pcm->state_mtx));
+ 	bool ok = pcm->state == state;
+ 	pthread_mutex_unlock(MUTABLE(&pcm->state_mtx));
+ 	return ok;
+ }
+ 
+ /**
+  * Wait until transport PCM reaches given state. */
+ int ba_transport_pcm_state_wait(
+ 		const struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_state state) {
+ 
+ 	enum ba_transport_pcm_state tmp;
+ 
+ 	pthread_mutex_lock(MUTABLE(&pcm->state_mtx));
+ 	while ((tmp = pcm->state) < state)
+ 		pthread_cond_wait(MUTABLE(&pcm->cond), MUTABLE(&pcm->state_mtx));
+ 	pthread_mutex_unlock(MUTABLE(&pcm->state_mtx));
+ 
+ 	if (tmp == state)
+ 		return 0;
+ 
+ 	errno = EIO;
+ 	return -1;
+ }
+ 
+ struct ba_transport_pcm *ba_transport_pcm_ref(struct ba_transport_pcm *pcm) {
+ 	ba_transport_ref(pcm->t);
+ 	return pcm;
+ }
+ 
+ void ba_transport_pcm_unref(struct ba_transport_pcm *pcm) {
+ 	ba_transport_unref(pcm->t);
+ }
+ 
+ /**
+  * Transport IO thread cleanup function for pthread cleanup. */
+ void ba_transport_pcm_thread_cleanup(struct ba_transport_pcm *pcm) {
+ 
+ 	struct ba_transport *t = pcm->t;
++	ba_transport_pcm_drop_sync_cancel(pcm);
+ 
+ 	/* The thread may have been cancelled while a PCM drain operation
+ 	 * is in progress. To prevent ba_transport_pcm_drain() from blocking
+ 	 * forever, we signal that drain is no longer in progress. */
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	pcm->drained = true;
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 	pthread_cond_signal(&pcm->cond);
+ 
+ 	/* For proper functioning of the transport, all threads have to be
+ 	 * operational. Therefore, if one of the threads is being cancelled,
+ 	 * we have to cancel all other threads. */
+ 	pthread_mutex_lock(&t->bt_fd_mtx);
+ 	ba_transport_stop_async(t);
+ 	pthread_mutex_unlock(&t->bt_fd_mtx);
+ 
+ 	/* Release BT socket file descriptor duplicate created either in the
+ 	 * ba_transport_pcm_start() function or in the IO thread itself. */
+ 	ba_transport_pcm_bt_release(pcm);
+ 
+ 	/* If we are closing master PCM, release underlying BT transport. */
+ 	if (pcm->master)
+ 		ba_transport_release(t);
+ 
+ #if DEBUG
+ 	/* XXX: If the order of the cleanup push is right, this function will
+ 	 *      indicate the end of the transport IO thread. */
+ 	char name[32];
+ 	pthread_getname_np(pcm->tid, name, sizeof(name));
+ 	debug("Exiting IO thread [%s]: %s", name, ba_transport_debug_name(t));
+ #endif
+ 
+ 	/* Remove reference which was taken by the ba_transport_pcm_start(). */
+ 	ba_transport_unref(t);
+ }
+ 
+ int ba_transport_pcm_bt_acquire(struct ba_transport_pcm *pcm) {
+ 
+ 	struct ba_transport *t = pcm->t;
+ 	int ret = -1;
+ 
+ 	if (pcm->fd_bt != -1)
+ 		return 0;
+ 
+ 	pthread_mutex_lock(&t->bt_fd_mtx);
+ 
+ 	const int bt_fd = t->bt_fd;
+ 
+ 	/* check if BT socket file descriptor is valid */
+ 	if (bt_fd == -1) {
+ 		error("Invalid BT socket: %d", bt_fd);
+ 		goto fail;
+ 	}
+ 
+ 	/* check for invalid (i.e. not set) MTU values */
+ 	if (t->mtu_read == 0 || t->mtu_write == 0) {
+ 		error("Invalid BT socket MTU [%d]: R:%zu W:%zu", bt_fd,
+ 				t->mtu_read, t->mtu_write);
+ 		goto fail;
+ 	}
+ 
+ 	if ((pcm->fd_bt = dup(bt_fd)) == -1) {
+ 		error("Couldn't duplicate BT socket [%d]: %s", bt_fd, strerror(errno));
+ 		goto fail;
+ 	}
+ 
+ 	debug("Created BT socket duplicate: [%d]: %d", bt_fd, pcm->fd_bt);
+ 	ret = 0;
+ 
+ fail:
+ 	pthread_mutex_unlock(&t->bt_fd_mtx);
+ 	return ret;
+ }
+ 
+ int ba_transport_pcm_bt_release(struct ba_transport_pcm *pcm) {
+ 
+ 	if (pcm->fd_bt != -1) {
+ #if DEBUG
+ 		pthread_mutex_lock(&pcm->t->bt_fd_mtx);
+ 		debug("Closing BT socket duplicate [%d]: %d", pcm->t->bt_fd, pcm->fd_bt);
+ 		pthread_mutex_unlock(&pcm->t->bt_fd_mtx);
+ #endif
+ 		close(pcm->fd_bt);
+ 		pcm->fd_bt = -1;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+ /**
+  * Start transport PCM thread. */
+ int ba_transport_pcm_start(
+ 		struct ba_transport_pcm *pcm,
+ 		ba_transport_pcm_thread_func th_func,
+ 		const char *name) {
+ 
+ 	struct ba_transport *t = pcm->t;
+ 	sigset_t sigset, oldset;
+ 	int ret = -1;
+ 
+ 	pthread_mutex_lock(&pcm->state_mtx);
+ 
+ 	pcm->state = BA_TRANSPORT_PCM_STATE_STARTING;
+ 
+ 	/* Please note, this call here does not guarantee that the BT socket
+ 	 * will be acquired, because transport might not be opened yet. */
+ 	if (ba_transport_pcm_bt_acquire(pcm) == -1) {
+ 		pcm->state = BA_TRANSPORT_PCM_STATE_TERMINATED;
+ 		goto fail;
+ 	}
+ 
+ 	ba_transport_ref(t);
+ 
+ 	/* Before creating a new thread, we have to block all signals (new thread
+ 	 * will inherit signal mask). This is required, because we are using thread
+ 	 * cancellation for stopping transport thread, and it seems that the
+ 	 * cancellation can deadlock if some signal handler, which uses POSIX API
+ 	 * which is a cancellation point, is called during the initial phase of the
+ 	 * thread cancellation. On top of that BlueALSA uses g_unix_signal_add()
+ 	 * for handling signals, which internally uses signal handler function which
+ 	 * calls write() for notifying the main loop about the signal. All that can
+ 	 * lead to deadlock during SIGTERM handling. */
+ 	sigfillset(&sigset);
+ 	if ((ret = pthread_sigmask(SIG_SETMASK, &sigset, &oldset)) != 0)
+ 		warn("Couldn't set signal mask: %s", strerror(ret));
+ 
+ 	if ((ret = pthread_create(&pcm->tid, NULL, PTHREAD_FUNC(th_func), pcm)) != 0) {
+ 		error("Couldn't create IO thread: %s", strerror(ret));
+ 		pcm->state = BA_TRANSPORT_PCM_STATE_TERMINATED;
+ 		pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+ 		ba_transport_unref(t);
+ 		goto fail;
+ 	}
+ 
+ 	if (config.io_thread_rt_priority != 0) {
+ 		struct sched_param param = { .sched_priority = config.io_thread_rt_priority };
+ 		if ((ret = pthread_setschedparam(pcm->tid, SCHED_FIFO, &param)) != 0)
+ 			warn("Couldn't set IO thread RT priority: %s", strerror(ret));
+ 		/* It's not a fatal error if we can't set thread priority. */
+ 		ret = 0;
+ 	}
+ 
+ 	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+ 
+ 	pthread_setname_np(pcm->tid, name);
+ 	debug("Created new IO thread [%s]: %s", name, ba_transport_debug_name(t));
+ 
+ fail:
+ 	pthread_mutex_unlock(&pcm->state_mtx);
+ 	pthread_cond_broadcast(&pcm->cond);
+ 	return ret == 0 ? 0 : -1;
+ }
+ 
+ /**
+  * Stop transport PCM thread in a synchronous manner.
+  *
+  * Please be aware that when using this function caller shall not hold
+  * any mutex which might be used in the IO thread. Mutex locking is not
+  * a cancellation point, so the IO thread might get stuck - it will not
+  * terminate, so join will not return either! */
+ void ba_transport_pcm_stop(
+ 		struct ba_transport_pcm *pcm) {
+ 
+ 	pthread_mutex_lock(&pcm->state_mtx);
+ 
+ 	/* If the transport thread is in the idle state (i.e. it is not running),
+ 	 * we can mark it as terminated right away. */
+ 	if (pcm->state == BA_TRANSPORT_PCM_STATE_IDLE) {
+ 		pcm->state = BA_TRANSPORT_PCM_STATE_TERMINATED;
+ 		pthread_mutex_unlock(&pcm->state_mtx);
+ 		pthread_cond_broadcast(&pcm->cond);
+ 		return;
+ 	}
+ 
+ 	/* If this function was called from more than one thread at the same time
+ 	 * (e.g. from transport thread manager thread and from main thread due to
+ 	 * SIGTERM signal), wait until the IO thread terminates - this function is
+ 	 * supposed to be synchronous. */
+ 	if (pcm->state == BA_TRANSPORT_PCM_STATE_JOINING) {
+ 		while (pcm->state != BA_TRANSPORT_PCM_STATE_TERMINATED)
+ 			pthread_cond_wait(&pcm->cond, &pcm->state_mtx);
+ 		pthread_mutex_unlock(&pcm->state_mtx);
+ 		return;
+ 	}
+ 
+ 	if (pcm->state == BA_TRANSPORT_PCM_STATE_TERMINATED) {
+ 		pthread_mutex_unlock(&pcm->state_mtx);
+ 		return;
+ 	}
+ 
+ 	/* The transport thread has to be marked for stopping. If at this point
+ 	 * the state is not STOPPING, it is a programming error. */
+ 	g_assert_cmpint(pcm->state, ==, BA_TRANSPORT_PCM_STATE_STOPPING);
+ 
+ 	int err;
+ 	pthread_t id = pcm->tid;
+ 	if ((err = pthread_cancel(id)) != 0 && err != ESRCH)
+ 		warn("Couldn't cancel IO thread: %s", strerror(err));
+ 
+ 	/* Set the state to JOINING before unlocking the mutex. This will
+ 	 * prevent calling the pthread_cancel() function once again. */
+ 	pcm->state = BA_TRANSPORT_PCM_STATE_JOINING;
+ 
+ 	pthread_mutex_unlock(&pcm->state_mtx);
+ 
+ 	if ((err = pthread_join(id, NULL)) != 0)
+ 		warn("Couldn't join IO thread: %s", strerror(err));
+ 
+ 	pthread_mutex_lock(&pcm->state_mtx);
+ 	pcm->state = BA_TRANSPORT_PCM_STATE_TERMINATED;
+ 	pthread_mutex_unlock(&pcm->state_mtx);
+ 
+ 	/* Notify others that the thread has been terminated. */
+ 	pthread_cond_broadcast(&pcm->cond);
+ 
+ }
+ 
+ int ba_transport_pcm_release(struct ba_transport_pcm *pcm) {
++	ba_transport_pcm_drop_sync_cancel(pcm);
+ 
+ #if DEBUG
+ 	/* assert that we were called with the lock held */
+ 	g_assert_cmpint(pthread_mutex_trylock(&pcm->mutex), !=, 0);
+ #endif
+ 
+ 	if (pcm->fd != -1) {
+ 		debug("Closing PCM: %d", pcm->fd);
+ 		close(pcm->fd);
+ 		pcm->fd = -1;
+ 	}
+ 
+ 	if (pcm->controller != NULL) {
+ 		g_source_destroy(pcm->controller);
+ 		g_source_unref(pcm->controller);
+ 		pcm->controller = NULL;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+ int ba_transport_pcm_pause(struct ba_transport_pcm *pcm) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	debug("PCM pause: %d", pcm->fd);
+ 	pcm->paused = true;
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	return ba_transport_pcm_signal_send(pcm, BA_TRANSPORT_PCM_SIGNAL_PAUSE);
+ }
+ 
+ int ba_transport_pcm_resume(struct ba_transport_pcm *pcm) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	debug("PCM resume: %d", pcm->fd);
+ 	pcm->paused = false;
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	return ba_transport_pcm_signal_send(pcm, BA_TRANSPORT_PCM_SIGNAL_RESUME);
+ }
+ 
+ int ba_transport_pcm_drain(struct ba_transport_pcm *pcm) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 
+ 	if (!ba_transport_pcm_state_check_running(pcm)) {
+ 		pthread_mutex_unlock(&pcm->mutex);
+ 		return errno = ESRCH, -1;
+ 	}
+ 
+ 	debug("PCM drain: %d", pcm->fd);
+ 
+ 	pcm->drained = false;
+ 	ba_transport_pcm_signal_send(pcm, BA_TRANSPORT_PCM_SIGNAL_DRAIN);
+ 
+ 	while (!pcm->drained)
+ 		pthread_cond_wait(&pcm->cond, &pcm->mutex);
+ 
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	/* TODO: Asynchronous transport release.
+ 	 *
+ 	 * Unfortunately, BlueZ does not provide API for internal buffer drain.
+ 	 * Also, there is no specification for Bluetooth playback drain. In order
+ 	 * to make sure, that all samples are played out, we have to wait some
+ 	 * arbitrary time before releasing transport. In order to make it right,
+ 	 * there is a requirement for an asynchronous release mechanism, which
+ 	 * is not implemented - it requires a little bit of refactoring. */
+ 	usleep(200000);
+ 
+ 	debug("PCM drained");
+ 	return 0;
+ }
+ 
+ int ba_transport_pcm_drop(struct ba_transport_pcm *pcm) {
+ 
+ #if DEBUG
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	debug("PCM drop: %d", pcm->fd);
+ 	pthread_mutex_unlock(&pcm->mutex);
+ #endif
+ 
+ 	int rv = ba_transport_pcm_signal_send(pcm, BA_TRANSPORT_PCM_SIGNAL_DROP);
+ 	if (rv == -1 && errno == ESRCH) {
+ 		/* If the transport thread is not running flush the PCM here. */
+ 		io_pcm_flush(pcm);
+ 		rv = 0;
+ 	}
+ 
+ 	return rv;
+ }
+ 
++/* The capability deliberately covers only the reviewed SBC encoder seam. */
++bool ba_transport_pcm_drop_sync_supported(struct ba_transport_pcm *pcm) {
++	return pcm->mode == BA_TRANSPORT_PCM_MODE_SINK &&
++		pcm->t->profile == BA_TRANSPORT_PROFILE_A2DP_SOURCE &&
++		ba_transport_get_codec(pcm->t) == A2DP_CODEC_SBC;
++}
++
++void ba_transport_pcm_drop_sync_cancel(struct ba_transport_pcm *pcm) {
++	if (!pcm->drop_sync_initialized)
++		return;
++	pthread_mutex_lock(&pcm->drop_sync_mtx);
++	pcm->drop_sync_active = 0;
++	pcm->drop_sync_result = ECANCELED;
++	pthread_cond_broadcast(&pcm->drop_sync_cond);
++	pthread_mutex_unlock(&pcm->drop_sync_mtx);
++}
++
++struct drop_sync_waiter { struct ba_transport_pcm *pcm; uint64_t token; };
++
++static void drop_sync_wait_cancel(void *userdata) {
++	struct drop_sync_waiter *waiter = userdata;
++	struct ba_transport_pcm *pcm = waiter->pcm;
++	/* pthread_cond_timedwait reacquires this mutex before cancellation. */
++	if (pcm->drop_sync_active == waiter->token) {
++		pcm->drop_sync_active = 0;
++		pcm->drop_sync_result = ECANCELED;
++	}
++	pthread_cond_broadcast(&pcm->drop_sync_cond);
++	pthread_mutex_unlock(&pcm->drop_sync_mtx);
++}
++
++/* pthread_mutex_lock has no monotonic deadline. Try-lock retries do not claim
++ * completion; only actually acquiring the mutex before the deadline does. */
++int ba_transport_pcm_drop_sync_lock(pthread_mutex_t *mutex, const struct timespec *deadline) {
++	for (;;) {
++		struct timespec now;
++		if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
++			return EIO;
++		if (now.tv_sec > deadline->tv_sec ||
++				(now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec))
++			return ETIMEDOUT;
++		int error = pthread_mutex_trylock(mutex);
++		if (error != EBUSY)
++			return error;
++		struct timespec retry = { .tv_sec = 0, .tv_nsec = 1000000 };
++		if (nanosleep(&retry, NULL) == -1 && errno != EINTR)
++			return EIO;
++	}
++}
++
++int ba_transport_pcm_drop_sync(struct ba_transport_pcm *pcm) {
++	/* glibc cleanup handlers may use setjmp: preserve the result across that scope. */
++	volatile int error = 0;
++	uint64_t token;
++	struct timespec deadline;
++	if (!ba_transport_pcm_drop_sync_supported(pcm))
++		return errno = ENOTSUP, -1;
++	if (clock_gettime(CLOCK_MONOTONIC, &deadline) == -1)
++		return -1;
++	/* Leave 50 ms of the client's 200 ms budget for controller delivery. */
++	deadline.tv_nsec += 150000000;
++	if (deadline.tv_nsec >= 1000000000) {
++		deadline.tv_sec++;
++		deadline.tv_nsec -= 1000000000;
++	}
++
++	int old_cancel_state;
++	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
++
++	/* Establish the request while release/reopen of the selected pipe is excluded.
++	 * Everywhere acquiring both locks takes PCM mutex before drop_sync_mtx. */
++	error = ba_transport_pcm_drop_sync_lock(&pcm->mutex, &deadline);
++	if (error != 0) {
++		pthread_setcancelstate(old_cancel_state, NULL);
++		return errno = error, -1;
++	}
++	error = ba_transport_pcm_drop_sync_lock(&pcm->drop_sync_mtx, &deadline);
++	if (error != 0) {
++		pthread_mutex_unlock(&pcm->mutex);
++		pthread_setcancelstate(old_cancel_state, NULL);
++		return errno = error, -1;
++	}
++	if (pcm->drop_sync_active != 0)
++		error = EBUSY;
++	else if (pcm->fd == -1 || !ba_transport_pcm_state_check_running(pcm))
++		error = ESRCH;
++	else if (pcm->drop_sync_next == UINT64_MAX)
++		error = EOVERFLOW;
++	if (error != 0) {
++		pthread_mutex_unlock(&pcm->drop_sync_mtx);
++		pthread_mutex_unlock(&pcm->mutex);
++		pthread_setcancelstate(old_cancel_state, NULL);
++		return errno = error, -1;
++	}
++	token = ++pcm->drop_sync_next;
++	pcm->drop_sync_active = token;
++	pcm->drop_sync_fd = pcm->fd;
++	pcm->drop_sync_deadline = deadline;
++	pcm->drop_sync_result = EINPROGRESS;
++	ssize_t written;
++	do written = write(pcm->drop_sync_pipe[1], &token, sizeof(token));
++	while (written == -1 && errno == EINTR);
++	if (written != sizeof(token)) {
++		error = written == -1 ? errno : EIO;
++		pcm->drop_sync_active = 0;
++	}
++	pthread_mutex_unlock(&pcm->mutex);
++
++	struct drop_sync_waiter waiter = { pcm, token };
++	pthread_cleanup_push(drop_sync_wait_cancel, &waiter);
++	pthread_setcancelstate(old_cancel_state, NULL);
++	while (error == 0 && pcm->drop_sync_active == token &&
++			pcm->drop_sync_result == EINPROGRESS) {
++		error = pthread_cond_timedwait(&pcm->drop_sync_cond, &pcm->drop_sync_mtx, &deadline);
++	}
++	if (error == 0)
++		error = pcm->drop_sync_active == token ? pcm->drop_sync_result : ECANCELED;
++	if (error == 0) {
++		struct timespec now;
++		if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
++			error = EIO;
++		else if (now.tv_sec > deadline.tv_sec ||
++				(now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
++			error = ETIMEDOUT;
++	}
++	if (pcm->drop_sync_active == token)
++		pcm->drop_sync_active = 0;
++	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
++	pthread_cleanup_pop(0);
++	pthread_mutex_unlock(&pcm->drop_sync_mtx);
++	pthread_setcancelstate(old_cancel_state, NULL);
++	if (error != 0)
++		return errno = error, -1;
++	return 0;
++}
++
++bool ba_transport_pcm_drop_sync_claim(struct ba_transport_pcm *pcm, uint64_t token,
++		int *fd, struct timespec *deadline) {
++	pthread_mutex_lock(&pcm->drop_sync_mtx);
++	bool valid = token != 0 && pcm->drop_sync_active == token &&
++		pcm->drop_sync_result == EINPROGRESS;
++	if (valid) {
++		*fd = pcm->drop_sync_fd;
++		*deadline = pcm->drop_sync_deadline;
++	}
++	pthread_mutex_unlock(&pcm->drop_sync_mtx);
++	return valid;
++}
++
++void ba_transport_pcm_drop_sync_complete(struct ba_transport_pcm *pcm, uint64_t token, int error) {
++	pthread_mutex_lock(&pcm->drop_sync_mtx);
++	if (token != 0 && pcm->drop_sync_active == token && pcm->drop_sync_result == EINPROGRESS) {
++		struct timespec now;
++		if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
++			error = EIO;
++		else if (now.tv_sec > pcm->drop_sync_deadline.tv_sec ||
++				(now.tv_sec == pcm->drop_sync_deadline.tv_sec && now.tv_nsec >= pcm->drop_sync_deadline.tv_nsec))
++			error = ETIMEDOUT;
++		pcm->drop_sync_result = error;
++		pthread_cond_broadcast(&pcm->drop_sync_cond);
++	}
++	pthread_mutex_unlock(&pcm->drop_sync_mtx);
++}
++
+ int ba_transport_pcm_signal_send(
+ 		struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_signal signal) {
+ 
+ 	int ret = -1;
+ 
+ 	pthread_mutex_lock(&pcm->state_mtx);
+ 
+ 	if (pcm->state != BA_TRANSPORT_PCM_STATE_RUNNING) {
+ 		errno = ESRCH;
+ 		goto fail;
+ 	}
+ 
+ 	if (write(pcm->pipe[1], &signal, sizeof(signal)) != sizeof(signal)) {
+ 		warn("Couldn't write transport PCM signal: %s", strerror(errno));
+ 		goto fail;
+ 	}
+ 
+ 	ret = 0;
+ 
+ fail:
+ 	pthread_mutex_unlock(&pcm->state_mtx);
+ 	return ret;
+ }
+ 
+ /**
+  * Receive signal sent by ba_transport_pcm_signal_send().
+  *
+  * @note
+  * In case of error, this function will return -1 instead of signal value. */
+ enum ba_transport_pcm_signal ba_transport_pcm_signal_recv(
+ 		struct ba_transport_pcm *pcm) {
+ 
+ 	enum ba_transport_pcm_signal signal;
+ 	ssize_t ret;
+ 
+ 	while ((ret = read(pcm->pipe[0], &signal, sizeof(signal))) == -1 &&
+ 			errno == EINTR)
+ 		continue;
+ 
+ 	if (ret == sizeof(signal))
+ 		return signal;
+ 
+ 	warn("Couldn't read transport PCM signal: %s", strerror(errno));
+ 	return -1;
+ }
+ 
+ bool ba_transport_pcm_is_active(const struct ba_transport_pcm *pcm) {
+ 	pthread_mutex_lock(MUTABLE(&pcm->mutex));
+ 	bool active = pcm->fd != -1 && !pcm->paused;
+ 	pthread_mutex_unlock(MUTABLE(&pcm->mutex));
+ 	return active;
+ }
+ 
+ /**
+  * Convert PCM volume level to [0, max] range. */
+ unsigned int ba_transport_pcm_volume_level_to_range(int value, int max) {
+ 	int volume = audio_decibel_to_loudness(value / 100.0) * max;
+ 	return MIN(MAX(volume, 0), max);
+ }
+ 
+ /**
+  * Convert [0, max] range to PCM volume level. */
+ int ba_transport_pcm_volume_range_to_level(int value, int max) {
+ 	int level = audio_loudness_to_decibel(1.0 * value / max) * 100;
+ 	return MIN(MAX(level, -9600), 9600);
+ }
+ 
+ /**
+  * Set PCM volume level/mute.
+  *
+  * One shall use this function instead of directly writing to PCM volume
+  * structure fields.
+  *
+  * @param level If not NULL, new PCM volume level in "dB * 100".
+  * @param soft_mute If not NULL, change software mute state.
+  * @param hard_mute If not NULL, change hardware mute state. */
+ void ba_transport_pcm_volume_set(
+ 		struct ba_transport_pcm_volume *volume,
+ 		const int *level,
+ 		const bool *soft_mute,
+ 		const bool *hard_mute) {
+ 
+ 	if (level != NULL)
+ 		volume->level = *level;
+ 	/* Allow software mute state modifications only if hardware mute
+ 	 * was not enabled or we are updating software and hardware mute
+ 	 * at the same time. */
+ 	if (soft_mute != NULL &&
+ 			(!volume->hard_mute || hard_mute != NULL))
+ 		volume->soft_mute = *soft_mute;
+ 	if (hard_mute != NULL)
+ 		volume->hard_mute = *hard_mute;
+ 
+ 	/* calculate PCM scale factor */
+ 	const bool muted = volume->soft_mute || volume->hard_mute;
+ 	volume->scale = muted ? 0 : pow(10, (0.01 * volume->level) / 20);
+ 
+ }
+ 
+ /**
+  * Synchronize PCM volume level.
+  *
+  * This function notifies remote Bluetooth device and D-Bus clients. */
+ int ba_transport_pcm_volume_sync(struct ba_transport_pcm *pcm, unsigned int update_mask) {
+ 
+ 	struct ba_transport *t = pcm->t;
+ 
+ 	/* In case of A2DP Source or HSP/HFP Audio Gateway skip notifying Bluetooth
+ 	 * device if we are using software volume control. This will prevent volume
+ 	 * double scaling - firstly by us and then by Bluetooth headset/speaker. */
+ 	if (pcm->soft_volume && t->profile & (
+ 				BA_TRANSPORT_PROFILE_A2DP_SOURCE | BA_TRANSPORT_PROFILE_MASK_AG))
+ 		goto final;
+ 
+ 	if (BA_TRANSPORT_PROFILE_IS_MEDIA(t)) {
+ 
+ 		/* A2DP specification defines volume property as a single value - volume
+ 		 * for only one channel. For multi-channel audio, we will use calculated
+ 		 * average volume level. */
+ 
+ 		int level_sum = 0;
+ 		for (size_t i = 0; i < pcm->channels; i++)
+ 			level_sum += pcm->volume[i].level;
+ 
+ 		/* Volume rage for A2DP and ASHA is the same. */
+ 		uint16_t volume = ba_transport_pcm_volume_level_to_range(
+ 				level_sum / (int)pcm->channels, BLUEZ_MEDIA_TRANSPORT_A2DP_VOLUME_MAX);
+ 
+ 		/* Skip update if nothing has changed. */
+ 		if (volume != t->media.volume) {
+ 
+ 			GError * err = NULL;
+ 			t->media.volume = volume;
+ 			g_dbus_set_property_sync(config.dbus, t->bluez_dbus_owner, t->bluez_dbus_path,
+ 					BLUEZ_IFACE_MEDIA_TRANSPORT, "Volume", g_variant_new_uint16(volume), &err);
+ 
+ 			if (err != NULL) {
+ 				warn("Couldn't set BT device volume: %s", err->message);
+ 				g_error_free(err);
+ 			}
+ 
+ 		}
+ 
+ 	}
+ 	else if (BA_TRANSPORT_PROFILE_IS_SCO(t)) {
+ 
+ 		if (t->sco.rfcomm != NULL)
+ 			/* notify associated RFCOMM transport */
+ 			ba_rfcomm_send_signal(t->sco.rfcomm, BA_RFCOMM_SIGNAL_UPDATE_VOLUME);
+ #if ENABLE_OFONO
+ 		else
+ 			ofono_call_volume_update(t);
+ #endif
+ 
+ 	}
+ 
+ final:
+ 	/* Notify all connected D-Bus clients. */
+ 	bluealsa_dbus_pcm_update(pcm, update_mask);
+ 	return 0;
+ }
+ 
+ /**
+  * Get non-software PCM volume level if available. */
+ int ba_transport_pcm_get_hardware_volume(
+ 		const struct ba_transport_pcm *pcm) {
+ 
+ 	const struct ba_transport *t = pcm->t;
+ 
+ 	if (BA_TRANSPORT_PROFILE_IS_MEDIA(t))
+ 		return t->media.volume;
+ 
+ 	if (BA_TRANSPORT_PROFILE_IS_SCO(t)) {
+ 
+ 		if (t->sco.rfcomm == NULL)
+ 			/* TODO: Cache volume level for oFono-based SCO */
+ 			return HFP_VOLUME_GAIN_MAX;
+ 
+ 		if (pcm == &t->sco.pcm_spk)
+diff --git a/src/ba-transport-pcm.h b/src/ba-transport-pcm.h
+index 59e11a5..cc647b1 100644
+--- a/src/ba-transport-pcm.h
++++ b/src/ba-transport-pcm.h
+@@ -1,266 +1,284 @@
+ /*
+  * BlueALSA - ba-transport-pcm.h
+  * SPDX-FileCopyrightText: 2016-2025 BlueALSA developers
+  * SPDX-License-Identifier: MIT
+  */
+ 
+ #pragma once
+ #ifndef BLUEALSA_BATRANSPORTPCM_H_
+ #define BLUEALSA_BATRANSPORTPCM_H_
+ 
+ #if HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <pthread.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+ #include <glib.h>
+ 
+ enum ba_transport_pcm_mode {
+ 	/* PCM used for capturing audio */
+ 	BA_TRANSPORT_PCM_MODE_SOURCE,
+ 	/* PCM used for playing audio */
+ 	BA_TRANSPORT_PCM_MODE_SINK,
+ };
+ 
+ enum ba_transport_pcm_state {
+ 	BA_TRANSPORT_PCM_STATE_IDLE,
+ 	BA_TRANSPORT_PCM_STATE_STARTING,
+ 	BA_TRANSPORT_PCM_STATE_RUNNING,
+ 	BA_TRANSPORT_PCM_STATE_STOPPING,
+ 	BA_TRANSPORT_PCM_STATE_JOINING,
+ 	BA_TRANSPORT_PCM_STATE_TERMINATED,
+ };
+ 
+ /**
+  * Builder for 16-bit PCM stream format identifier. */
+ #define BA_TRANSPORT_PCM_FORMAT(sign, width, bytes, endian) \
+ 	(((sign & 1) << 15) | ((endian & 1) << 14) | ((bytes & 0x3F) << 8) | (width & 0xFF))
+ 
+ #define BA_TRANSPORT_PCM_FORMAT_SIGN(format)   (((format) >> 15) & 0x1)
+ #define BA_TRANSPORT_PCM_FORMAT_WIDTH(format)  ((format) & 0xFF)
+ #define BA_TRANSPORT_PCM_FORMAT_BYTES(format)  (((format) >> 8) & 0x3F)
+ #define BA_TRANSPORT_PCM_FORMAT_ENDIAN(format) (((format) >> 14) & 0x1)
+ 
+ #define BA_TRANSPORT_PCM_FORMAT_U8      BA_TRANSPORT_PCM_FORMAT(0, 8, 1, 0)
+ #define BA_TRANSPORT_PCM_FORMAT_S16_2LE BA_TRANSPORT_PCM_FORMAT(1, 16, 2, 0)
+ #define BA_TRANSPORT_PCM_FORMAT_S24_3LE BA_TRANSPORT_PCM_FORMAT(1, 24, 3, 0)
+ #define BA_TRANSPORT_PCM_FORMAT_S24_4LE BA_TRANSPORT_PCM_FORMAT(1, 24, 4, 0)
+ #define BA_TRANSPORT_PCM_FORMAT_S32_4LE BA_TRANSPORT_PCM_FORMAT(1, 32, 4, 0)
+ 
+ enum ba_transport_pcm_channel {
+ 	BA_TRANSPORT_PCM_CHANNEL_MONO, /* mono */
+ 	BA_TRANSPORT_PCM_CHANNEL_FL,   /* front left */
+ 	BA_TRANSPORT_PCM_CHANNEL_FR,   /* front right */
+ 	BA_TRANSPORT_PCM_CHANNEL_FC,   /* front center */
+ 	BA_TRANSPORT_PCM_CHANNEL_RL,   /* rear left */
+ 	BA_TRANSPORT_PCM_CHANNEL_RR,   /* rear right */
+ 	BA_TRANSPORT_PCM_CHANNEL_SL,   /* side left */
+ 	BA_TRANSPORT_PCM_CHANNEL_SR,   /* side right */
+ 	BA_TRANSPORT_PCM_CHANNEL_LFE,  /* low frequency effects */
+ };
+ 
+ struct ba_transport_pcm_volume {
+ 	/* volume level change in "dB * 100" */
+ 	int level;
+ 	/* audio signal mute switches */
+ 	bool soft_mute;
+ 	bool hard_mute;
+ 	/* calculated PCM scale factor based on decibel formula
+ 	 * pow(10, dB / 20); for muted channel it shall equal 0 */
+ 	double scale;
+ };
+ 
+ enum ba_transport_pcm_signal {
+ 	BA_TRANSPORT_PCM_SIGNAL_OPEN,
+ 	BA_TRANSPORT_PCM_SIGNAL_CLOSE,
+ 	BA_TRANSPORT_PCM_SIGNAL_PAUSE,
+ 	BA_TRANSPORT_PCM_SIGNAL_RESUME,
+ 	BA_TRANSPORT_PCM_SIGNAL_DRAIN,
+ 	BA_TRANSPORT_PCM_SIGNAL_DROP,
+ };
+ 
+ struct ba_transport;
+ 
+ struct ba_transport_pcm {
+ 
+ 	/* backward reference to transport */
+ 	struct ba_transport *t;
+ 
+ 	/* PCM stream operation mode */
+ 	enum ba_transport_pcm_mode mode;
+ 	/* indicates a master PCM */
+ 	bool master;
+ 
+ 	/* guard PCM data updates */
+ 	pthread_mutex_t mutex;
+ 	/* updates notification */
+ 	pthread_cond_t cond;
+ 
+ 	pthread_mutex_t state_mtx;
+ 	/* current state of the PCM */
+ 	enum ba_transport_pcm_state state;
+ 
+ 	/* PCM file descriptor */
+ 	int fd;
+ 	/* clone of BT socket */
+ 	int fd_bt;
+ 
+ 	/* indicates whether PCM is running */
+ 	bool paused;
+ 
+ 	/* 16-bit stream format identifier */
+ 	uint16_t format;
+ 	/* number of audio channels */
+ 	unsigned int channels;
+ 	/* PCM sample rate */
+ 	unsigned int rate;
+ 
+ 	/* Delay caused by the codec due to internal buffering. The delay is
+ 	 * expressed in 1/10 of millisecond. */
+ 	unsigned int codec_delay_dms;
+ 	/* Delay caused by data processing. This delay component depends on
+ 	 * the host computational power. It is used to compensate for the time
+ 	 * required to encode or decode audio. */
+ 	unsigned int processing_delay_dms;
+ 	/* The last reported total codec + processing delay. It is used to limit
+ 	 * the rate at which changes are reported via D-Bus. */
+ 	unsigned int reported_codec_delay_dms;
+ 	/* Positive (or negative) delay reported by the client. */
+ 	int client_delay_dms;
+ 
+ 	/* Indicates whether FIFO buffer was drained. */
+ 	bool drained;
+ 
+ 	/* internal software volume control */
+ 	bool soft_volume;
+ 
+ 	/* channel map for current PCM configuration */
+ 	enum ba_transport_pcm_channel channel_map[8];
+ 
+ 	/* per-channel volume */
+ 	struct ba_transport_pcm_volume volume[8];
+ 
+ 	/* new PCM client mutex */
+ 	pthread_mutex_t client_mtx;
+ 
+ 	/* source watch for controller socket */
+ 	GSource *controller;
++	/* OpenRestricted grants only the bounded synchronous command. */
++	bool controller_restricted;
+ 
+ 	/* actual thread ID */
+ 	pthread_t tid;
+ 
++	/* Exact, bounded SBC DropSync requests; separate from legacy signals. */
++	pthread_mutex_t drop_sync_mtx;
++	pthread_cond_t drop_sync_cond;
++	bool drop_sync_initialized;
++	uint64_t drop_sync_next, drop_sync_active;
++	int drop_sync_fd, drop_sync_result;
++	struct timespec drop_sync_deadline;
++	int drop_sync_pipe[2];
++
+ 	/* notification PIPE */
+ 	int pipe[2];
+ 
+ 	/* exported PCM D-Bus API */
+ 	char *ba_dbus_path;
+ 	bool ba_dbus_exported;
+ 
+ };
+ 
+ int transport_pcm_init(
+ 		struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_mode mode,
+ 		struct ba_transport *t,
+ 		bool master);
+ void transport_pcm_free(
+ 		struct ba_transport_pcm *pcm);
+ 
+ int ba_transport_pcm_state_set(
+ 		struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_state state);
+ 
+ #define ba_transport_pcm_state_set_idle(pcm) \
+ 	ba_transport_pcm_state_set(pcm, BA_TRANSPORT_PCM_STATE_IDLE)
+ #define ba_transport_pcm_state_set_running(pcm) \
+ 	ba_transport_pcm_state_set(pcm, BA_TRANSPORT_PCM_STATE_RUNNING)
+ #define ba_transport_pcm_state_set_stopping(pcm) \
+ 	ba_transport_pcm_state_set(pcm, BA_TRANSPORT_PCM_STATE_STOPPING)
+ 
+ bool ba_transport_pcm_state_check(
+ 		const struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_state state);
+ 
+ #define ba_transport_pcm_state_check_idle(pcm) \
+ 	ba_transport_pcm_state_check(pcm, BA_TRANSPORT_PCM_STATE_IDLE)
+ #define ba_transport_pcm_state_check_running(pcm) \
+ 	ba_transport_pcm_state_check(pcm, BA_TRANSPORT_PCM_STATE_RUNNING)
+ #define ba_transport_pcm_state_check_terminated(pcm) \
+ 	ba_transport_pcm_state_check(pcm, BA_TRANSPORT_PCM_STATE_TERMINATED)
+ 
+ int ba_transport_pcm_state_wait(
+ 		const struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_state state);
+ 
+ #define ba_transport_pcm_state_wait_running(pcm) \
+ 	ba_transport_pcm_state_wait(pcm, BA_TRANSPORT_PCM_STATE_RUNNING)
+ #define ba_transport_pcm_state_wait_terminated(pcm) \
+ 	ba_transport_pcm_state_wait(pcm, BA_TRANSPORT_PCM_STATE_TERMINATED)
+ 
+ /**
+  * Transport PCM encoder/decoder IO thread function. */
+ typedef void *(*ba_transport_pcm_thread_func)(struct ba_transport_pcm *);
+ 
+ #define debug_transport_pcm_thread_loop(pcm, tag) \
+ 	debug("PCM IO loop: %s: %s: %s", tag, __func__, ba_transport_debug_name((pcm)->t))
+ 
+ void ba_transport_pcm_thread_cleanup(struct ba_transport_pcm *pcm);
+ 
+ struct ba_transport_pcm *ba_transport_pcm_ref(struct ba_transport_pcm *pcm);
+ void ba_transport_pcm_unref(struct ba_transport_pcm *pcm);
+ 
+ int ba_transport_pcm_bt_acquire(struct ba_transport_pcm *pcm);
+ int ba_transport_pcm_bt_release(struct ba_transport_pcm *pcm);
+ 
+ int ba_transport_pcm_start(
+ 		struct ba_transport_pcm *pcm,
+ 		ba_transport_pcm_thread_func th_func,
+ 		const char *name);
+ void ba_transport_pcm_stop(
+ 		struct ba_transport_pcm *pcm);
+ 
+ int ba_transport_pcm_release(struct ba_transport_pcm *pcm);
+ 
+ int ba_transport_pcm_pause(struct ba_transport_pcm *pcm);
+ int ba_transport_pcm_resume(struct ba_transport_pcm *pcm);
+ int ba_transport_pcm_drain(struct ba_transport_pcm *pcm);
+ int ba_transport_pcm_drop(struct ba_transport_pcm *pcm);
++bool ba_transport_pcm_drop_sync_supported(struct ba_transport_pcm *pcm);
++int ba_transport_pcm_drop_sync(struct ba_transport_pcm *pcm);
++int ba_transport_pcm_drop_sync_lock(pthread_mutex_t *mutex, const struct timespec *deadline);
++void ba_transport_pcm_drop_sync_cancel(struct ba_transport_pcm *pcm);
++void ba_transport_pcm_drop_sync_complete(struct ba_transport_pcm *pcm, uint64_t token, int error);
++bool ba_transport_pcm_drop_sync_claim(struct ba_transport_pcm *pcm, uint64_t token,
++		int *fd, struct timespec *deadline);
+ 
+ int ba_transport_pcm_signal_send(
+ 		struct ba_transport_pcm *pcm,
+ 		enum ba_transport_pcm_signal signal);
+ enum ba_transport_pcm_signal ba_transport_pcm_signal_recv(
+ 		struct ba_transport_pcm *pcm);
+ 
+ bool ba_transport_pcm_is_active(const struct ba_transport_pcm *pcm);
+ 
+ unsigned int ba_transport_pcm_volume_level_to_range(int value, int max);
+ int ba_transport_pcm_volume_range_to_level(int value, int max);
+ 
+ void ba_transport_pcm_volume_set(
+ 		struct ba_transport_pcm_volume *volume,
+ 		const int *level,
+ 		const bool *soft_mute,
+ 		const bool *hard_mute);
+ 
+ int ba_transport_pcm_volume_sync(
+ 		struct ba_transport_pcm *pcm,
+ 		unsigned int update_mask);
+ 
+ int ba_transport_pcm_get_hardware_volume(
+ 		const struct ba_transport_pcm *pcm);
+ 
+ int ba_transport_pcm_delay_get(
+ 		const struct ba_transport_pcm *pcm);
+ 
+ int ba_transport_pcm_delay_sync(
+ 		struct ba_transport_pcm *pcm,
+ 		unsigned int update_mask);
+ 
+ const char *ba_transport_pcm_channel_to_string(
+ 		enum ba_transport_pcm_channel channel);
+ 
+ #endif
+diff --git a/src/bluealsa-dbus.c b/src/bluealsa-dbus.c
+index c5ccb1c..decb74f 100644
+--- a/src/bluealsa-dbus.c
++++ b/src/bluealsa-dbus.c
+@@ -279,965 +279,996 @@ static GVariant *ba_variant_new_pcm_rate(const struct ba_transport_pcm *pcm) {
+ }
+ 
+ static GVariant *ba_variant_new_pcm_codec(const struct ba_transport_pcm *pcm) {
+ 	const struct ba_transport *t = pcm->t;
+ 	const char *codec = NULL;
+ 	if (BA_TRANSPORT_PROFILE_IS_MEDIA_A2DP(t))
+ 		codec = a2dp_codec_to_string(ba_transport_get_codec(t));
+ #if ENABLE_ASHA
+ 	else if (BA_TRANSPORT_PROFILE_IS_MEDIA_ASHA(t))
+ 		codec = asha_codec_to_string(ba_transport_get_codec(t));
+ #endif
+ 	else if (BA_TRANSPORT_PROFILE_IS_SCO(t))
+ 		codec = hfp_codec_to_string(ba_transport_get_codec(t));
+ 	if (codec != NULL)
+ 		return g_variant_new_string(codec);
+ 	return NULL;
+ }
+ 
+ static GVariant *ba_variant_new_pcm_codec_config(const struct ba_transport_pcm *pcm) {
+ 	const struct ba_transport *t = pcm->t;
+ 	if (BA_TRANSPORT_PROFILE_IS_MEDIA_A2DP(t))
+ 		return g_variant_new_fixed_byte_array(&t->media.a2dp.configuration,
+ 				t->media.a2dp.sep->config.caps_size);
+ 	return NULL;
+ }
+ 
+ static GVariant *ba_variant_new_pcm_delay(const struct ba_transport_pcm *pcm) {
+ 	return g_variant_new_uint16(ba_transport_pcm_delay_get(pcm));
+ }
+ 
+ static GVariant *ba_variant_new_pcm_client_delay(const struct ba_transport_pcm *pcm) {
+ 	return g_variant_new_int16(pcm->client_delay_dms);
+ }
+ 
+ static GVariant *ba_variant_new_pcm_soft_volume(const struct ba_transport_pcm *pcm) {
+ 	return g_variant_new_boolean(pcm->soft_volume);
+ }
+ 
+ static uint8_t ba_volume_pack_dbus_volume(bool muted, int value) {
+ 	return (muted << 7) | (((uint8_t)value) & 0x7F);
+ }
+ 
+ static GVariant *ba_variant_new_pcm_volume(const struct ba_transport_pcm *pcm) {
+ 
+ 	const bool is_sco = BA_TRANSPORT_PROFILE_IS_SCO(pcm->t);
+ 	const int max = is_sco ? HFP_VOLUME_GAIN_MAX : BLUEZ_MEDIA_TRANSPORT_A2DP_VOLUME_MAX;
+ 	const size_t n = pcm->channels;
+ 
+ 	uint8_t volume[ARRAYSIZE(pcm->volume)];
+ 	for (size_t i = 0; i < n; i++)
+ 		volume[i] = ba_volume_pack_dbus_volume(pcm->volume[i].scale == 0,
+ 				ba_transport_pcm_volume_level_to_range(pcm->volume[i].level, max));
+ 
+ 	return g_variant_new_fixed_byte_array(volume, n);
+ }
+ 
+ struct ba_populate_data {
+ 	GVariantBuilder *builder;
+ 	/* previously added value */
+ 	unsigned int value;
+ };
+ 
+ static error_code_t ba_populate_channels(struct a2dp_bit_mapping mapping, void *userdata) {
+ 	struct ba_populate_data *data = userdata;
+ 	if (data->value == mapping.value)
+ 		return ERROR_CODE_CONTINUE;
+ 	g_variant_builder_add_value(data->builder, g_variant_new_byte(mapping.value));
+ 	data->value = mapping.value;
+ 	return ERROR_CODE_CONTINUE;
+ }
+ 
+ static error_code_t ba_populate_rates(struct a2dp_bit_mapping mapping, void *userdata) {
+ 	struct ba_populate_data *data = userdata;
+ 	g_variant_builder_add_value(data->builder, g_variant_new_uint32(mapping.value));
+ 	return ERROR_CODE_CONTINUE;
+ }
+ 
+ static error_code_t ba_populate_channel_map(struct a2dp_bit_mapping mapping, void *userdata) {
+ 	struct ba_populate_data *data = userdata;
+ 
+ 	if (data->value == mapping.ch.channels)
+ 		return ERROR_CODE_CONTINUE;
+ 
+ 	const char *strv[16];
+ 	for (size_t i = 0; i < mapping.ch.channels; i++)
+ 		strv[i] = ba_transport_pcm_channel_to_string(mapping.ch.map[i]);
+ 
+ 	g_variant_builder_add_value(data->builder, g_variant_new_strv(strv, mapping.ch.channels));
+ 	data->value = mapping.ch.channels;
+ 	return ERROR_CODE_CONTINUE;
+ }
+ 
+ /**
+  * Populate dict variant builder with remote SEP properties. */
+ static void ba_variant_populate_remote_sep(GVariantBuilder *props,
+ 		const struct a2dp_sep *sep, const struct a2dp_sep_config *remote_sep_cfg,
+ 		enum a2dp_stream stream) {
+ 
+ 	GVariantBuilder builder;
+ 	struct ba_populate_data data = { .builder = &builder };
+ 
+ 	a2dp_t caps = remote_sep_cfg->capabilities;
+ 	sep->caps_helpers->intersect(&caps, &sep->config.capabilities);
+ 
+ 	g_variant_builder_add(props, "{sv}", "Capabilities",
+ 				g_variant_new_fixed_byte_array(&caps, remote_sep_cfg->caps_size));
+ 
+ 	data.value = 0;
+ 	g_variant_builder_init(&builder, G_VARIANT_TYPE("ay"));
+ 	sep->caps_helpers->foreach_channel_mode(&caps, stream, ba_populate_channels, &data);
+ 	g_variant_builder_add(props, "{sv}", "Channels", g_variant_builder_end(&builder));
+ 
+ 	data.value = 0;
+ 	g_variant_builder_init(&builder, G_VARIANT_TYPE("aas"));
+ 	sep->caps_helpers->foreach_channel_mode(&caps, stream, ba_populate_channel_map, &data);
+ 	g_variant_builder_add(props, "{sv}", "ChannelMaps", g_variant_builder_end(&builder));
+ 
+ 	data.value = 0;
+ 	g_variant_builder_init(&builder, G_VARIANT_TYPE("au"));
+ 	sep->caps_helpers->foreach_sample_rate(&caps, stream, ba_populate_rates, &data);
+ 	g_variant_builder_add(props, "{sv}", "Rates", g_variant_builder_end(&builder));
+ 
+ }
+ 
+ static GVariant *bluealsa_manager_get_property(const char *property,
+ 		GError **error, void *userdata) {
+ 	(void)error;
+ 	(void)userdata;
+ 
+ 	if (strcmp(property, "Version") == 0)
+ 		return ba_variant_new_bluealsa_version();
+ 	if (strcmp(property, "Adapters") == 0)
+ 		return ba_variant_new_bluealsa_adapters();
+ 	if (strcmp(property, "Profiles") == 0)
+ 		return ba_variant_new_bluealsa_profiles();
+ 	if (strcmp(property, "Codecs") == 0)
+ 		return ba_variant_new_bluealsa_codecs();
+ 
+ 	g_assert_not_reached();
+ 	return NULL;
+ }
+ 
+ /**
+  * Register BlueALSA D-Bus manager interfaces. */
+ void bluealsa_dbus_register(void) {
+ 
+ 	static const GDBusInterfaceSkeletonVTable vtable = {
+ 		.get_property = bluealsa_manager_get_property,
+ 	};
+ 
+ 	debug("Registering BlueALSA D-Bus manager: %s", bluealsa_dbus_manager_path);
+ 
+ 	OrgBluealsaManager1Skeleton *ifs_manager;
+ 	ifs_manager = org_bluealsa_manager1_skeleton_new(&vtable, NULL, NULL);
+ 	g_dbus_interface_skeleton_export(G_DBUS_INTERFACE_SKELETON(ifs_manager),
+ 			config.dbus, bluealsa_dbus_manager_path, NULL);
+ 
+ 	bluealsa_dbus_manager = g_dbus_object_manager_server_new(bluealsa_dbus_manager_path);
+ 	g_dbus_object_manager_server_set_connection(bluealsa_dbus_manager, config.dbus);
+ 
+ }
+ 
+ static int bluealsa_pcm_controller(
+ 		GIOChannel * ch,
+ 		G_GNUC_UNUSED GIOCondition cond,
+ 		void * userdata) {
+ 
+ 	struct ba_transport_pcm * pcm = userdata;
+ 	GError * err = NULL;
+ 	char command[32];
+ 	size_t len;
+ 
+ 	switch (g_io_channel_read_chars(ch, command, sizeof(command), &len, &err)) {
+ 	case G_IO_STATUS_AGAIN:
+ 		return G_SOURCE_CONTINUE;
+ 	case G_IO_STATUS_ERROR:
+ 		error("PCM controller read error: %s", err->message);
+ 		g_error_free(err);
+ 		return G_SOURCE_CONTINUE;
+ 	case G_IO_STATUS_NORMAL:
++		/* The handed-off controller cannot enter any legacy blocking operation. */
++		if (pcm->controller_restricted &&
++				(len != sizeof("DropSync") - 1 || memcmp(command, "DropSync", len) != 0)) {
++			g_io_channel_write_chars(ch, "Invalid", -1, &len, NULL);
++			g_io_channel_flush(ch, NULL);
++			return G_SOURCE_CONTINUE;
++		}
+ 		if (strncmp(command, BLUEALSA_PCM_CTRL_DRAIN, len) == 0) {
+ 			if (pcm->mode == BA_TRANSPORT_PCM_MODE_SINK)
+ 				ba_transport_pcm_drain(pcm);
+ 			g_io_channel_write_chars(ch, "OK", -1, &len, NULL);
+ 		}
++		else if (len == sizeof("DropSync") - 1 && memcmp(command, "DropSync", len) == 0) {
++			int rv = ba_transport_pcm_drop_sync(pcm);
++			g_io_channel_write_chars(ch, rv == 0 ? "OK" : "Failed", -1, &len, NULL);
++		}
+ 		else if (strncmp(command, BLUEALSA_PCM_CTRL_DROP, len) == 0) {
+ 			if (pcm->mode == BA_TRANSPORT_PCM_MODE_SINK)
+ 				ba_transport_pcm_drop(pcm);
+ 			g_io_channel_write_chars(ch, "OK", -1, &len, NULL);
+ 		}
+ 		else if (strncmp(command, BLUEALSA_PCM_CTRL_PAUSE, len) == 0) {
+ 			ba_transport_pcm_pause(pcm);
+ 			g_io_channel_write_chars(ch, "OK", -1, &len, NULL);
+ 		}
+ 		else if (strncmp(command, BLUEALSA_PCM_CTRL_RESUME, len) == 0) {
+ 			ba_transport_pcm_resume(pcm);
+ 			g_io_channel_write_chars(ch, "OK", -1, &len, NULL);
+ 		}
+ 		else {
+ 			warn("Invalid PCM control command: %*s", (int)len, command);
+ 			g_io_channel_write_chars(ch, "Invalid", -1, &len, NULL);
+ 		}
+ 		g_io_channel_flush(ch, NULL);
+ 		return G_SOURCE_CONTINUE;
+ 	case G_IO_STATUS_EOF:
+ 		pthread_mutex_lock(&pcm->mutex);
+ 		ba_transport_pcm_release(pcm);
+ 		pthread_mutex_unlock(&pcm->mutex);
+ 		ba_transport_pcm_signal_send(pcm, BA_TRANSPORT_PCM_SIGNAL_CLOSE);
+ 		/* Check whether we've just closed the last PCM client and in
+ 		 * such a case schedule transport IO threads termination. */
+ 		ba_transport_stop_if_no_clients(pcm->t);
+ 		/* Remove channel from watch. */
+ 		return G_SOURCE_REMOVE;
+ 	}
+ 
+ 	return G_SOURCE_CONTINUE;
+ }
+ 
+-static void bluealsa_pcm_open(GDBusMethodInvocation *inv, void *userdata) {
++static void bluealsa_pcm_open_common(GDBusMethodInvocation *inv, void *userdata, bool restricted) {
+ 
+ 	struct ba_transport_pcm *pcm = userdata;
++	if (restricted && !ba_transport_pcm_drop_sync_supported(pcm)) {
++		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
++				G_DBUS_ERROR_NOT_SUPPORTED, "Restricted PCM requires synchronous SBC drop");
++		return;
++	}
+ 	const bool is_sink = pcm->mode == BA_TRANSPORT_PCM_MODE_SINK;
+ 	const enum ba_transport_profile t_profile = pcm->t->profile;
+ 	struct ba_transport *t = pcm->t;
+ 	int pcm_fds[4] = { -1, -1, -1, -1 };
+ 
+ 	/* Prevent two (or more) clients trying to
+ 	 * open the same PCM at the same time. */
+ 	pthread_mutex_lock(&pcm->client_mtx);
+ 
+ 	/* preliminary check whether HFP codes is selected */
+ 	if (BA_TRANSPORT_PROFILE_IS_SCO(pcm->t) &&
+ 			ba_transport_get_codec(t) == HFP_CODEC_UNDEFINED) {
+ 		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 				G_DBUS_ERROR_FAILED, "HFP audio codec not selected");
+ 		goto fail;
+ 	}
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	const int pcm_fd = pcm->fd;
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	if (pcm_fd != -1) {
+ 		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 				G_DBUS_ERROR_LIMITS_EXCEEDED, "%s", strerror(EBUSY));
+ 		goto fail;
+ 	}
+ 
+ 	/* create PCM stream PIPE and PCM control socket */
+ 	if (pipe2(&pcm_fds[0], O_CLOEXEC) == -1 ||
+ 			socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, &pcm_fds[2]) == -1) {
+ 		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 				G_DBUS_ERROR_FAILED, "Create PIPE: %s", strerror(errno));
+ 		goto fail;
+ 	}
+ 
+ 	/* set our internal endpoint as non-blocking. */
+ 	if (fcntl(pcm_fds[is_sink ? 0 : 1], F_SETFL, O_NONBLOCK) == -1) {
+ 		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 				G_DBUS_ERROR_FAILED, "Setup PIPE: %s", strerror(errno));
+ 		goto fail;
+ 	}
+ 
+ 	/* Source profiles like A2DP Source and Audio Gateways should be initialized
+ 	 * only if the audio is about to be transferred. It is most likely, that BT
+ 	 * headset will not run voltage converter (power-on its circuit board) until
+ 	 * the transport is acquired in order to extend battery life. For profiles
+ 	 * like A2DP Sink and HFP headset, we will wait for incoming connection. */
+ 	if (t_profile & (
+ 				BA_TRANSPORT_PROFILE_A2DP_SOURCE |
+ #if ENABLE_ASHA
+ 				BA_TRANSPORT_PROFILE_ASHA_SOURCE |
+ #endif
+ 				BA_TRANSPORT_PROFILE_MASK_AG)) {
+ 
+ 		if (ba_transport_acquire(t) == -1) {
+ 			g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 					G_DBUS_ERROR_IO_ERROR, "Acquire transport: %s", strerror(errno));
+ 			goto fail;
+ 		}
+ 
+ 		/* Wait until transport thread is ready to process audio. */
+ 		if (ba_transport_pcm_state_wait_running(pcm) == -1) {
+ 			g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 					G_DBUS_ERROR_IO_ERROR, "Acquire transport: %s", strerror(errno));
+ 			goto fail;
+ 		}
+ 
+ 	}
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 
+ 	/* get correct PIPE endpoint - PIPE is unidirectional */
+ 	pcm->fd = pcm_fds[is_sink ? 0 : 1];
++	pcm->controller_restricted = restricted;
+ 	/* set newly opened PCM as active */
+ 	pcm->paused = false;
+ 
+ 	GIOChannel * ch = g_io_channel_unix_raw_new(pcm_fds[2]);
+ 	pcm->controller = g_io_create_watch_full(ch, G_PRIORITY_DEFAULT,
+ 			G_IO_IN, bluealsa_pcm_controller, ba_transport_pcm_ref(pcm),
+ 			(GDestroyNotify)ba_transport_pcm_unref);
+ 	g_io_channel_unref(ch);
+ 
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	/* notify our PCM IO thread that the PCM was opened */
+ 	ba_transport_pcm_signal_send(pcm, BA_TRANSPORT_PCM_SIGNAL_OPEN);
+ 
+ 	int fds[2] = { pcm_fds[is_sink ? 1 : 0], pcm_fds[3] };
+ 	GUnixFDList *fd_list = g_unix_fd_list_new_from_array(fds, 2);
+ 	g_dbus_method_invocation_return_value_with_unix_fd_list(inv,
+ 			g_variant_new("(hh)", 0, 1), fd_list);
+ 	g_object_unref(fd_list);
+ 
+ 	pthread_mutex_unlock(&pcm->client_mtx);
+ 	return;
+ 
+ fail:
+ 	pthread_mutex_unlock(&pcm->client_mtx);
+ 	/* clean up created file descriptors */
+ 	for (size_t i = 0; i < ARRAYSIZE(pcm_fds); i++)
+ 		if (pcm_fds[i] != -1)
+ 			close(pcm_fds[i]);
+ }
+ 
++static void bluealsa_pcm_open(GDBusMethodInvocation *inv, void *userdata) {
++	bluealsa_pcm_open_common(inv, userdata, false);
++}
++
++static void bluealsa_pcm_open_restricted(GDBusMethodInvocation *inv, void *userdata) {
++	bluealsa_pcm_open_common(inv, userdata, true);
++}
++
+ static void bluealsa_pcm_get_codecs(GDBusMethodInvocation *inv, void *userdata) {
+ 
+ 	struct ba_transport_pcm *pcm = userdata;
+ 	const struct ba_transport *t = pcm->t;
+ 	const GArray *sep_cfgs = t->d->sep_configs;
+ 
+ 	GVariantBuilder codecs;
+ 	g_variant_builder_init(&codecs, G_VARIANT_TYPE("a{sa{sv}}"));
+ 
+ 	if (BA_TRANSPORT_PROFILE_IS_MEDIA_A2DP(t)) {
+ 
+ 		GArray *codec_ids = g_array_sized_new(FALSE, FALSE, sizeof(uint32_t), 16);
+ 		const enum a2dp_type pcm_sep_type = t->media.a2dp.sep->config.type;
+ 		const enum a2dp_stream pcm_sep_stream = &t->media.pcm == pcm ? A2DP_MAIN : A2DP_BACKCHANNEL;
+ 
+ 		for (size_t i = 0; sep_cfgs != NULL && i < sep_cfgs->len; i++) {
+ 			const struct a2dp_sep_config *remote_sep_cfg = &ba_device_sep_cfg_array_index(sep_cfgs, i);
+ 
+ 			/* Match complementary SEP types (i.e.: source with sink). */
+ 			if (pcm_sep_type == remote_sep_cfg->type)
+ 				continue;
+ 
+ 			const struct a2dp_sep *sep;
+ 			/* Find local SEP for the remote one. */
+ 			if ((sep = a2dp_sep_lookup(pcm_sep_type, remote_sep_cfg->codec_id)) == NULL)
+ 				continue;
+ 
+ 			/* Do not report codec if corresponding local SEP is not enabled
+ 			 * in BlueALSA - it will be impossible to use it. */
+ 			if (!sep->enabled)
+ 				continue;
+ 
+ 			/* Check whether matched local and remote SEP support the same stream
+ 			 * direction as our current PCM SEP. If not, skip this codec. */
+ 			if (!sep->caps_helpers->has_stream(&sep->config.capabilities, pcm_sep_stream) ||
+ 					!sep->caps_helpers->has_stream(&remote_sep_cfg->capabilities, pcm_sep_stream))
+ 				continue;
+ 
+ 			bool duplicate = false;
+ 			/* Check whether we have already reported this codec. */
+ 			for (size_t j = 0; j < codec_ids->len; j++)
+ 				if (remote_sep_cfg->codec_id == g_array_index(codec_ids, uint32_t, j)) {
+ 					duplicate = true;
+ 					break;
+ 				}
+ 
+ 			/* Do not return duplicates.
+ 			 * Be aware of caveats - codec with the same ID might have different
+ 			 * capabilities... */
+ 			if (duplicate)
+ 				continue;
+ 
+ 			GVariantBuilder props;
+ 			g_variant_builder_init(&props, G_VARIANT_TYPE_VARDICT);
+ 
+ 			ba_variant_populate_remote_sep(&props, sep, remote_sep_cfg, pcm_sep_stream);
+ 
+ 			g_variant_builder_add(&codecs, "{sa{sv}}",
+ 					a2dp_codec_to_string(remote_sep_cfg->codec_id), &props);
+ 			g_variant_builder_clear(&props);
+ 
+ 			/* Remember reported codec ID. */
+ 			g_array_append_val(codec_ids, remote_sep_cfg->codec_id);
+ 
+ 		}
+ 
+ 		g_array_free(codec_ids, TRUE);
+ 
+ 	}
+ #if ENABLE_ASHA
+ 	else if (BA_TRANSPORT_PROFILE_IS_MEDIA_ASHA(t)) {
+ 
+ 		GVariantBuilder props;
+ 		g_variant_builder_init(&props, G_VARIANT_TYPE_VARDICT);
+ 
+ 		const uint8_t channels[] = { 1 };
+ 		g_variant_builder_add(&props, "{sv}", "Channels",
+ 					g_variant_new_fixed_byte_array(channels, 1));
+ 		const uint32_t rates[] = { 16000 };
+ 		g_variant_builder_add(&props, "{sv}", "Rates",
+ 					g_variant_new_fixed_array(G_VARIANT_TYPE_UINT32, rates, 1, sizeof(*rates)));
+ 
+ 		g_variant_builder_add(&codecs, "{sa{sv}}",
+ 				asha_codec_to_string(ASHA_CODEC_G722), &props);
+ 		g_variant_builder_clear(&props);
+ 
+ 	}
+ #endif
+ 	else if (BA_TRANSPORT_PROFILE_IS_SCO(t)) {
+ 
+ 		const struct ba_rfcomm *t_sco_rfcomm = t->sco.rfcomm;
+ 
+ 		/* HFP codec is selected by the AG. Because of that, HF is not aware of
+ 		 * AG supported codecs until the codec is actually selected. Anyway, we
+ 		 * will try to provide some heuristic here.
+ 		 * For built-in HFP profiles we will mark given codec as available, if
+ 		 * both AG and HF can support it. When HFP is provided by an external
+ 		 * application like oFono, we will mark given codec as available, if it
+ 		 * is enabled by our global configuration. */
+ 
+ 		const struct {
+ 			uint8_t codec_id;
+ 			unsigned int rate;
+ 			bool is_enabled_in_config;
+ 			bool is_available_in_rfcomm_ag;
+ 			bool is_available_in_rfcomm_hf;
+ 		} sco_codecs[] = {
+ 			{ HFP_CODEC_CVSD, 8000, config.hfp.codecs.cvsd,
+ 				t_sco_rfcomm == NULL || t_sco_rfcomm->ag_codecs.cvsd,
+ 				t_sco_rfcomm == NULL || t_sco_rfcomm->hf_codecs.cvsd },
+ #if ENABLE_MSBC
+ 			{ HFP_CODEC_MSBC, 16000, config.hfp.codecs.msbc,
+ 				t_sco_rfcomm == NULL || t_sco_rfcomm->ag_codecs.msbc,
+ 				t_sco_rfcomm == NULL || t_sco_rfcomm->hf_codecs.msbc },
+ #endif
+ #if ENABLE_LC3_SWB
+ 			{ HFP_CODEC_LC3_SWB, 32000, config.hfp.codecs.lc3_swb,
+ 				t_sco_rfcomm == NULL || t_sco_rfcomm->ag_codecs.lc3_swb,
+ 				t_sco_rfcomm == NULL || t_sco_rfcomm->hf_codecs.lc3_swb },
+ #endif
+ 		};
+ 
+ 		for (size_t i = 0; i < ARRAYSIZE(sco_codecs); i++)
+ 			if (sco_codecs[i].is_enabled_in_config &&
+ 					sco_codecs[i].is_available_in_rfcomm_ag &&
+ 					sco_codecs[i].is_available_in_rfcomm_hf) {
+ 
+ 				GVariantBuilder props;
+ 				g_variant_builder_init(&props, G_VARIANT_TYPE_VARDICT);
+ 
+ 				const uint8_t channels[] = { 1 };
+ 				g_variant_builder_add(&props, "{sv}", "Channels",
+ 							g_variant_new_fixed_byte_array(channels, 1));
+ 				const uint32_t rates[] = { sco_codecs[i].rate };
+ 				g_variant_builder_add(&props, "{sv}", "Rates",
+ 							g_variant_new_fixed_array(G_VARIANT_TYPE_UINT32, rates, 1, sizeof(*rates)));
+ 
+ 				g_variant_builder_add(&codecs, "{sa{sv}}",
+ 						hfp_codec_to_string(sco_codecs[i].codec_id), &props);
+ 				g_variant_builder_clear(&props);
+ 
+ 			}
+ 
+ 	}
+ 
+ 	g_dbus_method_invocation_return_value(inv, g_variant_new("(a{sa{sv}})", &codecs));
+ 	g_variant_builder_clear(&codecs);
+ 
+ }
+ 
+ static void bluealsa_pcm_select_codec(GDBusMethodInvocation *inv, void *userdata) {
+ 
+ 	GVariant *params = g_dbus_method_invocation_get_parameters(inv);
+ 	struct ba_transport_pcm *pcm = userdata;
+ 	struct ba_transport *t = pcm->t;
+ 	GVariantIter *properties;
+ 	GVariant *value;
+ 	const char *errmsg = NULL;
+ 	const char *codec_name;
+ 	const char *property;
+ 
+ 	/* Since transport can provide more than one PCM interface, i.e., source
+ 	 * and sink for bi-directional transports like HSP/HFP. In such case, both
+ 	 * PCMs should use the same codec. Given that, we need to lock codec
+ 	 * selection on the transport level. */
+ 	pthread_mutex_lock(&t->codec_select_client_mtx);
+ 
+ 	a2dp_t a2dp_configuration = { 0 };
+ 	size_t a2dp_configuration_size = 0;
+ 	unsigned int channels = 0;
+ 	unsigned int rate = 0;
+ 	bool conformance_check = true;
+ 
+ 	g_variant_get(params, "(&sa{sv})", &codec_name, &properties);
+ 	while (g_variant_iter_next(properties, "{&sv}", &property, &value)) {
+ 
+ 		if (strcmp(property, "Configuration") == 0 &&
+ 				g_variant_validate_value(value, G_VARIANT_TYPE_BYTESTRING, property)) {
+ 
+ 			const void *data = g_variant_get_fixed_array(value,
+ 					&a2dp_configuration_size, sizeof(char));
+ 
+ 			if (a2dp_configuration_size > sizeof(a2dp_configuration)) {
+ 				warn("Configuration blob size exceeded: %zu > %zu",
+ 						a2dp_configuration_size, sizeof(a2dp_configuration));
+ 				a2dp_configuration_size = sizeof(a2dp_configuration);
+ 			}
+ 
+ 			memcpy(&a2dp_configuration, data, a2dp_configuration_size);
+ 
+ 		}
+ 		else if (strcmp(property, "Channels") == 0 &&
+ 				g_variant_validate_value(value, G_VARIANT_TYPE_BYTE, property)) {
+ 			channels = g_variant_get_byte(value);
+ 		}
+ 		else if (strcmp(property, "Rate") == 0 &&
+ 				g_variant_validate_value(value, G_VARIANT_TYPE_UINT32, property)) {
+ 			rate = g_variant_get_uint32(value);
+ 		}
+ 		else if (strcmp(property, "NonConformant") == 0 &&
+ 				g_variant_validate_value(value, G_VARIANT_TYPE_BOOLEAN, property)) {
+ 			conformance_check = !g_variant_get_boolean(value);
+ 		}
+ 
+ 		g_variant_unref(value);
+ 	}
+ 
+ 	if (BA_TRANSPORT_PROFILE_IS_MEDIA_A2DP(t)) {
+ 
+ 		/* support for Stream End-Points not enabled in BlueZ */
+ 		if (t->d->sep_configs == NULL) {
+ 			errmsg = "No BlueZ SEP support";
+ 			goto fail;
+ 		}
+ 
+ 		uint32_t codec_id = a2dp_codec_from_string(codec_name);
+ 		const enum a2dp_type pcm_sep_type = t->media.a2dp.sep->config.type;
+ 		const enum a2dp_stream pcm_sep_stream = &t->media.pcm == pcm ? A2DP_MAIN : A2DP_BACKCHANNEL;
+ 		struct a2dp_sep_config *remote_sep_cfg = NULL;
+ 		const GArray *sep_cfgs = t->d->sep_configs;
+ 
+ 		for (size_t i = 0; i < sep_cfgs->len; i++)
+ 			if (ba_device_sep_cfg_array_index(sep_cfgs, i).type != pcm_sep_type &&
+ 					ba_device_sep_cfg_array_index(sep_cfgs, i).codec_id == codec_id) {
+ 				remote_sep_cfg = &ba_device_sep_cfg_array_index(sep_cfgs, i);
+ 				break;
+ 			}
+ 
+ 		/* requested codec not available */
+ 		if (remote_sep_cfg == NULL) {
+ 			errmsg = "SEP codec not available";
+ 			goto fail;
+ 		}
+ 
+ 		const struct a2dp_sep *sep;
+ 		if ((sep = a2dp_sep_lookup(pcm_sep_type, codec_id)) == NULL) {
+ 			errmsg = "SEP codec not supported";
+ 			goto fail;
+ 		}
+ 
+ 		if (a2dp_configuration_size == 0)
+ 			/* Default to capabilities supported by the local SEP. */
+ 			memcpy(&a2dp_configuration, &sep->config.capabilities, sep->config.caps_size);
+ 		else {
+ 			/* Validate the size of provided configuration blob. */
+ 			if (a2dp_configuration_size != remote_sep_cfg->caps_size) {
+ 				errmsg = error_code_strerror(ERROR_CODE_INVALID_SIZE);
+ 				goto fail;
+ 			}
+ 		}
+ 
+ 		/* Cap selected configuration with the remote SEP capabilities.
+ 		 * This is required to prevent unsupported configuration from
+ 		 * being set which will lead to A2DP disconnection. */
+ 		sep->caps_helpers->intersect(&a2dp_configuration, &remote_sep_cfg->capabilities);
+ 
+ 		if (channels != 0)
+ 			sep->caps_helpers->select_channel_mode(&a2dp_configuration, pcm_sep_stream, channels);
+ 		if (rate != 0)
+ 			sep->caps_helpers->select_sample_rate(&a2dp_configuration, pcm_sep_stream, rate);
+ 
+ 		if (a2dp_configuration_size == 0) {
+ 			/* Setup default configuration if it was not provided. */
+ 			if (a2dp_select_configuration(sep, &a2dp_configuration, sep->config.caps_size) != ERROR_CODE_OK)
+ 				goto fail;
+ 		}
+ 		else if (conformance_check) {
+ 			error_code_t rv;
+ 			/* Validate provided configuration. */
+ 			if ((rv = a2dp_check_configuration(sep, &a2dp_configuration,
+ 						a2dp_configuration_size)) != ERROR_CODE_OK) {
+ 				errmsg = error_code_strerror(rv);
+ 				goto fail;
+ 			}
+ 		}
+ 
+ 		if (ba_transport_select_codec_a2dp(t, remote_sep_cfg, &a2dp_configuration) == -1)
+ 			goto fail;
+ 
+ 	}
+ #if ENABLE_ASHA
+ 	else if (BA_TRANSPORT_PROFILE_IS_MEDIA_ASHA(t)) {
+ 		errmsg = "ASHA codec selection not supported";
+ 		goto fail;
+ 	}
+ #endif
+ 	else if (BA_TRANSPORT_PROFILE_IS_SCO(t)) {
+ 
+ 		uint8_t codec_id;
+ 		if ((codec_id = hfp_codec_from_string(codec_name)) == HFP_CODEC_UNDEFINED) {
+ 			errmsg = "HFP codec not available";
+ 			goto fail;
+ 		}
+ 
+ 		if (ba_transport_select_codec_sco(t, codec_id) == -1)
+ 			goto fail;
+ 
+ 	}
+ 
+ 	g_dbus_method_invocation_return_value(inv, NULL);
+ 	goto final;
+ 
+ fail:
+ 	if (errmsg == NULL)
+ 		errmsg = strerror(errno);
+ 	error("Couldn't select codec: %s: %s", codec_name, errmsg);
+ 	g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 			G_DBUS_ERROR_FAILED, "%s", errmsg);
+ 
+ final:
+ 	pthread_mutex_unlock(&t->codec_select_client_mtx);
+ 	g_variant_iter_free(properties);
+ }
+ 
+ static void bluealsa_rfcomm_open(GDBusMethodInvocation *inv, void *userdata) {
+ 
+ 	struct ba_rfcomm *r = userdata;
+ 	int fds[2] = { -1, -1 };
+ 
+ 	if (r->handler_fd != -1) {
+ 		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 				G_DBUS_ERROR_LIMITS_EXCEEDED, "%s", strerror(EBUSY));
+ 		return;
+ 	}
+ 
+ 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, fds) == -1) {
+ 		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+ 				G_DBUS_ERROR_FAILED, "Create socket: %s", strerror(errno));
+ 		return;
+ 	}
+ 
+ 	r->handler_fd = fds[0];
+ 	ba_rfcomm_send_signal(r, BA_RFCOMM_SIGNAL_PING);
+ 
+ 	GUnixFDList *fd_list = g_unix_fd_list_new_from_array(&fds[1], 1);
+ 	g_dbus_method_invocation_return_value_with_unix_fd_list(inv,
+ 			g_variant_new("(h)", 0), fd_list);
+ 	g_object_unref(fd_list);
+ }
+ 
+ static GVariant *bluealsa_pcm_get_property(const char *property,
+ 		GError **error, void *userdata) {
+ 
+ 	struct ba_transport_pcm *pcm = userdata;
+ 	struct ba_device *d = pcm->t->d;
+ 	GVariant *value;
+ 
+ 	if (strcmp(property, "Device") == 0)
+ 		return ba_variant_new_device_path(d);
+ 	if (strcmp(property, "Sequence") == 0)
+ 		return ba_variant_new_device_sequence(d);
+ 	if (strcmp(property, "Transport") == 0)
+ 		return ba_variant_new_transport_type(pcm->t);
+ 	if (strcmp(property, "Mode") == 0)
+ 		return ba_variant_new_pcm_mode(pcm);
++	if (strcmp(property, "RestrictedController") == 0)
++		return g_variant_new_boolean(true);
++	if (strcmp(property, "SynchronousDrop") == 0)
++		return g_variant_new_boolean(ba_transport_pcm_drop_sync_supported(pcm));
+ 	if (strcmp(property, "Running") == 0)
+ 		return ba_variant_new_pcm_running(pcm);
+ 	if (strcmp(property, "Format") == 0)
+ 		return ba_variant_new_pcm_format(pcm);
+ 	if (strcmp(property, "Channels") == 0)
+ 		return ba_variant_new_pcm_channels(pcm);
+ 	if (strcmp(property, "ChannelMap") == 0)
+ 		return ba_variant_new_pcm_channel_map(pcm);
+ 	if (strcmp(property, "Rate") == 0)
+ 		return ba_variant_new_pcm_rate(pcm);
+ 	if (strcmp(property, "Codec") == 0) {
+ 		if ((value = ba_variant_new_pcm_codec(pcm)) == NULL)
+ 			goto unavailable;
+ 		return value;
+ 	}
+ 	if (strcmp(property, "CodecConfiguration") == 0) {
+ 		if ((value = ba_variant_new_pcm_codec_config(pcm)) == NULL)
+ 			goto unavailable;
+ 		return value;
+ 	}
+ 	if (strcmp(property, "Delay") == 0)
+ 		return ba_variant_new_pcm_delay(pcm);
+ 	if (strcmp(property, "ClientDelay") == 0)
+ 		return ba_variant_new_pcm_client_delay(pcm);
+ 	if (strcmp(property, "SoftVolume") == 0)
+ 		return ba_variant_new_pcm_soft_volume(pcm);
+ 	if (strcmp(property, "Volume") == 0)
+ 		return ba_variant_new_pcm_volume(pcm);
+ 
+ 	g_assert_not_reached();
+ 	return NULL;
+ 
+ unavailable:
+ 	if (error != NULL)
+ 		*error = g_error_new(G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+ 				"No such property '%s'", property);
+ 	return NULL;
+ }
+ 
+ static bool bluealsa_pcm_set_property(const char *property, GVariant *value,
+ 		GError **error, void *userdata) {
+ 
+ 	struct ba_transport_pcm *pcm = userdata;
+ 	struct ba_transport *t = pcm->t;
+ 
+ 	const bool is_sco = BA_TRANSPORT_PROFILE_IS_SCO(t);
+ 	const int volume_max = is_sco ? HFP_VOLUME_GAIN_MAX : BLUEZ_MEDIA_TRANSPORT_A2DP_VOLUME_MAX;
+ 
+ 	if (strcmp(property, "ClientDelay") == 0) {
+ 		pcm->client_delay_dms = g_variant_get_int16(value);
+ 		ba_transport_pcm_delay_sync(pcm, BA_DBUS_PCM_UPDATE_CLIENT_DELAY);
+ 		return TRUE;
+ 	}
+ 
+ 	if (strcmp(property, "SoftVolume") == 0) {
+ 
+ 		const bool soft_volume = g_variant_get_boolean(value);
+ 
+ 		/* In case when the software volume was just enabled, set the volume level
+ 		 * to the maximum. This will prevent volume change during the transition.
+ 		 * In case of disabling the software volume, we will restore the hardware
+ 		 * volume level, so the volume control will indicate the correct level. */
+ 		const int volume = soft_volume ? volume_max : ba_transport_pcm_get_hardware_volume(pcm);
+ 		const int level = ba_transport_pcm_volume_range_to_level(volume, volume_max);
+ 
+ 		pthread_mutex_lock(&pcm->mutex);
+ 
+ 		debug("Setting software volume: %s", soft_volume ? "true" : "false");
+ 		pcm->soft_volume = soft_volume;
+ 
+ 		for (size_t i = 0; i < pcm->channels; i++)
+ 			ba_transport_pcm_volume_set(&pcm->volume[i], &level, NULL, NULL);
+ 
+ 		pthread_mutex_unlock(&pcm->mutex);
+ 
+ 		ba_transport_pcm_volume_sync(pcm, BA_DBUS_PCM_UPDATE_SOFT_VOLUME | BA_DBUS_PCM_UPDATE_VOLUME);
+ 		return true;
+ 	}
+ 
+ 	if (strcmp(property, "Volume") == 0) {
+ 
+ 		size_t channels = 0;
+ 		const uint8_t *volume = g_variant_get_fixed_array(value, &channels, sizeof(uint8_t));
+ 
+ 		if (channels != pcm->channels) {
+ 			*error = g_error_new(G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+ 					"Invalid number of channels: %zu != %u", channels, pcm->channels);
+ 			return false;
+ 		}
+ 
+ 		pthread_mutex_lock(&pcm->mutex);
+ 
+ 		for (size_t i = 0; i < channels; i++) {
+ 
+ 			const bool muted = !!(volume[i] & 0x80);
+ 			const int level = ba_transport_pcm_volume_range_to_level(volume[i] & 0x7F, volume_max);
+ 
+ 			debug("Setting volume [ch=%zu]: %u [%.2f dB] [%c]",
+ 					i, volume[i] & 0x7F, 0.01 * level, muted ? 'M' : ' ');
+ 			ba_transport_pcm_volume_set(&pcm->volume[i], &level, &muted, NULL);
+ 
+ 		}
+ 
+ 		pthread_mutex_unlock(&pcm->mutex);
+ 
+ 		ba_transport_pcm_volume_sync(pcm, BA_DBUS_PCM_UPDATE_VOLUME);
+ 		return true;
+ 	}
+ 
+ 	g_assert_not_reached();
+ 	return false;
+ }
+ 
+ /**
+  * Register BlueALSA D-Bus PCM interface. */
+ int bluealsa_dbus_pcm_register(struct ba_transport_pcm *pcm) {
+ 
+ 	static const GDBusMethodCallDispatcher dispatchers[] = {
+ 		{ .method = "Open",
+ 			.handler = bluealsa_pcm_open },
++		{ .method = "OpenRestricted",
++			.handler = bluealsa_pcm_open_restricted },
+ 		{ .method = "GetCodecs",
+ 			.handler = bluealsa_pcm_get_codecs },
+ 		{ .method = "SelectCodec",
+ 			.handler = bluealsa_pcm_select_codec },
+ 		{ 0 },
+ 	};
+ 
+ 	static const GDBusInterfaceSkeletonVTable vtable = {
+ 		.dispatchers = dispatchers,
+ 		.get_property = bluealsa_pcm_get_property,
+ 		.set_property = bluealsa_pcm_set_property,
+ 	};
+ 
+ 	GDBusObjectSkeleton *skeleton = NULL;
+ 	OrgBluealsaPcm1Skeleton *ifs_pcm = NULL;
+ 
+ 	if ((skeleton = g_dbus_object_skeleton_new(pcm->ba_dbus_path)) == NULL)
+ 		goto fail;
+ 
+ 	if ((ifs_pcm = org_bluealsa_pcm1_skeleton_new(&vtable,
+ 					pcm, (GDestroyNotify)ba_transport_pcm_unref)) == NULL)
+ 		goto fail;
+ 
+ 	g_dbus_interface_skeleton_set_flags(G_DBUS_INTERFACE_SKELETON(ifs_pcm),
+ 			G_DBUS_INTERFACE_SKELETON_FLAGS_HANDLE_METHOD_INVOCATIONS_IN_THREAD);
+ 
+ 	ba_transport_pcm_ref(pcm);
+ 
+ 	g_dbus_object_skeleton_add_interface(skeleton, G_DBUS_INTERFACE_SKELETON(ifs_pcm));
+ 	g_dbus_object_manager_server_export(bluealsa_dbus_manager, skeleton);
+ 	pcm->ba_dbus_exported = true;
+ 
+ fail:
+ 
+ 	if (skeleton != NULL)
+ 		g_object_unref(skeleton);
+ 	if (ifs_pcm != NULL)
+ 		g_object_unref(ifs_pcm);
+ 
+ 	return 0;
+ }
+ 
+ void bluealsa_dbus_pcm_update(struct ba_transport_pcm *pcm, unsigned int mask) {
+ 
+ 	GVariantBuilder props;
+ 	g_variant_builder_init(&props, G_VARIANT_TYPE_VARDICT);
+ 
+ 	if (mask & BA_DBUS_PCM_UPDATE_RUNNING)
+ 		g_variant_builder_add(&props, "{sv}", "Running", ba_variant_new_pcm_running(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_FORMAT)
+ 		g_variant_builder_add(&props, "{sv}", "Format", ba_variant_new_pcm_format(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_CHANNELS)
+ 		g_variant_builder_add(&props, "{sv}", "Channels", ba_variant_new_pcm_channels(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_CHANNEL_MAP)
+ 		g_variant_builder_add(&props, "{sv}", "ChannelMap", ba_variant_new_pcm_channel_map(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_RATE)
+ 		g_variant_builder_add(&props, "{sv}", "Rate", ba_variant_new_pcm_rate(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_CODEC)
+ 		g_variant_builder_add(&props, "{sv}", "Codec", ba_variant_new_pcm_codec(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_CODEC_CONFIG)
+ 		g_variant_builder_add(&props, "{sv}", "CodecConfiguration", ba_variant_new_pcm_codec_config(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_DELAY)
+ 		g_variant_builder_add(&props, "{sv}", "Delay", ba_variant_new_pcm_delay(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_CLIENT_DELAY)
+ 		g_variant_builder_add(&props, "{sv}", "ClientDelay", ba_variant_new_pcm_client_delay(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_SOFT_VOLUME)
+ 		g_variant_builder_add(&props, "{sv}", "SoftVolume", ba_variant_new_pcm_soft_volume(pcm));
+ 	if (mask & BA_DBUS_PCM_UPDATE_VOLUME)
+ 		g_variant_builder_add(&props, "{sv}", "Volume", ba_variant_new_pcm_volume(pcm));
+ 
+ 	g_dbus_connection_emit_properties_changed(config.dbus, pcm->ba_dbus_path,
+ 			BLUEALSA_IFACE_PCM, g_variant_builder_end(&props), NULL, NULL);
+ 
+ }
+ 
+ void bluealsa_dbus_pcm_unregister(struct ba_transport_pcm *pcm) {
+ 
+ 	if (!pcm->ba_dbus_exported)
+ 		return;
+ 
+ 	g_dbus_object_manager_server_unexport(bluealsa_dbus_manager, pcm->ba_dbus_path);
+ 	pcm->ba_dbus_exported = false;
+ 
+ }
+ 
+ static GVariant *bluealsa_rfcomm_get_property(const char *property,
+ 		GError **error, void *userdata) {
+ 	(void)error;
+ 
+ 	struct ba_rfcomm *r = userdata;
+ 	struct ba_transport *t = r->sco;
+ 	struct ba_device *d = t->d;
+ 
+ 	if (strcmp(property, "Transport") == 0)
+ 		return ba_variant_new_transport_type(t);
+ 	if (strcmp(property, "Features") == 0)
+ 		return ba_variant_new_rfcomm_features(r);
+ 	if (strcmp(property, "Battery") == 0)
+ 		return ba_variant_new_device_battery(d);
+ 
+ 	g_assert_not_reached();
+ 	return NULL;
+ }
+ 
+ /**
+  * Register BlueALSA D-Bus RFCOMM interface. */
+ int bluealsa_dbus_rfcomm_register(struct ba_rfcomm *r) {
+ 
+ 	static const GDBusMethodCallDispatcher dispatchers[] = {
+ 		{ .method = "Open",
+ 			.handler = bluealsa_rfcomm_open },
+ 		{ 0 },
+ 	};
+ 
+ 	static const GDBusInterfaceSkeletonVTable vtable = {
+ 		.dispatchers = dispatchers,
+ 		.get_property = bluealsa_rfcomm_get_property,
+ 	};
+ 
+ 	GDBusObjectSkeleton *skeleton = NULL;
+ 	OrgBluealsaRfcomm1Skeleton *ifs_rfcomm = NULL;
+ 
+ 	if ((skeleton = g_dbus_object_skeleton_new(r->ba_dbus_path)) == NULL)
+ 		goto fail;
+ 
+ 	if ((ifs_rfcomm = org_bluealsa_rfcomm1_skeleton_new(&vtable,
+ 					r, NULL)) == NULL)
+ 		goto fail;
+ 
+ 	g_dbus_object_skeleton_add_interface(skeleton, G_DBUS_INTERFACE_SKELETON(ifs_rfcomm));
+ 	g_dbus_object_manager_server_export(bluealsa_dbus_manager, skeleton);
+ 	r->ba_dbus_exported = true;
+ 
+ fail:
+ 
+ 	if (skeleton != NULL)
+ 		g_object_unref(skeleton);
+ 	if (ifs_rfcomm != NULL)
+ 		g_object_unref(ifs_rfcomm);
+ 
+ 	return 0;
+ }
+ 
+ void bluealsa_dbus_rfcomm_update(struct ba_rfcomm *r, unsigned int mask) {
+ 
+ 	GVariantBuilder props;
+ 	g_variant_builder_init(&props, G_VARIANT_TYPE_VARDICT);
+ 
+ 	if (mask & BA_DBUS_RFCOMM_UPDATE_FEATURES)
+ 		g_variant_builder_add(&props, "{sv}", "Features", ba_variant_new_rfcomm_features(r));
+ 	if (mask & BA_DBUS_RFCOMM_UPDATE_BATTERY)
+ 		g_variant_builder_add(&props, "{sv}", "Battery", ba_variant_new_device_battery(r->sco->d));
+ 
+ 	g_dbus_connection_emit_properties_changed(config.dbus, r->ba_dbus_path,
+ 			BLUEALSA_IFACE_RFCOMM, g_variant_builder_end(&props), NULL, NULL);
+ 
+ }
+ 
+ void bluealsa_dbus_rfcomm_unregister(struct ba_rfcomm *r) {
+ 	if (!r->ba_dbus_exported)
+ 		return;
+ 	g_dbus_object_manager_server_unexport(bluealsa_dbus_manager, r->ba_dbus_path);
+ 	r->ba_dbus_exported = false;
+ }
+diff --git a/src/dbus/org.bluealsa.xml b/src/dbus/org.bluealsa.xml
+index df5c2b2..5a40dc2 100644
+--- a/src/dbus/org.bluealsa.xml
++++ b/src/dbus/org.bluealsa.xml
+@@ -1,56 +1,62 @@
+ <!-- BlueALSA - org.bluealsa.xml
+ SPDX-FileCopyrightText: 2016-2025 BlueALSA developers
+ SPDX-License-Identifier: MIT
+ -->
+ <node>
+ 
+ 	<!-- NOTE: Due to a bug in gdbus-codegen in glib prior to 2.61.0,
+ 	           the first interface must have at least one method.
+ 	-->
+ 
+ 	<interface name="org.bluealsa.PCM1">
+ 		<method name="Open">
+ 			<arg direction="out" type="h" name="fd_pcm" />
+ 			<arg direction="out" type="h" name="fd_ctrl" />
+ 		</method>
++		<method name="OpenRestricted">
++			<arg direction="out" type="h" name="fd_pcm" />
++			<arg direction="out" type="h" name="fd_ctrl" />
++		</method>
+ 		<method name="GetCodecs">
+ 			<arg direction="out" type="a{sa{sv}}" name="codecs" />
+ 		</method>
+ 		<method name="SelectCodec">
+ 			<arg direction="in" type="s" name="codec" />
+ 			<arg direction="in" type="a{sv}" name="props" />
+ 		</method>
+ 		<property name="Device" type="o" access="read" />
+ 		<property name="Sequence" type="u" access="read" />
+ 		<property name="Transport" type="s" access="read" />
+ 		<property name="Mode" type="s" access="read" />
+ 		<property name="Running" type="b" access="read" />
++		<property name="SynchronousDrop" type="b" access="read" />
++		<property name="RestrictedController" type="b" access="read" />
+ 		<property name="Format" type="q" access="read" />
+ 		<property name="Channels" type="y" access="read" />
+ 		<property name="ChannelMap" type="as" access="read" />
+ 		<property name="Rate" type="u" access="read" />
+ 		<property name="Codec" type="s" access="read" />
+ 		<property name="CodecConfiguration" type="ay" access="read" />
+ 		<property name="Delay" type="q" access="read" />
+ 		<property name="ClientDelay" type="n" access="readwrite" />
+ 		<property name="SoftVolume" type="b" access="readwrite" />
+ 		<property name="Volume" type="ay" access="readwrite" />
+ 	</interface>
+ 
+ 	<interface name="org.bluealsa.RFCOMM1">
+ 		<method name="Open">
+ 			<arg direction="out" type="h" name="fd" />
+ 		</method>
+ 		<property name="Transport" type="s" access="read" />
+ 		<property name="Features" type="as" access="read" />
+ 		<property name="Battery" type="y" access="read" />
+ 	</interface>
+ 
+ 	<interface name="org.bluealsa.Manager1">
+ 		<property name="Version" type="s" access="read" />
+ 		<property name="Adapters" type="as" access="read" />
+ 		<property name="Profiles" type="as" access="read" />
+ 		<property name="Codecs" type="as" access="read" />
+ 	</interface>
+ 
+ </node>
+diff --git a/src/io.c b/src/io.c
+index a2ee60a..693ece1 100644
+--- a/src/io.c
++++ b/src/io.c
+@@ -1,430 +1,496 @@
+ /*
+  * BlueALSA - io.c
+  * SPDX-FileCopyrightText: 2016-2025 BlueALSA developers
+  * SPDX-License-Identifier: MIT
+  */
+ 
+ #include "io.h"
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <poll.h>
+ #include <pthread.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include <glib.h>
+ 
+ #include "audio.h"
+ #include "ba-config.h"
+ #include "shared/defs.h"
+ #include "shared/ffb.h"
+ #include "shared/log.h"
+ 
+ /**
+  * Read data from the BT transport (SCO or SEQPACKET) socket. */
+ ssize_t io_bt_read(
+ 		struct ba_transport_pcm *pcm,
+ 		void *buffer,
+ 		size_t count) {
+ 
+ 	const int fd = pcm->fd_bt;
+ 	ssize_t ret;
+ 
+ retry:
+ 	if ((ret = read(fd, buffer, count)) == -1)
+ 		switch (errno) {
+ 		case EINTR:
+ 			goto retry;
+ 		case ECONNRESET:
+ 		case ENOTCONN:
+ 			debug("BT socket disconnected: %s", strerror(errno));
+ 			ret = 0;
+ 			break;
+ 		case ECONNABORTED:
+ 		case ETIMEDOUT:
+ 			error("BT read error: %s", strerror(errno));
+ 			ret = 0;
+ 	}
+ 
+ 	if (ret == 0)
+ 		ba_transport_pcm_bt_release(pcm);
+ 
+ 	return ret;
+ }
+ 
+ /**
+  * Write data to the BT transport (SCO or SEQPACKET) socket.
+  *
+  * Note:
+  * This function may temporally re-enable thread cancellation! */
+ ssize_t io_bt_write(
+ 		struct ba_transport_pcm *pcm,
+ 		const void *buffer,
+ 		size_t count) {
+ 
+ 	const int fd = pcm->fd_bt;
+ 	ssize_t ret;
+ 
+ retry:
+ 	if ((ret = write(fd, buffer, count)) == -1)
+ 		switch (errno) {
+ 		case EINTR:
+ 			goto retry;
+ 		case EAGAIN:
+ 			/* In order to provide a way of escaping from the infinite poll()
+ 			 * we have to temporally re-enable thread cancellation. */
+ 			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+ 			struct pollfd pfd = { fd, POLLOUT, 0 };
+ 			poll(&pfd, 1, -1);
+ 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+ 			goto retry;
+ 		case ECONNRESET:
+ 		case ENOTCONN:
+ 			debug("BT socket disconnected: %s", strerror(errno));
+ 			ret = 0;
+ 			break;
+ 		case ECONNABORTED:
+ 		case ETIMEDOUT:
+ 			error("BT write error: %s", strerror(errno));
+ 			ret = 0;
+ 		}
+ 
+ 	if (ret == 0)
+ 		ba_transport_pcm_bt_release(pcm);
+ 
+ 	return ret;
+ }
+ 
+ /**
+  * Scale PCM signal according to the volume configuration. */
+ void io_pcm_scale(
+ 		struct ba_transport_pcm *pcm,
+ 		void *buffer,
+ 		size_t samples) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 
+ 	const unsigned int channels = pcm->channels;
+ 	const bool pcm_soft_volume = pcm->soft_volume;
+ 
+ 	double pcm_volume_ch_scales[ARRAYSIZE(pcm->volume)];
+ 	for (size_t i = 0; i < ARRAYSIZE(pcm_volume_ch_scales); i++)
+ 		pcm_volume_ch_scales[i] = pcm->volume[i].scale;
+ 
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	if (!pcm_soft_volume)
+ 		/* In case of hardware volume control we will perform mute operation,
+ 		 * because hardware muting is an equivalent of gain=0 which with some
+ 		 * headsets does not entirely silence audio. */
+ 		for (size_t i = 0; i < channels; i++)
+ 			if (pcm_volume_ch_scales[i] != 0.0)
+ 				pcm_volume_ch_scales[i] = 1.0;
+ 
+ 	bool identity = true;
+ 	/* Check whether volume scaling is required. */
+ 	for (size_t i = 0; i < channels; i++)
+ 		if (pcm_volume_ch_scales[i] != 1.0) {
+ 			identity = false;
+ 			break;
+ 		}
+ 
+ 	if (identity)
+ 		/* Nothing to do - volume is set to 100%. */
+ 		return;
+ 
+ 	switch (pcm->format) {
+ 	case BA_TRANSPORT_PCM_FORMAT_S16_2LE:
+ 		audio_scale_s16_2le(buffer, pcm_volume_ch_scales, channels, samples / channels);
+ 		break;
+ 	case BA_TRANSPORT_PCM_FORMAT_S24_4LE:
+ 	case BA_TRANSPORT_PCM_FORMAT_S32_4LE:
+ 		audio_scale_s32_4le(buffer, pcm_volume_ch_scales, channels, samples / channels);
+ 		break;
+ 	default:
+ 		g_assert_not_reached();
+ 	}
+ 
+ }
+ 
+ /**
+  * Flush read buffer of the transport PCM FIFO. */
+ ssize_t io_pcm_flush(struct ba_transport_pcm *pcm) {
+ 
+ 	ssize_t samples = 0;
+ 	ssize_t rv;
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 
+ 	const int fd = pcm->fd;
+ 	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(pcm->format);
+ 
+ 	while ((rv = splice(fd, NULL, config.null_fd, NULL, 32 * 1024, SPLICE_F_NONBLOCK)) > 0) {
+ 		debug("Flushed PCM samples [%d]: %zd", fd, rv / sample_size);
+ 		samples += rv / sample_size;
+ 	}
+ 
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	if (rv == -1 && errno != EAGAIN)
+ 		return rv;
+ 
+ 	return samples;
+ }
+ 
+ /**
+  * Read PCM signal from the transport PCM FIFO. */
+ ssize_t io_pcm_read(
+ 		struct ba_transport_pcm *pcm,
+ 		void *buffer,
+ 		size_t samples) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 
+ 	const int fd = pcm->fd;
+ 	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(pcm->format);
+ 	ssize_t ret;
+ 
+ 	while ((ret = read(fd, buffer, samples * sample_size)) == -1 &&
+ 			errno == EINTR)
+ 		continue;
+ 
+ 	if (ret == 0) {
+ 		debug("PCM client closed connection: %d", fd);
+ 		ba_transport_pcm_release(pcm);
+ 	}
+ 
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	if (ret <= 0)
+ 		return ret;
+ 
+ 	samples = ret / sample_size;
+ 	io_pcm_scale(pcm, buffer, samples);
+ 	return samples;
+ }
+ 
+ /**
+  * Write PCM signal to the transport PCM FIFO. */
+ ssize_t io_pcm_write(
+ 		struct ba_transport_pcm *pcm,
+ 		const void *buffer,
+ 		size_t samples) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 
+ 	const int fd = pcm->fd;
+ 	const uint8_t *buffer_ = buffer;
+ 	size_t len = samples * BA_TRANSPORT_PCM_FORMAT_BYTES(pcm->format);
+ 	ssize_t ret;
+ 
+ 	do {
+ 
+ 		if ((ret = write(fd, buffer_, len)) == -1)
+ 			switch (errno) {
+ 			case EINTR:
+ 				continue;
+ 			case EAGAIN:
+ 				/* If the client is so slow that the FIFO fills up, then it
+ 				 * is inevitable that audio frames will be eventually be
+ 				 * dropped in the bluetooth controller if we block here.
+ 				 * It is better that we discard frames here so that the
+ 				 * decoder is not interrupted. */
+ 				warn("Dropping PCM frames: %s", "PCM overrun");
+ 				ret = len;
+ 				break;
+ 			case EPIPE:
+ 				/* This errno value will be received only, when the SIGPIPE
+ 				 * signal is caught, blocked or ignored. */
+ 				debug("PCM client closed connection: %d", fd);
+ 				ba_transport_pcm_release(pcm);
+ 				ret = 0;
+ 				/* fall-through */
+ 			default:
+ 				goto final;
+ 			}
+ 
+ 		buffer_ += ret;
+ 		len -= ret;
+ 
+ 	} while (len != 0);
+ 
+ 	/* It is guaranteed, that this function will write data atomically. */
+ 	ret = samples;
+ 
+ final:
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 	return ret;
+ }
+ 
+ static void io_poll_drain_complete(
+ 		struct io_poll *io,
+ 		struct ba_transport_pcm *pcm) {
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	pcm->drained = true;
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 	pthread_cond_signal(&pcm->cond);
+ 
+ 	io->tainted = false;
+ 	io->draining = false;
+ 	io->timeout = -1;
+ 
+ }
+ 
+ /**
+  * Poll and read data from the BT transport socket.
+  *
+  * Note:
+  * This function temporally re-enables thread cancellation! */
+ ssize_t io_poll_and_read_bt(
+ 		struct io_poll *io,
+ 		struct ba_transport_pcm *pcm,
+ 		ffb_t *buffer) {
+ 
+ 	struct pollfd fds[] = {
+ 		{ pcm->pipe[0], POLLIN, 0 },
+ 		{ pcm->fd_bt, POLLIN, 0 }};
+ 
+ repoll:
+ 
+ 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+ 	int poll_rv = poll(fds, ARRAYSIZE(fds), io->timeout);
+ 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+ 
+ 	if (poll_rv == -1) {
+ 		if (errno == EINTR)
+ 			goto repoll;
+ 		return -1;
+ 	}
+ 
+ 	if (fds[0].revents & POLLIN)
+ 		switch (ba_transport_pcm_signal_recv(pcm)) {
+ 		default:
+ 			goto repoll;
+ 		}
+ 
+ 	ssize_t len;
+ 	if ((len = io_bt_read(pcm, buffer->tail, ffb_blen_in(buffer))) > 0)
+ 		ffb_seek(buffer, len);
+ 	return len;
+ }
+ 
++/* This flush is bounded even if a misbehaving client keeps writing. */
++static int io_pcm_drop_sync_flush(struct ba_transport_pcm *pcm, uint64_t token,
++		int fd, const struct timespec *deadline) {
++	int error = ba_transport_pcm_drop_sync_lock(&pcm->mutex, deadline);
++	if (error != 0)
++		return error;
++	int selected_fd;
++	struct timespec selected_deadline;
++	if (pcm->fd != fd || !ba_transport_pcm_drop_sync_claim(pcm, token, &selected_fd, &selected_deadline) ||
++			selected_fd != fd)
++		error = ECANCELED;
++	while (error == 0) {
++		struct timespec now;
++		if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
++			error = EIO;
++			break;
++		}
++		if (now.tv_sec > deadline->tv_sec ||
++				(now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) {
++			error = ETIMEDOUT;
++			break;
++		}
++		ssize_t rv = splice(fd, NULL, config.null_fd, NULL, 32 * 1024, SPLICE_F_NONBLOCK);
++		if (rv > 0 || (rv == -1 && errno == EINTR))
++			continue;
++		if (rv == -1 && errno == EAGAIN)
++			break;
++		error = rv == 0 ? EPIPE : errno;
++	}
++	pthread_mutex_unlock(&pcm->mutex);
++	return error;
++}
++
++void io_poll_drop_sync_complete(struct io_poll *io, struct ba_transport_pcm *pcm, int error) {
++	uint64_t token = io->drop_sync_token;
++	io->drop_sync_token = 0;
++	if (token != 0)
++		ba_transport_pcm_drop_sync_complete(pcm, token, io->drop_sync_result != 0 ? io->drop_sync_result : error);
++}
++
+ /**
+  * Poll and read data from the PCM FIFO.
+  *
+  * Note:
+  * This function temporally re-enables thread cancellation! */
+ ssize_t io_poll_and_read_pcm(
+ 		struct io_poll *io,
+ 		struct ba_transport_pcm *pcm,
+ 		ffb_t *buffer) {
+ 
+ 	struct pollfd fds[] = {
+ 		{ pcm->pipe[0], POLLIN, 0 },
+-		{ -1, POLLIN, 0 }};
++		{ -1, POLLIN, 0 },
++		{ pcm->drop_sync_pipe[0], POLLIN, 0 }};
+ 
+ repoll:
+ 
+ 	pthread_mutex_lock(&pcm->mutex);
+ 	/* Add PCM socket to the poll if it is not paused. */
+ 	fds[1].fd = pcm->paused ? -1 : pcm->fd;
+ 	pthread_mutex_unlock(&pcm->mutex);
+ 
+ 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+ 	int poll_rv = poll(fds, ARRAYSIZE(fds), io->timeout);
+ 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+ 
+ 	/* Poll for reading with optional drain timeout. */
+ 	switch (poll_rv) {
+ 	case 0:
+ 		if (io->draining)
+ 			/* If draining, use the logic in the read code block. */
+ 			break;
+ 		io_poll_drain_complete(io, pcm);
+ 		return 0;
+ 	case -1:
+ 		if (errno == EINTR)
+ 			goto repoll;
+ 		if (io->draining)
+ 			io_poll_drain_complete(io, pcm);
+ 		return -1;
+ 	}
+ 
++
+ 	if (fds[0].revents & POLLIN)
+ 		switch (ba_transport_pcm_signal_recv(pcm)) {
+ 		case BA_TRANSPORT_PCM_SIGNAL_OPEN:
+ 		case BA_TRANSPORT_PCM_SIGNAL_RESUME:
+ 			io->asrs.frames = 0;
+ 			io->initiated = false;
+ 			io->draining = false;
+ 			io->timeout = -1;
+ 			goto repoll;
+ 		case BA_TRANSPORT_PCM_SIGNAL_CLOSE:
++			/* A pending sync also fences legacy controls from a prior client. */
++			if (fds[2].revents & POLLIN)
++				goto repoll;
+ 			/* Reuse PCM read disconnection logic. */
+ 			break;
+ 		case BA_TRANSPORT_PCM_SIGNAL_DRAIN:
+ 			io->draining = io->tainted;
+ 			io->timeout = io->tainted ? 100 : 0;
+ 			goto repoll;
+ 		case BA_TRANSPORT_PCM_SIGNAL_DROP:
+ 			if (io->draining)
+ 				io_poll_drain_complete(io, pcm);
+ 			/* Flush the PCM FIFO and drop all PCM data in the buffer. */
+ 			io_pcm_flush(pcm);
+ 			ffb_rewind(buffer);
+ 			/* Notify caller that the PCM data has been dropped. This will give
+ 			 * the caller a chance to reinitialize its internal state. */
+ 			errno = ESTALE;
+ 			return -1;
+ 		default:
+ 			goto repoll;
+ 		}
+ 
++	/* Retire all previously queued legacy controls before a synchronous ACK. */
++	if (fds[2].revents & POLLIN) {
++		uint64_t token;
++		if (read(pcm->drop_sync_pipe[0], &token, sizeof(token)) != sizeof(token))
++			goto repoll;
++		int selected_fd;
++		struct timespec deadline;
++		if (!ba_transport_pcm_drop_sync_claim(pcm, token, &selected_fd, &deadline))
++			goto repoll;
++		io->drop_sync_token = token;
++		if (io->draining)
++			io_poll_drain_complete(io, pcm);
++		io->drop_sync_result = io_pcm_drop_sync_flush(pcm, token, selected_fd, &deadline);
++		ffb_rewind(buffer);
++		/* Only the selected encoder may complete this token after its reset. */
++		errno = ESTALE;
++		return -1;
++	}
++
++
+ 	ssize_t samples;
+ 	if ((samples = io_pcm_read(pcm, buffer->tail, ffb_len_in(buffer))) == -1) {
+ 		switch (errno) {
+ 		case EAGAIN:
+ 			if (!io->draining)
+ 				goto repoll;
+ 			/* The FIFO is now empty, but we must still ensure that any
+ 			 * remaining frames in the encoder buffer are flushed to BT.
+ 			 * We pad the buffer with silence to ensure the encoder
+ 			 * codesize minimum frames are available. */
+ 			samples = ffb_len_in(buffer);
+ 			memset(buffer->tail, 0, ffb_blen_in(buffer));
+ 			debug("Padding PCM with silence [%d]: %zd", fds[1].fd, samples);
+ 			/* Make sure that the next time this function is called we
+ 			 * flag that the drain is complete. */
+ 			io->draining = false;
+ 			io->timeout = 0;
+ 			break;
+ 		case EBADF:
+ 			samples = 0;
+ 			break;
+ 		}
+ 	}
+ 
+ 	if (samples <= 0) {
+ 		if (io->draining)
+ 			io_poll_drain_complete(io, pcm);
+ 		return samples;
+ 	}
+ 
+ 	/* When the thread is created, there might be no data in the FIFO. In fact
+ 	 * there might be no data for a long time - until client starts playback.
+ 	 * In order to correctly calculate time drift, the zero time point has to
+ 	 * be obtained after the stream has started. */
+ 	if (io->asrs.frames == 0)
+ 		asrsync_init(&io->asrs, pcm->rate);
+ 
+ 	/* Mark the IO as tainted, so in case of a drain operation we will
+ 	 * flush any remaining frames in the encoder buffers to BT. */
+ 	io->tainted = true;
+ 
+ 	ffb_seek(buffer, samples);
+ 	return samples;
+ }
+diff --git a/src/io.h b/src/io.h
+index 77f4829..d626d2b 100644
+--- a/src/io.h
++++ b/src/io.h
+@@ -1,79 +1,84 @@
+ /*
+  * BlueALSA - io.h
+  * SPDX-FileCopyrightText: 2016-2025 BlueALSA developers
+  * SPDX-License-Identifier: MIT
+  */
+ 
+ #pragma once
+ #ifndef BLUEALSA_IO_H_
+ #define BLUEALSA_IO_H_
+ 
+ #if HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <sys/types.h>
+ 
+ #include "ba-transport-pcm.h"
+ #include "shared/ffb.h"
+ #include "shared/rt.h"
+ 
+ /**
+  * Data associated with IO polling.
+  *
+  * Note:
+  * The timeout field shall be initialized to -1. */
+ struct io_poll {
+ 	/* transfer bit rate synchronization */
+ 	struct asrsync asrs;
+ 	/* transfer has been initiated */
+ 	bool initiated;
+ 	/* true when we have received data after the last drain */
+ 	bool tainted;
+ 	/* true when drain is in progress */
+ 	bool draining;
++	/* Exact synchronous drop awaiting the codec-side reset. */
++	uint64_t drop_sync_token;
++	int drop_sync_result;
+ 	/* keep-alive and drain timeout */
+ 	int timeout;
+ };
+ 
+ ssize_t io_bt_read(
+ 		struct ba_transport_pcm *pcm,
+ 		void *buffer,
+ 		size_t count);
+ 
+ ssize_t io_bt_write(
+ 		struct ba_transport_pcm *pcm,
+ 		const void *buffer,
+ 		size_t count);
+ 
+ void io_pcm_scale(
+ 		struct ba_transport_pcm *pcm,
+ 		void *buffer,
+ 		size_t samples);
+ 
+ ssize_t io_pcm_flush(
+ 		struct ba_transport_pcm *pcm);
+ 
+ ssize_t io_pcm_read(
+ 		struct ba_transport_pcm *pcm,
+ 		void *buffer,
+ 		size_t samples);
+ 
+ ssize_t io_pcm_write(
+ 		struct ba_transport_pcm *pcm,
+ 		const void *buffer,
+ 		size_t samples);
+ 
+ ssize_t io_poll_and_read_bt(
+ 		struct io_poll *io,
+ 		struct ba_transport_pcm *pcm,
+ 		ffb_t *buffer);
+ 
++void io_poll_drop_sync_complete(struct io_poll *io, struct ba_transport_pcm *pcm, int error);
++
+ ssize_t io_poll_and_read_pcm(
+ 		struct io_poll *io,
+ 		struct ba_transport_pcm *pcm,
+ 		ffb_t *buffer);
+ 
+ #endif

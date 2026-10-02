@@ -1,0 +1,928 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -112,7 +112,7 @@
+ 	misc_xml.c misc_xml.h \
+ 	rng.c rng.h \
+ 	smartpl_query.c smartpl_query.h \
+-	player.c player.h outputs/cast_json.h shiri_source.h shiri_source_json.h shiri_speech.c shiri_speech.h shiri_speech_ready.h shiri_speech_ready_json.h \
++	player.c player.h shiri_volume_settings.h shiri_volume_settings_json.h outputs/cast_json.h shiri_source.h shiri_source_json.h shiri_speech.c shiri_speech.h shiri_speech_ready.h shiri_speech_ready_json.h \
+ 	worker.c worker.h \
+ 	settings.c settings.h \
+ 	input.h input.c \
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -41,160 +41,162 @@
+ #include "outputs.h"
+ #include "conffile.h"
+ 
+ extern struct output_definition output_raop;
+ extern struct output_definition output_airplay;
+ extern struct output_definition output_streaming;
+ extern struct output_definition output_dummy;
+ extern struct output_definition output_fifo;
+ extern struct output_definition output_rcp;
+ #ifdef HAVE_ALSA
+ extern struct output_definition output_alsa;
+ extern struct output_definition output_shiri_pcm;
+ #endif
+ #ifdef HAVE_LIBPULSE
+ extern struct output_definition output_pulse;
+ #endif
+ #ifdef CHROMECAST
+ extern struct output_definition output_cast;
+ #endif
+ 
+ /* From player.c */
+ extern struct event_base *evbase_player;
+ 
+ // Must be in sync with enum output_types
+ static struct output_definition *outputs[] = {
+     &output_raop,
+     &output_airplay,
+     &output_streaming,
+     &output_dummy,
+     &output_fifo,
+     &output_rcp,
+ #ifdef HAVE_ALSA
+     &output_alsa,
+ #endif
+ #ifdef HAVE_LIBPULSE
+     &output_pulse,
+ #endif
+ #ifdef CHROMECAST
+     &output_cast,
+ #endif
+     NULL
+ };
+ 
+ // Default volume (must be from 0 - 100)
+ #define OUTPUTS_DEFAULT_VOLUME 50
+ 
+ // When we stop, we keep the outputs open for a while, just in case we are
+ // actually just restarting. This timeout determines how long we wait before
+ // full stop.
+ // (value is in seconds)
+ #define OUTPUTS_STOP_TIMEOUT 10
+ 
+ #define OUTPUTS_MAX_CALLBACKS 64
+ 
+ struct outputs_callback_register
+ {
+   int token; /* Never reused during this process lifetime. */
+   output_status_cb cb;
+   struct output_device *device;
+ 
+   // We have received the callback with the result from the backend
+   bool ready;
+ 
+   // We store a device_id to avoid the risk of dangling device pointer
+   uint64_t device_id;
+   enum output_device_state state;
+ };
+ 
+ struct output_quality_subscription
+ {
+   int count;
+   struct media_quality quality;
+   struct encode_ctx *encode_ctx;
+ };
+ 
+ // Buffer used to pass data to the backends
+ static struct output_buffer output_buffer;
+ 
+ static struct output_device *outputs_device_list;
+ static int outputs_master_volume;
++static bool shiri_volume_settings_active;
++static struct shiri_volume_settings shiri_saved_volume_settings;
+ static uint64_t outputs_buffer_duration_ms;
+ 
+ static bool outputs_exclusive_mode;
+ 
+ static struct outputs_callback_register outputs_cb_register[OUTPUTS_MAX_CALLBACKS];
+ static uint32_t outputs_callback_token;
+ static struct event *outputs_deferredev;
+ static struct timeval outputs_stop_timeout = { OUTPUTS_STOP_TIMEOUT, 0 };
+ 
+ // Last element is a zero terminator
+ static struct output_quality_subscription output_quality_subscriptions[OUTPUTS_MAX_QUALITY_SUBSCRIPTIONS + 1];
+ static bool outputs_got_new_subscription;
+ 
+ 
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+ 
+ static output_status_cb
+ callback_get(struct output_device *device)
+ {
+   int callback_id;
+ 
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+       if (outputs_cb_register[callback_id].device == device)
+ 	return outputs_cb_register[callback_id].cb;
+     }
+ 
+   return NULL;
+ }
+ 
+ static void
+ callback_remove(struct output_device *device)
+ {
+   int callback_id;
+ 
+   if (!device)
+     return;
+ 
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+       if (outputs_cb_register[callback_id].device == device)
+ 	{
+ 	  DPRINTF(E_DBG, L_PLAYER, "Removing callback to %s, id %d\n", player_pmap(outputs_cb_register[callback_id].cb), callback_id);
+ 	  memset(&outputs_cb_register[callback_id], 0, sizeof(struct outputs_callback_register));
+ 	}
+     }
+ }
+ 
+ static int
+ callback_add(struct output_device *device, output_status_cb cb)
+ {
+   int callback_id;
+ 
+   if (!cb)
+     return -1;
+ 
+   if (outputs_callback_token >= INT_MAX)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output callback identities exhausted; restart this backend\n");
+       return -1; /* Never wrap and mistake a late old callback for a new one. */
+     }
+ 
+   // We will replace any previously registered callbacks, since that's what the
+   // player expects
+   callback_remove(device);
+ 
+   // Find a free slot in the queue
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+       if (outputs_cb_register[callback_id].cb == NULL)
+ 	break;
+     }
+ 
+   if (callback_id == ARRAY_SIZE(outputs_cb_register))
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output callback queue is full! (size is %d)\n", OUTPUTS_MAX_CALLBACKS);
+       return -1;
+     }
+ 
+   outputs_cb_register[callback_id].token = (int)++outputs_callback_token;
+@@ -528,165 +530,190 @@
+ }
+ 
+ // *** Worker thread ***
+ static void
+ metadata_cb_prepare(void *arg)
+ {
+   struct output_metadata *metadata = *((struct output_metadata **)arg);
+ 
+   metadata->priv = outputs[metadata->type]->metadata_prepare(metadata);
+   if (!metadata->priv)
+     {
+       event_free(metadata->ev);
+       free(metadata);
+       return;
+     }
+ 
+   // Metadata is prepared, let the player thread do the actual sending
+   event_active(metadata->ev, 0, 0);
+ }
+ 
+ static void
+ metadata_free(struct output_metadata *metadata)
+ {
+   if (!metadata)
+     return;
+   if (metadata->ev)
+     event_free(metadata->ev);
+   free(metadata);
+ }
+ 
+ static void
+ metadata_send(enum output_types type, uint32_t item_id, bool startup, output_metadata_finalize_cb cb)
+ {
+   struct output_metadata *metadata;
+ 
+   CHECK_NULL(L_PLAYER, metadata = calloc(1, sizeof(struct output_metadata)));
+ 
+   metadata->type        = type;
+   metadata->item_id     = item_id;
+   metadata->startup     = startup;
+   metadata->finalize_cb = cb;
+ 
+   metadata->ev = event_new(evbase_player, -1, 0, metadata_cb_send, metadata);
+ 
+   if (outputs[type]->metadata_prepare)
+     worker_execute(metadata_cb_prepare, &metadata, sizeof(struct output_metadata *), 0);
+   else
+     outputs[type]->metadata_send(metadata);
+ }
+ 
+ 
+ /* ----------------------------- Volume helpers ----------------------------- */
+ 
+ static int
+ rel_to_vol(int relvol, int master_volume)
+ {
+   float vol;
+ 
+   if (relvol == 100)
+     return master_volume;
+ 
+   vol = ((float)relvol * (float)master_volume) / 100.0;
+ 
+   return (int)vol;
+ }
+ 
+ static int
+ vol_to_rel(int volume, int master_volume)
+ {
+   float rel;
+ 
+   if (volume == master_volume)
+     return 100;
+ 
+   rel = ((float)volume / (float)master_volume) * 100.0;
+ 
+   return (int)rel;
+ }
+ 
+ static void
++shiri_device_balance_restore(struct output_device *device)
++{
++  size_t i;
++  /* Retain the assigned group's trims across rediscovery/protocol replacement. */
++  for (i = 0; i < shiri_saved_volume_settings.count; i++)
++    if (shiri_saved_volume_settings.outputs[i].id == device->id)
++      {
++        device->shiri_balance_set = true;
++        device->shiri_balance_percent = shiri_saved_volume_settings.outputs[i].balance_percent;
++        return;
++      }
++}
++
++static void
+ vol_adjust(void)
+ {
+   struct output_device *device;
+   int selected_highest = -1;
+   int all_highest = -1;
++
++  if (shiri_volume_settings_active)
++    {
++      for (device = outputs_device_list; device; device = device->next)
++        {
++          shiri_device_balance_restore(device);
++          device->relvol = device->shiri_balance_set ? device->shiri_balance_percent : 100;
++          device->volume = shiri_balanced_volume(outputs_master_volume, device->relvol);
++        }
++      return;
++    }
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (OUTPUTS_DEVICE_DISPLAY_SELECTED(device) && (device->volume > selected_highest))
+ 	selected_highest = device->volume;
+ 
+       if (device->volume > all_highest)
+ 	all_highest = device->volume;
+     }
+ 
+   outputs_master_volume = (selected_highest >= 0) ? selected_highest : all_highest;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       device->relvol = vol_to_rel(device->volume, outputs_master_volume);
+     }
+ 
+ #ifdef DEBUG_VOLUME
+   DPRINTF(E_DBG, L_PLAYER, "*** Master: %d\n", outputs_master_volume);
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d selected %d\n", device->name, device->volume, device->relvol, OUTPUTS_DEVICE_DISPLAY_SELECTED(device));
+     }
+ #endif
+ }
+ 
+ /* ----------------------------------- API ---------------------------------- */
+ 
+ struct output_device *
+ outputs_device_get(uint64_t device_id)
+ {
+   struct output_device *device;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (device_id == device->id)
+ 	return device;
+     }
+ 
+   DPRINTF(E_WARN, L_PLAYER, "Output device with id %" PRIu64 " is not in our list\n", device_id);
+   return NULL;
+ }
+ 
+ uint64_t
+ outputs_buffer_duration_ms_get(void)
+ {
+   return outputs_buffer_duration_ms;
+ }
+ 
+ // Checked conversions preserve integer rounding and the backend's target width.
+ int
+ outputs_buffer_samples_get(uint64_t *samples, uint64_t duration_ms, int sample_rate, uint64_t limit)
+ {
+   uint64_t value;
+   if (!samples || sample_rate <= 0 || duration_ms > UINT64_MAX / (unsigned)sample_rate)
+     return -1;
+   value = duration_ms * (unsigned)sample_rate / 1000;
+   if (value > limit)
+     return -1;
+   *samples = value;
+   return 0;
+ }
+ 
+ int
+ outputs_buffer_size_get(uint64_t *bytes, uint64_t frames, int bits_per_sample, int channels, uint64_t limit)
+ {
+   uint64_t bytes_per_frame;
+   if (!bytes || bits_per_sample <= 0 || bits_per_sample % 8 || channels <= 0)
+     return -1;
+   bytes_per_frame = (uint64_t)(unsigned)channels * (unsigned)(bits_per_sample / 8);
+   if (frames > UINT64_MAX / bytes_per_frame || frames * bytes_per_frame > limit)
+     return -1;
+   *bytes = frames * bytes_per_frame;
+   return 0;
+ }
+ 
+ 
+ bool
+ outputs_exclusive_mode_get(void)
+@@ -1291,255 +1318,300 @@
+       else
+         pending += ret;
+     }
+   return pending;
+ }
+ 
+ /* The maintained callback registry uses never-reused tokens. Once a START
+  * has been replaced by stop/volume/etc, its old backend reply is ignored. */
+ int
+ outputs_shiri_stop_delayed_cancel(struct output_device *device)
+ {
+   if (!device || !device->selected || !device->stop_timer) return -1;
+   return event_del(device->stop_timer);
+ }
+ 
+ bool
+ outputs_shiri_callback_pending(uint64_t device_id, output_status_cb callback)
+ {
+   unsigned index;
+   for (index = 0; index < ARRAY_SIZE(outputs_cb_register); ++index)
+     if (outputs_cb_register[index].device_id == device_id && outputs_cb_register[index].cb == callback)
+       return true;
+   return false;
+ }
+ 
+ int
+ outputs_shiri_start(output_status_cb cb, int *failed)
+ {
+   struct output_device *device;
+   int ret, pending = 0;
+   *failed = 0;
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (!device->selected)
+         continue;
+       ret = outputs_device_start(device, cb, false);
+       if (ret < 0)
+         *failed = 1;
+       else
+         pending += ret;
+     }
+   return pending;
+ }
+ 
+ int
+ outputs_volume_get(void)
+ {
+   return outputs_master_volume;
+ }
+ 
+ int
+ outputs_volume_set(int volume, output_status_cb cb)
+ {
+   struct output_device *device;
+   int pending = 0;
+   int ret;
+ 
+   if (outputs_master_volume == volume)
+     return 0;
+ 
+   outputs_master_volume = volume;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (!device->selected)
+ 	continue;
+ 
+       device->volume = rel_to_vol(device->relvol, outputs_master_volume);
+ 
+       ret = outputs_device_volume_set(device, cb);
+       if (ret < 0)
+ 	continue;
+ 
+       pending += ret;
+     }
+ 
+   return pending;
+ }
+ 
+ int
++outputs_shiri_volume_settings_set(const struct shiri_volume_settings *settings, output_status_cb cb)
++{
++  struct output_device *device;
++  size_t i, j;
++  int volume, ret, pending = 0;
++  if (!settings || settings->volume < 0 || settings->volume > 100 || settings->count > SHIRI_VOLUME_OUTPUTS_MAX)
++    return -1;
++  /* Validate the complete request before altering any gain or master state. */
++  for (i = 0; i < settings->count; i++)
++    {
++      if (settings->outputs[i].balance_percent < 0 || settings->outputs[i].balance_percent > 100
++          || !outputs_device_get(settings->outputs[i].id))
++        return -1;
++      for (j = 0; j < i; j++)
++        if (settings->outputs[i].id == settings->outputs[j].id)
++          return -1;
++    }
++  for (i = 0; i < settings->count; i++)
++    {
++      device = outputs_device_get(settings->outputs[i].id);
++      device->shiri_balance_percent = settings->outputs[i].balance_percent;
++      device->shiri_balance_set = true;
++    }
++  shiri_volume_settings_active = true;
++  shiri_saved_volume_settings = *settings;
++  outputs_master_volume = settings->volume;
++  for (device = outputs_device_list; device; device = device->next)
++    {
++      device->relvol = device->shiri_balance_set ? device->shiri_balance_percent : 100;
++      volume = shiri_balanced_volume(outputs_master_volume, device->relvol);
++      if (device->volume == volume)
++        continue;
++      device->volume = volume;
++      if (!device->selected)
++        continue;
++      ret = outputs_device_volume_set(device, cb);
++      if (ret > 0)
++        pending += ret;
++    }
++  return pending;
++}
++
++int
+ outputs_sessions_count(void)
+ {
+   struct output_device *device;
+   int count = 0;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     if (device->session)
+       count++;
+ 
+   return count;
+ }
+ 
+ void
+ outputs_write(void *buf, size_t bufsize, int nsamples, struct media_quality *quality, struct timespec *pts)
+ {
+   int i;
+ 
+   buffer_fill(&output_buffer, buf, bufsize, quality, nsamples, pts);
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled)
+ 	continue;
+ 
+       if (outputs[i]->write)
+ 	outputs[i]->write(&output_buffer);
+     }
+ 
+   buffer_drain(&output_buffer);
+ }
+ 
+ void
+ outputs_metadata_send(uint32_t item_id, bool startup, output_metadata_finalize_cb cb)
+ {
+   int i;
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled || !outputs[i]->metadata_send)
+ 	continue;
+ 
+       metadata_send(i, item_id, startup, cb);
+     }
+ }
+ 
+ void
+ outputs_metadata_purge(void)
+ {
+   int i;
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled || !outputs[i]->metadata_purge)
+ 	continue;
+ 
+       outputs[i]->metadata_purge();
+     }
+ }
+ 
+ int
+ outputs_priority(struct output_device *device)
+ {
+   return outputs[device->type]->priority;
+ }
+ 
+ const char *
+ outputs_name(enum output_types type)
+ {
+   return outputs[type]->name;
+ }
+ 
+ struct output_device *
+ outputs_list(void)
+ {
+   return outputs_device_list;
+ }
+ 
+ int
+ outputs_init(void)
+ {
+   cfg_opt_t *start_buffer_opt;
+   int no_output;
+   int ret;
+   int i;
+   int j;
+ 
+ #ifdef HAVE_ALSA
+   // Explicit profile only; all default and network routing remains unchanged.
+   outputs[OUTPUT_TYPE_ALSA] = &output_alsa;
+   if (cfg_getstr(cfg_getsec(cfg, "audio"), "type")
+       && strcmp(cfg_getstr(cfg_getsec(cfg, "audio"), "type"), "shiri-pcm") == 0)
+     outputs[OUTPUT_TYPE_ALSA] = &output_shiri_pcm;
+ #endif
+ 
+   outputs_master_volume = -1;
++  shiri_volume_settings_active = false;
++  shiri_saved_volume_settings.count = 0;
+ 
+   // Number of milliseconds the outputs should buffer before starting playback.
+   // The default of 2250 comes from RAOP, where iTunes and Apple Music will send
+   // a sync packet with a 2000 ms/88200 delay, and the speaker will add it's own
+   // audio latency of 250 ms/11025. See e.g. shairport-sync's rtp.c. While a
+   // shorter delay would seem desirable, some Airplay devices ignore the values
+   // we give and stick to 2.25 seconds.
+   start_buffer_opt = cfg_getopt(cfg_getsec(cfg, "general"), "start_buffer_ms");
+   // Validate the signed configuration before converting to the unsigned delay.
+   if (cfg_opt_getnint(start_buffer_opt, 0) < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output buffer duration must not be negative\n");
+       return -1;
+     }
+   outputs_buffer_duration_ms = cfg_opt_getnint(start_buffer_opt, 0);
+   if (outputs_buffer_duration_ms != start_buffer_opt->def.number)
+     DPRINTF(E_WARN, L_PLAYER, "Output buffer duration is configured to a non-standard value %" PRIu64 "\n", outputs_buffer_duration_ms);
+ 
+   CHECK_NULL(L_PLAYER, outputs_deferredev = evtimer_new(evbase_player, deferred_cb, NULL));
+ 
+   no_output = 1;
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->type != i)
+ 	{
+ 	  DPRINTF(E_FATAL, L_PLAYER, "BUG! Output definitions are misaligned with output enum\n");
+ 	  return -1;
+ 	}
+ 
+       if (outputs[i]->disabled)
+ 	{
+ 	  continue;
+ 	}
+ 
+       // Check if the user has configured "exclusive" for any output type speaker
+       if (outputs[i]->cfg_name)
+ 	{
+ 	  for (j = 0; j < cfg_size(cfg, outputs[i]->cfg_name) && !outputs_exclusive_mode; j++)
+ 	    outputs_exclusive_mode = cfg_getbool(cfg_getnsec(cfg, outputs[i]->cfg_name, j), "exclusive");
+ 	}
+ 
+       if (!outputs[i]->init)
+ 	{
+ 	  no_output = 0;
+ 	  continue;
+ 	}
+ 
+       ret = outputs[i]->init();
+       if (ret < 0)
+ 	outputs[i]->disabled = 1;
+       else
+ 	no_output = 0;
+     }
+ 
+   if (no_output)
+     return -1;
+ 
+   for (i = 0; i < ARRAY_SIZE(output_buffer.data); i++)
+     output_buffer.data[i].evbuf = evbuffer_new();
+ 
+   return 0;
+ }
+ 
+ void
+ outputs_deinit(void)
+ {
+   int i;
+ 
+   event_free(outputs_deferredev);
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled)
+ 	continue;
+ 
+       if (outputs[i]->deinit)
+         outputs[i]->deinit();
+     }
+ 
+   // In case some outputs forgot to unsubscribe
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -7,6 +7,7 @@
+ #include <event2/event.h>
+ #include <event2/buffer.h>
+ #include "misc.h"
++#include "shiri_volume_settings.h"
+ 
+ /* Outputs is a generic interface between the player and a media output method,
+  * like for instance AirPlay (raop) or ALSA. The purpose of the interface is to
+@@ -125,6 +126,8 @@
+   int volume;
+   int relvol;
+   int max_volume;
++  int shiri_balance_percent;
++  bool shiri_balance_set;
+ 
+   // Quality of audio output
+   struct media_quality quality;
+@@ -399,6 +402,9 @@
+ outputs_volume_set(int volume, output_status_cb cb);
+ 
+ int
++outputs_shiri_volume_settings_set(const struct shiri_volume_settings *settings, output_status_cb cb);
++
++int
+ outputs_stop_delayed_cancel(void);
+ 
+ int
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -3221,6 +3221,7 @@
+   spk->relvol = device->relvol;
+   spk->absvol = device->volume;
+   spk->offset_ms = device->offset_ms;
++  spk->balance_percent = device->shiri_balance_set ? device->shiri_balance_percent : 100;
+ 
+   spk->supported_formats = device->supported_formats;
+   // Devices supporting more than one format should at least have default_format set
+@@ -3757,6 +3758,13 @@
+ }
+ 
+ static enum command_state
++shiri_volume_settings(void *arg, int *retval)
++{
++  *retval = outputs_shiri_volume_settings_set(arg, device_volume_cb);
++  return *retval > 0 ? COMMAND_PENDING : COMMAND_END;
++}
++
++static enum command_state
+ volume_set(void *arg, int *retval)
+ {
+   union player_arg *cmdarg = arg;
+@@ -4444,6 +4452,14 @@
+   ret = commands_exec_sync(cmdbase, volume_set, volume_generic_bh, &cmdarg);
+ 
+   return ret;
++}
++
++int
++player_shiri_volume_settings(const struct shiri_volume_settings *settings)
++{
++  if (!settings)
++    return -1;
++  return commands_exec_sync(cmdbase, shiri_volume_settings, volume_generic_bh, (void *)settings);
+ }
+ 
+ int
+diff --git a/src/player.h b/src/player.h
+--- a/src/player.h
++++ b/src/player.h
+@@ -10,6 +10,7 @@
+ #include "shiri_source.h"
+ #include "shiri_speech_ready.h"
+ #include "shiri_speech.h"
++#include "shiri_volume_settings.h"
+ 
+ // Maximum number of previously played songs that are remembered
+ #define MAX_HISTORY_COUNT 20
+@@ -40,6 +41,7 @@
+   int relvol;
+   int absvol;
+   int offset_ms;
++  int balance_percent;
+ 
+   enum media_format format;
+   uint32_t supported_formats;
+@@ -188,6 +190,9 @@
+ player_volume_set(int vol);
+ 
+ int
++player_shiri_volume_settings(const struct shiri_volume_settings *settings);
++
++int
+ player_volume_setrel_speaker(uint64_t id, int relvol);
+ 
+ int
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -53,6 +53,7 @@
+ #include "misc_json.h"
+ #include "player.h"
+ #include "shiri_source_json.h"
++#include "shiri_volume_settings_json.h"
+ #include "shiri_speech_ready_json.h"
+ #include "remote_pairing.h"
+ #include "settings.h"
+@@ -1636,6 +1637,7 @@
+   json_object_object_add(output, "needs_auth_key", json_object_new_boolean(spk->needs_auth_key));
+   json_object_object_add(output, "volume", json_object_new_int(spk->absvol));
+   json_object_object_add(output, "offset_ms", json_object_new_int(spk->offset_ms));
++  json_object_object_add(output, "balance_percent", json_object_new_int(spk->balance_percent));
+   json_object_object_add(output, "format", json_object_new_string(media_format_to_string(spk->format)));
+   json_object_object_add(output, "supported_formats", supported_formats);
+ 
+@@ -2188,6 +2190,33 @@
+ }
+ 
+ static int
++jsonapi_reply_player_shiri_volume_settings(struct httpd_request *hreq)
++{
++  struct shiri_volume_settings settings;
++  json_object *body;
++  const char *reply;
++  int ret;
++  if (evbuffer_get_length(hreq->in_body) > 65536)
++    return HTTP_BADREQUEST;
++  body = jparse_obj_from_evbuffer(hreq->in_body);
++  if (shiri_volume_settings_parse(body, &settings) < 0)
++    {
++      if (body) json_object_put(body);
++      return HTTP_BADREQUEST;
++    }
++  ret = player_shiri_volume_settings(&settings);
++  if (ret < 0)
++    {
++      json_object_put(body);
++      return HTTP_SERVUNAVAIL;
++    }
++  reply = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
++  evbuffer_add(hreq->out_body, reply, strlen(reply));
++  json_object_put(body);
++  return HTTP_OK;
++}
++
++static int
+ jsonapi_reply_player_toggle(struct httpd_request *hreq)
+ {
+   struct player_status status;
+@@ -4853,6 +4882,7 @@
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-speech-ready$",             jsonapi_reply_player_shiri_speech_ready },
+     { HTTPD_METHOD_GET,    "^/api/player/shiri-speech-status$",            jsonapi_reply_player_shiri_speech_status },
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-volume$",                   jsonapi_reply_player_shiri_volume },
++    { HTTPD_METHOD_POST,   "^/api/player/shiri-volume-settings$",          jsonapi_reply_player_shiri_volume_settings },
+     { HTTPD_METHOD_GET,    "^/api/player$",                                jsonapi_reply_player },
+     { HTTPD_METHOD_PUT,    "^/api/player/play$",                           jsonapi_reply_player_play },
+     { HTTPD_METHOD_PUT,    "^/api/player/pause$",                          jsonapi_reply_player_pause },
+diff --git a/src/shiri_volume_settings.h b/src/shiri_volume_settings.h
+new file mode 100644
+--- /dev/null
++++ b/src/shiri_volume_settings.h
+@@ -0,0 +1,16 @@
++#ifndef SHIRI_VOLUME_SETTINGS_H
++#define SHIRI_VOLUME_SETTINGS_H
++#include <stdint.h>
++#include <stddef.h>
++#define SHIRI_VOLUME_OUTPUTS_MAX 512
++struct shiri_volume_output { uint64_t id; int balance_percent; };
++struct shiri_volume_settings {
++  int volume;
++  size_t count;
++  struct shiri_volume_output outputs[SHIRI_VOLUME_OUTPUTS_MAX];
++};
++static inline int shiri_balanced_volume(int volume, int balance_percent)
++{
++  return volume * balance_percent / 100;
++}
++#endif
+diff --git a/src/shiri_volume_settings_json.h b/src/shiri_volume_settings_json.h
+new file mode 100644
+--- /dev/null
++++ b/src/shiri_volume_settings_json.h
+@@ -0,0 +1,60 @@
++#ifndef SHIRI_VOLUME_SETTINGS_JSON_H
++#define SHIRI_VOLUME_SETTINGS_JSON_H
++#include <string.h>
++#include <json-c/json.h>
++#include "shiri_volume_settings.h"
++static inline int
++shiri_volume_settings_parse(json_object *body, struct shiri_volume_settings *settings)
++{
++  json_object *volume, *outputs, *entry, *id, *balance;
++  const char *text;
++  uint64_t value;
++  size_t i, j, length;
++  int64_t number;
++  if (!body || json_object_get_type(body) != json_type_object
++      || json_object_object_length(body) != 2
++      || !json_object_object_get_ex(body, "volume", &volume)
++      || json_object_get_type(volume) != json_type_int
++      || !json_object_object_get_ex(body, "outputs", &outputs)
++      || json_object_get_type(outputs) != json_type_array)
++    return -1;
++  number = json_object_get_int64(volume);
++  if (number < 0 || number > 100)
++    return -1;
++  settings->volume = (int)number;
++  settings->count = json_object_array_length(outputs);
++  if (settings->count > SHIRI_VOLUME_OUTPUTS_MAX)
++    return -1;
++  for (i = 0; i < settings->count; i++)
++    {
++      entry = json_object_array_get_idx(outputs, i);
++      if (!entry || json_object_get_type(entry) != json_type_object
++          || json_object_object_length(entry) != 2
++          || !json_object_object_get_ex(entry, "id", &id)
++          || json_object_get_type(id) != json_type_string
++          || !json_object_object_get_ex(entry, "balance_percent", &balance)
++          || json_object_get_type(balance) != json_type_int)
++        return -1;
++      text = json_object_get_string(id);
++      length = json_object_get_string_len(id);
++      if (length == 0 || length > 20 || strlen(text) != length || (length > 1 && text[0] == '0'))
++        return -1;
++      value = 0;
++      for (j = 0; j < length; j++)
++        {
++          if (text[j] < '0' || text[j] > '9' || value > (UINT64_MAX - (text[j] - '0')) / 10)
++            return -1;
++          value = value * 10 + (text[j] - '0');
++        }
++      for (j = 0; j < i; j++)
++        if (settings->outputs[j].id == value)
++          return -1;
++      number = json_object_get_int64(balance);
++      if (number < 0 || number > 100)
++        return -1;
++      settings->outputs[i].id = value;
++      settings->outputs[i].balance_percent = (int)number;
++    }
++  return 0;
++}
++#endif

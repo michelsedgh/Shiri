@@ -16,6 +16,9 @@ class Settings:
     api_port: int = 8080
     simulation: bool = False
     api_token_file: Path = Path("/etc/shiri/api-token")
+    daemon_identity_file: Path = Path("/etc/shiri/daemon-identities.json")
+    bind_policy_helper: Path | None = None
+    pcm_exec_helper: Path | None = None
     max_rooms: int = 8
     trusted_proxy_ips: str = "127.0.0.1,::1"
 
@@ -47,6 +50,11 @@ class Settings:
             api_port=int(os.environ.get("SHIRI_PORT", "8080")),
             simulation=os.environ.get("SHIRI_SIMULATION", "0") == "1",
             api_token_file=Path(os.environ.get("SHIRI_API_TOKEN_FILE", "/etc/shiri/api-token")),
+            daemon_identity_file=Path(os.environ.get("SHIRI_DAEMON_IDENTITY_FILE", "/etc/shiri/daemon-identities.json")),
+            bind_policy_helper=(Path(os.environ["SHIRI_BIND_POLICY_HELPER"])
+                                if os.environ.get("SHIRI_BIND_POLICY_HELPER") else None),
+            pcm_exec_helper=(Path(os.environ["SHIRI_PCM_EXEC_HELPER"])
+                             if os.environ.get("SHIRI_PCM_EXEC_HELPER") else None),
             max_rooms=int(os.environ.get("SHIRI_MAX_ROOMS", "8")),
             trusted_proxy_ips=os.environ.get("SHIRI_TRUSTED_PROXY_IPS", "127.0.0.1,::1"),
         )

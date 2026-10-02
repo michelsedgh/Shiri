@@ -1,0 +1,4785 @@
+diff --git a/configure.ac b/configure.ac
+index c208644b1ee9d08d11b37e6a5e234e4818357444..0e27b70cf797f7ddb5d535b289cc7f33d07566f3 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,104 +1,104 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+ AC_CONFIG_AUX_DIR([build-aux])
+ AC_CONFIG_HEADERS([config.h])
+ AM_INIT_AUTOMAKE([foreign subdir-objects 1.11])
+ AM_SILENT_RULES([yes])
+ 
+ dnl Requires autoconf 2.60
+ AC_USE_SYSTEM_EXTENSIONS
+ 
+ dnl Checks for programs.
+ AC_PROG_CC
+ AC_PROG_CC_C_O
+ AC_PROG_SED
+ AC_PROG_MKDIR_P
+ LT_INIT([disable-static])
+ 
+ AC_PATH_PROG([GPERF], [[gperf]])
+ AS_IF([[test -z "$GPERF"]],
+ 	[AS_IF([[test -f "$srcdir/src/dmap_fields_hash.h"]],
+ 		[AM_MISSING_PROG([GPERF], [[gperf]])
+ 		AC_MSG_NOTICE([[
+ 
+ GNU gperf not found, but its output appears to be present.
+ If you modify any .gperf files, you will need to install it.]])],
+ 		[AC_MSG_ERROR([[GNU gperf required, please install it.]])])
+ 	])
+ 
+ AX_PROG_FLEX([AC_DEFINE([LEX], [flex], [flex found])],
+ 	[AS_IF([test ! -f "$srcdir/src/parsers/smartpl_lexer.c"],
+ 		[AC_MSG_ERROR([flex required, please install it])])
+ 	])
+ AX_PROG_BISON([AC_DEFINE([YACC], [bison], [GNU bison found])],
+ 	[AS_IF([test ! -f "$srcdir/src/parsers/smartpl_parser.c"],
+ 		[AC_MSG_ERROR([GNU bison required, please install it])])
+ 	])
+ 
+ dnl Enable all warnings by default.
+ AM_CPPFLAGS="-Wall"
+ AC_SUBST([AM_CPPFLAGS])
+ 
+ dnl Checks for header files.
+ AC_CHECK_HEADERS_ONCE([regex.h pthread_np.h])
+ AC_CHECK_HEADERS([sys/wait.h sys/param.h dirent.h getopt.h stdint.h], [],
+ 	[AC_MSG_ERROR([[Missing header required to build OwnTone]])])
+ AC_CHECK_HEADERS([time.h], [],
+ 	[AC_MSG_ERROR([[Missing header required to build OwnTone]])])
+ AC_CHECK_FUNCS_ONCE([posix_fadvise pipe2 gettid])
+ AC_CHECK_FUNCS([strptime strtok_r], [],
+ 	[AC_MSG_ERROR([[Missing function required to build OwnTone]])])
+ 
+ dnl check for clock_gettime or replace it
+ AC_SEARCH_LIBS([clock_gettime], [rt],
+ 	[AC_DEFINE([HAVE_CLOCK_GETTIME], 1,
+ 		[Define to 1 if have clock_gettime function])],
+ 	[AC_CHECK_HEADER([mach/mach_time.h],
+ 	[AC_DEFINE([HAVE_MACH_CLOCK], 1,
+ 		[Define to 1 if mach kernel clock replacement available])],
+ 	[AC_MSG_ERROR([[Missing clock_gettime and any replacement]])])])
+ 
+ dnl check for timer_settime or replace it
+ AC_SEARCH_LIBS([timer_settime], [rt],
+ 	[AC_DEFINE([HAVE_TIMER_SETTIME], 1,
+ 		[Define to 1 if have timer_settime function])],
+ 	[AC_CHECK_HEADER([mach/mach_time.h],
+ 	[AC_DEFINE([HAVE_MACH_TIMER], 1,
+ 		[Define to 1 if mach kernel clock replacement available])],
+ 	[AC_MSG_ERROR([[Missing timer_settime and any replacement]])])])
+ 
+ AC_SEARCH_LIBS([pthread_exit], [pthread], [],
+ 	[AC_MSG_ERROR([[pthreads library is required]])])
+ AC_SEARCH_LIBS([pthread_setname_np], [pthread],
+ 	[AC_MSG_CHECKING([[for two-parameter pthread_setname_np]])
+ 	 AC_LINK_IFELSE([AC_LANG_PROGRAM([[@%:@include <pthread.h>]],
+ 		[[pthread_setname_np(pthread_self(), "name");]])],
+ 		[AC_MSG_RESULT([yes])
+ 		 AC_DEFINE([HAVE_PTHREAD_SETNAME_NP], 1,
+ 			[Define to 1 if you have pthread_setname_np with 2 args])],
+ 		[AC_MSG_RESULT([[no]])])
+ 	 AC_MSG_CHECKING([[for MacOS single-parameter pthread_setname_np]])
+ 	 AC_LINK_IFELSE([AC_LANG_PROGRAM([[@%:@include <pthread.h>]],
+ 		[[pthread_setname_np("name");]])],
+ 		[AC_MSG_RESULT([yes])
+ 		 AC_DEFINE([HAVE_PTHREAD_SETNAME_NP_MACOS], 1,
+ 			[Define to 1 if you have pthread_setname_np with 1 arg])],
+ 		[AC_MSG_RESULT([[no]])])])
+ AC_SEARCH_LIBS([pthread_set_name_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_SET_NAME_NP], 1,
+ 		[Define to 1 if you have pthread_set_name_np])])
+ AC_SEARCH_LIBS([pthread_getname_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_GETNAME_NP], 1,
+ 		[Define to 1 if you have pthread_getname_np])])
+ AC_SEARCH_LIBS([pthread_get_name_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_GET_NAME_NP], 1,
+ 		[Define to 1 if you have pthread_get_name_np])])
+ AC_SEARCH_LIBS([pthread_getthreadid_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_GETTHREADID_NP], 1,
+ 		[Define to 1 if you have pthread_getthreadid_np])])
+ 
+diff --git a/src/outputs.c b/src/outputs.c
+index d3867a7e53052a633320aad9b7996467896e74aa..47ca4987e7055c2e9826b245e634f55b0043f769 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -538,200 +538,228 @@ metadata_send(enum output_types type, uint32_t item_id, bool startup, output_met
+   CHECK_NULL(L_PLAYER, metadata = calloc(1, sizeof(struct output_metadata)));
+ 
+   metadata->type        = type;
+   metadata->item_id     = item_id;
+   metadata->startup     = startup;
+   metadata->finalize_cb = cb;
+ 
+   metadata->ev = event_new(evbase_player, -1, 0, metadata_cb_send, metadata);
+ 
+   if (outputs[type]->metadata_prepare)
+     worker_execute(metadata_cb_prepare, &metadata, sizeof(struct output_metadata *), 0);
+   else
+     outputs[type]->metadata_send(metadata);
+ }
+ 
+ 
+ /* ----------------------------- Volume helpers ----------------------------- */
+ 
+ static int
+ rel_to_vol(int relvol, int master_volume)
+ {
+   float vol;
+ 
+   if (relvol == 100)
+     return master_volume;
+ 
+   vol = ((float)relvol * (float)master_volume) / 100.0;
+ 
+   return (int)vol;
+ }
+ 
+ static int
+ vol_to_rel(int volume, int master_volume)
+ {
+   float rel;
+ 
+   if (volume == master_volume)
+     return 100;
+ 
+   rel = ((float)volume / (float)master_volume) * 100.0;
+ 
+   return (int)rel;
+ }
+ 
+ static void
+ vol_adjust(void)
+ {
+   struct output_device *device;
+   int selected_highest = -1;
+   int all_highest = -1;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (OUTPUTS_DEVICE_DISPLAY_SELECTED(device) && (device->volume > selected_highest))
+ 	selected_highest = device->volume;
+ 
+       if (device->volume > all_highest)
+ 	all_highest = device->volume;
+     }
+ 
+   outputs_master_volume = (selected_highest >= 0) ? selected_highest : all_highest;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       device->relvol = vol_to_rel(device->volume, outputs_master_volume);
+     }
+ 
+ #ifdef DEBUG_VOLUME
+   DPRINTF(E_DBG, L_PLAYER, "*** Master: %d\n", outputs_master_volume);
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d selected %d\n", device->name, device->volume, device->relvol, OUTPUTS_DEVICE_DISPLAY_SELECTED(device));
+     }
+ #endif
+ }
+ 
+ /* ----------------------------------- API ---------------------------------- */
+ 
+ struct output_device *
+ outputs_device_get(uint64_t device_id)
+ {
+   struct output_device *device;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (device_id == device->id)
+ 	return device;
+     }
+ 
+   DPRINTF(E_WARN, L_PLAYER, "Output device with id %" PRIu64 " is not in our list\n", device_id);
+   return NULL;
+ }
+ 
+ uint64_t
+ outputs_buffer_duration_ms_get(void)
+ {
+   return outputs_buffer_duration_ms;
+ }
+ 
++// Checked conversions preserve integer rounding and the backend's target width.
++int
++outputs_buffer_samples_get(uint64_t *samples, uint64_t duration_ms, int sample_rate, uint64_t limit)
++{
++  uint64_t value;
++  if (!samples || sample_rate <= 0 || duration_ms > UINT64_MAX / (unsigned)sample_rate)
++    return -1;
++  value = duration_ms * (unsigned)sample_rate / 1000;
++  if (value > limit)
++    return -1;
++  *samples = value;
++  return 0;
++}
++
++int
++outputs_buffer_size_get(uint64_t *bytes, uint64_t frames, int bits_per_sample, int channels, uint64_t limit)
++{
++  uint64_t bytes_per_frame;
++  if (!bytes || bits_per_sample <= 0 || bits_per_sample % 8 || channels <= 0)
++    return -1;
++  bytes_per_frame = (uint64_t)(unsigned)channels * (unsigned)(bits_per_sample / 8);
++  if (frames > UINT64_MAX / bytes_per_frame || frames * bytes_per_frame > limit)
++    return -1;
++  *bytes = frames * bytes_per_frame;
++  return 0;
++}
++
++
+ bool
+ outputs_exclusive_mode_get(void)
+ {
+   return outputs_exclusive_mode;
+ }
+ 
+ /* ----------------------- Called by backend modules ------------------------ */
+ 
+ // Sessions free their sessions themselves, but should not touch the device,
+ // since they can't know for sure that it is still valid in memory
+ int
+ outputs_device_session_add(uint64_t device_id, void *session)
+ {
+   struct output_device *device;
+ 
+   device = outputs_device_get(device_id);
+   if (!device)
+     return -1;
+ 
+   device->session = session;
+   return 0;
+ }
+ 
+ void
+ outputs_device_session_remove(uint64_t device_id)
+ {
+   struct output_device *device;
+ 
+   device = outputs_device_get(device_id);
+   if (device)
+     device->session = NULL;
+ 
+   return;
+ }
+ 
+ int
+ outputs_quality_subscribe(struct media_quality *quality)
+ {
+   int i;
+ 
+   // If someone else is already subscribing to this quality we just increase the
+   // reference count.
+   for (i = 0; output_quality_subscriptions[i].count > 0; i++)
+     {
+       if (!quality_is_equal(quality, &output_quality_subscriptions[i].quality))
+ 	continue;
+ 
+       output_quality_subscriptions[i].count++;
+ 
+       DPRINTF(E_DBG, L_PLAYER, "Subscription request for quality %d/%d/%d (now %d subscribers)\n",
+ 	quality->sample_rate, quality->bits_per_sample, quality->channels, output_quality_subscriptions[i].count);
+ 
+       return 0;
+     }
+ 
+   if (i >= (ARRAY_SIZE(output_quality_subscriptions) - 1))
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Bug! The number of different quality levels requested by outputs is too high\n");
+       return -1;
+     }
+ 
+   output_quality_subscriptions[i].quality = *quality;
+   output_quality_subscriptions[i].count++;
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Subscription request for quality %d/%d/%d (now %d subscribers)\n",
+     quality->sample_rate, quality->bits_per_sample, quality->channels, output_quality_subscriptions[i].count);
+ 
+   // Better way of signaling this?
+   outputs_got_new_subscription = true;
+ 
+   return 0;
+ }
+ 
+ void
+ outputs_quality_unsubscribe(struct media_quality *quality)
+ {
+   int i;
+ 
+   // Find subscription
+   for (i = 0; output_quality_subscriptions[i].count > 0; i++)
+     {
+       if (quality_is_equal(quality, &output_quality_subscriptions[i].quality))
+ 	break;
+     }
+ 
+   if (output_quality_subscriptions[i].count == 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Bug! Unsubscription request for a quality level that there is no subscription for\n");
+       return;
+     }
+ 
+   output_quality_subscriptions[i].count--;
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Unsubscription request for quality %d/%d/%d (now %d subscribers)\n",
+     quality->sample_rate, quality->bits_per_sample, quality->channels, output_quality_subscriptions[i].count);
+ 
+   if (output_quality_subscriptions[i].count > 0)
+     return;
+ 
+   transcode_encode_cleanup(&output_quality_subscriptions[i].encode_ctx);
+@@ -1285,177 +1313,183 @@ outputs_volume_set(int volume, output_status_cb cb)
+ 
+   return pending;
+ }
+ 
+ int
+ outputs_sessions_count(void)
+ {
+   struct output_device *device;
+   int count = 0;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     if (device->session)
+       count++;
+ 
+   return count;
+ }
+ 
+ void
+ outputs_write(void *buf, size_t bufsize, int nsamples, struct media_quality *quality, struct timespec *pts)
+ {
+   int i;
+ 
+   buffer_fill(&output_buffer, buf, bufsize, quality, nsamples, pts);
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled)
+ 	continue;
+ 
+       if (outputs[i]->write)
+ 	outputs[i]->write(&output_buffer);
+     }
+ 
+   buffer_drain(&output_buffer);
+ }
+ 
+ void
+ outputs_metadata_send(uint32_t item_id, bool startup, output_metadata_finalize_cb cb)
+ {
+   int i;
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled || !outputs[i]->metadata_send)
+ 	continue;
+ 
+       metadata_send(i, item_id, startup, cb);
+     }
+ }
+ 
+ void
+ outputs_metadata_purge(void)
+ {
+   int i;
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled || !outputs[i]->metadata_purge)
+ 	continue;
+ 
+       outputs[i]->metadata_purge();
+     }
+ }
+ 
+ int
+ outputs_priority(struct output_device *device)
+ {
+   return outputs[device->type]->priority;
+ }
+ 
+ const char *
+ outputs_name(enum output_types type)
+ {
+   return outputs[type]->name;
+ }
+ 
+ struct output_device *
+ outputs_list(void)
+ {
+   return outputs_device_list;
+ }
+ 
+ int
+ outputs_init(void)
+ {
+   cfg_opt_t *start_buffer_opt;
+   int no_output;
+   int ret;
+   int i;
+   int j;
+ 
+   outputs_master_volume = -1;
+ 
+   // Number of milliseconds the outputs should buffer before starting playback.
+   // The default of 2250 comes from RAOP, where iTunes and Apple Music will send
+   // a sync packet with a 2000 ms/88200 delay, and the speaker will add it's own
+   // audio latency of 250 ms/11025. See e.g. shairport-sync's rtp.c. While a
+   // shorter delay would seem desirable, some Airplay devices ignore the values
+   // we give and stick to 2.25 seconds.
+   start_buffer_opt = cfg_getopt(cfg_getsec(cfg, "general"), "start_buffer_ms");
++  // Validate the signed configuration before converting to the unsigned delay.
++  if (cfg_opt_getnint(start_buffer_opt, 0) < 0)
++    {
++      DPRINTF(E_LOG, L_PLAYER, "Output buffer duration must not be negative\n");
++      return -1;
++    }
+   outputs_buffer_duration_ms = cfg_opt_getnint(start_buffer_opt, 0);
+   if (outputs_buffer_duration_ms != start_buffer_opt->def.number)
+     DPRINTF(E_WARN, L_PLAYER, "Output buffer duration is configured to a non-standard value %" PRIu64 "\n", outputs_buffer_duration_ms);
+ 
+   CHECK_NULL(L_PLAYER, outputs_deferredev = evtimer_new(evbase_player, deferred_cb, NULL));
+ 
+   no_output = 1;
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->type != i)
+ 	{
+ 	  DPRINTF(E_FATAL, L_PLAYER, "BUG! Output definitions are misaligned with output enum\n");
+ 	  return -1;
+ 	}
+ 
+       if (outputs[i]->disabled)
+ 	{
+ 	  continue;
+ 	}
+ 
+       // Check if the user has configured "exclusive" for any output type speaker
+       if (outputs[i]->cfg_name)
+ 	{
+ 	  for (j = 0; j < cfg_size(cfg, outputs[i]->cfg_name) && !outputs_exclusive_mode; j++)
+ 	    outputs_exclusive_mode = cfg_getbool(cfg_getnsec(cfg, outputs[i]->cfg_name, j), "exclusive");
+ 	}
+ 
+       if (!outputs[i]->init)
+ 	{
+ 	  no_output = 0;
+ 	  continue;
+ 	}
+ 
+       ret = outputs[i]->init();
+       if (ret < 0)
+ 	outputs[i]->disabled = 1;
+       else
+ 	no_output = 0;
+     }
+ 
+   if (no_output)
+     return -1;
+ 
+   for (i = 0; i < ARRAY_SIZE(output_buffer.data); i++)
+     output_buffer.data[i].evbuf = evbuffer_new();
+ 
+   return 0;
+ }
+ 
+ void
+ outputs_deinit(void)
+ {
+   int i;
+ 
+   event_free(outputs_deferredev);
+ 
+   for (i = 0; outputs[i]; i++)
+     {
+       if (outputs[i]->disabled)
+ 	continue;
+ 
+       if (outputs[i]->deinit)
+         outputs[i]->deinit();
+     }
+ 
+   // In case some outputs forgot to unsubscribe
+   for (i = 0; i < ARRAY_SIZE(output_quality_subscriptions); i++)
+     if (output_quality_subscriptions[i].count > 0)
+       {
+ 	transcode_encode_cleanup(&output_quality_subscriptions[i].encode_ctx);
+ 	memset(&output_quality_subscriptions[i], 0, sizeof(struct output_quality_subscription));
+       }
+ 
+   for (i = 0; i < ARRAY_SIZE(output_buffer.data); i++)
+     evbuffer_free(output_buffer.data[i].evbuf);
+ }
+ 
+diff --git a/src/outputs.h b/src/outputs.h
+index d7aaab1f33406f7d509b6507e98eb47290194c9a..ed98336d860b30c9d2c87fd19c527c7b5eb4e51e 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -182,200 +182,208 @@ struct output_data
+   struct evbuffer *evbuf;
+   uint8_t *buffer;
+   size_t bufsize;
+   int samples;
+ };
+ 
+ struct output_buffer
+ {
+   struct timespec pts;
+   // The array is two larger than max quality subscriptions because element 0
+   // holds the original, untranscoded, data (which might not have any
+   // subscribers, and the last element is a zero terminator.
+   struct output_data data[OUTPUTS_MAX_QUALITY_SUBSCRIPTIONS + 2];
+ };
+ 
+ struct output_definition
+ {
+   // Name of the output
+   const char *name;
+ 
+   // The output's config section name in the config file
+   const char *cfg_name;
+ 
+   // Type of output
+   enum output_types type;
+ 
+   // Priority to give this output when autoselecting an output, or when
+   // selectinga which output definition to use for a device that has multiple,
+   // e.g. AirPlay 1 and 2.
+   // 1 = highest priority, 0 = don't autoselect
+   int priority;
+ 
+   // Set to 1 if the output initialization failed
+   int disabled;
+ 
+   // Initialization function called during startup
+   // Output must call device_cb when an output device becomes available/unavailable
+   int (*init)(void);
+ 
+   // Deinitialization function called at shutdown
+   void (*deinit)(void);
+ 
+   // For all the below that take callbacks, the return values are:
+   // - negative: error
+   // - zero:     ok, won't make a callback
+   // - positive: number of callbacks that will be made
+ 
+   // Prepare a playback session on device and call back
+   int (*device_start)(struct output_device *device, int callback_id);
+ 
+   // Close a session prepared by device_start and call back
+   int (*device_stop)(struct output_device *device, int callback_id);
+ 
+   // Flush device session and call back
+   int (*device_flush)(struct output_device *device, int callback_id);
+ 
+   // Test the connection to a device and call back
+   int (*device_probe)(struct output_device *device, int callback_id);
+ 
+   // Set the volume and call back
+   int (*device_volume_set)(struct output_device *device, int callback_id);
+ 
+   // Convert device internal representation of volume to our pct scale
+   int (*device_volume_to_pct)(struct output_device *device, const char *volume);
+ 
+   // Request a change of quality from the device
+   int (*device_quality_set)(struct output_device *device, struct media_quality *quality, int callback_id);
+ 
+   // Authorize the server to use the device
+   int (*device_authorize)(struct output_device *device, const char *pin, int callback_id);
+ 
+   // Change the call back associated with a device
+   void (*device_cb_set)(struct output_device *device, int callback_id);
+ 
+   // Free the private device data
+   void (*device_free_extra)(struct output_device *device);
+ 
+   // Write stream data to the output devices
+   void (*write)(struct output_buffer *buffer);
+ 
+   // Called from worker thread for async preparation of metadata (e.g. getting
+   // artwork, which might involce downloading image data). The prepared data is
+   // saved to metadata->priv, which metadata_send() can use.
+   void *(*metadata_prepare)(struct output_metadata *metadata);
+ 
+   // Send metadata to outputs. Ownership of *metadata is transferred.
+   void (*metadata_send)(struct output_metadata *metadata);
+ 
+   // Output will cleanup all metadata (so basically like flush but for metadata)
+   void (*metadata_purge)(void);
+ };
+ 
+ /* ------------------------------- General use ------------------------------ */
+ 
+ struct output_device *
+ outputs_device_get(uint64_t device_id);
+ 
+ uint64_t
+ outputs_buffer_duration_ms_get(void);
+ 
++// Negative rates, multiplication overflow and backend width overflow fail closed.
++int
++outputs_buffer_samples_get(uint64_t *samples, uint64_t duration_ms, int sample_rate, uint64_t limit);
++
++int
++outputs_buffer_size_get(uint64_t *bytes, uint64_t frames, int bits_per_sample, int channels, uint64_t limit);
++
++
+ bool
+ outputs_exclusive_mode_get(void);
+ 
+ /* ----------------------- Called by backend modules ------------------------ */
+ 
+ int
+ outputs_device_session_add(uint64_t device_id, void *session);
+ 
+ void
+ outputs_device_session_remove(uint64_t device_id);
+ 
+ int
+ outputs_quality_subscribe(struct media_quality *quality);
+ 
+ void
+ outputs_quality_unsubscribe(struct media_quality *quality);
+ 
+ void
+ outputs_cb(int callback_id, uint64_t device_id, enum output_device_state);
+ 
+ void
+ outputs_metadata_free(struct output_metadata *metadata);
+ 
+ struct output_buffer *
+ outputs_buffer_copy(struct output_buffer *buffer);
+ 
+ void
+ outputs_buffer_free(struct output_buffer *buffer);
+ 
+ /* ---------------------------- Called by player ---------------------------- */
+ 
+ // Ownership of *add is transferred, so don't address after calling. Instead you
+ // can address the return value (which is not the same if the device was already
+ // in the list).
+ struct output_device *
+ outputs_device_add(struct output_device *add, bool new_deselect);
+ 
+ void
+ outputs_device_remove(struct output_device *remove);
+ 
+ void
+ outputs_device_select(struct output_device *device, int max_volume);
+ 
+ void
+ outputs_device_deselect(struct output_device *device);
+ 
+ int
+ outputs_device_start(struct output_device *device, output_status_cb cb, bool only_probe);
+ 
+ int
+ outputs_device_stop(struct output_device *device, output_status_cb cb);
+ 
+ int
+ outputs_device_stop_delayed(struct output_device *device, output_status_cb cb);
+ 
+ int
+ outputs_device_flush(struct output_device *device, output_status_cb cb);
+ 
+ void
+ outputs_device_volume_register(struct output_device *device, int absvol, int relvol);
+ 
+ int
+ outputs_device_volume_set(struct output_device *device, output_status_cb cb);
+ 
+ int
+ outputs_device_volume_to_pct(struct output_device *device, const char *value);
+ 
+ int
+ outputs_device_quality_set(struct output_device *device, struct media_quality *quality, output_status_cb cb);
+ 
+ int
+ outputs_device_authorize(struct output_device *device, const char *pin, output_status_cb cb);
+ 
+ void
+ outputs_device_cb_set(struct output_device *device, output_status_cb cb);
+ 
+ void
+ outputs_device_free(struct output_device *device);
+ 
+ int
+ outputs_start(output_status_cb started_cb, output_status_cb stopped_cb, bool only_probe);
+ 
+ int
+ outputs_stop(output_status_cb cb);
+ 
+ int
+ outputs_flush(output_status_cb cb);
+ 
+ int
+ outputs_shiri_flush(output_status_cb cb, int *failed);
+ 
+ int
+ outputs_shiri_start(output_status_cb cb, int *failed);
+ 
+ int
+ outputs_volume_get(void);
+ 
+ int
+ outputs_volume_set(int volume, output_status_cb cb);
+ 
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+index 8b128b0ce666e04d55c509b70e9849bf3307839d..7e6c18249b744ccd09ff12ecd49142313e98c3ce 100644
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -184,201 +184,201 @@ enum airplay_status_flags
+   AIRPLAY_FLAG_PIN_REQUIRED                   = (1 << 3),
+   AIRPLAY_FLAG_SUPPORTS_FROM_CLOUD            = (1 << 6),
+   AIRPLAY_FLAG_PASSWORD_REQUIRED              = (1 << 7),
+   AIRPLAY_FLAG_ONE_TIME_PAIRING_REQUIRED      = (1 << 9),
+   AIRPLAY_FLAG_SETUP_HK_ACCESS_CTRL           = (1 << 10),
+   AIRPLAY_FLAG_SUPPORTS_RELAY                 = (1 << 11),
+   AIRPLAY_FLAG_SILENT_PRIMARY                 = (1 << 12),
+   AIRPLAY_FLAG_TIGHT_SYNC_IS_GRP_LEADER       = (1 << 13),
+   AIRPLAY_FLAG_TIGHT_SYNC_BUDDY_NOT_REACHABLE = (1 << 14),
+   AIRPLAY_FLAG_IS_APPLE_MUSIC_SUBSCRIBER      = (1 << 15),
+   AIRPLAY_FLAG_CLOUD_LIBRARY_ON               = (1 << 16),
+   AIRPLAY_FLAG_RECEIVER_IS_BUSY               = (1 << 17),
+ };
+ 
+ // Info about the device, which is not required by the player, only internally
+ struct airplay_extra
+ {
+   enum airplay_devtype devtype;
+ 
+   char *mdns_name;
+ 
+   uint16_t wanted_metadata;
+   bool supports_auth_setup;
+   bool supports_encryption;
+   bool use_ptp;
+ };
+ 
+ struct airplay_master_session
+ {
+   struct evbuffer *input_buffer;
+   uint32_t input_buffer_samples;
+ 
+   // ALAC encoder and buffer for encoded data
+   struct encode_ctx *encode_ctx;
+   struct evbuffer *encoded_buffer;
+ 
+   struct rtp_session *rtp_session;
+ 
+   struct rtcp_timestamp cur_stamp;
+ 
+   uint8_t *rawbuf;
+   size_t rawbuf_size;
+   uint32_t samples_per_packet;
+ 
+   // Session characteristics
+   struct media_quality quality;
+   bool use_ptp;
+ 
+   // Number of samples that we tell the output to buffer (this will mean that
+   // the position that we send in the sync packages are offset by this amount
+   // compared to the rtptimes of the corresponding RTP packages we are sending)
+   uint32_t output_buffer_samples;
+ 
+   struct airplay_master_session *next;
+ };
+ 
+ struct airplay_session
+ {
+   uint64_t device_id;
+   int callback_id;
+ 
+   struct airplay_master_session *master_session;
+ 
+   struct evrtsp_connection *ctrl;
+ 
+   enum airplay_state state;
+ 
+   enum airplay_seq_type next_seq;
+ 
+   uint64_t statusflags;
+   uint16_t wanted_metadata;
+   bool req_has_auth;
+   bool supports_auth_setup;
+   bool supports_encryption;
+ 
+   struct event *deferredev;
+ 
+   int reqs_in_flight;
+   int cseq;
+ 
+   uint32_t session_id;
+   char session_url[128];
+   char session_uuid[37];
+ 
+   char group_uuid[37];
+ 
+   char *realm;
+   char *nonce;
+   const char *password;
+ 
+   char *devname;
+   char *address;
+   int family;
+ 
+   union net_sockaddr naddr;
+ 
+   int volume;
+ 
+   // device->offset_ms in samples (user config for correction of static
+   // amplifier or DSP delays)
+-  int offset_samples;
++  int64_t offset_samples;
+ 
+   char *local_v4_address;
+   char *local_v6_address;
+   char local_mac_address[18];
+ 
+   unsigned short data_port;
+   unsigned short control_port;
+   unsigned short events_port;
+ 
+   /* Pairing, see pair.h */
+   enum pair_type pair_type;
+   struct pair_cipher_context *control_cipher_ctx;
+   struct pair_verify_context *pair_verify_ctx;
+   struct pair_setup_context *pair_setup_ctx;
+ 
+   uint8_t shared_secret[64];
+   size_t shared_secret_len; // 32 or 64, see AIRPLAY_AUDIO_KEY_LEN for comment
+ 
+   gcry_cipher_hd_t packet_cipher_hd;
+ 
+   int server_fd;
+ 
+   struct airplay_service *timing_svc;
+   struct airplay_service *control_svc;
+ 
+   uint32_t ptpd_slave_id;
+ 
+   struct airplay_session *next;
+ };
+ 
+ struct airplay_metadata
+ {
+   struct evbuffer *metadata;
+   struct evbuffer *artwork;
+   int artwork_fmt;
+ };
+ 
+ struct airplay_service
+ {
+   struct net_socket socket;
+   unsigned short port;
+   struct event *ev4;
+   struct event *ev6;
+ };
+ 
+ /* NTP timestamp definitions */
+ #define FRAC             4294967296. /* 2^32 as a double */
+ #define NTP_EPOCH_DELTA  0x83aa7e80  /* 2208988800 - that's 1970 - 1900 in seconds */
+ 
+ // TODO move to rtp_common
+ struct ntp_stamp
+ {
+   uint32_t sec;
+   uint32_t frac;
+ };
+ 
+ 
+ /* --------------------------- SEQUENCE DEFINITIONS ------------------------- */
+ 
+ struct airplay_seq_definition
+ {
+   enum airplay_seq_type seq_type;
+ 
+   // Called when a sequence ends, successfully or not. Shoulds also, if
+   // required, take care of notifying  player and free the session.
+   void (*on_success)(struct airplay_session *session);
+   void (*on_error)(struct airplay_session *session);
+ };
+ 
+ struct airplay_seq_request
+ {
+   enum airplay_seq_type seq_type;
+   const char *name; // Name of request (for logging)
+   enum evrtsp_cmd_type rtsp_type;
+   int (*payload_make)(struct evrtsp_request *req, struct airplay_session *session, void *arg);
+   enum airplay_seq_type (*response_handler)(struct evrtsp_request *req, struct airplay_session *session);
+   const char *content_type;
+   const char *uri;
+   bool proceed_on_rtsp_not_ok; // If true return code != RTSP_OK will not abort the sequence
+ };
+ 
+ struct airplay_seq_ctx
+ {
+   int callback_id; /* Exact output operation which admitted this sequence. */
+   bool owns_callback;
+   struct airplay_seq_request *cur_request;
+   void (*on_success)(struct airplay_session *session);
+   void (*on_error)(struct airplay_session *session);
+   struct airplay_session *session;
+   void *payload_make_arg;
+   const char *log_caller;
+ };
+ 
+ 
+ /* ------------------------------ MISC GLOBALS ------------------------------ */
+ 
+ #if AIRPLAY_USE_AUTH_SETUP
+ static const uint8_t airplay_auth_setup_pubkey[] =
+   "\x59\x02\xed\xe9\x0d\x4e\xf2\xbd\x4c\xb6\x8a\x63\x30\x03\x82\x07"
+   "\xa9\x4d\xbd\x50\xd8\xaa\x46\x5b\x5d\x8c\x01\x2a\x0c\x7e\x1d\x4e";
+@@ -1054,256 +1054,262 @@ rtsp_cipher(struct evbuffer *outbuf, struct evbuffer *inbuf, void *arg, int encr
+   return -1;
+ }
+ 
+ 
+ /* ------------------------------ Session handling -------------------------- */
+ 
+ // Maps our internal state to the generic output state and then makes a callback
+ // to the player to tell that state
+ static void
+ session_status(struct airplay_session *session)
+ {
+   enum output_device_state state;
+ 
+   switch (session->state)
+     {
+       case AIRPLAY_STATE_AUTH:
+ 	state = OUTPUT_STATE_PASSWORD;
+ 	break;
+       case AIRPLAY_STATE_FAILED:
+ 	state = OUTPUT_STATE_FAILED;
+ 	break;
+       case AIRPLAY_STATE_STOPPED:
+ 	state = OUTPUT_STATE_STOPPED;
+ 	break;
+       case AIRPLAY_STATE_INFO ... AIRPLAY_STATE_RECORD:
+ 	state = OUTPUT_STATE_STARTUP;
+ 	break;
+       case AIRPLAY_STATE_CONNECTED:
+ 	state = OUTPUT_STATE_CONNECTED;
+ 	break;
+       case AIRPLAY_STATE_STREAMING:
+ 	state = OUTPUT_STATE_STREAMING;
+ 	break;
+       case AIRPLAY_STATE_TEARDOWN:
+ 	DPRINTF(E_LOG, L_AIRPLAY, "Bug! session_status() called with transitional state (TEARDOWN)\n");
+ 	state = OUTPUT_STATE_STOPPED;
+ 	break;
+       default:
+ 	DPRINTF(E_LOG, L_AIRPLAY, "Bug! Unhandled state in session_status(): %d\n", session->state);
+ 	state = OUTPUT_STATE_FAILED;
+     }
+ 
+   outputs_cb(session->callback_id, session->device_id, state);
+   session->callback_id = -1;
+ }
+ 
+ static void
+ master_session_free(struct airplay_master_session *ams)
+ {
+   if (!ams)
+     return;
+ 
+   outputs_quality_unsubscribe(&ams->rtp_session->quality);
+   rtp_session_free(ams->rtp_session);
+ 
+   transcode_encode_cleanup(&ams->encode_ctx);
+ 
+   if (ams->input_buffer)
+     evbuffer_free(ams->input_buffer);
+   if (ams->encoded_buffer)
+     evbuffer_free(ams->encoded_buffer);
+ 
+   free(ams->rawbuf);
+   free(ams);
+ }
+ 
+ static void
+ master_session_cleanup(struct airplay_master_session *ams)
+ {
+   struct airplay_master_session *s;
+   struct airplay_session *session;
+ 
+   // First check if any other session is using the master session
+   for (session = airplay_sessions; session; session=session->next)
+     {
+       if (session->master_session == ams)
+ 	return;
+     }
+ 
+   if (ams == airplay_master_sessions)
+     airplay_master_sessions = airplay_master_sessions->next;
+   else
+     {
+       for (s = airplay_master_sessions; s && (s->next != ams); s = s->next)
+ 	; /* EMPTY */
+ 
+       if (!s)
+ 	DPRINTF(E_WARN, L_AIRPLAY, "WARNING: struct airplay_master_session not found in list; BUG!\n");
+       else
+ 	s->next = ams->next;
+     }
+ 
+   master_session_free(ams);
+ }
+ 
+ static struct airplay_master_session *
+ master_session_make(struct media_quality *quality, bool use_ptp)
+ {
+   struct airplay_master_session *ams;
+   uint64_t buffer_duration_ms;
++  uint64_t buffer_samples;
+   struct transcode_encode_setup_args encode_args = { .profile = XCODE_ALAC, .quality = quality };
+   uint64_t clock_id;
+   int ret;
+ 
+   // First check if we already have a suitable session
+   for (ams = airplay_master_sessions; ams; ams = ams->next)
+     {
+       if (quality_is_equal(quality, &ams->rtp_session->quality) && use_ptp == ams->use_ptp)
+ 	return ams;
+     }
+ 
+   // Let's create a master session
+   ret = outputs_quality_subscribe(quality);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not subscribe to required audio quality (%d/%d/%d)\n", quality->sample_rate, quality->bits_per_sample, quality->channels);
+       return NULL;
+     }
+ 
+   CHECK_NULL(L_AIRPLAY, ams = calloc(1, sizeof(struct airplay_master_session)));
+ 
+   clock_id = use_ptp ? ptpd_clock_id_get() : 0;
+ 
+   ams->rtp_session = rtp_session_new(quality, AIRPLAY_PACKET_BUFFER_SIZE, 0, clock_id);
+   if (!ams->rtp_session)
+     {
+       goto error;
+     }
+ 
+   encode_args.src_ctx = transcode_decode_setup_raw(XCODE_PCM16, quality);
+   if (!encode_args.src_ctx)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not create decoding context\n");
+       goto error;
+     }
+ 
+   ams->encode_ctx = transcode_encode_setup(encode_args);
+   transcode_decode_cleanup(&encode_args.src_ctx);
+   if (!ams->encode_ctx)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Will not be able to stream AirPlay 2, ffmpeg has no ALAC encoder\n");
+       goto error;
+     }
+ 
+   buffer_duration_ms = outputs_buffer_duration_ms_get();
+   if (buffer_duration_ms <= AIRPLAY_AUDIO_LATENCY_MS)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Configuration of start_buffer_ms must be higher than min latency (%d)\n", AIRPLAY_AUDIO_LATENCY_MS);
+       goto error;
+     }
+ 
+   ams->quality = *quality;
+   ams->use_ptp = use_ptp;
+   ams->samples_per_packet = AIRPLAY_SAMPLES_PER_PACKET;
+   ams->rawbuf_size = STOB(ams->samples_per_packet, quality->bits_per_sample, quality->channels);
+-  ams->output_buffer_samples = (buffer_duration_ms - AIRPLAY_AUDIO_LATENCY_MS) * quality->sample_rate / 1000;
++  if (outputs_buffer_samples_get(&buffer_samples, buffer_duration_ms - AIRPLAY_AUDIO_LATENCY_MS, quality->sample_rate, UINT32_MAX) < 0)
++    {
++      DPRINTF(E_LOG, L_AIRPLAY, "Configured output buffer cannot be represented as an RTP sample count\n");
++      goto error;
++    }
++  ams->output_buffer_samples = buffer_samples;
+ 
+   CHECK_NULL(L_AIRPLAY, ams->rawbuf = malloc(ams->rawbuf_size));
+   CHECK_NULL(L_AIRPLAY, ams->input_buffer = evbuffer_new());
+   CHECK_NULL(L_AIRPLAY, ams->encoded_buffer = evbuffer_new());
+ 
+   ams->next = airplay_master_sessions;
+   airplay_master_sessions = ams;
+ 
+   return ams;
+ 
+  error:
+   master_session_free(ams);
+   return NULL;
+ }
+ 
+ static void
+ session_free(struct airplay_session *session)
+ {
+   if (!session)
+     return;
+ 
+   if (session->master_session)
+     master_session_cleanup(session->master_session);
+ 
+   if (session->ctrl)
+     {
+       evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
+       evrtsp_connection_free(session->ctrl);
+     }
+ 
+   if (session->deferredev)
+     event_free(session->deferredev);
+ 
+   if (session->server_fd >= 0)
+     close(session->server_fd);
+ 
+   if (session->ptpd_slave_id > 0)
+     ptpd_slave_remove(session->ptpd_slave_id);
+ 
+   chacha_close(session->packet_cipher_hd);
+ 
+   pair_setup_free(session->pair_setup_ctx);
+   pair_verify_free(session->pair_verify_ctx);
+   pair_cipher_free(session->control_cipher_ctx);
+ 
+   free(session->local_v4_address);
+   free(session->local_v6_address);
+   free(session->realm);
+   free(session->nonce);
+   free(session->address);
+   free(session->devname);
+ 
+   free(session);
+ }
+ 
+ static void
+ session_cleanup(struct airplay_session *session)
+ {
+   struct airplay_session *s;
+ 
+   if (session == airplay_sessions)
+     airplay_sessions = airplay_sessions->next;
+   else
+     {
+       for (s = airplay_sessions; s && (s->next != session); s = s->next)
+ 	; /* EMPTY */
+ 
+       if (!s)
+ 	DPRINTF(E_WARN, L_AIRPLAY, "WARNING: struct airplay_session not found in list; BUG!\n");
+       else
+ 	s->next = session->next;
+     }
+ 
+   outputs_device_session_remove(session->device_id);
+ 
+   session_free(session);
+ }
+ 
+ static void
+ session_failure(struct airplay_session *session)
+ {
+   /* Session failed, let our user know */
+   if (session->state != AIRPLAY_STATE_AUTH)
+     session->state = AIRPLAY_STATE_FAILED;
+ 
+   session_status(session);
+ 
+   session_cleanup(session);
+ }
+ 
+ static void
+ deferred_session_failure_cb(int fd, short what, void *arg)
+ {
+   struct airplay_session *session = arg;
+ 
+   DPRINTF(E_DBG, L_AIRPLAY, "Cleaning up failed session (deferred) on device '%s'\n", session->devname);
+   session_failure(session);
+ }
+ 
+ static void
+@@ -1500,201 +1506,201 @@ session_ids_set(struct airplay_session *session)
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not determine local v4 address\n");
+       goto error;
+     }
+ 
+   intf = strchr(address, '%');
+   if (intf)
+     {
+       *intf = '\0';
+       intf++;
+     }
+   else
+     {
+       ret = net_if_get(ifname, sizeof(ifname), address);
+       intf = (ret < 0) ? NULL : ifname;
+     }
+ 
+   ret = net_mac_get(mac, sizeof(mac), intf);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not determine local MAC address\n");
+       goto error;
+     }
+ 
+   ret = snprintf(session->local_mac_address, sizeof(session->local_mac_address), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+   if ((ret < 0) || (ret >= sizeof(session->local_mac_address)))
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Session URL length exceeds 127 characters\n");
+       goto error;
+     }
+ 
+   DPRINTF(E_DBG, L_AIRPLAY, "Local address: %s port %d, if %s, mac %s\n", address, port, intf, session->local_mac_address);
+ 
+   // Session UUID, ID and session URL
+   uuid_make(session->session_uuid);
+   uuid_make(session->group_uuid);
+ 
+   gcry_randomize(&session->session_id, sizeof(session->session_id), GCRY_STRONG_RANDOM);
+ 
+   ret = snprintf(session->session_url, sizeof(session->session_url), (family == AF_INET) ? "rtsp://%s/%u" : "rtsp://[%s]/%u", address, session->session_id);
+   if ((ret < 0) || (ret >= sizeof(session->session_url)))
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Session URL length exceeds 127 characters\n");
+       goto error;
+     }
+ 
+   if (family == AF_INET)
+     session->local_v4_address = address;
+   else
+     session->local_v6_address = address;
+ 
+   return 0;
+ 
+  error:
+   free(address);
+   return -1;
+ }
+ 
+ static struct airplay_session *
+ session_find_by_address(union net_sockaddr *peer_addr)
+ {
+   struct airplay_session *session;
+   uint32_t *addr_ptr;
+   int family = peer_addr->sa.sa_family;
+ 
+   for (session = airplay_sessions; session; session = session->next)
+     {
+       if (family == session->family)
+ 	{
+ 	  if (family == AF_INET && peer_addr->sin.sin_addr.s_addr == session->naddr.sin.sin_addr.s_addr)
+ 	    break;
+ 
+ 	  if (family == AF_INET6 && IN6_ARE_ADDR_EQUAL(&peer_addr->sin6.sin6_addr, &session->naddr.sin6.sin6_addr))
+ 	    break;
+ 	}
+       else if (family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&peer_addr->sin6.sin6_addr))
+ 	{
+ 	  // ipv4 mapped to ipv6 consists of 16 bytes/4 words: 0x00000000 0x00000000 0x0000ffff 0x[IPv4]
+ 	  addr_ptr = (uint32_t *)(&peer_addr->sin6.sin6_addr);
+ 	  if (addr_ptr[3] == session->naddr.sin.sin_addr.s_addr)
+ 	    break;
+ 	}
+     }
+ 
+   return session;
+ }
+ 
+ static struct airplay_session *
+ session_make(struct output_device *device, int callback_id)
+ {
+   struct airplay_session *session;
+   struct airplay_extra *extra;
+   int ret;
+ 
+   extra = device->extra_device_info;
+ 
+   CHECK_NULL(L_AIRPLAY, session = calloc(1, sizeof(struct airplay_session)));
+   CHECK_NULL(L_AIRPLAY, session->deferredev = evtimer_new(evbase_player, deferred_session_failure_cb, session));
+ 
+   session->devname = strdup(device->name);
+   session->volume = device->volume;
+-  session->offset_samples = device->offset_ms * device->quality.sample_rate / 1000;
++  session->offset_samples = (int64_t)device->offset_ms * device->quality.sample_rate / 1000;
+ 
+   session->state = AIRPLAY_STATE_STOPPED;
+   session->reqs_in_flight = 0;
+   session->cseq = 1;
+ 
+   session->device_id = device->id;
+   session->callback_id = callback_id;
+ 
+   session->server_fd = -1;
+ 
+   session->password = device->password;
+ 
+   session->supports_auth_setup = extra->supports_auth_setup;
+   session->wanted_metadata = extra->wanted_metadata;
+   session->supports_encryption = extra->supports_encryption;
+ 
+   session->next_seq = AIRPLAY_SEQ_CONTINUE;
+   session->timing_svc = &airplay_timing_svc;
+   session->control_svc = &airplay_control_svc;
+ 
+   ret = session_connection_setup(session, device, AF_INET6);
+   if (ret < 0)
+     {
+       ret = session_connection_setup(session, device, AF_INET);
+       if (ret < 0)
+ 	goto error;
+     }
+ 
+   session->master_session = master_session_make(&device->quality, extra->use_ptp);
+   if (!session->master_session)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not attach a master session for device '%s'\n", device->name);
+       goto error;
+     }
+ 
+   // Attach to list of sessions
+   session->next = airplay_sessions;
+   airplay_sessions = session;
+ 
+   // rs is now the official device session
+   outputs_device_session_add(device->id, session);
+ 
+   return session;
+ 
+  error:
+   session_free(session);
+ 
+   return NULL;
+ }
+ 
+ 
+ /* ----------------------------- Metadata handling -------------------------- */
+ 
+ static void
+ airplay_metadata_free(struct airplay_metadata *rmd)
+ {
+   if (!rmd)
+     return;
+ 
+   if (rmd->metadata)
+     evbuffer_free(rmd->metadata);
+   if (rmd->artwork)
+     evbuffer_free(rmd->artwork);
+ 
+   free(rmd);
+ }
+ 
+ static void
+ airplay_metadata_purge(void)
+ {
+   if (!airplay_cur_metadata)
+     return;
+ 
+   airplay_metadata_free(airplay_cur_metadata->priv);
+   free(airplay_cur_metadata);
+   airplay_cur_metadata = NULL;
+ }
+ 
+ // *** Thread: worker ***
+ static void *
+ airplay_metadata_prepare(struct output_metadata *metadata)
+ {
+   struct db_queue_item *queue_item;
+   struct airplay_metadata *rmd;
+   struct evbuffer *tmp;
+   int ret;
+ 
+   queue_item = db_queue_fetch_byitemid(metadata->item_id);
+   if (!queue_item)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not fetch queue item\n");
+       return NULL;
+     }
+ 
+   CHECK_NULL(L_AIRPLAY, rmd = calloc(1, sizeof(struct airplay_metadata)));
+   CHECK_NULL(L_AIRPLAY, rmd->artwork = evbuffer_new());
+   CHECK_NULL(L_AIRPLAY, rmd->metadata = evbuffer_new());
+   CHECK_NULL(L_AIRPLAY, tmp = evbuffer_new());
+ 
+   ret = artwork_get_by_queue_item_id(rmd->artwork, queue_item->id, ART_DEFAULT_WIDTH, ART_DEFAULT_HEIGHT, 0);
+@@ -2090,201 +2096,201 @@ packets_send(struct airplay_master_session *ams)
+   if (len < 0)
+     return -1;
+ 
+   pkt = rtp_packet_next(ams->rtp_session, len, ams->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE);
+ 
+   evbuffer_remove(ams->encoded_buffer, pkt->payload, pkt->payload_len);
+ 
+   for (session = airplay_sessions; session; session = session->next)
+     {
+       if (session->master_session != ams)
+ 	continue;
+ 
+       // Device just joined
+       if (session->state == AIRPLAY_STATE_CONNECTED)
+ 	{
+ 	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
+ 	  packet_send(session, pkt);
+ 	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
+ 	}
+       else if (session->state == AIRPLAY_STATE_STREAMING)
+ 	{
+ 	  packet_send(session, pkt);
+ 	}
+     }
+ 
+   // Commits packet to retransmit buffer, and prepares the session for the next packet
+   rtp_packet_commit(ams->rtp_session, pkt);
+ 
+   return 0;
+ }
+ 
+ // Overview of rtptimes as they should be when starting a stream, and assuming
+ // the first rtptime (pos) is 88200:
+ //   sync pkt:  cur_pos = 0, rtptime = 88200
+ //   audio pkt: rtptime = 88200
+ //   RECORD:    rtptime = 88200
+ //   SET_PARAMETER text/artwork:
+ //              rtptime = 88200
+ //   SET_PARAMETER progress:
+ //              progress = 72840/~88200/[len]
+ static inline void
+ timestamp_set(struct airplay_master_session *ams, struct timespec ts)
+ {
+   // The last write from the player had a timestamp which has been passed to
+   // this function as ts. This is the player clock, which is more precise than
+   // the actual clock because it gives us a calculated time reference, which is
+   // independent of how busy the thread is. We save that here, we need this for
+   // reference when sending sync packets and progress.
+   ams->cur_stamp.ts = ts;
+ 
+   // So what rtptime should be playing, i.e. coming out of the speaker, at time
+   // ts (which is normally "now")? Let's calculate by example:
+   //   - we started playback with a rtptime (pos) of X
+   //   - up until time ts we have received a 1000 samples from the player
+   //   - ams->output_buffer_samples is configured to 400 samples
+   //   -> we should be playing rtptime X + 600
+   //
+   // So how do we measure samples received from player? We know that from the
+   // pos, which says how much has been sent to the device, and from ams->input_buffer,
+   // which is the unsent stuff being buffered:
+   //   - received = (pos - X) + ams->input_buffer_samples
+   //
+   // This means the rtptime is computed as:
+   //   - rtptime = X + received - ams->output_buffer_samples
+   //   -> rtptime = X + (pos - X) + ams->input_buffer_samples - ams->out_buffer_samples
+   //   -> rtptime = pos + ams->input_buffer_samples - ams->output_buffer_samples
+   ams->cur_stamp.pos = ams->rtp_session->pos + ams->input_buffer_samples - ams->output_buffer_samples;
+ }
+ 
+ static void
+ packets_sync_send(struct airplay_master_session *ams)
+ {
+   struct rtp_packet *sync_pkt;
+   struct rtcp_timestamp cur_stamp;
+   struct airplay_session *session;
+   struct timespec ts;
+   bool is_sync_time;
+ 
+   // Check if it is time send a sync packet to sessions that are already running
+   is_sync_time = rtp_sync_is_time(ams->rtp_session);
+ 
+   // Just used for logging, the clock shouldn't be too far from ams->cur_stamp.ts
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+ 
+   for (session = airplay_sessions; session; session = session->next)
+     {
+       if (session->master_session != ams)
+ 	continue;
+ 
+       cur_stamp = ams->cur_stamp;
+ 
+       // Apply user configured offset
+       cur_stamp.pos -= session->offset_samples;
+ 
+       // A device has joined and should get an init sync packet
+       if (session->state == AIRPLAY_STATE_CONNECTED)
+ 	{
+ 	  sync_pkt = rtp_sync_packet_next(ams->rtp_session, cur_stamp, 0x90);
+ 	  control_packet_send(session, sync_pkt);
+ 
+-	  DPRINTF(E_DBG, L_AIRPLAY, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 ", timing=%s\n",
++	  DPRINTF(E_DBG, L_AIRPLAY, "Start sync packet sent to '%s': offset=%" PRIi64 ", cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 ", timing=%s\n",
+ 	    session->devname, session->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec,
+ 	    ams->rtp_session->pos, ams->use_ptp ? "PTP" : "NTP");
+ 	}
+       else if (is_sync_time && session->state == AIRPLAY_STATE_STREAMING)
+ 	{
+ 	  sync_pkt = rtp_sync_packet_next(ams->rtp_session, cur_stamp, 0x80);
+ 	  control_packet_send(session, sync_pkt);
+ 	}
+     }
+ }
+ 
+ 
+ /* ------------------------- Time and control service ----------------------- */
+ 
+ static void
+ service_stop(struct airplay_service *svc)
+ {
+   if (svc->ev4)
+     event_free(svc->ev4);
+   if (svc->ev6)
+     event_free(svc->ev6);
+ 
+   svc->ev4 = NULL;
+   svc->ev6 = NULL;
+ 
+   net_socket_close(&svc->socket);
+ 
+   svc->port = 0;
+ }
+ 
+ static int
+ service_start(struct airplay_service *svc, event_callback_fn cb, unsigned short port, const char *log_service_name)
+ {
+   int ret;
+ 
+   memset(svc, 0, sizeof(struct airplay_service));
+ 
+   svc->socket.fd4 = -1;
+   svc->socket.fd6 = -1;
+ 
+   ret = net_bind(&svc->socket, &port, SOCK_DGRAM, log_service_name);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not start '%s' service\n", log_service_name);
+       goto error;
+     }
+ 
+   if (svc->socket.fd4 >= 0) {
+     svc->ev4 = event_new(evbase_player, svc->socket.fd4, EV_READ | EV_PERSIST, cb, svc);
+     if (!svc->ev4)
+       goto error;
+ 
+     event_add(svc->ev4, NULL);
+   }
+ 
+   if (svc->socket.fd6 >= 0) {
+     svc->ev6 = event_new(evbase_player, svc->socket.fd6, EV_READ | EV_PERSIST, cb, svc);
+     if (!svc->ev6)
+       goto error;
+ 
+     event_add(svc->ev6, NULL);
+   }
+ 
+   svc->port = port;
+ 
+   return 0;
+ 
+  error:
+   service_stop(svc);
+   return -1;
+ }
+ 
+ static void
+ timing_svc_cb(int fd, short what, void *arg)
+ {
+   union net_sockaddr peer_addr;
+   socklen_t peer_addrlen = sizeof(peer_addr);
+   char address[INET6_ADDRSTRLEN];
+   uint8_t req[32];
+   uint8_t res[32];
+   struct ntp_stamp recv_stamp;
+   struct ntp_stamp xmit_stamp;
+   int ret;
+ 
+   ret = timing_get_clock_ntp(&recv_stamp);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Couldn't get receive timestamp\n");
+       return;
+     }
+ 
+   peer_addrlen = sizeof(peer_addr);
+   ret = recvfrom(fd, req, sizeof(req), 0, &peer_addr.sa, &peer_addrlen);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Error reading timing request: %s\n", strerror(errno));
+       return;
+     }
+ 
+   if (ret != 32)
+diff --git a/src/outputs/alsa.c b/src/outputs/alsa.c
+index ae4475fd5c1e711fac6b394371f129d82f28a050..0cea8e9de3e74931f98df82976ef908067a81796 100644
+--- a/src/outputs/alsa.c
++++ b/src/outputs/alsa.c
+@@ -648,257 +648,264 @@ pcm_configure(snd_pcm_t *hdl)
+   ret = snd_pcm_sw_params_current(hdl, sw_params);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not retrieve current sw params: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_sw_params_set_tstamp_type(hdl, sw_params, SND_PCM_TSTAMP_TYPE_MONOTONIC);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set tstamp type: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_sw_params_set_tstamp_mode(hdl, sw_params, SND_PCM_TSTAMP_ENABLE);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set tstamp mode: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   ret = snd_pcm_sw_params(hdl, sw_params);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not set sw params: %s\n", snd_strerror(ret));
+       goto out_fail;
+     }
+ 
+   snd_pcm_sw_params_free(sw_params);
+ 
+   return 0;
+ 
+  out_fail:
+   snd_pcm_sw_params_free(sw_params);
+ 
+   return -1;
+ }
+ 
+ static void
+ playback_session_free(struct alsa_playback_session *pb)
+ {
+   if (!pb)
+     return;
+ 
+   // Unsubscribe from qualities that sync_correct() might have requested
+   if (pb->sync_resample_step != 0)
+     outputs_quality_unsubscribe(&pb->quality);
+ 
+   pcm_close(pb->pcm);
+ 
+   ringbuffer_free(&pb->prebuf, 1);
+ 
+   free(pb->latency_history);
+   free(pb->volume_buf);
+   free(pb);
+ }
+ 
+ static void
+ playback_session_remove(struct alsa_session *as, struct alsa_playback_session *pb)
+ {
+   struct alsa_playback_session *s;
+ 
+   DPRINTF(E_DBG, L_LAUDIO, "Removing playback session (quality %d/%d/%d) from ALSA device '%s'\n",
+     pb->quality.sample_rate, pb->quality.bits_per_sample, pb->quality.channels, as->devname);
+ 
+   if (pb == as->pb)
+     as->pb = as->pb->next;
+   else
+     {
+       for (s = as->pb; s && (s->next != pb); s = s->next)
+ 	; /* EMPTY */
+ 
+       if (!s)
+ 	DPRINTF(E_WARN, L_LAUDIO, "WARNING: struct alsa_playback_session not found in list; BUG!\n");
+       else
+ 	s->next = pb->next;
+     }
+ 
+   playback_session_free(pb);
+ }
+ 
+ static void
+ playback_session_remove_all(struct alsa_session *as)
+ {
+   struct alsa_playback_session *s;
+ 
+   for (s = as->pb; s; s = as->pb)
+     {
+       as->pb = s->next;
+       playback_session_free(s);
+     }
+ }
+ 
+ static int
+ playback_session_add(struct alsa_session *as, struct media_quality *quality, struct timespec pts)
+ {
+   struct alsa_playback_session *pb;
+   struct alsa_playback_session *tail_pb;
+   struct timespec delay_ts;
+   size_t size;
++  uint64_t buffer_samples, buffer_bytes;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_LAUDIO, "Adding playback session (quality %d/%d/%d) to ALSA device '%s'\n",
+     quality->sample_rate, quality->bits_per_sample, quality->channels, as->devname);
+ 
+   CHECK_NULL(L_LAUDIO, pb = calloc(1, sizeof(struct alsa_playback_session)));
+   CHECK_NULL(L_LAUDIO, pb->latency_history = calloc(alsa_latency_history_size, sizeof(double)));
+   pb->session = as;
+ 
+   ret = pcm_open(&pb->pcm, as->devname, quality, as->pcm_identity_file);
+   if (ret == ALSA_ERROR_DEVICE_BUSY)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "ALSA device '%s' won't open due to existing session (no support for concurrent audio), truncating audio\n", as->devname);
+       playback_session_remove_all(as);
+       ret = pcm_open(&pb->pcm, as->devname, quality, as->pcm_identity_file);
+       if (ret == ALSA_ERROR_DEVICE_BUSY)
+ 	{
+ 	  DPRINTF(E_LOG, L_LAUDIO, "ALSA device '%s' failed: Device still busy after closing previous sessions\n", as->devname);
+ 	  goto error;
+ 	}
+     }
+ 
+   if (ret == ALSA_ERROR_IDENTITY)
+     goto error; /* No fallback may bypass a failed physical identity fence. */
+ 
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Device '%s' does not support quality (%d/%d/%d), falling back to default\n", as->devname, quality->sample_rate, quality->bits_per_sample, quality->channels);
+       ret = pcm_open(&pb->pcm, as->devname, &alsa_fallback_quality, as->pcm_identity_file);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_LOG, L_LAUDIO, "ALSA device failed setting fallback quality\n");
+ 	  goto error;
+ 	}
+ 
+       pb->quality = alsa_fallback_quality;
+     }
+   else
+     pb->quality = *quality;
+ 
+   // If this fails it just means we won't get timestamps, which we can handle
+   pcm_configure(pb->pcm);
+ 
+   dump_config(pb->pcm);
+ 
+   // Time stamps used for syncing, here we set when playback should start
+   delay_ts.tv_sec = as->delay_ms / 1000;
+   delay_ts.tv_nsec = as->delay_ms % 1000 * 1000000UL;
+   pb->stamp_pts = timespec_add(pts, delay_ts);
+ 
+   // The difference between pos and start pos should match the 2 second buffer
+   // that e.g. AirPlay uses + user configured offset_ms. We will not use alsa's
+   // buffer for the initial buffering, because my sound card's start_threshold
+   // is not to be counted on. Instead we allocate our own buffer, and when it is
+   // time to play we write as much as we can to alsa's buffer.
+-  pb->buffer_nsamp = as->delay_ms * pb->quality.sample_rate / 1000;
+-  size = STOB(pb->buffer_nsamp, pb->quality.bits_per_sample, pb->quality.channels);
++  if (outputs_buffer_samples_get(&buffer_samples, as->delay_ms, pb->quality.sample_rate, INT_MAX) < 0
++      || outputs_buffer_size_get(&buffer_bytes, buffer_samples, pb->quality.bits_per_sample, pb->quality.channels, SIZE_MAX) < 0)
++    {
++      DPRINTF(E_LOG, L_LAUDIO, "Configured ALSA prebuffer cannot be represented safely\n");
++      goto error;
++    }
++  pb->buffer_nsamp = buffer_samples;
++  size = buffer_bytes;
+   ringbuffer_init(&pb->prebuf, size);
+ 
+   // Add to the end of the list, because when we iterate through it in
+   // alsa_write() we want to write data from the oldest playback session first
+   if (as->pb)
+     {
+       for (tail_pb = as->pb; tail_pb->next; tail_pb = tail_pb->next)
+         ; // Fast forward
+       tail_pb->next = pb;
+     }
+   else
+     as->pb = pb;
+ 
+   return 0;
+ 
+  error:
+   playback_session_free(pb);
+ 
+   return -1;
+ }
+ 
+ /* Keep every buffered block raw until submission. Gain changes neither the
+  * source buffer nor frame counts, timestamps, queue state or synchronization.
+  */
+ static snd_pcm_sframes_t
+ pcm_write(struct alsa_playback_session *pb, const uint8_t *buf, snd_pcm_sframes_t nsamp)
+ {
+   struct alsa_session *as = pb->session;
+   uint8_t *allocated;
+   ssize_t bytes;
+   size_t frame_bytes;
+ 
+   if (!as->software_volume)
+     return snd_pcm_writei(pb->pcm, buf, nsamp);
+   if (nsamp < 0 || pb->quality.channels <= 0
+       || (pb->quality.bits_per_sample != 16 && pb->quality.bits_per_sample != 24
+           && pb->quality.bits_per_sample != 32))
+     return -EINVAL;
+   if (nsamp == 0)
+     return 0;
+   if ((size_t)pb->quality.channels > SIZE_MAX / (pb->quality.bits_per_sample / 8))
+     return -EINVAL;
+   frame_bytes = (size_t)(pb->quality.bits_per_sample / 8) * pb->quality.channels;
+   if ((uint64_t)nsamp > (uint64_t)SSIZE_MAX / frame_bytes)
+     return -EINVAL;
+   bytes = snd_pcm_frames_to_bytes(pb->pcm, nsamp);
+   if (bytes < 0 || (size_t)bytes != (size_t)nsamp * frame_bytes)
+     return -EINVAL;
+   if ((size_t)bytes > pb->volume_bufsize)
+     {
+       allocated = realloc(pb->volume_buf, bytes);
+       if (!allocated)
+         return -ENOMEM;
+       pb->volume_buf = allocated;
+       pb->volume_bufsize = bytes;
+     }
+   if (pcm_volume_scale_copy(pb->volume_buf, buf, bytes, pb->quality.bits_per_sample, as->volume) < 0)
+     return -EINVAL;
+ 
+   return snd_pcm_writei(pb->pcm, pb->volume_buf, nsamp);
+ }
+ 
+ // This function writes the sample buf into either the prebuffer or directly to
+ // ALSA, depending on how much room there is in ALSA, and whether we are
+ // prebuffering or not. It also transfers from the the prebuffer to ALSA, if
+ // needed. Returns 0 on success, negative on error.
+ static int
+ buffer_write(struct alsa_playback_session *pb, struct output_data *odata, snd_pcm_sframes_t avail)
+ {
+   uint8_t *buf;
+   ssize_t bufsize;
+   size_t wrote;
+   snd_pcm_sframes_t nsamp;
+   snd_pcm_sframes_t ret;
+ 
+   // Prebuffering, no actual writing
+   if (avail == 0)
+     {
+       wrote = ringbuffer_write(&pb->prebuf, odata->buffer, odata->bufsize);
+       if (wrote < odata->bufsize)
+ 	DPRINTF(E_WARN, L_LAUDIO, "Bug! Partial prebuf write %zu/%zu\n", wrote, odata->bufsize);
+ 
+       nsamp = snd_pcm_bytes_to_frames(pb->pcm, wrote);
+       return nsamp;
+     }
+ 
+   // Read from prebuffer if it has data and write to device
+   if (pb->prebuf.read_avail != 0)
+     {
+       // Maximum amount of bytes we want to read
+       bufsize = snd_pcm_frames_to_bytes(pb->pcm, avail);
+ 
+       bufsize = ringbuffer_read(&buf, bufsize, &pb->prebuf);
+       if (bufsize == 0)
+ 	return 0;
+ 
+ //      DPRINTF(E_DBG, L_LAUDIO, "Writing prebuffer (read_avail=%zu, bufsize=%zu, avail=%li)\n", pb->prebuf.read_avail, bufsize, avail);
+ 
+       nsamp = snd_pcm_bytes_to_frames(pb->pcm, bufsize);
+ 
+@@ -1379,183 +1386,183 @@ static void
+ alsa_write(struct output_buffer *obuf)
+ {
+   struct alsa_session *as;
+   struct alsa_session *as_next;
+   struct alsa_playback_session *pb;
+   struct alsa_playback_session *pb_next;
+   bool quality_changed;
+   int ret;
+ 
+   quality_changed = !quality_is_equal(&obuf->data[0].quality, &alsa_last_quality);
+   alsa_last_quality = obuf->data[0].quality;
+ 
+   for (as = sessions; as; as = as->next)
+     {
+       if (quality_changed || as->state == OUTPUT_STATE_CONNECTED)
+ 	{
+ 	  ret = playback_session_add(as, &obuf->data[0].quality, obuf->pts);
+ 	  if (ret < 0)
+ 	    {
+ 	      as->state = OUTPUT_STATE_FAILED;
+ 	      continue;
+ 	    }
+ 
+ 	  as->state = OUTPUT_STATE_STREAMING;
+ 	}
+ 
+       for (pb = as->pb; pb; pb = pb_next)
+ 	{
+ 	  pb_next = pb->next;
+ 
+ 	  // If !pb_next then it means that it is the most recent session, so it
+ 	  // is setup with the quality level that matches obuf. The other pb's
+ 	  // may still have data that needs to be written before removal.
+ 	  if (!pb_next)
+ 	    ret = playback_write(pb, obuf);
+ 	  else
+ 	    ret = playback_drain(pb);
+ 
+ 	  if (ret < 0)
+ 	    {
+ 	      playback_session_remove(as, pb); // pb becomes invalid
+ 	      if (ret == ALSA_ERROR_WRITE)
+ 		as->state = OUTPUT_STATE_FAILED;
+ 	      else if (ret == ALSA_ERROR_UNDERRUN)
+ 		as->state = OUTPUT_STATE_CONNECTED;
+ 	    }
+ 	}
+     }
+ 
+   // Cleanup failed sessions
+   for (as = sessions; as; as = as_next)
+     {
+       as_next = as->next;
+ 
+       if (as->state == OUTPUT_STATE_FAILED)
+ 	alsa_status(as); // as becomes invalid
+     }
+ }
+ 
+ static void
+ alsa_device_add(cfg_t* cfg_audio, int id)
+ {
+   struct output_device *device;
+   struct alsa_extra *ae;
+   const char *nickname;
+   int offset_ms;
+   int ret;
+ 
+   if (outputs_exclusive_mode_get() && !(cfg_audio && cfg_getbool(cfg_audio, "exclusive")))
+     {
+       DPRINTF(E_INFO, L_LAUDIO, "ALSA device ignored, other speaker(s) set as exclusive\n");
+       return;
+     }
+ 
+   CHECK_NULL(L_LAUDIO, device = calloc(1, sizeof(struct output_device)));
+   CHECK_NULL(L_LAUDIO, ae = calloc(1, sizeof(struct alsa_extra)));
+ 
+   device->id = id;
+   device->type = OUTPUT_TYPE_ALSA;
+   device->type_name = outputs_name(device->type);
+   device->extra_device_info = ae;
+   device->supported_formats = MEDIA_FORMAT_PCM;
+ 
+   // The audio section will have no title, so there we get the value from the
+   // "card" option
+   ae->card_name = cfg_title(cfg_audio);
+   if (!ae->card_name)
+     ae->card_name = cfg_getstr(cfg_audio, "card");
+ 
+   nickname = cfg_getstr(cfg_audio, "nickname");
+   device->name = strdup(nickname ? nickname : ae->card_name);
+ 
+   ae->mixer_name = cfg_getstr(cfg_audio, "mixer");
+   ae->mixer_device_name = cfg_getstr(cfg_audio, "mixer_device");
+   if (!ae->mixer_device_name || strlen(ae->mixer_device_name) == 0)
+     ae->mixer_device_name = ae->card_name;
+   ae->pcm_identity_file = cfg_getstr(cfg_audio, "pcm_identity_file");
+   ae->software_volume = cfg_getbool(cfg_audio, "software_volume");
+ 
+   offset_ms = cfg_getint(cfg_audio, "offset_ms");
+-  if (abs(offset_ms) > 1000)
++  if (offset_ms < -1000 || offset_ms > 1000)
+     DPRINTF(E_LOG, L_LAUDIO, "The ALSA offset_ms (%d) set in the configuration is out of bounds (-1000 -> 1000)\n", offset_ms);
+   else
+     device->offset_ms = offset_ms;
+ 
+   DPRINTF(E_INFO, L_LAUDIO, "Adding ALSA device '%s' with name '%s'\n", ae->card_name, device->name);
+ 
+   ret = player_device_add(device);
+   if (ret < 0)
+     outputs_device_free(device);
+ }
+ 
+ static int
+ alsa_init(void)
+ {
+   cfg_t *cfg_audio;
+   cfg_t *cfg_alsasec;
+   const char *type;
+   int i;
+   int alsa_cfg_secn;
+ 
+   // Is ALSA enabled in config?
+   cfg_audio = cfg_getsec(cfg, "audio");
+   type = cfg_getstr(cfg_audio, "type");
+   if (type && (strcasecmp(type, "alsa") != 0))
+     return -1;
+ 
+   cards_list();
+ 
+   alsa_sync_disable = cfg_getbool(cfg_audio, "sync_disable");
+   alsa_latency_history_size = cfg_getint(cfg_audio, "adjust_period_seconds");
+ 
+   alsa_cfg_secn = cfg_size(cfg, "alsa");
+   if (alsa_cfg_secn == 0)
+     {
+       alsa_device_add(cfg_audio, 0);
+     }
+   else
+     {
+       for (i = 0; i < alsa_cfg_secn; ++i)
+         {
+           cfg_alsasec = cfg_getnsec(cfg, "alsa", i);
+           alsa_device_add(cfg_alsasec, i);
+         }
+     }
+ 
+   snd_lib_error_set_handler(logger_alsa);
+ 
+   return 0;
+ }
+ 
+ static void
+ alsa_deinit(void)
+ {
+   struct alsa_session *as;
+ 
+   snd_lib_error_set_handler(NULL);
+ 
+   for (as = sessions; sessions; as = sessions)
+     {
+       sessions = as->next;
+       alsa_session_free(as);
+     }
+ }
+ 
+ struct output_definition output_alsa =
+ {
+   .name = "ALSA",
+   .cfg_name = "alsa",
+   .type = OUTPUT_TYPE_ALSA,
+   .priority = 3,
+   .disabled = 0,
+   .init = alsa_init,
+   .deinit = alsa_deinit,
+   .device_start = alsa_device_start,
+   .device_stop = alsa_device_stop,
+   .device_flush = alsa_device_flush,
+   .device_probe = alsa_device_probe,
+   .device_volume_set = alsa_device_volume_set,
+   .device_cb_set = alsa_device_cb_set,
+   .device_free_extra = alsa_device_free_extra,
+   .write = alsa_write,
+ };
+diff --git a/src/outputs/cast.c b/src/outputs/cast.c
+index d3aefbeb81107089f4d8db2d35a2170d293f8d65..e995f20a872781f8e9b15ada6ba8d4ee252880b5 100644
+--- a/src/outputs/cast.c
++++ b/src/outputs/cast.c
+@@ -1843,338 +1843,338 @@ cast_reply_timeout_cb(int fd, short what, void *arg)
+   struct cast_session *cs = arg;
+   struct cast_reply_entry entry;
+   int64_t now = cast_reply_now(), earliest = INT64_MAX;
+   unsigned int request_id = 0, i;
+   int taken;
+   if (now < 0)
+     goto error;
+   for (i = 0; i < CALLBACK_REGISTER_SIZE; i++)
+     if (cs->callback_register[i].completion && cs->callback_register[i].deadline_ns < earliest)
+       { earliest = cs->callback_register[i].deadline_ns; request_id = cs->callback_register[i].request_id; }
+   if (!request_id || earliest > now)
+     {
+       if (cast_reply_schedule(cs) < 0)
+         goto error;
+       return;
+     }
+   taken = cast_reply_take(cs, request_id, &entry);
+   if (taken < 0)
+     goto error;
+   if (taken > 0 && entry.callback_id == cs->callback_id)
+     entry.completion(cs, NULL);
+   return;
+  error:
+   cs->state = CAST_STATE_CONNECTED;
+   cast_session_shutdown(cs, CAST_STATE_FAILED);
+ }
+ 
+ static void
+ cast_device_cb(const char *name, const char *type, const char *domain, const char *hostname, int family, const char *address, int port, struct keyval *txt)
+ {
+   struct output_device *device;
+   const char *friendly_name;
+   cfg_t *devcfg;
+   int offset_ms;
+   uint32_t id;
+ 
+   id = djb_hash(name, strlen(name));
+ 
+   friendly_name = keyval_get(txt, "fn");
+   if (friendly_name)
+     name = friendly_name;
+ 
+   DPRINTF(E_DBG, L_CAST, "Event for Chromecast device '%s' (port %d, id %" PRIu32 ")\n", name, port, id);
+ 
+   devcfg = cfg_gettsec(cfg, "chromecast", name);
+   if (devcfg && cfg_getbool(devcfg, "exclude"))
+     {
+       DPRINTF(E_LOG, L_CAST, "Excluding Chromecast device '%s' as set in config\n", name);
+       return;
+     }
+   if (outputs_exclusive_mode_get() && !(devcfg && cfg_getbool(devcfg, "exclusive")))
+     {
+       DPRINTF(E_INFO, L_CAST, "Chromecast device '%s' ignored, other speaker(s) set as exclusive\n", name);
+       return;
+     }
+   if (devcfg && cfg_getstr(devcfg, "nickname"))
+     {
+       name = cfg_getstr(devcfg, "nickname");
+     }
+ 
+   device = calloc(1, sizeof(struct output_device));
+   if (!device)
+     {
+       DPRINTF(E_LOG, L_CAST, "Out of memory for new Chromecast device\n");
+       return;
+     }
+ 
+   device->id = id;
+   device->name = strdup(name);
+   device->type = OUTPUT_TYPE_CAST;
+   device->type_name = outputs_name(device->type);
+   device->supported_formats = MEDIA_FORMAT_OPUS;
+ 
+   if (port < 0)
+     {
+       /* Device stopped advertising */
+       switch (family)
+ 	{
+ 	  case AF_INET:
+ 	    device->v4_port = 1;
+ 	    break;
+ 
+ 	  case AF_INET6:
+ 	    device->v6_port = 1;
+ 	    break;
+ 	}
+ 
+       player_device_remove(device);
+ 
+       return;
+     }
+ 
+   device->max_volume = devcfg ? cfg_getint(devcfg, "max_volume") : CAST_CONFIG_MAX_VOLUME;
+   if ((device->max_volume < 1) || (device->max_volume > CAST_CONFIG_MAX_VOLUME))
+     {
+       DPRINTF(E_LOG, L_CAST, "Config has bad max_volume (%d) for device '%s', using default instead\n", device->max_volume, name);
+       device->max_volume = CAST_CONFIG_MAX_VOLUME;
+     }
+ 
+   offset_ms = devcfg ? cfg_getint(devcfg, "offset_ms") : 0;
+-  if (abs(offset_ms) > CAST_OFFSET_MAX)
++  if (offset_ms < -CAST_OFFSET_MAX || offset_ms > CAST_OFFSET_MAX)
+     DPRINTF(E_LOG, L_CAST, "The offset_ms (%d) set in the configuration for '%s' is out of bounds (-%d -> %d)\n", offset_ms, name, CAST_OFFSET_MAX, CAST_OFFSET_MAX);
+   else
+     device->offset_ms = offset_ms;
+ 
+   DPRINTF(E_INFO, L_CAST, "Adding Chromecast device '%s'\n", name);
+ 
+   device->advertised = 1;
+ 
+   switch (family)
+     {
+       case AF_INET:
+ 	device->v4_address = strdup(address);
+ 	device->v4_port = port;
+ 	break;
+ 
+       case AF_INET6:
+ 	device->v6_address = strdup(address);
+ 	device->v6_port = port;
+ 	break;
+     }
+ 
+   player_device_add(device);
+ }
+ 
+ 
+ /* --------------------- SESSION CONSTRUCTION AND SHUTDOWN ------------------ */
+ 
+ static struct cast_master_session *
+ master_session_make(struct media_quality *quality)
+ {
+   struct cast_master_session *cms;
+   int ret;
+ 
+   // First check if we already have a master session, then just use that
+   if (cast_master_session)
+     return cast_master_session;
+ 
+   // Let's create a master session
+   ret = outputs_quality_subscribe(quality);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not subscribe to required audio quality (%d/%d/%d)\n", quality->sample_rate, quality->bits_per_sample, quality->channels);
+       return NULL;
+     }
+ 
+   CHECK_NULL(L_CAST, cms = calloc(1, sizeof(struct cast_master_session)));
+ 
+   CHECK_NULL(L_CAST, cms->rtp_session = rtp_session_new(quality, CAST_PACKET_BUFFER_SIZE, 0, 0));
+   // Change the SSRC to be in the interval [CAST_SSRC_AUDIO_MIN, CAST_SSRC_AUDIO_MAX]
+   cms->rtp_session->ssrc_id = ((cms->rtp_session->ssrc_id + CAST_SSRC_AUDIO_MIN) % CAST_SSRC_AUDIO_MAX) + CAST_SSRC_AUDIO_MIN;
+ 
+   cms->rtp_session->seqnum = 0; // TODO test
+ 
+   cms->quality = *quality;
+   cms->samples_per_packet = CAST_SAMPLES_PER_PACKET;
+   cms->rawbuf_size = STOB(cms->samples_per_packet, quality->bits_per_sample, quality->channels);
+ 
+   CHECK_NULL(L_CAST, cms->rawbuf = malloc(cms->rawbuf_size));
+   CHECK_NULL(L_CAST, cms->evbuf = evbuffer_new());
+ 
+   CHECK_NULL(L_CAST, cms->rtp_artwork = rtp_session_new(NULL, CAST_PACKET_ARTWORK_SIZE, 0, 0));
+   // Change the SSRC to be in the interval [CAST_SSRC_VIDEO_MIN, CAST_SSRC_VIDEO_MAX]
+   cms->rtp_artwork->ssrc_id = ((cms->rtp_artwork->ssrc_id + CAST_SSRC_VIDEO_MIN) % CAST_SSRC_VIDEO_MAX) + CAST_SSRC_VIDEO_MIN;
+ 
+   cast_master_session = cms;
+ 
+   return cms;
+ }
+ 
+ static struct cast_session *
+ cast_session_make(struct output_device *device, int family, int callback_id)
+ {
+   struct cast_session *cs;
+   const char *proto;
+   const char *err;
+   char *address;
+   unsigned short port;
+   uint64_t delay_ms;
+   int flags;
+   int ret;
+ 
+   switch (family)
+     {
+       case AF_INET:
+ 	/* We always have the v4 services, so no need to check */
+ 	if (!device->v4_address)
+ 	  return NULL;
+ 
+ 	address = device->v4_address;
+ 	port = device->v4_port;
+ 	break;
+ 
+       case AF_INET6:
+ 	if (!device->v6_address)
+ 	  return NULL;
+ 
+ 	address = device->v6_address;
+ 	port = device->v6_port;
+ 	break;
+ 
+       default:
+ 	return NULL;
+     }
+ 
+   CHECK_NULL(L_CAST, cs = calloc(1, sizeof(struct cast_session)));
+ 
+   cs->state = CAST_STATE_DISCONNECTED;
+   cs->device_id = device->id;
+   cs->callback_id = callback_id;
+ 
+   cs->master_session = master_session_make(&cast_quality_default);
+   if (!cs->master_session)
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not attach a master session for device '%s'\n", device->name);
+       goto out_free_session;
+     }
+ 
+   cs->ssrc_id = cs->master_session->rtp_session->ssrc_id;
+ 
+   /* Init TLS session, use default priorities and put the x509 credentials to the current session */
+   if ( ((ret = gnutls_init(&cs->tls_session, GNUTLS_CLIENT)) != GNUTLS_E_SUCCESS) ||
+        ((ret = gnutls_priority_set_direct(cs->tls_session, "PERFORMANCE", &err)) != GNUTLS_E_SUCCESS) ||
+        ((ret = gnutls_credentials_set(cs->tls_session, GNUTLS_CRD_CERTIFICATE, tls_credentials)) != GNUTLS_E_SUCCESS) )
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not initialize GNUTLS session: %s\n", gnutls_strerror(ret));
+       goto out_free_master_session;
+     }
+ 
+   cs->server_fd = net_connect(address, port, SOCK_STREAM, "Chomecast control");
+   if (cs->server_fd < 0)
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not connect to %s\n", device->name);
+       goto out_deinit_gnutls;
+     }
+ 
+   delay_ms = outputs_buffer_duration_ms_get() + CAST_DEVICE_START_DELAY_MS;
+-  if (delay_ms + device->offset_ms < 0)
++  if (device->offset_ms < 0 && delay_ms < (uint64_t)(-(int64_t)device->offset_ms))
+     DPRINTF(E_LOG, L_CAST, "'%s' configured with invalid start time (delay=%" PRIu64 ", offset=%d)\n", device->name, delay_ms, device->offset_ms);
+   else
+     delay_ms += device->offset_ms;
+ 
+   cs->delay_ts.tv_sec  = (delay_ms / 1000);
+   cs->delay_ts.tv_nsec = (delay_ms % 1000) * 1000000UL;
+ 
+   DPRINTF(E_DBG, L_CAST, "Delay is set to %ld:%09ld\n", (long)cs->delay_ts.tv_sec, (long)cs->delay_ts.tv_nsec);
+ 
+   cs->ev = event_new(evbase_player, cs->server_fd, EV_READ | EV_PERSIST, cast_listen_cb, cs);
+   if (!cs->ev)
+     {
+       DPRINTF(E_LOG, L_CAST, "Out of memory for listener event\n");
+       goto out_close_connection;
+     }
+ 
+   cs->reply_timeout = evtimer_new(evbase_player, cast_reply_timeout_cb, cs);
+   if (!cs->reply_timeout)
+     {
+       DPRINTF(E_LOG, L_CAST, "Out of memory for reply_timeout\n");
+       goto out_close_connection;
+     }
+ 
+   gnutls_transport_set_int(cs->tls_session, cs->server_fd);
+   ret = gnutls_handshake(cs->tls_session);
+   if (ret != GNUTLS_E_SUCCESS)
+     {
+       DPRINTF(E_LOG, L_CAST, "Could not attach TLS to TCP connection: %s\n", gnutls_strerror(ret));
+       goto out_free_ev;
+     }
+ 
+   flags = fcntl(cs->server_fd, F_GETFL, 0);
+   fcntl(cs->server_fd, F_SETFL, flags | O_NONBLOCK);
+ 
+   event_add(cs->ev, NULL); // &heartbeat_timeout
+ 
+   cs->devname = strdup(device->name);
+   cs->address = strdup(address);
+   cs->family = family;
+ 
+   cs->udp_fd = -1;
+ 
+   cs->volume = 0.01 * device->volume;
+ 
+   cs->next = cast_sessions;
+   cast_sessions = cs;
+ 
+   // cs is now the official device session
+   outputs_device_session_add(device->id, cs);
+ 
+   proto = gnutls_protocol_get_name(gnutls_protocol_get_version(cs->tls_session));
+ 
+   DPRINTF(E_INFO, L_CAST, "Connection to '%s' established using %s\n", cs->devname, proto);
+ 
+   return cs;
+ 
+  out_free_ev:
+   event_free(cs->reply_timeout);
+   event_free(cs->ev);
+  out_close_connection:
+   cast_disconnect(cs->server_fd);
+  out_deinit_gnutls:
+   gnutls_deinit(cs->tls_session);
+  out_free_master_session:
+   master_session_cleanup(cs->master_session);
+  out_free_session:
+   free(cs);
+ 
+   return NULL;
+ }
+ 
+ // Attempts to "nicely" bring down a session to wanted_state, and then issues
+ // the callback. If wanted_state is CAST_STATE_NONE/FAILED then the session is purged.
+ static void
+ cast_session_shutdown(struct cast_session *cs, enum cast_state wanted_state)
+ {
+   int pending;
+   int ret;
+ 
+   if (cs->state == wanted_state)
+     {
+       cast_status(cs);
+       return;
+     }
+   else if (cs->state < wanted_state)
+     {
+       DPRINTF(E_LOG, L_CAST, "Bug! Shutdown request got wanted_state (%d) that is higher than current state (%d)\n", wanted_state, cs->state);
+       return;
+     }
+ 
+   cs->wanted_state = wanted_state;
+ 
+   pending = 0;
+   switch (cs->state)
+     {
+       case CAST_STATE_STREAMING:
+       case CAST_STATE_BUFFERING:
+       case CAST_STATE_APP_READY:
+ 	cast_disconnect(cs->udp_fd);
+ 	cs->udp_fd = -1;
+diff --git a/src/outputs/fifo.c b/src/outputs/fifo.c
+index df6e6b4d76aa17469fdbbe09ddc09de5563096fd..653871dfdb0dc79e33359b43cd340329f7418894 100644
+--- a/src/outputs/fifo.c
++++ b/src/outputs/fifo.c
+@@ -163,201 +163,201 @@ fifo_check(struct fifo_session *fifo_session)
+   if (stat(fifo_session->path, &st) < 0)
+     {
+       if (errno == ENOENT)
+ 	{
+ 	  /* Path doesn't exist */
+ 	  return fifo_make(fifo_session);
+ 	}
+ 
+       DPRINTF(E_LOG, L_FIFO, "Failed to stat FIFO \"%s\": %d\n", fifo_session->path, errno);
+       return -1;
+     }
+ 
+   if (!S_ISFIFO(st.st_mode))
+     {
+       DPRINTF(E_LOG, L_FIFO, "\"%s\" already exists, but is not a FIFO\n", fifo_session->path);
+       return -1;
+     }
+ 
+   return 0;
+ }
+ 
+ static int
+ fifo_open(struct fifo_session *fifo_session)
+ {
+   int ret;
+ 
+   ret = fifo_check(fifo_session);
+   if (ret < 0)
+     return -1;
+ 
+   fifo_session->input_fd = open(fifo_session->path, O_RDONLY | O_NONBLOCK, 0);
+   if (fifo_session->input_fd < 0)
+     {
+       DPRINTF(E_LOG, L_FIFO, "Could not open FIFO \"%s\" for reading: %d\n", fifo_session->path, errno);
+       fifo_close(fifo_session);
+       return -1;
+     }
+ 
+   fifo_session->output_fd = open(fifo_session->path, O_WRONLY | O_NONBLOCK, 0);
+   if (fifo_session->output_fd < 0)
+     {
+       DPRINTF(E_LOG, L_FIFO, "Could not open FIFO \"%s\" for writing: %d\n", fifo_session->path, errno);
+       fifo_close(fifo_session);
+       return -1;
+     }
+ 
+   return 0;
+ }
+ 
+ static void
+ fifo_empty(struct fifo_session *fifo_session)
+ {
+   char buf[FIFO_BUFFER_SIZE];
+   int bytes = 1;
+ 
+   while (bytes > 0 && errno != EINTR)
+     bytes = read(fifo_session->input_fd, buf, FIFO_BUFFER_SIZE);
+ 
+   if (bytes < 0 && errno != EAGAIN)
+     {
+       DPRINTF(E_LOG, L_FIFO, "Flush of FIFO \"%s\" failed: %d\n", fifo_session->path, errno);
+     }
+ }
+ 
+ /* ---------------------------- SESSION HANDLING ---------------------------- */
+ 
+ static void
+ fifo_session_free(struct fifo_session *fifo_session)
+ {
+   if (!fifo_session)
+     return;
+ 
+   free(fifo_session);
+   free_buffer();
+ }
+ 
+ static void
+ fifo_session_cleanup(struct fifo_session *fifo_session)
+ {
+   // Normally some here code to remove from linked list - here we just say:
+   sessions = NULL;
+ 
+   outputs_device_session_remove(fifo_session->device_id);
+ 
+   fifo_session_free(fifo_session);
+ }
+ 
+ static struct fifo_session *
+ fifo_session_make(struct output_device *device, int callback_id)
+ {
+   struct fifo_session *fifo_session;
+   uint64_t delay_ms;
+ 
+   CHECK_NULL(L_FIFO, fifo_session = calloc(1, sizeof(struct fifo_session)));
+ 
+   fifo_session->state = OUTPUT_STATE_CONNECTED;
+   fifo_session->device_id = device->id;
+   fifo_session->callback_id = callback_id;
+ 
+   delay_ms = outputs_buffer_duration_ms_get();
+-  if (delay_ms + device->offset_ms < 0)
++  if (device->offset_ms < 0 && delay_ms < (uint64_t)(-(int64_t)device->offset_ms))
+     DPRINTF(E_LOG, L_FIFO, "'%s' configured with invalid start time (delay=%" PRIu64 ", offset=%d)\n", device->name, delay_ms, device->offset_ms);
+   else
+     delay_ms += device->offset_ms;
+ 
+   fifo_session->delay.tv_sec = delay_ms / 1000;
+   fifo_session->delay.tv_nsec = (delay_ms % 1000) * 1000000UL;
+ 
+   fifo_session->created = 0;
+   fifo_session->path = device->extra_device_info;
+   fifo_session->input_fd = -1;
+   fifo_session->output_fd = -1;
+ 
+   sessions = fifo_session;
+ 
+   outputs_device_session_add(device->id, fifo_session);
+ 
+   return fifo_session;
+ }
+ 
+ 
+ /* ---------------------------- STATUS HANDLERS ----------------------------- */
+ 
+ static void
+ fifo_status(struct fifo_session *fifo_session)
+ {
+   outputs_cb(fifo_session->callback_id, fifo_session->device_id, fifo_session->state);
+ 
+   if (fifo_session->state == OUTPUT_STATE_STOPPED)
+     fifo_session_cleanup(fifo_session);
+ }
+ 
+ /* ------------------ INTERFACE FUNCTIONS CALLED BY OUTPUTS.C --------------- */
+ 
+ static int
+ fifo_device_start(struct output_device *device, int callback_id)
+ {
+   struct fifo_session *fifo_session;
+   int ret;
+ 
+   ret = outputs_quality_subscribe(&fifo_quality);
+   if (ret < 0)
+     return -1;
+ 
+   fifo_session = fifo_session_make(device, callback_id);
+   if (!fifo_session)
+     return -1;
+ 
+   ret = fifo_open(fifo_session);
+   if (ret < 0)
+     return -1;
+ 
+   fifo_status(fifo_session);
+ 
+   return 1;
+ }
+ 
+ static int
+ fifo_device_stop(struct output_device *device, int callback_id)
+ {
+   struct fifo_session *fifo_session = device->session;
+ 
+   outputs_quality_unsubscribe(&fifo_quality);
+ 
+   fifo_session->callback_id = callback_id;
+ 
+   fifo_close(fifo_session);
+   free_buffer();
+ 
+   fifo_session->state = OUTPUT_STATE_STOPPED;
+   fifo_status(fifo_session);
+ 
+   return 1;
+ }
+ 
+ static int
+ fifo_device_flush(struct output_device *device, int callback_id)
+ {
+   struct fifo_session *fifo_session = device->session;
+ 
+   fifo_empty(fifo_session);
+   free_buffer();
+ 
+   fifo_session->callback_id = callback_id;
+   fifo_session->state = OUTPUT_STATE_CONNECTED;
+   fifo_status(fifo_session);
+ 
+   return 1;
+ }
+ 
+ static int
+ fifo_device_probe(struct output_device *device, int callback_id)
+ {
+   struct fifo_session *fifo_session;
+   int ret;
+ 
+   fifo_session = fifo_session_make(device, callback_id);
+   if (!fifo_session)
+     return -1;
+ 
+   ret = fifo_open(fifo_session);
+diff --git a/src/outputs/pulse.c b/src/outputs/pulse.c
+index 421ac4072e656c667045f780cb92e252f4cdc228..36b3a0ad56e4524fefbd657f124b389ae7a483bf 100644
+--- a/src/outputs/pulse.c
++++ b/src/outputs/pulse.c
+@@ -73,201 +73,201 @@ struct pulse_session
+ 
+   uint64_t delay_ms;
+ 
+   int logcount;
+ 
+   struct pulse_session *next;
+ };
+ 
+ // From player.c
+ extern struct event_base *evbase_player;
+ 
+ // Globals
+ static struct pulse_session *sessions;
+ 
+ // Internal list with indeces of the Pulseaudio devices (sinks) we have registered
+ static uint32_t pulse_known_devices[PULSE_MAX_DEVICES];
+ 
+ static struct media_quality pulse_last_quality;
+ static struct media_quality pulse_fallback_quality = { 44100, 16, 2, 0 };
+ 
+ // Converts from 0 - 100 to Pulseaudio's scale
+ static inline pa_volume_t
+ pulse_from_device_volume(int device_volume)
+ {
+   return (PA_VOLUME_MUTED + (device_volume * (PA_VOLUME_NORM - PA_VOLUME_MUTED)) / 100);
+ }
+ 
+ /* ---------------------------- SESSION HANDLING ---------------------------- */
+ 
+ static void
+ pulse_session_free(struct pulse_session *ps)
+ {
+   if (!ps)
+     return;
+ 
+   if (ps->stream)
+     {
+       pa_threaded_mainloop_lock(pulse.mainloop);
+ 
+       pa_stream_set_underflow_callback(ps->stream, NULL, NULL);
+       pa_stream_set_overflow_callback(ps->stream, NULL, NULL);
+       pa_stream_set_state_callback(ps->stream, NULL, NULL);
+       pa_stream_disconnect(ps->stream);
+       pa_stream_unref(ps->stream);
+ 
+       pa_threaded_mainloop_unlock(pulse.mainloop);
+     }
+ 
+   outputs_quality_unsubscribe(&pulse_fallback_quality);
+ 
+   free(ps->devname);
+ 
+   free(ps);
+ }
+ 
+ static void
+ pulse_session_cleanup(struct pulse_session *ps)
+ {
+   struct pulse_session *p;
+ 
+   if (ps == sessions)
+     sessions = sessions->next;
+   else
+     {
+       for (p = sessions; p && (p->next != ps); p = p->next)
+ 	; /* EMPTY */
+ 
+       if (!p)
+ 	DPRINTF(E_WARN, L_LAUDIO, "WARNING: struct pulse_session not found in list; BUG!\n");
+       else
+ 	p->next = ps->next;
+     }
+ 
+   outputs_device_session_remove(ps->device_id);
+ 
+   pulse_session_free(ps);
+ }
+ 
+ static struct pulse_session *
+ pulse_session_make(struct output_device *device, int callback_id)
+ {
+   struct pulse_session *ps;
+   int ret;
+ 
+   ret = outputs_quality_subscribe(&pulse_fallback_quality);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Could not subscribe to fallback audio quality\n");
+       return NULL;
+     }
+ 
+   CHECK_NULL(L_LAUDIO, ps = calloc(1, sizeof(struct pulse_session)));
+ 
+   ps->state = PA_STREAM_UNCONNECTED;
+   ps->device_id = device->id;
+   ps->callback_id = callback_id;
+   ps->volume = pulse_from_device_volume(device->volume);
+   ps->devname = strdup(device->extra_device_info);
+ 
+   ps->delay_ms = outputs_buffer_duration_ms_get();
+-  if (ps->delay_ms + device->offset_ms < 0)
++  if (device->offset_ms < 0 && ps->delay_ms < (uint64_t)(-(int64_t)device->offset_ms))
+     DPRINTF(E_LOG, L_LAUDIO, "'%s' configured with invalid start time (delay=%" PRIu64 ", offset=%d)\n", device->name, ps->delay_ms, device->offset_ms);
+   else
+     ps->delay_ms += device->offset_ms;
+ 
+   ps->next = sessions;
+   sessions = ps;
+ 
+   outputs_device_session_add(device->id, ps);
+ 
+   return ps;
+ }
+ 
+ /* ---------------------------- COMMAND HANDLERS ---------------------------- */
+ 
+ // Maps our internal state to the generic output state and then makes a callback
+ // to the player to tell that state. Should always be called deferred.
+ static enum command_state
+ send_status(void *arg, int *ptr)
+ {
+   struct pulse_session *ps = arg;
+   enum output_device_state state;
+ 
+   switch (ps->state)
+     {
+       case PA_STREAM_FAILED:
+ 	state = OUTPUT_STATE_FAILED;
+ 	break;
+       case PA_STREAM_UNCONNECTED:
+       case PA_STREAM_TERMINATED:
+ 	state = OUTPUT_STATE_STOPPED;
+ 	break;
+       case PA_STREAM_READY:
+ 	state = OUTPUT_STATE_CONNECTED;
+ 	break;
+       case PA_STREAM_CREATING:
+ 	state = OUTPUT_STATE_STARTUP;
+ 	break;
+       default:
+ 	DPRINTF(E_LOG, L_LAUDIO, "Bug! Unhandled state in send_status()\n");
+ 	state = OUTPUT_STATE_FAILED;
+     }
+ 
+   outputs_cb(ps->callback_id, ps->device_id, state);
+   ps->callback_id = -1;
+ 
+   return COMMAND_PENDING; // Don't want the command module to clean up ps
+ }
+ 
+ static enum command_state
+ session_shutdown(void *arg, int *ptr)
+ {
+   struct pulse_session *ps = arg;
+ 
+   send_status(ps, ptr);
+   pulse_session_cleanup(ps);
+ 
+   return COMMAND_PENDING; // Don't want the command module to clean up ps
+ }
+ 
+ /* ---------------------- EXECUTED IN PULSEAUDIO THREAD --------------------- */
+ 
+ static void
+ pulse_status(struct pulse_session *ps)
+ {
+   // async to avoid risk of deadlock if the player should make calls back to Pulseaudio
+   commands_exec_async(pulse.cmdbase, send_status, ps);
+ }
+ 
+ static void
+ pulse_session_shutdown(struct pulse_session *ps)
+ {
+   // async to avoid risk of deadlock if the player should make calls back to Pulseaudio
+   commands_exec_async(pulse.cmdbase, session_shutdown, ps);
+ }
+ 
+ static void
+ pulse_session_shutdown_all(pa_stream_state_t state)
+ {
+   struct pulse_session *ps;
+   struct pulse_session *next;
+ 
+   for (ps = sessions; ps; ps = next)
+     {
+       next = ps->next;
+       ps->state = state;
+       pulse_session_shutdown(ps);
+     }
+ }
+ 
+ /* --------------------- CALLBACKS FROM PULSEAUDIO THREAD ------------------- */
+ 
+ 
+ // This will be called if something happens to the stream after it was opened
+ static void
+ stream_state_cb(pa_stream *s, void *userdata)
+ {
+   struct pulse_session *ps = userdata;
+ 
+   DPRINTF(E_DBG, L_LAUDIO, "Pulseaudio stream to '%s' changed state (%d)\n", ps->devname, ps->state);
+ 
+@@ -329,385 +329,389 @@ start_cb(pa_stream *s, void *userdata)
+   if (ps->state == PA_STREAM_CREATING)
+     return;
+ 
+   if (ps->state != PA_STREAM_READY)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Error starting Pulseaudio stream to '%s' (%d)\n", ps->devname, ps->state);
+       pulse_session_shutdown(ps);
+       return;
+     }
+ 
+   pa_stream_set_underflow_callback(ps->stream, underrun_cb, ps);
+   pa_stream_set_overflow_callback(ps->stream, overrun_cb, ps);
+   pa_stream_set_state_callback(ps->stream, stream_state_cb, ps);
+ 
+   pulse_status(ps);
+ }
+ 
+ static void
+ close_cb(pa_stream *s, void *userdata)
+ {
+   struct pulse_session *ps = userdata;
+ 
+   pulse_session_shutdown(ps);
+ }
+ 
+ // This will be called our request to probe the stream has completed
+ static void
+ probe_cb(pa_stream *s, void *userdata)
+ {
+   struct pulse_session *ps = userdata;
+ 
+   ps->state = pa_stream_get_state(s);
+   if (ps->state == PA_STREAM_CREATING)
+     return;
+ 
+   if (ps->state != PA_STREAM_READY)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Error probing Pulseaudio stream to '%s' (%d)\n", ps->devname, ps->state);
+       pulse_session_shutdown(ps);
+       return;
+     }
+ 
+   // This will callback to the player with succes and then remove the session
+   pulse_session_shutdown(ps);
+ }
+ 
+ static void
+ flush_cb(pa_stream *s, int success, void *userdata)
+ {
+   struct pulse_session *ps = userdata;
+ 
+   pulse_status(ps);
+ }
+ 
+ static void
+ volume_cb(pa_context *c, int success, void *userdata)
+ {
+   struct pulse_session *ps = userdata;
+ 
+   pulse_status(ps);
+ }
+ 
+ static void
+ sinklist_cb(pa_context *ctx, const pa_sink_info *info, int eol, void *userdata)
+ {
+   struct output_device *device;
+   const char *name;
+   int i;
+   int pos;
+   int offset_ms;
+ 
+   if (eol > 0 || !info)
+     return;
+ 
+   DPRINTF(E_DBG, L_LAUDIO, "Callback for Pulseaudio sink '%s' (id %" PRIu32 ")\n", info->name, info->index);
+ 
+   pos = -1;
+   for (i = 0; i < PULSE_MAX_DEVICES; i++)
+     {
+       if (pulse_known_devices[i] == (info->index + 1))
+ 	return;
+ 
+       if (pulse_known_devices[i] == 0)
+ 	pos = i;
+     }
+ 
+   if (pos == -1)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Maximum number of Pulseaudio devices reached (%d), cannot add '%s'\n", PULSE_MAX_DEVICES, info->name);
+       return;
+     }
+ 
+   device = calloc(1, sizeof(struct output_device));
+   if (!device)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Out of memory for new Pulseaudio sink\n");
+       return;
+     }
+ 
+   offset_ms =  cfg_getint(cfg_getsec(cfg, "audio"), "offset_ms");
+-  if (abs(offset_ms) > 1000)
++  if (offset_ms < -1000 || offset_ms > 1000)
+     DPRINTF(E_LOG, L_LAUDIO, "Pulseaudio offset_ms (%d) set in the configuration is out of bounds (-1000 -> 1000)\n", offset_ms);
+   else
+     device->offset_ms = offset_ms;
+ 
+   if (info->index == 0)
+     {
+       name = cfg_getstr(cfg_getsec(cfg, "audio"), "nickname");
+ 
+       DPRINTF(E_LOG, L_LAUDIO, "Adding Pulseaudio sink '%s' (%s) with name '%s'\n", info->description, info->name, name);
+     }
+   else
+     {
+       name = info->description;
+ 
+       DPRINTF(E_LOG, L_LAUDIO, "Adding Pulseaudio sink '%s' (%s)\n", info->description, info->name);
+     }
+ 
+   pulse_known_devices[pos] = info->index + 1; // Array values of 0 mean no device, so we add 1 to make sure the value is > 0
+ 
+   device->id = info->index;
+   device->name = strdup(name);
+   device->type = OUTPUT_TYPE_PULSE;
+   device->type_name = outputs_name(device->type);
+   device->extra_device_info = strdup(info->name);
+   device->supported_formats = MEDIA_FORMAT_PCM;
+ 
+   player_device_add(device);
+ }
+ 
+ static void
+ subscribe_cb(pa_context *c, pa_subscription_event_type_t t, uint32_t index, void *userdata)
+ {
+   struct output_device *device;
+   pa_operation *o;
+   int i;
+ 
+   DPRINTF(E_DBG, L_LAUDIO, "Callback for Pulseaudio subscribe (id %" PRIu32 ", event %d)\n", index, t);
+ 
+   if ((t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK) != PA_SUBSCRIPTION_EVENT_SINK)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Pulseaudio subscribe called back with unknown event\n");
+       return;
+     }
+ 
+   if ((t & PA_SUBSCRIPTION_EVENT_TYPE_MASK) == PA_SUBSCRIPTION_EVENT_REMOVE)
+     {
+       device = calloc(1, sizeof(struct output_device));
+       if (!device)
+ 	{
+ 	  DPRINTF(E_LOG, L_LAUDIO, "Out of memory for temp Pulseaudio device\n");
+ 	  return;
+ 	}
+ 
+       device->id = index;
+ 
+       DPRINTF(E_LOG, L_LAUDIO, "Removing Pulseaudio sink with id %" PRIu32 "\n", index);
+ 
+       for (i = 0; i < PULSE_MAX_DEVICES; i++)
+ 	{
+ 	  if (pulse_known_devices[i] == index)
+ 	    pulse_known_devices[i] = 0;
+ 	}
+ 
+       player_device_remove(device);
+       return;
+     }
+ 
+   o = pa_context_get_sink_info_by_index(c, index, sinklist_cb, NULL);
+   if (!o)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Pulseaudio error getting sink info for id %" PRIu32 "\n", index);
+       return;
+     }
+   pa_operation_unref(o);
+ }
+ 
+ static void
+ context_state_cb(pa_context *c, void *userdata)
+ {
+   pa_context_state_t state;
+   pa_operation *o;
+ 
+   state = pa_context_get_state(c);
+ 
+   switch (state)
+     {
+       case PA_CONTEXT_READY:
+ 	DPRINTF(E_DBG, L_LAUDIO, "Pulseaudio context state changed to ready\n");
+ 
+ 	o = pa_context_get_sink_info_list(c, sinklist_cb, NULL);
+ 	if (!o)
+ 	  {
+ 	    DPRINTF(E_LOG, L_LAUDIO, "Could not list Pulseaudio sink info\n");
+ 	    return;
+ 	  }
+ 	pa_operation_unref(o);
+ 
+ 	pa_context_set_subscribe_callback(c, subscribe_cb, NULL);
+ 	o = pa_context_subscribe(c, PA_SUBSCRIPTION_MASK_SINK, NULL, NULL);
+ 	if (!o)
+ 	  {
+ 	    DPRINTF(E_LOG, L_LAUDIO, "Could not subscribe to Pulseaudio sink info\n");
+ 	    return;
+ 	  }
+ 	pa_operation_unref(o);
+ 
+ 	pa_threaded_mainloop_signal(pulse.mainloop, 0);
+ 	break;
+ 
+       case PA_CONTEXT_FAILED:
+ 	DPRINTF(E_LOG, L_LAUDIO, "Pulseaudio failed with error: %s\n", pa_strerror(pa_context_errno(c)));
+ 	pulse_session_shutdown_all(PA_STREAM_FAILED);
+ 	pa_threaded_mainloop_signal(pulse.mainloop, 0);
+ 	break;
+ 
+       case PA_CONTEXT_TERMINATED:
+ 	DPRINTF(E_LOG, L_LAUDIO, "Pulseaudio terminated\n");
+ 	pulse_session_shutdown_all(PA_STREAM_UNCONNECTED);
+ 	pa_threaded_mainloop_signal(pulse.mainloop, 0);
+ 	break;
+ 
+       case PA_CONTEXT_UNCONNECTED:
+       case PA_CONTEXT_CONNECTING:
+       case PA_CONTEXT_AUTHORIZING:
+       case PA_CONTEXT_SETTING_NAME:
+ 	break;
+     }
+ }
+ 
+ 
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+ 
+ // Used by init and deinit to stop main thread
+ static void
+ pulse_free(void)
+ {
+   if (pulse.mainloop)
+     pa_threaded_mainloop_stop(pulse.mainloop);
+ 
+   if (pulse.context)
+     {
+       pa_context_disconnect(pulse.context);
+       pa_context_unref(pulse.context);
+     }
+ 
+   if (pulse.cmdbase)
+     commands_base_free(pulse.cmdbase);
+ 
+   if (pulse.mainloop)
+     pa_threaded_mainloop_free(pulse.mainloop);
+ }
+ 
+ static int
+ stream_open(struct pulse_session *ps, struct media_quality *quality, pa_stream_notify_cb_t cb)
+ {
+   pa_stream_flags_t flags;
+   pa_sample_spec ss;
+   pa_cvolume cvol;
+   int ret;
++  uint64_t buffer_samples, buffer_bytes;
+ 
+   DPRINTF(E_DBG, L_LAUDIO, "Opening Pulseaudio stream to '%s'\n", ps->devname);
+ 
+   if (quality->bits_per_sample == 16)
+     ss.format = PA_SAMPLE_S16LE;
+   else if (quality->bits_per_sample == 24)
+     ss.format = PA_SAMPLE_S24LE;
+   else if (quality->bits_per_sample == 32)
+     ss.format = PA_SAMPLE_S32LE;
+   else
+     ss.format = 0;
+ 
+   ss.channels = quality->channels;
+   ss.rate = quality->sample_rate;
+ 
+   pa_threaded_mainloop_lock(pulse.mainloop);
+ 
+   if (!(ps->stream = pa_stream_new(pulse.context, PACKAGE_NAME " audio", &ss, NULL)))
+     goto unlock_and_fail;
+ 
+   pa_stream_set_state_callback(ps->stream, cb, ps);
+ 
+   flags = PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_AUTO_TIMING_UPDATE;
+ 
+-  ps->attr.tlength   = STOB(ps->delay_ms * ss.rate / 1000, quality->bits_per_sample, quality->channels);
++  if (outputs_buffer_samples_get(&buffer_samples, ps->delay_ms, quality->sample_rate, UINT64_MAX) < 0
++      || outputs_buffer_size_get(&buffer_bytes, buffer_samples, quality->bits_per_sample, quality->channels, UINT32_MAX / 2) < 0)
++    goto unlock_and_fail;
++  ps->attr.tlength   = buffer_bytes;
+   ps->attr.maxlength = 2 * ps->attr.tlength;
+   ps->attr.prebuf    = (uint32_t)-1;
+   ps->attr.minreq    = (uint32_t)-1;
+   ps->attr.fragsize  = (uint32_t)-1;
+ 
+   pa_cvolume_set(&cvol, 2, ps->volume);
+ 
+   ret = pa_stream_connect_playback(ps->stream, ps->devname, &ps->attr, flags, &cvol, NULL);
+   if (ret < 0)
+     goto unlock_and_fail;
+ 
+   ps->state = pa_stream_get_state(ps->stream);
+   if (!PA_STREAM_IS_GOOD(ps->state))
+     goto unlock_and_fail;
+ 
+   pa_threaded_mainloop_unlock(pulse.mainloop);
+ 
+   return 0;
+ 
+  unlock_and_fail:
+   ret = pa_context_errno(pulse.context);
+ 
+   DPRINTF(E_LOG, L_LAUDIO, "Pulseaudio could not start '%s' using quality %d/%d/%d: %s\n",
+     ps->devname, quality->sample_rate, quality->bits_per_sample, quality->channels, pa_strerror(ret));
+ 
+   pa_threaded_mainloop_unlock(pulse.mainloop);
+ 
+   return -1;
+ }
+ 
+ static void
+ stream_close(struct pulse_session *ps, pa_stream_notify_cb_t cb)
+ {
+   if (!ps->stream)
+     return;
+ 
+   pa_threaded_mainloop_lock(pulse.mainloop);
+ 
+   pa_stream_set_underflow_callback(ps->stream, NULL, NULL);
+   pa_stream_set_overflow_callback(ps->stream, NULL, NULL);
+   pa_stream_set_state_callback(ps->stream, cb, ps);
+ 
+   pa_stream_disconnect(ps->stream);
+   pa_stream_unref(ps->stream);
+ 
+   ps->state = PA_STREAM_TERMINATED;
+   ps->stream = NULL;
+ 
+   pa_threaded_mainloop_unlock(pulse.mainloop);
+ }
+ 
+ static void
+ playback_restart(struct pulse_session *ps, struct output_buffer *obuf)
+ {
+   int ret;
+ 
+   stream_close(ps, NULL);
+ 
+   // Negotiate quality (sample rate) with device - first we try to use the source quality
+   ps->quality = obuf->data[0].quality;
+   ret = stream_open(ps, &ps->quality, start_cb);
+   if (ret < 0)
+     {
+       DPRINTF(E_INFO, L_LAUDIO, "Input quality (%d/%d/%d) not supported, falling back to default\n",
+         ps->quality.sample_rate, ps->quality.bits_per_sample, ps->quality.channels);
+ 
+       ps->quality = pulse_fallback_quality;
+       ret = stream_open(ps, &ps->quality, start_cb);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_LOG, L_LAUDIO, "Pulseaudio device failed setting fallback quality\n");
+ 	  ps->state = PA_STREAM_FAILED;
+ 	  pulse_session_shutdown(ps);
+ 	  return;
+ 	}
+     }
+ }
+ 
+ static void
+ playback_write(struct pulse_session *ps, struct output_buffer *obuf)
+ {
+   int i;
+   int ret;
+ 
+   // Find the quality we want
+   for (i = 0; obuf->data[i].buffer; i++)
+     {
+       if (quality_is_equal(&ps->quality, &obuf->data[i].quality))
+ 	break;
+     }
+ 
+   if (!obuf->data[i].buffer)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Output not delivering required data quality, aborting\n");
+       ps->state = PA_STREAM_FAILED;
+       pulse_session_shutdown(ps);
+       return;
+     }
+ 
+   pa_threaded_mainloop_lock(pulse.mainloop);
+diff --git a/src/outputs/raop.c b/src/outputs/raop.c
+index 68347d5eb3d14c6d887ad3b4944515064d8f4cd9..b0c8b8ccf49f51cfecf0b5a6229b751712b2ad5c 100644
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -1,336 +1,339 @@
+ /*
+  * Copyright (C) 2012-2020 Espen Jürgensen <espenjurgensen@gmail.com>
+  * Copyright (C) 2010-2011 Julien BLACHE <jb@jblache.org>
+  *
+  * RAOP AirTunes v2
+  *
+  * Crypto code adapted from VideoLAN
+  *   Copyright (C) 2008 the VideoLAN team
+  *   Author: Michael Hanselmann
+  *   GPLv2+
+  *
+  * ALAC encoding adapted from raop_play
+  *   Copyright (C) 2005 Shiro Ninomiya <shiron@snino.com>
+  *   GPLv2+
+  *
+  * ALAC update to add end tags for compatibility with the FFmpeg ALAC decoder
+  *   Copyright (C) 2023 Mike Brady <4265913+mikebrady@users.noreply.github.com>
+  *   GPLv2+
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <stdio.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <stdint.h>
+ #include <inttypes.h>
++#include <limits.h>
+ #include <math.h>
+ #include <errno.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <netdb.h>
+ #include <fcntl.h>
+ #include <time.h>
+ #include <strings.h> // strcasecmp
+ #include <sys/queue.h>
+ #include <event2/keyvalq_struct.h>
+ 
+ #include <arpa/inet.h>
+ #include <net/if.h>
+ #include <netinet/in.h>
+ 
+ #include <event2/event.h>
+ #include <event2/buffer.h>
+ #include <gcrypt.h>
+ 
+ #include "evrtsp/evrtsp.h"
+ #include "conffile.h"
+ #include "logger.h"
+ #include "mdns.h"
+ #include "misc.h"
+ #include "player.h"
+ #include "db.h"
+ #include "artwork.h"
+ #include "dmap_common.h"
+ #include "rtp_common.h"
+ #include "transcode.h"
+ #include "outputs.h"
+ #include "pair_ap/pair.h"
+ 
+ #define ALAC_HEADER_LEN                      3
+ 
+ #define RAOP_QUALITY_SAMPLE_RATE_DEFAULT     44100
++// Candidate discovery policy; bound receiver-supplied resampling/allocation.
++#define RAOP_QUALITY_SAMPLE_RATE_MAX         384000
+ #define RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT 16
+ #define RAOP_QUALITY_CHANNELS_DEFAULT        2
+ 
+ // AirTunes v2 number of samples per packet
+ // Probably using this value because 44100/352 and 48000/352 has good 32 byte
+ // alignment, which improves performance of some encoders
+ #define RAOP_SAMPLES_PER_PACKET              352
+ 
+ #define RAOP_RTP_PAYLOADTYPE                 0x60
+ 
+ // See AIRPLAY_AUDIO_LATENCY_MS
+ #define RAOP_AUDIO_LATENCY_MS                250
+ 
+ // How many RTP packets to buffer for retransmission
+ #define RAOP_PACKET_BUFFER_SIZE    1000
+ 
+ #define RAOP_MD_DELAY_STARTUP      15360
+ #define RAOP_MD_DELAY_SWITCH       (RAOP_MD_DELAY_STARTUP * 2)
+ #define RAOP_MD_WANTS_TEXT         (1 << 0)
+ #define RAOP_MD_WANTS_ARTWORK      (1 << 1)
+ #define RAOP_MD_WANTS_PROGRESS     (1 << 2)
+ 
+ // ATV4 and Homepod disconnect for reasons that are not clear, but sending them
+ // progress metadata at regular intervals reduces the problem. The below
+ // interval was determined via testing, see:
+ // https://github.com/owntone/owntone-server/issues/734#issuecomment-622959334
+ #define RAOP_KEEP_ALIVE_INTERVAL   25
+ 
+ // This is an arbitrary value which just needs to be kept in sync with the config
+ #define RAOP_CONFIG_MAX_VOLUME     11
+ 
+ enum raop_devtype {
+   RAOP_DEV_APEX1_80211G,
+   RAOP_DEV_APEX2_80211N,
+   RAOP_DEV_APEX3_80211N,
+   RAOP_DEV_APPLETV,
+   RAOP_DEV_APPLETV4,
+   RAOP_DEV_HOMEPOD,
+   RAOP_DEV_OTHER,
+ };
+ 
+ // Session is starting up
+ #define RAOP_STATE_F_STARTUP    (1 << 13)
+ // Streaming is up (connection established)
+ #define RAOP_STATE_F_CONNECTED  (1 << 14)
+ // Couldn't start device
+ #define RAOP_STATE_F_FAILED     (1 << 15)
+ 
+ enum raop_state {
+   // Device is stopped (no session)
+   RAOP_STATE_STOPPED   = 0,
+   // Session startup
+   RAOP_STATE_STARTUP   = RAOP_STATE_F_STARTUP | 0x01,
+   RAOP_STATE_OPTIONS   = RAOP_STATE_F_STARTUP | 0x02,
+   RAOP_STATE_ANNOUNCE  = RAOP_STATE_F_STARTUP | 0x03,
+   RAOP_STATE_SETUP     = RAOP_STATE_F_STARTUP | 0x04,
+   RAOP_STATE_RECORD    = RAOP_STATE_F_STARTUP | 0x05,
+   // Session established
+   // - streaming ready (RECORD sent and acked, connection established)
+   // - commands (SET_PARAMETER) are possible
+   RAOP_STATE_CONNECTED = RAOP_STATE_F_CONNECTED | 0x01,
+   // Media data is being sent
+   RAOP_STATE_STREAMING = RAOP_STATE_F_CONNECTED | 0x02,
+   // Session teardown in progress (-> going to STOPPED state)
+   RAOP_STATE_TEARDOWN  = RAOP_STATE_F_CONNECTED | 0x03,
+   // Session is failed, couldn't startup or error occurred
+   RAOP_STATE_FAILED    = RAOP_STATE_F_FAILED | 0x01,
+   // Password issue: unknown password or bad password, or pending PIN from user
+   RAOP_STATE_PASSWORD  = RAOP_STATE_F_FAILED | 0x02,
+ };
+ 
+ // Info about the device, which is not required by the player, only internally
+ struct raop_extra
+ {
+   enum raop_devtype devtype;
+ 
+   uint16_t wanted_metadata;
+   bool encrypt;
+   bool supports_auth_setup;
+ };
+ 
+ struct raop_master_session
+ {
+   struct evbuffer *input_buffer;
+   uint32_t input_buffer_samples;
+ 
+   struct rtp_session *rtp_session;
+ 
+   struct rtcp_timestamp cur_stamp;
+ 
+   // ALAC encoder and buffer for encoded data
+   struct encode_ctx *encode_ctx;
+   struct evbuffer *encoded_buffer;
+ 
+   uint8_t *rawbuf;
+   size_t rawbuf_size;
+   uint32_t samples_per_packet;
+   bool encrypt;
+ 
+   struct media_quality quality;
+ 
+   // Number of samples that we tell the output to buffer (this will mean that
+   // the position that we send in the sync packages are offset by this amount
+   // compared to the rtptimes of the corresponding RTP packages we are sending)
+   uint32_t output_buffer_samples;
+ 
+   struct raop_master_session *next;
+ };
+ 
+ /* Bounded exact request-operation contexts. */
+ #define RAOP_OWNED_REQUEST_MAX 32
+ struct raop_owned_request;
+ 
+ struct raop_session
+ {
+   uint64_t device_id;
+   int callback_id;
+   struct raop_owned_request *owned_requests;
+   unsigned int owned_request_count;
+ 
+   struct raop_master_session *master_session;
+ 
+   struct evrtsp_connection *ctrl;
+ 
+   enum raop_state state;
+ 
+   uint16_t wanted_metadata;
+   bool req_has_auth;
+   bool encrypt;
+   bool auth_quirk_itunes;
+   bool supports_post;
+   bool supports_auth_setup;
+ 
+   bool only_probe;
+ 
+   struct event *deferredev;
+ 
+   int reqs_in_flight;
+   int cseq;
+   char *session;
+   char session_url[128];
+ 
+   char *realm;
+   char *nonce;
+   const char *password;
+ 
+   char *devname;
+   char *address;
+   int family;
+ 
+   union net_sockaddr naddr;
+ 
+   int volume;
+ 
+   // device->offset_ms in samples (user config for correction of static
+   // amplifier or DSP delays)
+-  int offset_samples;
++  int64_t offset_samples;
+ 
+   /* AirTunes v2 */
+   unsigned short server_port;
+   unsigned short control_port;
+   unsigned short timing_port; // ATV4 has this set to 0, but it is not used by us anyway
+ 
+   /* Device verification, see pair.h */
+   struct pair_verify_context *pair_verify_ctx;
+   struct pair_setup_context *pair_setup_ctx;
+ 
+   int server_fd;
+ 
+   struct raop_service *timing_svc;
+   struct raop_service *control_svc;
+ 
+   struct raop_session *next;
+ };
+ 
+ struct raop_metadata
+ {
+   struct evbuffer *metadata;
+   struct evbuffer *artwork;
+   int artwork_fmt;
+ };
+ 
+ struct raop_service
+ {
+   struct net_socket socket;
+   unsigned short port;
+   struct event *ev4;
+   struct event *ev6;
+ };
+ 
+ typedef void (*evrtsp_req_cb)(struct evrtsp_request *req, void *arg);
+ 
+ /* NTP timestamp definitions */
+ #define FRAC             4294967296. /* 2^32 as a double */
+ #define NTP_EPOCH_DELTA  0x83aa7e80  /* 2208988800 - that's 1970 - 1900 in seconds */
+ 
+ // TODO move to rtp_common
+ struct ntp_stamp
+ {
+   uint32_t sec;
+   uint32_t frac;
+ };
+ 
+ 
+ static const uint8_t raop_rsa_pubkey[] =
+   "\xe7\xd7\x44\xf2\xa2\xe2\x78\x8b\x6c\x1f\x55\xa0\x8e\xb7\x05\x44"
+   "\xa8\xfa\x79\x45\xaa\x8b\xe6\xc6\x2c\xe5\xf5\x1c\xbd\xd4\xdc\x68"
+   "\x42\xfe\x3d\x10\x83\xdd\x2e\xde\xc1\xbf\xd4\x25\x2d\xc0\x2e\x6f"
+   "\x39\x8b\xdf\x0e\x61\x48\xea\x84\x85\x5e\x2e\x44\x2d\xa6\xd6\x26"
+   "\x64\xf6\x74\xa1\xf3\x04\x92\x9a\xde\x4f\x68\x93\xef\x2d\xf6\xe7"
+   "\x11\xa8\xc7\x7a\x0d\x91\xc9\xd9\x80\x82\x2e\x50\xd1\x29\x22\xaf"
+   "\xea\x40\xea\x9f\x0e\x14\xc0\xf7\x69\x38\xc5\xf3\x88\x2f\xc0\x32"
+   "\x3d\xd9\xfe\x55\x15\x5f\x51\xbb\x59\x21\xc2\x01\x62\x9f\xd7\x33"
+   "\x52\xd5\xe2\xef\xaa\xbf\x9b\xa0\x48\xd7\xb8\x13\xa2\xb6\x76\x7f"
+   "\x6c\x3c\xcf\x1e\xb4\xce\x67\x3d\x03\x7b\x0d\x2e\xa3\x0c\x5f\xff"
+   "\xeb\x06\xf8\xd0\x8a\xdd\xe4\x09\x57\x1a\x9c\x68\x9f\xef\x10\x72"
+   "\x88\x55\xdd\x8c\xfb\x9a\x8b\xef\x5c\x89\x43\xef\x3b\x5f\xaa\x15"
+   "\xdd\xe6\x98\xbe\xdd\xf3\x59\x96\x03\xeb\x3e\x6f\x61\x37\x2b\xb6"
+   "\x28\xf6\x55\x9f\x59\x9a\x78\xbf\x50\x06\x87\xaa\x7f\x49\x76\xc0"
+   "\x56\x2d\x41\x29\x56\xf8\x98\x9e\x18\xa6\x35\x5b\xd8\x15\x97\x82"
+   "\x5e\x0f\xc8\x75\x34\x3e\xc7\x82\x11\x76\x25\xcd\xbf\x98\x44\x7b";
+ 
+ static const uint8_t raop_rsa_exp[] = "\x01\x00\x01";
+ 
+ static const uint8_t raop_auth_setup_pubkey[] =
+   "\x59\x02\xed\xe9\x0d\x4e\xf2\xbd\x4c\xb6\x8a\x63\x30\x03\x82\x07"
+   "\xa9\x4d\xbd\x50\xd8\xaa\x46\x5b\x5d\x8c\x01\x2a\x0c\x7e\x1d\x4e";
+ 
+ 
+ /* Keep in sync with enum raop_devtype */
+ static const char *raop_devtype[] =
+ {
+   "AirPort Express 1 - 802.11g",
+   "AirPort Express 2 - 802.11n",
+   "AirPort Express 3 - 802.11n",
+   "AppleTV",
+   "AppleTV4",
+   "HomePod",
+   "Other",
+ };
+ 
+ /* Struct with default quality levels */
+ static struct media_quality raop_quality_default =
+ {
+   RAOP_QUALITY_SAMPLE_RATE_DEFAULT,
+   RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT,
+   RAOP_QUALITY_CHANNELS_DEFAULT
+ };
+ 
+ /* From player.c */
+ extern struct event_base *evbase_player;
+ 
+ /* RAOP AES stream key */
+ static uint8_t raop_aes_key[16];
+ static uint8_t raop_aes_iv[16];
+ static gcry_cipher_hd_t raop_aes_ctx;
+ 
+@@ -1031,200 +1034,208 @@ raop_parse_auth(struct raop_session *rs, struct evrtsp_request *req)
+ 
+   if (rs->nonce)
+     {
+       free(rs->nonce);
+       rs->nonce = NULL;
+     }
+ 
+   param = evrtsp_find_header(req->input_headers, "WWW-Authenticate");
+   if (!param)
+     {
+       DPRINTF(E_LOG, L_RAOP, "WWW-Authenticate header not found\n");
+       goto error;
+     }
+ 
+   DPRINTF(E_DBG, L_RAOP, "WWW-Authenticate: %s\n", param);
+ 
+   if (strncmp(param, "Digest ", strlen("Digest ")) != 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Unsupported authentication method: %s\n", param);
+       goto error;
+     }
+ 
+   auth = strdup(param);
+   if (!auth)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Out of memory for WWW-Authenticate header copy\n");
+       goto error;
+     }
+ 
+   token = strchr(auth, ' ');
+   if (!token)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Unexpected WWW-Authenticate auth\n");
+       goto error;
+     }
+ 
+   token++;
+ 
+   token = strtok_r(token, " =", &ptr);
+   while (token)
+     {
+       if (strcmp(token, "realm") == 0)
+ 	{
+ 	  token = strtok_r(NULL, "=\"", &ptr);
+ 	  if (!token)
+ 	    break;
+ 
+ 	  rs->realm = strdup(token);
+ 	}
+       else if (strcmp(token, "nonce") == 0)
+ 	{
+ 	  token = strtok_r(NULL, "=\"", &ptr);
+ 	  if (!token)
+ 	    break;
+ 
+ 	  rs->nonce = strdup(token);
+ 	}
+ 
+       token = strtok_r(NULL, " =", &ptr);
+     }
+ 
+   if (!rs->realm || !rs->nonce)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not find realm/nonce in WWW-Authenticate header\n");
+ 
+       if (rs->realm)
+ 	{
+ 	  free(rs->realm);
+ 	  rs->realm = NULL;
+ 	}
+ 
+       if (rs->nonce)
+ 	{
+ 	  free(rs->nonce);
+ 	  rs->nonce = NULL;
+ 	}
+ 
+       goto error;
+     }
+ 
+   DPRINTF(E_DBG, L_RAOP, "Found realm: [%s], nonce: [%s]\n", rs->realm, rs->nonce);
+ 
+   free(auth);
+   return 0;
+ 
+  error:
+   free(auth);
+   return -1;
+ }
+ 
+ static int
+ raop_add_headers(struct raop_session *rs, struct evrtsp_request *req, enum evrtsp_cmd_type req_method)
+ {
+   char buf[64];
+   const char *method;
+   const char *url;
+   const char *user_agent;
+   const char *client_name;
+   int ret;
+ 
++  // Never overflow or reuse a request number in this session. The caller
++  // frees the unsubmitted request and reports failure through the normal path.
++  if (rs->cseq <= 0 || rs->cseq == INT_MAX)
++    {
++      DPRINTF(E_LOG, L_RAOP, "RTSP request sequence exhausted for '%s'\n", rs->devname);
++      return -1;
++    }
++
+   method = evrtsp_method(req_method);
+ 
+   snprintf(buf, sizeof(buf), "%d", rs->cseq);
+   evrtsp_add_header(req->output_headers, "CSeq", buf);
+ 
+   rs->cseq++;
+ 
+   user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
+   evrtsp_add_header(req->output_headers, "User-Agent", user_agent);
+ 
+   client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
+   evrtsp_add_header(req->output_headers, "X-Apple-Client-Name", client_name);
+ 
+   /* Add Authorization header */
+   url = (req_method == EVRTSP_REQ_OPTIONS) ? "*" : rs->session_url;
+ 
+   ret = raop_add_auth(rs, req, method, url);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not add Authorization header\n");
+ 
+       if (ret == -2)
+ 	rs->state = RAOP_STATE_PASSWORD;
+ 
+       return -1;
+     }
+ 
+   snprintf(buf, sizeof(buf), "%" PRIX64, libhash);
+   evrtsp_add_header(req->output_headers, "Client-Instance", buf);
+   evrtsp_add_header(req->output_headers, "DACP-ID", buf);
+ 
+   // We set Active-Remote as 32 bit unsigned decimal, as at least my device
+   // can't handle any larger. Must be aligned with volume_byactiveremote().
+   snprintf(buf, sizeof(buf), "%" PRIu32, (uint32_t)rs->device_id);
+   evrtsp_add_header(req->output_headers, "Active-Remote", buf);
+ 
+   if (rs->session)
+     evrtsp_add_header(req->output_headers, "Session", rs->session);
+ 
+   /* Content-Length added automatically by evrtsp */
+ 
+   return 0;
+ }
+ 
+ /* This check should compare the reply CSeq with the request CSeq, but it has
+  * been removed because RAOP targets like Reflector and AirFoil don't return
+  * the CSeq according to the rtsp spec, and the CSeq is not really important
+  * anyway.
+  */
+ static int
+ raop_check_cseq(struct raop_session *rs, struct evrtsp_request *req)
+ {
+   return 0;
+ }
+ 
+ /* evrtsp dispatches a response to the FIFO head, without CSeq correlation.
+  * A source FLUSH acknowledgment therefore requires this exact request ID. */
+ static int
+ raop_check_flush_cseq(struct evrtsp_request *req)
+ {
+   struct evkeyval *header;
+   const char *expected = evrtsp_find_header(req->output_headers, "CSeq");
+   const char *received = NULL;
+   unsigned int count = 0;
+   if (!expected || !*expected)
+     return -1;
+   TAILQ_FOREACH(header, req->input_headers, next)
+     if (strcasecmp(header->key, "CSeq") == 0)
+       { received = header->value; count++; }
+   return count == 1 && received && strcmp(received, expected) == 0 ? 0 : -1;
+ }
+ 
+ static int
+ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address, int family, uint32_t session_id)
+ {
+ #define SDP_PLD_FMT							\
+   "v=0\r\n"								\
+     "o=iTunes %u 0 IN %s %s\r\n"					\
+     "s=iTunes\r\n"							\
+     "c=IN %s %s\r\n"							\
+     "t=0 0\r\n"								\
+     "m=audio 0 RTP/AVP 96\r\n"						\
+     "a=rtpmap:96 AppleLossless\r\n"					\
+     "a=fmtp:96 %d 0 16 40 10 14 2 255 0 0 44100\r\n"			\
+     "a=rsaaeskey:%s\r\n"						\
+     "a=aesiv:%s\r\n"
+ #define SDP_PLD_FMT_NO_ENC						\
+   "v=0\r\n"								\
+     "o=iTunes %u 0 IN %s %s\r\n"					\
+     "s=iTunes\r\n"							\
+     "c=IN %s %s\r\n"							\
+     "t=0 0\r\n"								\
+     "m=audio 0 RTP/AVP 96\r\n"						\
+     "a=rtpmap:96 AppleLossless\r\n"					\
+     "a=fmtp:96 %d 0 16 40 10 14 2 255 0 0 44100\r\n"
+ 
+   const char *af;
+   const char *rs_af;
+   char *p;
+   int ret;
+@@ -1889,254 +1900,260 @@ raop_send_req_pin_start(struct raop_session *rs, evrtsp_req_cb cb, const char *l
+ }
+ 
+ 
+ /* ------------------------------ Session handling -------------------------- */
+ 
+ // Maps our internal state to the generic output state and then makes a callback
+ // to the player to tell that state
+ static void
+ raop_status(struct raop_session *rs)
+ {
+   enum output_device_state state;
+ 
+   switch (rs->state)
+     {
+       case RAOP_STATE_PASSWORD:
+ 	state = OUTPUT_STATE_PASSWORD;
+ 	break;
+       case RAOP_STATE_FAILED:
+ 	state = OUTPUT_STATE_FAILED;
+ 	break;
+       case RAOP_STATE_STOPPED:
+ 	state = OUTPUT_STATE_STOPPED;
+ 	break;
+       case RAOP_STATE_STARTUP ... RAOP_STATE_RECORD:
+ 	state = OUTPUT_STATE_STARTUP;
+ 	break;
+       case RAOP_STATE_CONNECTED:
+ 	state = OUTPUT_STATE_CONNECTED;
+ 	break;
+       case RAOP_STATE_STREAMING:
+ 	state = OUTPUT_STATE_STREAMING;
+ 	break;
+       case RAOP_STATE_TEARDOWN:
+ 	DPRINTF(E_LOG, L_RAOP, "Bug! raop_status() called with transitional state (TEARDOWN)\n");
+ 	state = OUTPUT_STATE_STOPPED;
+ 	break;
+       default:
+ 	DPRINTF(E_LOG, L_RAOP, "Bug! Unhandled state in raop_status(): %d\n", rs->state);
+ 	state = OUTPUT_STATE_FAILED;
+     }
+ 
+   outputs_cb(rs->callback_id, rs->device_id, state);
+   rs->callback_id = -1;
+ }
+ 
+ static void
+ master_session_free(struct raop_master_session *rms)
+ {
+   if (!rms)
+     return;
+ 
+   outputs_quality_unsubscribe(&rms->rtp_session->quality);
+   rtp_session_free(rms->rtp_session);
+ 
+   transcode_encode_cleanup(&rms->encode_ctx);
+ 
+   if (rms->input_buffer)
+     evbuffer_free(rms->input_buffer);
+   if (rms->encoded_buffer)
+     evbuffer_free(rms->encoded_buffer);
+ 
+   free(rms->rawbuf);
+   free(rms);
+ }
+ 
+ static void
+ master_session_cleanup(struct raop_master_session *rms)
+ {
+   struct raop_master_session *s;
+   struct raop_session *rs;
+ 
+   // First check if any other session is using the master session
+   for (rs = raop_sessions; rs; rs=rs->next)
+     {
+       if (rs->master_session == rms)
+ 	return;
+     }
+ 
+   if (rms == raop_master_sessions)
+     raop_master_sessions = raop_master_sessions->next;
+   else
+     {
+       for (s = raop_master_sessions; s && (s->next != rms); s = s->next)
+ 	; /* EMPTY */
+ 
+       if (!s)
+ 	DPRINTF(E_WARN, L_RAOP, "WARNING: struct raop_master_session not found in list; BUG!\n");
+       else
+ 	s->next = rms->next;
+     }
+ 
+   master_session_free(rms);
+ }
+ 
+ static struct raop_master_session *
+ master_session_make(struct media_quality *quality, bool encrypt)
+ {
+   struct raop_master_session *rms;
+   struct transcode_encode_setup_args encode_args = { .profile = XCODE_ALAC, .quality = quality };
+   uint64_t buffer_duration_ms;
++  uint64_t buffer_samples;
+   int ret;
+ 
+   // First check if we already have a suitable session
+   for (rms = raop_master_sessions; rms; rms = rms->next)
+     {
+       if (encrypt == rms->encrypt && quality_is_equal(quality, &rms->rtp_session->quality))
+ 	return rms;
+     }
+ 
+   // Let's create a master session
+   ret = outputs_quality_subscribe(quality);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not subscribe to required audio quality (%d/%d/%d)\n", quality->sample_rate, quality->bits_per_sample, quality->channels);
+       return NULL;
+     }
+ 
+   CHECK_NULL(L_RAOP, rms = calloc(1, sizeof(struct raop_master_session)));
+ 
+   rms->rtp_session = rtp_session_new(quality, RAOP_PACKET_BUFFER_SIZE, 0, 0);
+   if (!rms->rtp_session)
+     {
+       outputs_quality_unsubscribe(quality);
+       free(rms);
+       return NULL;
+     }
+ 
+   encode_args.src_ctx = transcode_decode_setup_raw(XCODE_PCM16, quality);
+   if (!encode_args.src_ctx)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create decoding context\n");
+       goto error;
+     }
+ 
+   rms->encode_ctx = transcode_encode_setup(encode_args);
+   transcode_decode_cleanup(&encode_args.src_ctx);
+   if (!rms->encode_ctx)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Will not be able to stream AirPlay, ffmpeg has no ALAC encoder\n");
+       goto error;
+     }
+ 
+   buffer_duration_ms = outputs_buffer_duration_ms_get();
+   if (buffer_duration_ms <= RAOP_AUDIO_LATENCY_MS)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Configuration of start_buffer_ms must be higher than min latency (%d)\n", RAOP_AUDIO_LATENCY_MS);
+       goto error;
+     }
+ 
+   rms->encrypt = encrypt;
+   rms->quality = *quality;
+   rms->samples_per_packet = RAOP_SAMPLES_PER_PACKET;
+   rms->rawbuf_size = STOB(rms->samples_per_packet, quality->bits_per_sample, quality->channels);
+-  rms->output_buffer_samples = (buffer_duration_ms - RAOP_AUDIO_LATENCY_MS) * quality->sample_rate / 1000;
++  if (outputs_buffer_samples_get(&buffer_samples, buffer_duration_ms - RAOP_AUDIO_LATENCY_MS, quality->sample_rate, UINT32_MAX) < 0)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Configured output buffer cannot be represented as an RTP sample count\n");
++      goto error;
++    }
++  rms->output_buffer_samples = buffer_samples;
+ 
+   CHECK_NULL(L_RAOP, rms->rawbuf = malloc(rms->rawbuf_size));
+   CHECK_NULL(L_RAOP, rms->input_buffer = evbuffer_new());
+   CHECK_NULL(L_RAOP, rms->encoded_buffer = evbuffer_new());
+ 
+   rms->next = raop_master_sessions;
+   raop_master_sessions = rms;
+ 
+   return rms;
+ 
+  error:
+   master_session_free(rms);
+   return NULL;
+ }
+ 
+ static void
+ session_free(struct raop_session *rs)
+ {
+   if (!rs)
+     return;
+ 
+   if (rs->master_session)
+     master_session_cleanup(rs->master_session);
+ 
+   if (rs->ctrl)
+     {
+       evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
+       evrtsp_connection_free(rs->ctrl);
+     }
+ 
+   raop_owned_requests_clear(rs);
+ 
+   if (rs->deferredev)
+     event_free(rs->deferredev);
+ 
+   if (rs->server_fd >= 0)
+     close(rs->server_fd);
+ 
+   free(rs->realm);
+   free(rs->nonce);
+   free(rs->session);
+   free(rs->address);
+   free(rs->devname);
+ 
+   free(rs);
+ }
+ 
+ static void
+ session_cleanup(struct raop_session *rs)
+ {
+   struct raop_session *s;
+ 
+   if (rs == raop_sessions)
+     raop_sessions = raop_sessions->next;
+   else
+     {
+       for (s = raop_sessions; s && (s->next != rs); s = s->next)
+ 	; /* EMPTY */
+ 
+       if (!s)
+ 	DPRINTF(E_WARN, L_RAOP, "WARNING: struct raop_session not found in list; BUG!\n");
+       else
+ 	s->next = rs->next;
+     }
+ 
+   outputs_device_session_remove(rs->device_id);
+ 
+   session_free(rs);
+ }
+ 
+ static void
+ session_failure(struct raop_session *rs)
+ {
+   /* Session failed, let our user know */
+   if (rs->state != RAOP_STATE_PASSWORD)
+     rs->state = RAOP_STATE_FAILED;
+ 
+   raop_status(rs);
+ 
+   session_cleanup(rs);
+ }
+ 
+ static void
+ deferred_session_failure(struct raop_session *rs)
+ {
+   struct timeval tv;
+ 
+   rs->state = RAOP_STATE_FAILED;
+ 
+   evutil_timerclear(&tv);
+   evtimer_add(rs->deferredev, &tv);
+ }
+ 
+ static void
+ raop_rtsp_close_cb(struct evrtsp_connection *evcon, void *arg)
+ {
+   struct raop_session *rs = arg;
+ 
+   DPRINTF(E_LOG, L_RAOP, "Device '%s' closed RTSP connection\n", rs->devname);
+ 
+@@ -2222,201 +2239,201 @@ session_connection_setup(struct raop_session *rs, struct output_device *rd, int
+       case AF_INET6:
+ 	if (!rd->v6_address)
+ 	  return -1;
+ 
+ 	address = rd->v6_address;
+ 	port = rd->v6_port;
+ 
+ 	intf = strchr(address, '%');
+ 	if (intf)
+ 	  *intf = '\0';
+ 
+ 	ret = inet_pton(AF_INET6, address, &rs->naddr.sin6.sin6_addr);
+ 
+ 	if (intf)
+ 	  {
+ 	    *intf = '%';
+ 
+ 	    intf++;
+ 
+ 	    rs->naddr.sin6.sin6_scope_id = if_nametoindex(intf);
+ 	    if (rs->naddr.sin6.sin6_scope_id == 0)
+ 	      {
+ 		DPRINTF(E_LOG, L_RAOP, "Could not find interface %s\n", intf);
+ 
+ 		ret = -1;
+ 		break;
+ 	      }
+ 	  }
+ 
+ 	break;
+ 
+       default:
+ 	return -1;
+     }
+ 
+   if (ret <= 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Device '%s' has invalid address (%s) for %s\n", rd->name, address, (family == AF_INET) ? "ipv4" : "ipv6");
+       return -1;
+     }
+ 
+   rs->ctrl = evrtsp_connection_new(address, port);
+   if (!rs->ctrl)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not create control connection to '%s' (%s)\n", rd->name, address);
+       return -1;
+     }
+ 
+   evrtsp_connection_set_base(rs->ctrl, evbase_player);
+ 
+   rs->address = strdup(address);
+   rs->family = family;
+ 
+   return 0;
+ }
+ 
+ static struct raop_session *
+ session_find_by_address(union net_sockaddr *peer_addr)
+ {
+   struct raop_session *rs;
+   uint32_t *addr_ptr;
+   int family = peer_addr->sa.sa_family;
+ 
+   for (rs = raop_sessions; rs; rs = rs->next)
+     {
+       if (family == rs->family)
+ 	{
+ 	  if (family == AF_INET && peer_addr->sin.sin_addr.s_addr == rs->naddr.sin.sin_addr.s_addr)
+ 	    break;
+ 
+ 	  if (family == AF_INET6 && IN6_ARE_ADDR_EQUAL(&peer_addr->sin6.sin6_addr, &rs->naddr.sin6.sin6_addr))
+ 	    break;
+ 	}
+       else if (family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&peer_addr->sin6.sin6_addr))
+ 	{
+ 	  // ipv4 mapped to ipv6 consists of 16 bytes/4 words: 0x00000000 0x00000000 0x0000ffff 0x[IPv4]
+ 	  addr_ptr = (uint32_t *)(&peer_addr->sin6.sin6_addr);
+ 	  if (addr_ptr[3] == rs->naddr.sin.sin_addr.s_addr)
+ 	    break;
+ 	}
+     }
+ 
+   return rs;
+ }
+ 
+ static struct raop_session *
+ session_make(struct output_device *rd, int callback_id, bool only_probe)
+ {
+   struct raop_session *rs;
+   struct raop_extra *re;
+   int ret;
+ 
+   re = rd->extra_device_info;
+ 
+ 
+   CHECK_NULL(L_RAOP, rs = calloc(1, sizeof(struct raop_session)));
+   CHECK_NULL(L_RAOP, rs->deferredev = evtimer_new(evbase_player, deferredev_cb, rs));
+ 
+   rs->devname = strdup(rd->name);
+   rs->volume = rd->volume;
+-  rs->offset_samples = rd->offset_ms * rd->quality.sample_rate / 1000;
++  rs->offset_samples = (int64_t)rd->offset_ms * rd->quality.sample_rate / 1000;
+ 
+   rs->state = RAOP_STATE_STOPPED;
+   rs->only_probe = only_probe;
+   rs->reqs_in_flight = 0;
+   rs->cseq = 1;
+ 
+   rs->device_id = rd->id;
+   rs->callback_id = callback_id;
+ 
+   rs->server_fd = -1;
+ 
+   rs->password = rd->password;
+ 
+   rs->supports_auth_setup = re->supports_auth_setup;
+   rs->wanted_metadata = re->wanted_metadata;
+ 
+   switch (re->devtype)
+     {
+       case RAOP_DEV_APEX1_80211G:
+ 	rs->encrypt = 1;
+ 	rs->auth_quirk_itunes = 1;
+ 	break;
+ 
+       case RAOP_DEV_APEX2_80211N:
+ 	rs->encrypt = 1;
+ 	rs->auth_quirk_itunes = 0;
+ 	break;
+ 
+       case RAOP_DEV_APEX3_80211N:
+ 	rs->encrypt = 0;
+ 	rs->auth_quirk_itunes = 0;
+ 	break;
+ 
+       case RAOP_DEV_APPLETV:
+ 	rs->encrypt = 0;
+ 	rs->auth_quirk_itunes = 0;
+ 	break;
+ 
+       case RAOP_DEV_APPLETV4:
+ 	rs->encrypt = 0;
+ 	rs->auth_quirk_itunes = 0;
+ 	break;
+ 
+       default:
+ 	rs->encrypt = re->encrypt;
+ 	rs->auth_quirk_itunes = 0;
+     }
+ 
+   rs->timing_svc = &raop_timing_svc;
+   rs->control_svc = &raop_control_svc;
+ 
+   ret = session_connection_setup(rs, rd, AF_INET6);
+   if (ret < 0)
+     {
+       ret = session_connection_setup(rs, rd, AF_INET);
+       if (ret < 0)
+ 	goto error;
+     }
+ 
+   rs->master_session = master_session_make(&rd->quality, rs->encrypt);
+   if (!rs->master_session)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not attach a master session for device '%s'\n", rd->name);
+       goto error;
+     }
+ 
+   // Attach to list of sessions
+   rs->next = raop_sessions;
+   raop_sessions = rs;
+ 
+   // rs is now the official device session
+   outputs_device_session_add(rd->id, rs);
+ 
+   return rs;
+ 
+  error:
+   session_free(rs);
+ 
+   return NULL;
+ }
+ 
+ 
+ /* ----------------------------- Metadata handling -------------------------- */
+ 
+ static void
+ raop_metadata_free(struct raop_metadata *rmd)
+ {
+   if (!rmd)
+     return;
+ 
+   if (rmd->metadata)
+     evbuffer_free(rmd->metadata);
+   if (rmd->artwork)
+     evbuffer_free(rmd->artwork);
+ 
+   free(rmd);
+ }
+ 
+ static void
+ raop_metadata_purge(void)
+@@ -3093,201 +3110,201 @@ packets_send(struct raop_master_session *rms)
+   if (rms->encrypt)
+     {
+       ret = packet_encrypt(pkt);
+       if (ret < 0)
+ 	return -1;
+     }
+ 
+   for (rs = raop_sessions; rs; rs = rs->next)
+     {
+       if (rs->master_session != rms)
+ 	continue;
+ 
+       // Device just joined
+       if (rs->state == RAOP_STATE_CONNECTED)
+ 	{
+ 	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
+ 	  packet_send(rs, pkt);
+ 	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
+ 	}
+       else if (rs->state == RAOP_STATE_STREAMING)
+ 	{
+ 	  packet_send(rs, pkt);
+ 	}
+     }
+ 
+   // Commits packet to retransmit buffer, and prepares the session for the next packet
+   rtp_packet_commit(rms->rtp_session, pkt);
+ 
+   return 0;
+ }
+ 
+ // Overview of rtptimes as they should be when starting a stream, and assuming
+ // the first rtptime (pos) is 88200:
+ //   sync pkt:  cur_pos = 0, rtptime = 88200
+ //   audio pkt: rtptime = 88200
+ //   RECORD:    rtptime = 88200
+ //   SET_PARAMETER text/artwork:
+ //              rtptime = 88200
+ //   SET_PARAMETER progress:
+ //              progress = 72840/~88200/[len]
+ static inline void
+ timestamp_set(struct raop_master_session *rms, struct timespec ts)
+ {
+   // The last write from the player had a timestamp which has been passed to
+   // this function as ts. This is the player clock, which is more precise than
+   // the actual clock because it gives us a calculated time reference, which is
+   // independent of how busy the thread is. We save that here, we need this for
+   // reference when sending sync packets and progress.
+   rms->cur_stamp.ts = ts;
+ 
+   // So what rtptime should be playing, i.e. coming out of the speaker, at time
+   // ts (which is normally "now")? Let's calculate by example:
+   //   - we started playback with a rtptime (pos) of X
+   //   - up until time ts we have received a 1000 samples from the player
+   //   - rms->output_buffer_samples is configured to 400 samples
+   //   -> we should be playing rtptime X + 600
+   //
+   // So how do we measure samples received from player? We know that from the
+   // pos, which says how much has been sent to the device, and from rms->input_buffer,
+   // which is the unsent stuff being buffered:
+   //   - received = (pos - X) + rms->input_buffer_samples
+   //
+   // This means the rtptime is computed as:
+   //   - rtptime = X + received - rms->output_buffer_samples
+   //   -> rtptime = X + (pos - X) + rms->input_buffer_samples - rms->out_buffer_samples
+   //   -> rtptime = pos + rms->input_buffer_samples - rms->output_buffer_samples
+   rms->cur_stamp.pos = rms->rtp_session->pos + rms->input_buffer_samples - rms->output_buffer_samples;
+ }
+ 
+ static void
+ packets_sync_send(struct raop_master_session *rms)
+ {
+   struct rtp_packet *sync_pkt;
+   struct rtcp_timestamp cur_stamp;
+   struct raop_session *rs;
+   struct timespec ts;
+   bool is_sync_time;
+ 
+   // Check if it is time send a sync packet to sessions that are already running
+   is_sync_time = rtp_sync_is_time(rms->rtp_session);
+ 
+   // Just used for logging, the clock shouldn't be too far from rms->cur_stamp.ts
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+ 
+   for (rs = raop_sessions; rs; rs = rs->next)
+     {
+       if (rs->master_session != rms)
+ 	continue;
+ 
+       cur_stamp = rms->cur_stamp;
+ 
+       // Apply user configured offset
+       cur_stamp.pos -= rs->offset_samples;
+ 
+       // A device has joined and should get an init sync packet
+       if (rs->state == RAOP_STATE_CONNECTED)
+ 	{
+ 	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
+ 	  control_packet_send(rs, sync_pkt);
+ 
+-	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
++	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%" PRIi64 ", cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
+ 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
+ 	}
+       else if (is_sync_time && rs->state == RAOP_STATE_STREAMING)
+ 	{
+ 	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80);
+ 	  control_packet_send(rs, sync_pkt);
+ 	}
+     }
+ }
+ 
+ 
+ /* ------------------------- Time and control service ----------------------- */
+ 
+ static void
+ service_stop(struct raop_service *svc)
+ {
+   if (svc->ev4)
+     event_free(svc->ev4);
+   if (svc->ev6)
+     event_free(svc->ev6);
+ 
+   svc->ev4 = NULL;
+   svc->ev6 = NULL;
+ 
+   net_socket_close(&svc->socket);
+ 
+   svc->port = 0;
+ }
+ 
+ static int
+ service_start(struct raop_service *svc, event_callback_fn cb, unsigned short port, const char *log_service_name)
+ {
+   int ret;
+ 
+   memset(svc, 0, sizeof(struct raop_service));
+ 
+   svc->socket.fd4 = -1;
+   svc->socket.fd6 = -1;
+ 
+   ret = net_bind(&svc->socket, &port, SOCK_DGRAM, log_service_name);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not start '%s' service\n", log_service_name);
+       goto error;
+     }
+ 
+   if (svc->socket.fd4 >= 0) {
+     svc->ev4 = event_new(evbase_player, svc->socket.fd4, EV_READ | EV_PERSIST, cb, svc);
+     if (!svc->ev4)
+       goto error;
+ 
+     event_add(svc->ev4, NULL);
+   }
+ 
+   if (svc->socket.fd6 >= 0) {
+     svc->ev6 = event_new(evbase_player, svc->socket.fd6, EV_READ | EV_PERSIST, cb, svc);
+     if (!svc->ev6)
+       goto error;
+ 
+     event_add(svc->ev6, NULL);
+   }
+ 
+   svc->port = port;
+ 
+   return 0;
+ 
+  error:
+   service_stop(svc);
+   return -1;
+ }
+ 
+ static void
+ timing_svc_cb(int fd, short what, void *arg)
+ {
+   union net_sockaddr peer_addr;
+   socklen_t peer_addrlen = sizeof(peer_addr);
+   uint8_t req[32];
+   uint8_t res[32];
+   struct ntp_stamp recv_stamp;
+   struct ntp_stamp xmit_stamp;
+   int ret;
+ 
+   ret = timing_get_clock_ntp(&recv_stamp);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Couldn't get receive timestamp\n");
+       return;
+     }
+ 
+   peer_addrlen = sizeof(peer_addr);
+   ret = recvfrom(fd, req, sizeof(req), 0, &peer_addr.sa, &peer_addrlen);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Error reading timing request: %s\n", strerror(errno));
+       return;
+     }
+ 
+   if (ret != 32)
+     {
+       DPRINTF(E_WARN, L_RAOP, "Got timing request with size %d\n", ret);
+@@ -4382,320 +4399,333 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
+   if (devcfg && cfg_getstr(devcfg, "nickname"))
+     {
+       device_name = cfg_getstr(devcfg, "nickname");
+     }
+ 
+   CHECK_NULL(L_RAOP, rd = calloc(1, sizeof(struct output_device)));
+   CHECK_NULL(L_RAOP, re = calloc(1, sizeof(struct raop_extra)));
+ 
+   rd->id = id;
+   rd->name = strdup(device_name);
+   rd->type = OUTPUT_TYPE_RAOP;
+   rd->type_name = outputs_name(rd->type);
+   rd->extra_device_info = re;
+   rd->supported_formats = MEDIA_FORMAT_ALAC;
+ 
+   if (port < 0)
+     {
+       // Device stopped advertising
+       switch (family)
+ 	{
+ 	  case AF_INET:
+ 	    rd->v4_port = 1;
+ 	    break;
+ 
+ 	  case AF_INET6:
+ 	    rd->v6_port = 1;
+ 	    break;
+ 	}
+ 
+       ret = player_device_remove(rd);
+       if (ret < 0)
+ 	goto free_rd;
+ 
+       return;
+     }
+ 
+   // Protocol
+   p = keyval_get(txt, "tp");
+   if (!p)
+     {
+       DPRINTF(E_LOG, L_RAOP, "AirPlay '%s': no tp field in TXT record!\n", device_name);
+ 
+       goto free_rd;
+     }
+ 
+   if (*p == '\0')
+     {
+       DPRINTF(E_LOG, L_RAOP, "AirPlay '%s': tp has no value\n", device_name);
+ 
+       goto free_rd;
+     }
+ 
+   if (!strstr(p, "UDP"))
+     {
+       DPRINTF(E_LOG, L_RAOP, "AirPlay '%s': device does not support AirTunes v2 (tp=%s), discarding\n", device_name, p);
+ 
+       goto free_rd;
+     }
+ 
+   // Password protection
+   password = NULL;
+   p = keyval_get(txt, "pw");
+   if (!p)
+     {
+       rd->has_password = 0;
+     }
+   else if (*p == '\0')
+     {
+       DPRINTF(E_LOG, L_RAOP, "AirPlay '%s': pw has no value\n", device_name);
+ 
+       goto free_rd;
+     }
+   else
+     {
+       rd->has_password = (strcasecmp(p, "false") != 0);
+     }
+ 
+   if (rd->has_password)
+     {
+       DPRINTF(E_LOG, L_RAOP, "AirPlay device '%s' is password-protected\n", device_name);
+ 
+       if (devcfg)
+ 	password = cfg_getstr(devcfg, "password");
+ 
+       if (!password)
+ 	DPRINTF(E_LOG, L_RAOP, "No password given in config for AirPlay device '%s'\n", device_name);
+     }
+ 
+   rd->password = password;
+ 
+   // Device verification
+   p = keyval_get(txt, "sf");
+   if (p && (safe_hextou64(p, &sf) == 0))
+     {
+       if (sf & (1 << 9))
+ 	rd->requires_auth = 1;
+ 
+       // Note: device_add() in player.c will get the auth key from the db if available
+     }
+ 
+-  // Quality supported - note this is mostly WIP, since newer devices that support
+-  // higher than 44100/16 don't seem to use the below fields (probably use sf instead)
++  // Missing legacy fields use defaults. Malformed advertised fields fail closed.
+   p = keyval_get(txt, "sr");
+-  if (!p || (safe_atoi32(p, &rd->quality.sample_rate) != 0))
++  if (!p)
+     rd->quality.sample_rate = RAOP_QUALITY_SAMPLE_RATE_DEFAULT;
++  else if (safe_atoi32(p, &rd->quality.sample_rate) != 0)
++    goto invalid_quality;
+ 
+   p = keyval_get(txt, "ss");
+-  if (!p || (safe_atoi32(p, &rd->quality.bits_per_sample) != 0))
++  if (!p)
+     rd->quality.bits_per_sample = RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT;
++  else if (safe_atoi32(p, &rd->quality.bits_per_sample) != 0)
++    goto invalid_quality;
+ 
+   p = keyval_get(txt, "ch");
+-  if (!p || (safe_atoi32(p, &rd->quality.channels) != 0))
++  if (!p)
+     rd->quality.channels = RAOP_QUALITY_CHANNELS_DEFAULT;
++  else if (safe_atoi32(p, &rd->quality.channels) != 0)
++    goto invalid_quality;
++
++  if (rd->quality.sample_rate <= 0 || rd->quality.sample_rate > RAOP_QUALITY_SAMPLE_RATE_MAX
++      || (rd->quality.bits_per_sample != 16 && rd->quality.bits_per_sample != 24 && rd->quality.bits_per_sample != 32)
++      || rd->quality.channels <= 0 || rd->quality.channels > 8)
++    goto invalid_quality;
+ 
+   if (!quality_is_equal(&rd->quality, &raop_quality_default))
+     DPRINTF(E_LOG, L_RAOP, "Device '%s' requested non-default audio quality (%d/%d/%d)\n", rd->name, rd->quality.sample_rate, rd->quality.bits_per_sample, rd->quality.channels);
+ 
+   // Max volume
+   rd->max_volume = devcfg ? cfg_getint(devcfg, "max_volume") : RAOP_CONFIG_MAX_VOLUME;
+   if ((rd->max_volume < 1) || (rd->max_volume > RAOP_CONFIG_MAX_VOLUME))
+     {
+       DPRINTF(E_LOG, L_RAOP, "Config has bad max_volume (%d) for device '%s', using default instead\n", rd->max_volume, device_name);
+       rd->max_volume = RAOP_CONFIG_MAX_VOLUME;
+     }
+ 
+   // Device type
+   re->devtype = RAOP_DEV_OTHER;
+   p = keyval_get(txt, "am");
+ 
+   if (!p)
+     re->devtype = RAOP_DEV_APEX1_80211G; // First generation AirPort Express
+   else if (strncmp(p, "AirPort4", strlen("AirPort4")) == 0)
+     re->devtype = RAOP_DEV_APEX2_80211N; // Second generation
+   else if (strncmp(p, "AirPort", strlen("AirPort")) == 0)
+     re->devtype = RAOP_DEV_APEX3_80211N; // Third generation and newer
+   else if (strncmp(p, "AppleTV5,3", strlen("AppleTV5,3")) == 0)
+     re->devtype = RAOP_DEV_APPLETV4; // Stream to ATV with tvOS 10 needs to be kept alive
+   else if (strncmp(p, "AppleTV", strlen("AppleTV")) == 0)
+     re->devtype = RAOP_DEV_APPLETV;
+   else if (strncmp(p, "AudioAccessory", strlen("AudioAccessory")) == 0)
+     re->devtype = RAOP_DEV_HOMEPOD;
+   else if (*p == '\0')
+     DPRINTF(E_LOG, L_RAOP, "AirPlay device '%s': am has no value\n", device_name);
+ 
+   // If the user didn't set any reconnect setting we enable for Apple TV and
+   // HomePods due to https://github.com/owntone/owntone-server/issues/734
+   cfgopt = devcfg ? cfg_getopt(devcfg, "reconnect") : NULL;
+   if (cfgopt && cfgopt->nvalues == 1)
+     rd->resurrect = cfg_opt_getnbool(cfgopt, 0);
+   else
+     rd->resurrect = (re->devtype == RAOP_DEV_APPLETV4) || (re->devtype == RAOP_DEV_HOMEPOD);
+ 
+   // Encrypt stream
+   p = keyval_get(txt, "ek");
+   if (p && (*p == '1'))
+     re->encrypt = 1;
+ 
+   // Metadata support
+   p = keyval_get(txt, "md");
+   if (p)
+     {
+       CHECK_NULL(L_RAOP, s = strdup(p));
+       token = strtok_r(s, ",", &ptr);
+       while (token)
+ 	{
+ 	  if (strcmp(token, "0") == 0)
+ 	    re->wanted_metadata |= RAOP_MD_WANTS_TEXT;
+ 	  else if (strcmp(token, "1") == 0)
+ 	    re->wanted_metadata |= RAOP_MD_WANTS_ARTWORK;
+ 	  else if (strcmp(token, "2") == 0)
+ 	    re->wanted_metadata |= RAOP_MD_WANTS_PROGRESS;
+ 
+ 	  token = strtok_r(NULL, ",", &ptr);
+ 	}
+       free(s);
+     }
+ 
+   p = keyval_get(txt, "et");
+   if (p)
+     {
+       CHECK_NULL(L_RAOP, s = strdup(p));
+       token = strtok_r(s, ",", &ptr);
+       while (token)
+ 	{
+ 	  // Value of 4 seems to indicate support (!= requirement) for auth-setup
+ 	  if (strcmp(token, "4") == 0)
+ 	    re->supports_auth_setup = 1;
+ 
+ 	  token = strtok_r(NULL, ",", &ptr);
+ 	}
+       free(s);
+     }
+ 
+   switch (family)
+     {
+       case AF_INET:
+ 	rd->v4_address = strdup(address);
+ 	rd->v4_port = port;
+ 	DPRINTF(E_INFO, L_RAOP, "Adding AirPlay device '%s': password: %u, verification: %u, encrypt: %u, authsetup: %u, metadata: %u, type %s, address %s:%d\n", 
+ 	  device_name, rd->has_password, rd->requires_auth, re->encrypt, re->supports_auth_setup, re->wanted_metadata, raop_devtype[re->devtype], address, port);
+ 	break;
+ 
+       case AF_INET6:
+ 	rd->v6_address = strdup(address);
+ 	rd->v6_port = port;
+ 	DPRINTF(E_INFO, L_RAOP, "Adding AirPlay device '%s': password: %u, verification: %u, encrypt: %u, authsetup: %u, metadata: %u, type %s, address [%s]:%d\n", 
+ 	  device_name, rd->has_password, rd->requires_auth, re->encrypt, re->supports_auth_setup, re->wanted_metadata, raop_devtype[re->devtype], address, port);
+ 	break;
+ 
+       default:
+ 	DPRINTF(E_LOG, L_RAOP, "Error: AirPlay device '%s' has neither ipv4 og ipv6 address\n", device_name);
+ 	goto free_rd;
+     }
+ 
+   ret = player_device_add(rd);
+   if (ret < 0)
+     goto free_rd;
+ 
+   return;
+ 
++ invalid_quality:
++  DPRINTF(E_LOG, L_RAOP, "Ignoring AirPlay device '%s': invalid advertised audio quality (rate 1..%d Hz, bits 16/24/32, channels 1..8 required)\n", device_name, RAOP_QUALITY_SAMPLE_RATE_MAX);
++
+  free_rd:
+   outputs_device_free(rd);
+ }
+ 
+ 
+ /* ---------------------------- Module definitions -------------------------- */
+ /*                                Thread: player                              */
+ 
+ static int
+ raop_device_start_generic(struct output_device *device, int callback_id, bool only_probe)
+ {
+   struct raop_session *rs;
+   int ret = -1; // The logic below makes some compilers react with a maybe-uninitialized warning
+ 
+   /* Send an OPTIONS request to establish the connection. If device verification
+    * is required we start with that. After that, we can determine our local
+    * address and build our session URL for all subsequent requests.
+    */
+ 
+   rs = session_make(device, callback_id, only_probe);
+   if (!rs)
+     return -1;
+ 
+   if (device->auth_key)
+     {
+       ret = raop_pair_verify(rs);
+     }
+ 
+   if (!device->auth_key) // If no auth keys or if raop_pair_verify() cleared the key
+     {
+       if (device->requires_auth)
+ 	ret = raop_send_req_pin_start(rs, raop_cb_pin_start, "device_start");
+       else
+ 	ret = raop_send_req_options(rs, raop_cb_startup_options, "device_start");
+     }
+ 
+   if (ret < 0)
+     {
+       DPRINTF(E_WARN, L_RAOP, "Could not send verification or OPTIONS request to '%s' (address %s)\n", device->name, rs->address);
+       session_cleanup(rs);
+       return -1;
+     }
+ 
+   return 1;
+ }
+ 
+ static int
+ raop_device_probe(struct output_device *device, int callback_id)
+ {
+   return raop_device_start_generic(device, callback_id, 1);
+ }
+ 
+ static int
+ raop_device_start(struct output_device *device, int callback_id)
+ {
+   return raop_device_start_generic(device, callback_id, 0);
+ }
+ 
+ static int
+ raop_device_stop(struct output_device *device, int callback_id)
+ {
+   struct raop_session *rs = device->session;
+ 
+   rs->callback_id = callback_id;
+ 
+   session_teardown(rs, "device_stop");
+ 
+   return 1;
+ }
+ 
+ static int
+ raop_device_flush(struct output_device *device, int callback_id)
+ {
+   struct raop_session *rs = device->session;
+   int ret;
+ 
+   if (rs->state != RAOP_STATE_STREAMING)
+     return 0; // No-op, nothing to flush
+ 
+   rs->callback_id = callback_id;
+   ret = raop_send_req_flush(rs, raop_cb_flush, "flush");
+   if (ret < 0)
+     {
+       /* evrtsp may retain the failed request in its queue. Cancel the exact
+        * connection before releasing contexts; report the new operation failed. */
+       session_failure(rs);
+       return 1;
+     }
+ 
+   return 1;
+ }
+ 
+ static void
+ raop_device_cb_set(struct output_device *device, int callback_id)
+ {
+   struct raop_session *rs = device->session;
+ 
+   rs->callback_id = callback_id;
+ }
+ 

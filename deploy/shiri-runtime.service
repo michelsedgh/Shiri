@@ -22,7 +22,10 @@ TimeoutStopSec=120
 # making namespaces invisible to replacement brokers after a service crash.
 # Apply those directives to the API and future unprivileged daemon units instead.
 PrivateMounts=no
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE CAP_KILL CAP_DAC_OVERRIDE CAP_CHOWN CAP_SETUID CAP_SETGID
+# FOWNER permits mode updates on admitted worker-owned directories, IPC and
+# held timing/socket inodes. FSETID preserves the prepared IPC directory's
+# receiver group when its owner creates a socket. Workers receive empty sets.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE CAP_KILL CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 LockPersonality=true
 

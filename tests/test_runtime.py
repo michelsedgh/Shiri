@@ -72,7 +72,10 @@ def test_service_allows_owned_network_setup_without_proc_ptrace_access():
     unit = (Path(__file__).parents[1] / "deploy" / "shiri-runtime.service").read_text()
     settings = dict(line.split("=", 1) for line in unit.splitlines() if "=" in line)
     capabilities = set(settings["CapabilityBoundingSet"].split())
-    assert {"CAP_NET_ADMIN", "CAP_CHOWN"} <= capabilities
+    assert capabilities == {
+        "CAP_SYS_ADMIN", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_NET_BIND_SERVICE", "CAP_SYS_NICE",
+        "CAP_KILL", "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_FOWNER", "CAP_FSETID", "CAP_SETUID", "CAP_SETGID",
+    }
     assert "CAP_SYS_PTRACE" not in capabilities
     assert "AF_PACKET" in settings["RestrictAddressFamilies"].split()
     assert settings["User"] == "root" and settings["Group"] == "root"
@@ -104,10 +107,11 @@ async def test_control_socket_group_and_peer_policy_are_explicit_for_root_group_
     service.config.runtime_dir.mkdir(parents=True)
     service.preflight = AsyncMock(side_effect=RuntimeFailure("Test preflight unavailable"))
     server = SimpleNamespace(close=Mock(), wait_closed=AsyncMock())
+    lock = service._singleton_lock(service.config.runtime_dir / "broker.lock", os.geteuid())
     with (
         patch("shiri.runtime.broker.sys.platform", "linux"),
         patch("shiri.runtime.broker.os.geteuid", return_value=0),
-        patch("shiri.runtime.broker.os.fstat", return_value=SimpleNamespace(st_uid=0)),
+        patch.object(service, "_singleton_lock", return_value=lock) as singleton,
         patch("shiri.runtime.broker.root_directory") as directories,
         patch("shiri.runtime.broker.os.chown") as ownership,
         patch("shiri.runtime.broker.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=123, pw_gid=998)),
@@ -118,6 +122,7 @@ async def test_control_socket_group_and_peer_policy_are_explicit_for_root_group_
             assert not snapshot["ready"]
             directories.assert_any_call(service.config.runtime_dir, 0o750)
             ownership.assert_called_once_with(service.config.runtime_dir, 0, 998)
+            singleton.assert_called_once_with(service.config.runtime_dir / "broker.lock", 0)
             assert serve.await_args.kwargs == {"allowed_uids": {0, 123}, "socket_gid": 998}
         finally:
             await service.close()
@@ -220,7 +225,7 @@ async def test_saved_process_birth_prevents_reused_pid_signal():
 @pytest.mark.asyncio
 async def test_stopping_one_room_preserves_other_sender_reservation(tmp_path):
     service = broker(tmp_path)
-    service.network = SimpleNamespace(remove=AsyncMock())
+    service.network = SimpleNamespace(remove=AsyncMock(), manifest={"processes": {}})
     service._stop_sender = AsyncMock()
     first, second = runtime_room(tmp_path), runtime_room(tmp_path)
     service.sender_users = {first.desired.id, second.desired.id}
@@ -668,9 +673,10 @@ async def test_ready_process_manifest_tracks_final_exec_not_its_launcher(tmp_pat
         "while not Path(sys.argv[1]).exists(): time.sleep(0.01)\n"
         f"os.execv(sys.executable, [sys.executable, '-c', {final!r}])\n"
     )
-    owned = await service._start_process(
-        "room:exec", "exec", [sys.executable, "-c", launcher, str(gate), str(ready)], tmp_path
+    owned = await service.runner.start(
+        "exec", [sys.executable, "-c", launcher, str(gate), str(ready)], tmp_path / "exec.log"
     )
+    await service._remember_process("room:exec", owned)
     try:
 
         async def wait_for(predicate):
@@ -694,20 +700,22 @@ async def test_ready_process_manifest_tracks_final_exec_not_its_launcher(tmp_pat
 @pytest.mark.asyncio
 async def test_cancelled_partial_selection_keeps_lease_until_verified_backend_stop(tmp_path):
     service = broker(tmp_path)
-    service.network = SimpleNamespace(remove=AsyncMock(), forget_process=Mock())
+    service.network = SimpleNamespace(remove=AsyncMock(), forget_process=Mock(), manifest={"processes": {}})
     speaker = SpeakerRef(id="123", name="Physical speaker", protocol="airplay2")
     first = runtime_room(tmp_path, room(enabled=True))
     second = runtime_room(tmp_path, room(enabled=True, slot=1, airplay_name="Bedroom input"))
     output = normalize_output({"id": "123", "name": speaker.name, "type": "AirPlay 2"}, set())
     first.client = SimpleNamespace(
         outputs=AsyncMock(return_value=[output]),
+        volume_settings=AsyncMock(return_value={"ok": True}),
         select=AsyncMock(side_effect=asyncio.CancelledError),
         close=AsyncMock(),
     )
     second.client = SimpleNamespace(
-        outputs=AsyncMock(return_value=[output]), select=AsyncMock(return_value={"ok": True})
+        outputs=AsyncMock(return_value=[output]), select=AsyncMock(return_value={"ok": True}), volume=AsyncMock(), volume_settings=AsyncMock(return_value={"ok": True})
     )
     first.status = second.status = "running"
+    first.timing = second.timing = (500, 600)  # Actual installed AirPlay buffer profile for this peer fake.
     first.processes["owntone"] = SimpleNamespace(
         stop=AsyncMock(side_effect=RuntimeFailure("termination not proven"))
     )

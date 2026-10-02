@@ -11,6 +11,9 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
+import hashlib
+import hmac
+import json
 import logging
 import os
 from pathlib import Path
@@ -19,20 +22,38 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import sys
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
 from shiri.domain import Room, SpeakerRef, local_audio_device_key, speaker_key, validate_local_audio_device
 from shiri.rpc import RpcError, call_rpc, serve_rpc
 from shiri.settings import RuntimeConfig
-from .backend import OwnToneClient
-from .configuration import backend_configs, isolated_command, isolated_runtime
+from shiri.source import SourceToken
+from .backend import OwnToneClient, OwnToneRejected
+from .configuration import backend_configs
+from .latency import latency_plan, room_buffer_ms
+from .identities import DaemonIdentities
+from .local_devices import LocalDevices
+from .alsa_identity import PCMIdentityError, inventory as alsa_inventory, resolve as resolve_pcm
+from .layout import admit_bus_socket, directory as private_directory, file_owner, prepare_discovery, prepare_room_view
+from .units import Bind, PCMExec, UnitManager, UnitSpec, VIEW, new_unit
+from .bind_policy import trusted_file
 from .network import DHCP_HOOK, NetworkManager
+from .speech_endpoint import retire as retire_speech_endpoint
+from .unix_directory import PinnedUnixDirectory
 from .system import OwnedProcess, Runner, RuntimeFailure, atomic_json, read_json, root_directory
 
 log = logging.getLogger(__name__)
+REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1"
+_OWNTONE_VERSION_PATTERN = re.compile(r"(?<![\w.-])" + re.escape(REQUIRED_OWNTONE_VERSION) + r"(?![\w.-])")
+# The pinned receiver appends these feature tokens after its backend marker.
+# Its sysconfdir path is removed before matching, so path text cannot qualify.
+_SHAIRPORT_TIMED_PATTERN = re.compile(
+    r"-shiri-timed3-startup1(?=$|\s|(?:-soxr)?(?:-convolution)?(?:-metadata)?(?:-mqtt)?(?:-dbus)?(?:-mpris)?$)"
+)
 
 
 def now():
@@ -71,10 +92,23 @@ class RuntimeRoom:
     active_local_device: str | None = None
     phone_volume_update: dict | None = None
     phone_volume_next: dict | None = None
+    worker_sockets: dict[str, Path] = field(default_factory=dict)
+    signal_server: object | None = None
+    launch_generation: str | None = None
+    native_volume_receipts: dict[str, dict] = field(default_factory=dict)
+    local_pin: object | None = None
+    held_local_node: str | None = None
+    bluetooth_admission: object | None = None
+    bluetooth_handoff: object | None = None
+    bluetooth_rpc_directory: PinnedUnixDirectory | None = None
+    timing: tuple[int, int] = (40, 140)
+    active_timing: tuple[int, int] | None = None
+    gain_pending: bool = False
 
     def snapshot(self):
         offsets = {speaker.id: speaker.offset_ms for speaker in self.desired.speakers}
-        outputs = [dict(output, requested_offset_ms=offsets.get(output["id"])) for output in self.outputs]
+        balances = {speaker.id: speaker.balance_percent for speaker in self.desired.speakers}
+        outputs = [dict(output, requested_offset_ms=offsets.get(output["id"]), requested_balance_percent=balances.get(output["id"])) for output in self.outputs]
         return {
             "room_id": self.desired.id,
             "status": self.status,
@@ -83,10 +117,13 @@ class RuntimeRoom:
             "owntone_url": self.client.base_url if self.client else None,
             "last_health_at": self.last_health_at,
             "volume": self.current_volume,
+            "volume_settings_pending": self.gain_pending,
             "phone_volume_update": self.phone_volume_update,
             "selected_ids": self.selected_ids,
             "outputs": outputs,
             "player": self.player,
+            "timing": {"output_buffer_ms": self.timing[0], "common_relay_delay_ms": self.timing[1],
+                       "active": self.active_timing == self.timing and self.client is not None},
             "processes": [
                 {"name": process.name, "pid": process.process.pid, "alive": process.alive}
                 for process in self.processes.values()
@@ -99,6 +136,10 @@ class Broker:
     def __init__(self, config: RuntimeConfig, *, runner: Runner | None = None):
         self.config, self.runner = config, runner or Runner()
         self.network: NetworkManager | None = None
+        self.identities: DaemonIdentities | None = None
+        self.unit_manager: UnitManager | None = None
+        self.local_devices: LocalDevices | None = None
+        self.bluealsa = None
         self.rooms: dict[str, RuntimeRoom] = {}
         self.sender: dict | None = None
         self.sender_processes: dict[str, OwnedProcess] = {}
@@ -108,6 +149,7 @@ class Broker:
         self.slot_locks = [asyncio.Lock() for _ in range(config.max_rooms)]
         self.speaker_lock = asyncio.Lock()
         self.speaker_leases: dict[tuple, str] = {}
+        self.local_node_leases: dict[str, str] = {}
         self.sessions: dict[str, str] = {}
         self.session_generations: dict[str, object] = {}
         self.pending_sessions: set[str] = set()
@@ -142,17 +184,21 @@ class Broker:
             raise RuntimeFailure(
                 "The real audio runtime requires a root Linux broker; the Mac hosts the control app only"
             )
-        for name in ["ip", "dhclient", "unshare", "mount", "dbus-daemon", "avahi-daemon", "ping"]:
+        for name in ["ip", "dhclient", "dbus-daemon", "systemd-run", "journalctl", "ping"]:
             if not shutil.which(name):
                 raise RuntimeFailure(f"Required system command {name} is missing")
-        for name in ["nqptp", "shairport-sync", "airptpd", "owntone"]:
-            self.binary(name)
+        for name in ["nqptp", "shairport-sync", "airptpd", "owntone", "avahi-daemon"]:
+            trusted_file(Path(self.binary(name)), executable=True)
         for name in ["nqptp", "shairport-sync"]:
             result = await self.runner.run([self.binary(name), "-V"])
             self.versions[name] = (result.stdout or result.stderr).strip()
         shairport = self.versions["shairport-sync"]
-        if "AirPlay2" not in shairport or "ALSA" not in shairport:
-            raise RuntimeFailure("Shairport Sync must include AirPlay 2 and ALSA support")
+        receiver_features = shairport.split("-sysconfdir:", 1)[0]
+        if "AirPlay2" not in receiver_features or not _SHAIRPORT_TIMED_PATTERN.search(receiver_features):
+            raise RuntimeFailure(
+                "Shairport Sync must include AirPlay 2 and the shiri-timed3 private PCM backend "
+                "with bounded clock sampling and recovery, synchronous selected-output preparation and exact receive-thread cleanup; rebuild pinned backends using install/build_backends.sh"
+            )
         pinned_shairport = False
         if self.config.binary_dir:
             manifest = self.config.binary_dir / "share" / "shiri" / "backends.json"
@@ -170,23 +216,26 @@ class Broker:
             raise RuntimeFailure("NQPTP and Shairport shared-memory interfaces do not match")
         result = await self.runner.run([self.binary("owntone"), "--version"])
         self.versions["owntone"] = (result.stdout or result.stderr).strip()
-        if not re.search(r"(?<![\w.-])29\.3-shiri-swvol1(?![\w.-])", self.versions["owntone"]):
+        if not _OWNTONE_VERSION_PATTERN.search(self.versions["owntone"]):
             raise RuntimeFailure(
-                "This runtime requires OwnTone 29.3-shiri-swvol1 with per-session software volume; "
+                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement and saved speaker balance; "
                 "rebuild pinned backends using install/build_backends.sh"
             )
         if not DHCP_HOOK.is_file() or not os.access(DHCP_HOOK, os.X_OK):
             raise RuntimeFailure("The private namespace DHCP hook is missing")
-        info = Path("/proc/asound/Loopback/pcm0p/info")
-        try:
-            info_text = await asyncio.to_thread(info.read_text)
-        except OSError as exc:
-            raise RuntimeFailure(
-                "ALSA Loopback is unavailable; load snd-aloop and check VM sound/kernel modules"
-            ) from exc
-        match = re.search(r"subdevices_count:\s*(\d+)", info_text)
-        if not match or int(match.group(1)) < self.config.max_rooms:
-            raise RuntimeFailure("ALSA Loopback does not provide the configured number of room slots")
+        self.identities = DaemonIdentities(self.config.daemon_identity_file).load()
+        if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+            raise RuntimeFailure("Daemon isolation requires unified cgroup v2")
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise RuntimeFailure("Daemon recovery requires Linux process-handle signaling")
+        result = await self.runner.run([self.binary("avahi-daemon"), "--version"])
+        self.versions["avahi-daemon"] = (result.stdout or result.stderr).strip()
+        if "0.8-shiri-user1" not in self.versions["avahi-daemon"]:
+            raise RuntimeFailure("Private discovery requires the pinned Avahi 0.8-shiri-user1 backend")
+        trusted_file(self.bind_policy_helper(), executable=True)
+        trusted_file(self.pcm_exec_helper(), executable=True)
+        trusted_file(Path(__file__).with_name("launch_gate.py"))
+        trusted_file(Path(__file__).with_name("log_reader.py"))
         await self.runner.run(
             [
                 sys.executable,
@@ -198,6 +247,53 @@ class Broker:
                 "import aiortc; import av; import numpy",
             ]
         )
+
+    @staticmethod
+    def _singleton_lock(path: Path, owner: int):
+        """Hold only an unchanged owner-private regular inode; never repair it."""
+        descriptor = original = None
+
+        def validate(info):
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != owner or stat.S_IMODE(info.st_mode) != 0o600):
+                raise RuntimeFailure(
+                    "Broker singleton lock must be an unchanged owner-only 0600 regular file with one link; "
+                    "stop owned services and inspect the existing lock before repairing its metadata"
+                )
+
+        def unchanged():
+            held = os.fstat(descriptor)
+            named = path.lstat()
+            validate(held)
+            validate(named)
+            if ((named.st_dev, named.st_ino) != (held.st_dev, held.st_ino)
+                    or (original is not None and original != (held.st_dev, held.st_ino))):
+                raise RuntimeFailure("Broker singleton lock was replaced; preserve both inodes for inspection")
+
+        try:
+            try:
+                previous = path.lstat()
+                validate(previous)
+                original = previous.st_dev, previous.st_ino
+            except FileNotFoundError:
+                pass
+            flags = os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+            if original is None:
+                flags |= os.O_CREAT | os.O_EXCL
+            descriptor = os.open(path, flags, 0o600)
+            unchanged()
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            unchanged()
+            handle = os.fdopen(descriptor, "a")
+            descriptor = None
+            return handle
+        except BlockingIOError as exc:
+            raise RuntimeFailure("Another Shiri runtime broker owns this installation") from exc
+        except OSError as exc:
+            raise RuntimeFailure("Broker singleton lock cannot be admitted safely; preserve it for inspection") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     async def start(self, *, serve=True):
         allowed, socket_gid = {0}, None
@@ -213,25 +309,23 @@ class Broker:
                 os.chown(self.config.runtime_dir, 0, socket_gid)
         else:
             self.config.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
-        descriptor = os.open(
-            self.config.runtime_dir / "broker.lock",
-            os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
-            0o600,
+        self._lock_file = self._singleton_lock(
+            self.config.runtime_dir / "broker.lock", 0 if sys.platform == "linux" else os.geteuid(),
         )
-        if sys.platform == "linux" and os.geteuid() == 0 and os.fstat(descriptor).st_uid != 0:
-            os.close(descriptor)
-            raise RuntimeFailure("Broker singleton lock is not root-owned")
-        self._lock_file = os.fdopen(descriptor, "a")
-        try:
-            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            self._lock_file.close()
-            self._lock_file = None
-            raise RuntimeFailure("Another Shiri runtime broker owns this installation") from exc
         try:
             await self.preflight()
             self.network = NetworkManager(self.config.runtime_state_dir, self.runner)
+            if (self.identities.installation_id != self.network.installation_id
+                    or self.identities.runtime_state_dir != self.config.runtime_state_dir
+                    or self.identities.runtime_dir != self.config.runtime_dir):
+                raise RuntimeFailure("Daemon identities belong to another installation or state directory")
+            self.unit_manager = UnitManager(self.runner, self.network, bind_policy_helper=self.bind_policy_helper(),
+                                            pcm_exec_helper=self.pcm_exec_helper())
+            self.runner.unit_manager = self.unit_manager
+            await self.unit_manager.connect()
             await self.network.recover()
+            self.local_devices = LocalDevices(self.config.runtime_state_dir / "local-devices.json",
+                                             self.network.installation_id)
             credential_file = self.config.runtime_state_dir / "backend-credential.json"
             credential = read_json(credential_file, {})
             self._password = credential.get("password") or secrets.token_urlsafe(32)
@@ -268,6 +362,16 @@ class Broker:
                 return {"interfaces": await self.network.interfaces()}
             if operation == "reconcile":
                 return await self.reconcile(payload)
+            if operation in {"local_devices", "bind_local_device"}:
+                if self.local_devices is None or not self.ready:
+                    raise RpcError("runtime_unavailable", "Start the audio runtime before selecting local speakers")
+                if operation == "local_devices":
+                    return self.local_devices.inventory()
+                if set(payload) != {"selection_id", "binding", "conversion"}:
+                    raise RpcError("invalid_request", "Select one inventoried device, binding and conversion preference")
+                async with self.config_lock:
+                    return self.local_devices.bind(payload["selection_id"], payload["binding"],
+                                                   conversion=payload["conversion"])
             if (
                 operation == "speech"
                 and payload.get("action") == "close"
@@ -334,6 +438,7 @@ class Broker:
             raise RpcError("invalid_request", "rooms must be a list within the configured room limit")
         desired = [Room.model_validate(item) for item in definitions]
         ids, slots, names, interfaces, speakers, cards = set(), set(), set(), set(), set(), set()
+        playback_nodes = set()
         for room in desired:
             if room.slot >= self.config.max_rooms:
                 raise RpcError("invalid_configuration", "Room slot exceeds the configured hardware limit")
@@ -353,6 +458,19 @@ class Broker:
                         "invalid_configuration", "A local sound device cannot be shared between rooms"
                     )
                 cards.add(device)
+                if room.enabled and not device.startswith("bluealsa:"):
+                    # SUBDEV does not have an independent kernel character
+                    # node. Per-room device isolation must reserve the entire
+                    # playback node, including the BlueALSA bridge's Loopback.
+                    pin = self._resolve_local_pin(room.local_audio_device, room.slot)
+                    try:
+                        boundary = pin.playback_node
+                    finally:
+                        pin.close()
+                    if boundary in playback_nodes:
+                        raise RpcError("invalid_configuration",
+                                       "Room output isolation requires separate ALSA playback device nodes")
+                    playback_nodes.add(boundary)
             for speaker in room.speakers:
                 key = self._speaker_key(room, speaker)
                 if key in speakers:
@@ -365,7 +483,12 @@ class Broker:
         if len(interfaces) > 1:
             raise RpcError("invalid_configuration", "Enabled rooms must share the same LAN interface")
         async with self.config_lock:
-            for definition in desired:
+            # Stale API revisions must not change another room's common clock.
+            effective = [self.rooms[item.id].desired
+                         if item.id in self.rooms and item.revision < self.rooms[item.id].desired.revision
+                         else item for item in desired]
+            plan = latency_plan(effective)
+            for definition in effective:
                 room = self.rooms.get(definition.id)
                 if room is not None and definition.revision < room.desired.revision:
                     # A phone event ACK may advance intent while an older API
@@ -373,11 +496,27 @@ class Broker:
                     # replace the complete definition after a volume-only ACK.
                     continue
                 completed = room is not None and room.task is not None and room.task.done()
-                changed = room is None or room.desired != definition or completed
+                timing = (room_buffer_ms(definition), plan.common_horizon_ms)
+                timing_changed = room is not None and room.timing != timing
+                changed = room is None or room.desired != definition or completed or timing_changed
                 if room is None:
                     directory = self.config.runtime_state_dir / "rooms" / definition.id
                     room = RuntimeRoom(definition, directory, current_volume=definition.volume)
                     stored = read_json(directory / "phone-volume.json")
+                    if isinstance(stored, dict) and stored.get("version") == 2:
+                        receipts = stored.get("native_receipts")
+                        if (not isinstance(receipts, dict) or len(receipts) > 256
+                                or any(not re.fullmatch(r"[0-9a-f]{32}", event_id)
+                                       or not isinstance(receipt, dict)
+                                       or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("fingerprint")))
+                                       or type(receipt.get("accepted")) is not bool
+                                       for event_id, receipt in receipts.items())):
+                            raise RuntimeFailure("Invalid native volume receipt state; inspection required")
+                        room.native_volume_receipts = receipts
+                        following = stored.get("next")
+                        stored = stored.get("pending")
+                        if stored is not None and following is not None:
+                            stored = {**stored, "next": following}
                     if stored is not None:
                         if (
                             not isinstance(stored, dict)
@@ -414,6 +553,11 @@ class Broker:
                     room.desired, room.removing = definition, False
                     if completed:
                         room.task = asyncio.create_task(self._room_loop(room), name=f"room-{definition.id}")
+                room.timing = timing
+                if timing_changed and (room.client or room.processes):
+                    # An administrative buffer/group change retires the old
+                    # program incarnation. Speech never enters this path.
+                    room.restart_required = True
                 if not self.ready and definition.enabled:
                     room.status, room.error = "error", self.error
                 else:
@@ -422,7 +566,8 @@ class Broker:
                     elif (
                         room.client
                         and room.backend_definition
-                        and self._material(room.backend_definition) != self._material(definition)
+                        and (self._material(room.backend_definition) != self._material(definition)
+                             or timing_changed)
                     ):
                         room.status = "starting"
                     elif definition.enabled and room.status == "stopped":
@@ -467,8 +612,66 @@ class Broker:
             return "plughw:" + canonical.removeprefix("hw:")
         return canonical
 
+    def _resolve_local_pin(self, device: str | None, slot: int):
+        if not device:
+            return None
+        canonical = self._playback_device(device)
+        try:
+            if canonical.startswith("shiri:device="):
+                if self.local_devices is None:
+                    raise RuntimeFailure("Local speaker bindings are unavailable; start the audio runtime")
+                return self.local_devices.resolve(canonical)
+            if canonical.startswith("bluealsa:"):
+                # Bluetooth receives admitted PCM descriptors. It does not
+                # reserve a Loopback substream or gain ALSA/control access.
+                return None
+            # Direct physical ALSA names are not durable hardware identity.
+            # Only an actual snd_aloop virtual instance has a constrained named
+            # exception for synthetic testing and the owned Bluetooth bridge.
+            requested = canonical
+            wanted = re.fullmatch(r"(?:plug)?hw:CARD=([A-Za-z0-9_-]+),DEV=(\d+),SUBDEV=(\d+)", requested)
+            matches = [candidate for candidate in alsa_inventory()
+                       if wanted and candidate.card_id == wanted[1]
+                       and candidate.device == int(wanted[2]) and candidate.subdevice == int(wanted[3])
+                       and candidate.fingerprint and candidate.fingerprint.get("kind") == "virtual"
+                       and candidate.fingerprint.get("binding") == "loopback"]
+            if len(matches) != 1:
+                raise RuntimeFailure("Physical local speakers require a verified device inventory binding; "
+                                     "named cards alone can change destination after reconnect")
+            return resolve_pcm(matches[0].fingerprint, conversion=requested.startswith("plughw:"))
+        except PCMIdentityError as exc:
+            raise RuntimeFailure(str(exc)) from exc
+
+    async def _reserve_local_pin(self, room: RuntimeRoom, pin):
+        if pin is None:
+            return
+        async with self.speaker_lock:
+            if self.local_node_leases.get(pin.playback_node) not in {None, room.desired.id}:
+                raise RuntimeFailure("Local playback device is still owned by another room; retrying after its unit stops")
+            self.local_node_leases[pin.playback_node] = room.desired.id
+            room.local_pin, room.held_local_node = pin, pin.playback_node
+
+    async def _release_local_pin(self, room: RuntimeRoom):
+        released = room.held_local_node
+        async with self.speaker_lock:
+            if room.held_local_node and self.local_node_leases.get(room.held_local_node) == room.desired.id:
+                self.local_node_leases.pop(room.held_local_node)
+            room.held_local_node = None
+            if room.local_pin:
+                room.local_pin.close()
+                room.local_pin = None
+        if released:
+            for waiting in self.rooms.values():
+                if waiting is not room and waiting.desired.enabled and waiting.status in {"error", "degraded"}:
+                    waiting.wake.set()
+
     def _material(self, definition: Room):
-        return definition.interface, definition.slot, definition.airplay_name, definition.local_audio_device
+        return (definition.interface, definition.slot, definition.airplay_name,
+                definition.local_audio_device, room_buffer_ms(definition))
+
+    @staticmethod
+    def _output_assignment(definition: Room):
+        return [speaker.model_dump(exclude={"balance_percent"}) for speaker in definition.speakers]
 
     async def _reserve_speakers(self, room: RuntimeRoom, speakers: list[SpeakerRef], local_device):
         keys = {speaker_key(speaker, local_device) for speaker in speakers}
@@ -503,6 +706,7 @@ class Broker:
             or not room.desired.enabled
             or room.removing
             or self._material(room.desired) != self._material(starting)
+            or room.active_timing != room.timing
         ):
             raise Superseded()
 
@@ -523,6 +727,9 @@ class Broker:
         while not self._closing:
             await room.wake.wait()
             room.wake.clear()
+            if self._closing:
+                return
+            gain_only = False
             try:
                 if not room.desired.enabled or room.removing:
                     await self._stop_room(room)
@@ -543,8 +750,15 @@ class Broker:
                     await self._start_room(room)
                 else:
                     async with room.control_lock:
-                        await room.client.volume(room.current_volume)
-                        await self._restore_outputs(room)
+                        gain_only = bool(room.applied is not None and (room.status == "running" or room.gain_pending)
+                                         and self._output_assignment(room.applied) == self._output_assignment(room.desired))
+                        await self._sync_worker_intent(room)
+                        if gain_only:
+                            await room.client.volume_settings(room.current_volume, room.desired.speakers)
+                            room.gain_pending = False
+                            room.status, room.error = "running", None
+                        else:
+                            await self._restore_outputs(room)
                 room.applied = room.desired
                 room.failures, room.retry_at, room.restart_required = 0, 0, False
             except Superseded:
@@ -556,24 +770,77 @@ class Broker:
             except (RuntimeFailure, RpcError, OSError) as exc:
                 room.error = str(exc)
                 log.exception("Room %s failed", room.desired.id)
-                try:
-                    await self._stop_room(room)
-                except (RuntimeFailure, OSError) as cleanup_error:
-                    room.error += f"; cleanup pending: {cleanup_error}"
-                room.status = "error"
+                if gain_only:
+                    # An ambiguous gain ACK may already have applied. Retain
+                    # the live route and lease, then retry the same saved gains.
+                    room.gain_pending = True
+                    room.status = "degraded"
+                else:
+                    try:
+                        await self._stop_room(room)
+                    except (RuntimeFailure, OSError) as cleanup_error:
+                        room.error += f"; cleanup pending: {cleanup_error}"
+                    room.status = "error"
                 room.failures += 1
                 room.retry_at = asyncio.get_running_loop().time() + min(60, 2 ** min(room.failures, 6))
             finally:
                 room.last_health_at = now()
 
-    async def _start_process(self, key: str, name: str, command: list[str], directory: Path):
-        process = await self.runner.start(name, command, directory / "logs" / f"{name}.log")
-        try:
-            await self._remember_process(key, process)
-        except BaseException:
-            await asyncio.shield(process.stop())
-            raise
-        return process
+    def _account(self, owner: str, role: str, slot: int | None = None):
+        if self.identities is None:
+            raise RuntimeFailure("Managed daemon identities have not been validated")
+        return self.identities.account(f"sender.{role}" if owner == "sender" else f"slot{slot}.{role}")
+
+    def bind_policy_helper(self):
+        return (self.config.bind_policy_helper
+                or (self.config.binary_dir or Path("/opt/shiri")) / "libexec/shiri-bind-policy")
+
+    def pcm_exec_helper(self):
+        return (self.config.pcm_exec_helper
+                or (self.config.binary_dir or Path("/opt/shiri")) / "libexec/shiri-pcm-exec")
+
+    def _hidden_paths(self):
+        # Include configured candidate paths, not only production defaults.
+        return tuple(sorted({"/run/dbus/system_bus_socket",
+                             str(self.config.api_token_file.parent), str(self.config.daemon_identity_file.parent),
+                             str(self.config.api_token_file), str(self.config.daemon_identity_file),
+                             str(self.config.state_dir), str(self.config.runtime_dir)}))
+
+    def _environment(self, *, bus=False):
+        environment = [f"PYTHONPATH={Path(__file__).resolve().parents[2]}"]
+        if self.config.binary_dir:
+            prefix = self.config.binary_dir
+            environment.append(f"LD_LIBRARY_PATH={prefix}/lib:{prefix}/lib/{os.uname().machine}-linux-gnu")
+        if bus:
+            environment.append(f"DBUS_SYSTEM_BUS_ADDRESS=unix:path={VIEW}/bus/bus.sock")
+        return tuple(environment)
+
+    async def _start_process(self, key: str, name: str, command: list[str], directory: Path,
+                             *, account: dict, namespace=None, binds=(), devices=(), ptp=False, bus=False, host_bus=False,
+                             listen_port=None, extra_environment=()):
+        if self.unit_manager is None:
+            raise RuntimeFailure("Privileged daemon launches require the owned system-manager boundary")
+        owner = key.partition(":")[0]
+        pcm = None
+        if devices:
+            # The bridge uses only stdlib and system GI; invoking the canonical
+            # system interpreter avoids a symlink in the held-executable seam.
+            if name == "local-output":
+                command = [str(Path(command[0]).resolve(strict=True)), *command[1:]]
+            pcm = PCMExec(str(self.pcm_exec_helper()), tuple(command))
+            command = list(pcm.command())
+        service = UnitSpec(
+            new_unit(self.network.installation_tag, owner, name), name,
+            account["name"], account["name"], tuple(command),
+            namespace=f"/run/netns/{namespace}" if namespace else "",
+            binds=tuple(binds) + tuple(Bind(device, device, True) for device in devices),
+            devices=tuple(devices), supplementary_groups=("audio",) if devices else (),
+            environment=self._environment(bus=bus) + tuple(extra_environment),
+            inaccessible=tuple(path for path in self._hidden_paths()
+                               if not (host_bus and path == "/run/dbus/system_bus_socket")), ptp=ptp, listen_port=listen_port,
+            pcm_exec=pcm,
+        )
+        return await self.unit_manager.start(key, service, directory / "logs" / f"{name}.log")
 
     async def _remember_process(self, key: str, process):
         identity = await process.coherent_identity()
@@ -583,35 +850,64 @@ class Broker:
         for name, process in processes.items():
             await self._remember_process(f"{key}:{name}", process)
 
-    async def _start_namespace_services(self, key: str, record: dict, directory: Path):
-        runtime = directory / "isolation"
-        dbus, avahi, _ = isolated_runtime(runtime, record["namespace"], record["interface"])
+    async def _stop_reserved_units(self, owner: str):
+        # A partial launch can fail before the in-memory process map receives
+        # its handle. Durable intents must be released before network/outputs.
+        for key, entry in reversed(list(self.network.manifest["processes"].items())):
+            if key.startswith(owner + ":"):
+                await self.runner.stop_saved(entry)
+                self.network.forget_process(key)
+
+    def _retire_speech_endpoint(self, room: RuntimeRoom):
+        # Caller holds the room lifecycle lock and has proved all exact room
+        # units stopped. A socket left by SIGKILL must not block the next
+        # OwnTone launch; an unexpected path must never be deleted.
+        parent = room.directory / "overlay"
+        try:
+            parent.lstat()
+        except FileNotFoundError:
+            return
+        if self.network is None:
+            raise RuntimeFailure("Speech endpoint retirement requires exact room unit ownership")
+        enclosing = room.directory.lstat()
+        if (not stat.S_ISDIR(enclosing.st_mode) or enclosing.st_uid != 0
+                or stat.S_IMODE(enclosing.st_mode) != 0o700):
+            raise RuntimeFailure("Speech endpoint retirement requires the root-private room directory")
+        definition = room.backend_definition or room.desired
+        output = self._account(definition.id, "output", definition.slot)
+        audio = self._account(definition.id, "audio", definition.slot)
+        retire_speech_endpoint(parent, output["uid"], audio["gid"])
+
+    async def _start_namespace_services(self, key: str, record: dict, directory: Path, *, slot=None):
+        private_directory(directory)
+        account = self._account(key, "discovery", slot)
+        clients = ([self._account("room", "output", item) for item in range(self.config.max_rooms)]
+                   if key == "sender" else [self._account(key, "receiver", slot)])
+        discovery_binds = prepare_discovery(directory / "discovery", account, clients, record)
         processes = {}
         try:
             processes["dbus"] = await self._start_process(
-                f"{key}:dbus",
-                "dbus",
-                ["dbus-daemon", "--config-file", str(dbus), "--nofork", "--nopidfile"],
-                directory,
+                f"{key}:dbus", "dbus",
+                [shutil.which("dbus-daemon"), "--config-file", str(VIEW / "config" / "dbus.conf"),
+                 "--nofork", "--nopidfile"], directory, account=account,
+                namespace=record["namespace"], binds=[discovery_binds[0], Bind(
+                    str(directory / "discovery" / "config" / "dbus.conf"), str(VIEW / "config" / "dbus.conf"))],
             )
             await asyncio.sleep(0.2)
             if not processes["dbus"].alive:
                 raise RuntimeFailure("Private D-Bus exited during startup")
+            admit_bus_socket(directory / "discovery" / "bus" / "bus.sock", account)
             processes["avahi"] = await self._start_process(
-                f"{key}:avahi",
-                "avahi",
-                isolated_command(
-                    runtime,
-                    record["namespace"],
-                    ["avahi-daemon", "--file", str(avahi), "--no-drop-root", "--no-chroot", "--debug"],
-                ),
-                directory,
+                f"{key}:avahi", "avahi",
+                [self.binary("avahi-daemon"), "--file", str(VIEW / "config" / "avahi.conf"),
+                 "--no-drop-root", "--no-chroot", "--debug"], directory,
+                account=account, namespace=record["namespace"], bus=True,
+                binds=[*discovery_binds, Bind(str(directory / "discovery" / "config" / "avahi.conf"),
+                                            str(VIEW / "config" / "avahi.conf"))],
             )
             await asyncio.sleep(0.5)
             if not processes["avahi"].alive:
                 raise RuntimeFailure("Private Avahi exited during startup")
-            # Exec wrappers have now settled; persist the actual executable and
-            # argv rather than an intermediate unshare/shell command line.
             await self._refresh_processes(key, processes)
             return processes
         except BaseException:
@@ -640,12 +936,10 @@ class Broker:
                 self.sender_processes["airptpd"] = await self._start_process(
                     "sender:airptpd",
                     "airptpd",
-                    isolated_command(
-                        directory / "isolation",
-                        self.sender["namespace"],
-                        [self.binary("airptpd"), "-f", "-v"],
-                    ),
-                    directory,
+                    [self.binary("airptpd"), "-f", "-v"], directory,
+                    account=self._account("sender", "timing"), namespace=self.sender["namespace"], ptp=True,
+                    binds=[Bind(str(private_directory(directory / "shm", self._account("sender", "timing"), mode=0o755)),
+                                "/dev/shm", True)],
                 )
                 await asyncio.sleep(0.4)
                 if not self.sender_processes["airptpd"].alive:
@@ -657,16 +951,108 @@ class Broker:
                 await asyncio.shield(self._stop_sender())
                 raise
 
+    def _room_password(self, room_id: str):
+        return hmac.new(self._password.encode(), room_id.encode(), hashlib.sha256).hexdigest()
+
+    def _worker_socket(self, room: RuntimeRoom, name="audio"):
+        return room.worker_sockets.get(name, room.directory / f"{name}.sock")
+
+    async def _worker_rpc(self, room: RuntimeRoom, name, operation, payload, *, timeout=15.0, socket=None):
+        if name != 'bluetooth-output':
+            return await call_rpc(socket or self._worker_socket(room, name), operation, payload, timeout=timeout)
+        directory, generation = room.bluetooth_rpc_directory, room.launch_generation
+        if (directory is None or not isinstance(generation, str)
+                or re.fullmatch(r'[0-9a-f]{32}', generation) is None or generation == '0' * 32
+                or directory.path != (room.directory / 'bridge-state' / generation)):
+            raise RuntimeFailure('Bluetooth worker RPC requires this exact live room launch')
+        with directory.address('bridge.sock') as address:
+            result = await call_rpc(address, operation, payload, timeout=timeout)
+            if room.bluetooth_rpc_directory is not directory or room.launch_generation != generation:
+                raise RuntimeFailure('Bluetooth worker RPC completed after its exact launch retired')
+            return result
+
+    async def _start_bluetooth(self, room, bridge, output, generation):
+        from .bluealsa import BlueALSA, HandoffServer
+        from .socket_publication import discard, prepare, publish
+        if self.bluealsa is None:
+            self.bluealsa = BlueALSA(service_uid=0)
+        room.bluetooth_admission = await self.bluealsa.admit(
+            room.desired.local_audio_device, room.desired.id, generation,
+        )
+        private_directory(room.directory / "bridge-state")
+        state = private_directory(room.directory / "bridge-state" / generation, bridge)
+        room.bluetooth_rpc_directory = PinnedUnixDirectory(
+            state, uid=bridge['uid'], gid=bridge['gid'], mode=0o700,
+        )
+        private_directory(room.directory / "bridge-handoff")
+        handoff = private_directory(room.directory / "bridge-handoff" / generation,
+                                    {"uid": 0, "gid": bridge["gid"]}, mode=0o750)
+        room.bluetooth_handoff = HandoffServer(handoff / "pcm.sock", room.bluetooth_admission, bridge["gid"])
+        room.worker_sockets["bluetooth-output"] = state / "bridge.sock"
+        process = await self._start_process(
+            f"{room.desired.id}:bluetooth-output", "bluetooth-output",
+            [sys.executable, "-m", "shiri.runtime.bluetooth_output",
+             "--input", str(VIEW / "state" / "final-pcm.sock"),
+             "--handoff", str(VIEW / "handoff" / "pcm.sock"), "--room-id", room.desired.id,
+             "--generation", generation, "--output-uid", str(output["uid"]),
+             "--socket", str(VIEW / "state" / "bridge.sock")], room.directory,
+            account=bridge, binds=[Bind(str(state), str(VIEW / "state"), True),
+                                   Bind(str(handoff), str(VIEW / "handoff"))],
+        )
+        room.processes["bluetooth-output"] = process
+        room.bluetooth_handoff.authorize(bridge["uid"], process.process.pid)
+        await room.bluetooth_handoff.wait_delivered(timeout=3)
+        await self._wait_worker(room, "bluetooth-output", self._worker_socket(room, "bluetooth-output"))
+        private_directory(room.directory / "bridge-published")
+        record, listener_fd, directory_fd = prepare(
+            state / "final-pcm.sock", room.directory / "bridge-published" / generation,
+            uid=bridge["uid"], initial_gid=bridge["gid"], gid=output["gid"],
+        )
+        try:
+            process.entry["socket_publication"] = record
+            # Persist the inode and destination before rename. A SIGKILL at
+            # either side of publication leaves exact recovery authority.
+            try:
+                await self._remember_process(f"{room.desired.id}:bluetooth-output", process)
+            except BaseException:
+                # The listener has not moved; discard this new empty root dir.
+                discard(record)
+                raise
+            socket = publish(state / "final-pcm.sock", record, listener_fd, directory_fd)
+        finally:
+            os.close(listener_fd)
+            os.close(directory_fd)
+        return Bind(str(socket), str(VIEW / "bridge" / "final-pcm.sock"))
+
     async def _start_room(self, room: RuntimeRoom):
         starting = room.desired
         local_device = self._playback_device(starting.local_audio_device)
+        bluetooth = bool(local_device and local_device.startswith("bluealsa:"))
+        if bluetooth and not _OWNTONE_VERSION_PATTERN.search(self.versions.get("owntone", "")):
+            raise RuntimeFailure("Bluetooth output requires the reviewed framed backend; the host-bus bridge is disabled")
+        pin = self._resolve_local_pin(starting.local_audio_device, starting.slot)
         room.status, room.error = "starting", None
-        if room.processes or room.receiver or room.reserved_slot is not None:
-            await self._stop_room(room)
-        await self.slot_locks[starting.slot].acquire()
-        room.reserved_slot = starting.slot
+        try:
+            if (room.processes or room.receiver or room.reserved_slot is not None or room.local_pin
+                    or room.bluetooth_admission):
+                await self._stop_room(room)
+            await self.slot_locks[starting.slot].acquire()
+            room.reserved_slot = starting.slot
+            async with room.control_lock:
+                # Recovery may already have removed the durable process map,
+                # leaving no in-memory handles but an old filesystem socket.
+                await self._stop_reserved_units(starting.id)
+                self._retire_speech_endpoint(room)
+            await self._reserve_local_pin(room, pin)
+        except BaseException:
+            if pin and room.local_pin is not pin:
+                pin.close()
+            raise
         room.backend_definition = starting
-        room.active_local_device = local_device
+        room.active_timing = room.timing
+        output_buffer_ms, relay_delay_ms = room.active_timing
+        room.active_local_device = (local_device if local_device and local_device.startswith("bluealsa:")
+                                    else pin.pcm if pin else local_device)
         self._check_start(room, starting)
         interfaces = await self.network.interfaces()
         candidate = next((item for item in interfaces if item["name"] == starting.interface), None)
@@ -678,67 +1064,105 @@ class Broker:
         self._check_start(room, starting)
         room.receiver = await self.network.create_receiver(starting)
         self._check_start(room, starting)
+        audio = self._account(starting.id, "audio", starting.slot)
+        receiver = self._account(starting.id, "receiver", starting.slot)
+        output = self._account(starting.id, "output", starting.slot)
+        timing = self._account(starting.id, "timing", starting.slot)
+        room.launch_generation = uuid4().hex
+        generation = room.launch_generation
+        endpoint = None
+        bluetooth_bind = None
+        if bluetooth:
+            bridge = self._account(starting.id, "bridge", starting.slot)
+            bluetooth_bind = await self._start_bluetooth(room, bridge, output, generation)
+            self._check_start(room, starting)
+            endpoint = room.bluetooth_admission.endpoint
+        password = self._room_password(starting.id)
+        own_url = f"http://{sender['api_ip']}:{3869 + starting.slot * 10}"
         shairport, owntone = backend_configs(
-            starting.model_copy(update={"local_audio_device": room.active_local_device}),
-            room.directory,
-            room.receiver,
-            sender,
+            starting.model_copy(update={"local_audio_device": "shiri" if pin else local_device if bluetooth else None}),
+            room.directory, room.receiver, sender,
             broker_socket=self.config.runtime_socket,
-            all_receiver_names=sorted(self._receiver_names()),
-            password=self._password,
+            all_receiver_names=sorted(self._receiver_names()), password=password,
+            view_directory=VIEW, output_state_directory=VIEW / "state", own_username=output["name"],
+            native_timing=True, audio_uid=audio["uid"], music_socket=VIEW / "input" / "music.sock",
+            output_buffer_ms=output_buffer_ms,
+            speech_output={"socket": VIEW / "overlay" / "speech.sock", "peer_uid": audio["uid"],
+                           "room_id": starting.id, "launch_generation": generation},
+            pcm_identity_file=VIEW / "credentials" / "pcm-identity.json" if pin else None,
+            **({"framed_output": {"socket": VIEW / "bridge" / "final-pcm.sock", "peer_uid": bridge["uid"],
+                                  "room_id": starting.id, "launch_generation": generation,
+                                  "rate": endpoint.rate, "channels": endpoint.channels,
+                                  "format_code": endpoint.format_code}} if bluetooth else {}),
         )
-        room.processes = await self._start_namespace_services(starting.id, room.receiver, room.directory)
+        prepare_room_view(room.directory, audio, receiver, output)
+        output_binds, output_environment = [bluetooth_bind] if bluetooth_bind else [], []
+        if pin:
+            from .alsa_configuration import render_pcm_config
+            identity = room.directory / "credentials" / "pcm-identity.json"
+            pin.validate()
+            atomic_json(identity, pin.manifest)
+            file_owner(identity, output)
+            alsa = room.directory / "config" / "alsa.conf"
+            alsa.write_text(render_pcm_config(pin, conversion=pin.pcm.startswith("plughw:")), encoding="utf-8")
+            file_owner(alsa, output)
+            output_binds = [Bind(str(identity), str(VIEW / "credentials" / "pcm-identity.json")),
+                            Bind(str(alsa), str(VIEW / "config" / "alsa.conf"))]
+            output_environment = [f"ALSA_CONFIG_PATH={VIEW}/config/alsa.conf"]
+        signal_account = {"uid": 0, "gid": audio["gid"]}
+        signals = private_directory(room.directory / "signals", signal_account, mode=0o750)
+
+        async def dispatch_signal(operation, payload):
+            if room.launch_generation != generation:
+                raise RpcError("stale_launch", "This room audio launch has ended")
+            if operation != "native-volume":
+                raise RpcError("unknown_operation", "This socket only accepts this room's native volume events")
+            try:
+                return await self._native_volume(room, payload)
+            except (ValidationError, ValueError, TypeError) as exc:
+                raise RpcError("invalid_request", "Native volume request is malformed") from exc
+            except RuntimeFailure as exc:
+                raise RpcError("backend_unavailable", str(exc)) from exc
+
+        room.signal_server = await serve_rpc(
+            signals / "events.sock", dispatch_signal, mode=0o660,
+            allowed_uids={0, audio["uid"]}, socket_gid=audio["gid"],
+        )
+        credential = room.directory / "credentials" / "owntone.json"
+        atomic_json(credential, {"password": password})
+        file_owner(credential, audio)
+        room.worker_sockets["audio"] = room.directory / "control" / "audio.sock"
+        room.processes.update(await self._start_namespace_services(
+            starting.id, room.receiver, room.directory, slot=starting.slot,
+        ))
+        room_shm = private_directory(room.directory / "shm", timing, mode=0o755)
         room.processes["nqptp"] = await self._start_process(
-            f"{starting.id}:nqptp",
-            "nqptp",
-            isolated_command(
-                room.directory / "isolation", room.receiver["namespace"], [self.binary("nqptp"), "-v"]
-            ),
-            room.directory,
+            f"{starting.id}:nqptp", "nqptp", [self.binary("nqptp"), "-v"], room.directory,
+            account=timing, namespace=room.receiver["namespace"], ptp=True,
+            binds=[Bind(str(room_shm), "/dev/shm", True)],
         )
         await asyncio.sleep(0.2)
         self._check_start(room, starting)
-        if starting.local_audio_device and starting.local_audio_device.lower().startswith("bluealsa"):
-            room.processes["local-output"] = await self._start_process(
-                f"{starting.id}:local-output",
-                "local-output",
-                [
-                    sys.executable,
-                    "-m",
-                    "shiri.runtime.local_output",
-                    "--capture",
-                    f"hw:Loopback,0,{starting.slot}",
-                    "--device",
-                    starting.local_audio_device,
-                    "--socket",
-                    str(room.directory / "local-output.sock"),
-                ],
-                room.directory,
-            )
-            await self._wait_worker(room, "local-output", room.directory / "local-output.sock")
-            self._check_start(room, starting)
         room.processes["owntone"] = await self._start_process(
-            f"{starting.id}:owntone",
-            "owntone",
-            isolated_command(
-                self.config.runtime_state_dir / "sender" / "isolation",
-                sender["namespace"],
-                [
-                    self.binary("owntone"),
-                    "-f",
-                    "-c",
-                    str(owntone),
-                    "--mdns-no-rsp",
-                    "--mdns-no-daap",
-                    "--mdns-no-web",
-                    "--mdns-no-cname",
-                ],
-            ),
-            room.directory,
+            f"{starting.id}:owntone", "owntone",
+            [self.binary("owntone"), "-f", "-c", str(VIEW / "config" / "owntone.conf"),
+             "--mdns-no-rsp", "--mdns-no-daap", "--mdns-no-web", "--mdns-no-cname"], room.directory,
+            account=output, namespace=sender["namespace"],
+            devices=[pin.playback_node, f"/dev/snd/controlC{pin.manifest['card_index']}"] if pin else (), bus=True,
+            extra_environment=output_environment,
+            listen_port=3869 + starting.slot * 10,
+            binds=[Bind(str(owntone), str(VIEW / "config" / "owntone.conf")),
+                   Bind(str(room.directory / "output"), str(VIEW / "state"), True),
+                   Bind(str(room.directory / "pipes"), str(VIEW / "pipes"), True),
+                   Bind(str(room.directory / "overlay"), str(VIEW / "overlay"), True),
+                   Bind(str(self.config.runtime_state_dir / "sender" / "discovery" / "bus"), str(VIEW / "bus")),
+                   Bind(str(self.config.runtime_state_dir / "sender" / "shm"), "/dev/shm"), *output_binds],
         )
-        room.client = OwnToneClient(
-            f"http://{sender['api_ip']}:{3869 + starting.slot * 10}", password=self._password
-        )
+        if bluetooth:
+            await self._worker_rpc(room, "bluetooth-output", "authorize-peer",
+                           {"pid": room.processes["owntone"].process.pid}, timeout=2)
+            self._check_start(room, starting)
+        room.client = OwnToneClient(own_url, password=password)
         deadline = asyncio.get_running_loop().time() + 30
         last_error = "No control response"
         while asyncio.get_running_loop().time() < deadline:
@@ -754,34 +1178,40 @@ class Broker:
             raise RuntimeFailure(f"OwnTone did not become ready within its startup deadline: {last_error}")
         await room.client.volume(room.current_volume)
         room.processes["audio"] = await self._start_process(
-            f"{starting.id}:audio",
-            "audio",
-            [
-                sys.executable,
-                "-m",
-                "shiri.runtime.audio",
-                "--room-dir",
-                str(room.directory),
-                "--capture",
-                f"hw:Loopback,1,{starting.slot}",
-                "--socket",
-                str(room.directory / "audio.sock"),
+            f"{starting.id}:audio", "audio",
+            [sys.executable, "-m", "shiri.runtime.audio", "--room-dir", str(VIEW),
+             "--socket", str(VIEW / "control" / "audio.sock"), "--native", "--room-id", starting.id,
+             "--native-uid", str(receiver["uid"]), "--native-socket", str(VIEW / "input" / "music.sock"),
+             "--own-url", own_url, "--own-password-file", str(VIEW / "credentials" / "owntone.json"),
+             "--speech-socket", str(VIEW / "overlay" / "speech.sock"), "--speech-launch-generation", generation,
+             "--output-uid", str(output["uid"]), "--output-buffer-ms", str(output_buffer_ms),
+             "--relay-delay-ms", str(relay_delay_ms),
+             "--signal-socket", str(VIEW / "signals" / "events.sock"),
+             "--signal-generation", generation, "--control-revision", str(starting.revision)],
+            room.directory, account=audio, binds=[
+                Bind(str(room.directory / "pipes"), str(VIEW / "pipes"), True),
+                Bind(str(room.directory / "control"), str(VIEW / "control"), True),
+                Bind(str(room.directory / "input"), str(VIEW / "input"), True),
+                Bind(str(room.directory / "overlay"), str(VIEW / "overlay")),
+                Bind(str(credential), str(VIEW / "credentials" / "owntone.json")),
+                Bind(str(signals), str(VIEW / "signals")),
             ],
-            room.directory,
         )
         self._check_start(room, starting)
-        await self._wait_worker(room, "audio", room.directory / "audio.sock")
+        await self._wait_worker(room, "audio", self._worker_socket(room))
         room.processes["shairport"] = await self._start_process(
-            f"{starting.id}:shairport",
-            "shairport",
-            isolated_command(
-                room.directory / "isolation",
-                room.receiver["namespace"],
-                [self.binary("shairport-sync"), "-v", "-c", str(shairport)],
-            ),
-            room.directory,
+            f"{starting.id}:shairport", "shairport",
+            [self.binary("shairport-sync"), "-v", "-c", str(VIEW / "config" / "shairport.conf")],
+            room.directory, account=receiver, namespace=room.receiver["namespace"], bus=True,
+            binds=[Bind(str(shairport), str(VIEW / "config" / "shairport.conf")),
+                   Bind(str(room.directory / "input"), str(VIEW / "input")),
+                   Bind(str(room.directory / "metadata"), str(VIEW / "metadata"), True),
+                   Bind(str(room.directory / "discovery" / "bus"), str(VIEW / "bus")),
+                   Bind(str(room_shm), "/dev/shm")],
         )
-        await asyncio.sleep(0.3)
+        from .receiver_readiness import wait_receiver_ready
+        await wait_receiver_ready(room.processes["shairport"], room.receiver, receiver)
+        self._check_start(room, starting)
         self._require_alive(room.processes, "after starting the AirPlay receiver")
         await self._refresh_processes(starting.id, room.processes)
         async with room.control_lock:
@@ -792,7 +1222,7 @@ class Broker:
     async def _wait_worker(self, room: RuntimeRoom, name: str, socket: Path):
         for _ in range(20):
             try:
-                health = await call_rpc(socket, "health", {}, timeout=1)
+                health = await self._worker_rpc(room, name, "health", {}, timeout=1, socket=socket)
                 if health.get("ready") is False or health.get("error"):
                     raise RuntimeFailure(health.get("error") or f"Room {name} is not ready")
                 return
@@ -810,6 +1240,7 @@ class Broker:
             keys = await self._reserve_speakers(
                 room, speakers, room.active_local_device or definition.local_audio_device
             )
+            await room.client.volume_settings(room.current_volume, speakers)
             await room.client.select(speakers, room.outputs)
             await self._commit_speakers(room, keys)
             room.selected_ids = [speaker.id for speaker in speakers]
@@ -828,6 +1259,7 @@ class Broker:
             self.network.forget_process(f"sender:{name}")
             self.sender_processes.pop(name, None)
         if self.network:
+            await self._stop_reserved_units("sender")
             await self.network.remove("sender")
         self.sender = None
 
@@ -836,15 +1268,35 @@ class Broker:
             await self._stop_room_locked(room)
 
     async def _stop_room_locked(self, room: RuntimeRoom):
-        if room.processes or room.receiver or room.client:
+        room.gain_pending = False
+        if room.processes or room.receiver or room.client or room.bluetooth_admission:
             room.status = "stopping"
+        room.launch_generation = None
         for session_id, room_id in list(self.sessions.items()):
             if room_id == room.desired.id:
                 self._forget_session(session_id)
+        if room.signal_server:
+            room.signal_server.close()
+            await room.signal_server.wait_closed()
+            room.signal_server = None
+        if room.bluetooth_handoff:
+            room.bluetooth_handoff.close()
         for name, process in reversed(list(room.processes.items())):
             await process.stop()
             self.network.forget_process(f"{room.desired.id}:{name}")
             room.processes.pop(name, None)
+        if self.network:
+            await self._stop_reserved_units(room.desired.id)
+        if room.bluetooth_rpc_directory is not None:
+            room.bluetooth_rpc_directory.close()
+            room.bluetooth_rpc_directory = None
+        self._retire_speech_endpoint(room)
+        if room.bluetooth_admission:
+            await room.bluetooth_admission.close(verified_unit_stopped=True)
+            room.bluetooth_admission = None
+        room.bluetooth_handoff = None
+        room.worker_sockets.clear()
+        await self._release_local_pin(room)
         if room.client:
             await room.client.close()
             room.client = None
@@ -878,12 +1330,19 @@ class Broker:
             if room.client is not client:
                 raise RpcError("room_not_running", "The room changed while applying speakers")
             self._client(room)
+            proposed = room.desired.model_copy(update={"speakers": speakers})
+            proposed_plan = latency_plan([proposed if other is room else other.desired
+                                          for other in self.rooms.values() if not other.removing])
+            if (room_buffer_ms(proposed), proposed_plan.common_horizon_ms) != room.timing:
+                raise RpcError("configuration_requires_reconcile",
+                               "Save this speaker configuration so all grouped zones can update their timing together")
             outputs = await client.outputs(self._receiver_names())
             try:
                 definition = room.backend_definition or room.desired
                 leases = await self._reserve_speakers(
                     room, speakers, room.active_local_device or definition.local_audio_device
                 )
+                await client.volume_settings(room.current_volume, speakers)
                 result = await client.select(speakers, outputs)
                 await self._commit_speakers(room, leases)
             except (RuntimeFailure, asyncio.CancelledError) as exc:
@@ -899,12 +1358,86 @@ class Broker:
             room.status, room.error = "running", None
         return {**result, "selected_ids": room.selected_ids}
 
+    async def _sync_worker_intent(self, room: RuntimeRoom):
+        if room.launch_generation and "audio" in room.processes:
+            await call_rpc(self._worker_socket(room), "control-intent",
+                           {"revision": room.desired.revision}, timeout=2)
+
+    def _native_receipt(self, room, event_id, fingerprint, accepted):
+        previous = dict(room.native_volume_receipts)
+        room.native_volume_receipts[event_id] = {"fingerprint": fingerprint, "accepted": accepted}
+        while len(room.native_volume_receipts) > 256:
+            room.native_volume_receipts.pop(next(iter(room.native_volume_receipts)))
+        try:
+            self._save_phone_volume(room)
+        except (OSError, RuntimeFailure):
+            room.native_volume_receipts = previous
+            raise
+        return {"ok": True, "durable": True, "acknowledged": True, "event_id": str(UUID(hex=event_id)), "accepted": accepted}
+
+    async def _native_volume(self, room: RuntimeRoom, payload: dict):
+        if (set(payload) != {"launch_generation", "event_id", "base_revision", "token", "generation", "volume"}
+                or payload.get("launch_generation") != room.launch_generation or not room.launch_generation):
+            raise RpcError("stale_launch", "Native volume does not belong to this exact room launch")
+        token = SourceToken.model_validate(payload["token"])
+        if token.zone_id != room.desired.id:
+            raise RpcError("forbidden", "Native volume belongs to another room")
+        event_id = UUID(payload["event_id"]).hex
+        generation, base, volume = payload["generation"], payload["base_revision"], payload["volume"]
+        if (type(generation) is not int or not 1 <= generation <= 2**63 - 1
+                or type(base) is not int or base < 1 or type(volume) is not int or not 0 <= volume <= 100
+                or token.epoch > 2**63 - 1):
+            raise RpcError("invalid_request", "Native volume identity or bounds are invalid")
+        body = {"incarnation": UUID(token.incarnation).hex, "session_id": UUID(token.session_id).hex,
+                "epoch": token.epoch, "generation": generation, "volume": volume}
+        if body["session_id"] == "0" * 32:
+            raise RpcError("invalid_request", "Native volume needs a nonzero admitted session")
+        fingerprint = hashlib.sha256(json.dumps(
+            {"body": body, "base_revision": base}, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        async with room.control_lock:
+            saved = room.native_volume_receipts.get(event_id)
+            if saved:
+                if saved["fingerprint"] != fingerprint:
+                    raise RpcError("conflict", "Native event identity was reused for different data")
+                return {"ok": True, "durable": True, "acknowledged": True, "event_id": str(UUID(hex=event_id)),
+                        "accepted": saved["accepted"]}
+            if base != room.desired.revision or not room.desired.enabled or not room.client:
+                return self._native_receipt(room, event_id, fingerprint, False)
+            try:
+                ack = await room.client.request("POST", "/api/player/shiri-volume", json=body)
+            except OwnToneRejected as exc:
+                if exc.status_code == 409:
+                    return self._native_receipt(room, event_id, fingerprint, False)
+                raise
+            if ack != body:
+                raise RuntimeFailure("OwnTone did not acknowledge the exact native volume identity")
+            # An API reconciliation can advance intent during the bounded HTTP
+            # await. Its actor will restore that newer intent after this lock.
+            if base != room.desired.revision:
+                room.wake.set()
+                return self._native_receipt(room, event_id, fingerprint, False)
+            old_pending, old_next, old_volume = (room.phone_volume_update, room.phone_volume_next, room.current_volume)
+            update = {"id": event_id, "volume": volume, "base_revision": base}
+            if room.phone_volume_update:
+                room.phone_volume_next = update
+            else:
+                room.phone_volume_update = update
+            room.current_volume = volume
+            try:
+                return self._native_receipt(room, event_id, fingerprint, True)
+            except (OSError, RuntimeFailure):
+                room.phone_volume_update, room.phone_volume_next, room.current_volume = old_pending, old_next, old_volume
+                raise
+
     async def set_volume(self, room: RuntimeRoom, value, *, pending=False):
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
             raise RpcError("invalid_request", "Volume must be an integer from 0 to 100")
         if not pending:
             self._client(room)
         async with room.control_lock:
+            if not pending:
+                await self._sync_worker_intent(room)
             if pending:
                 update = {"id": uuid4().hex, "volume": value, "base_revision": room.desired.revision}
                 # Keep the event being committed stable until acknowledged.
@@ -926,6 +1459,9 @@ class Broker:
         update = room.phone_volume_update
         if update and room.phone_volume_next:
             update = {**update, "next": room.phone_volume_next}
+        if room.native_volume_receipts:
+            update = {"version": 2, "pending": room.phone_volume_update,
+                      "next": room.phone_volume_next, "native_receipts": room.native_volume_receipts}
         atomic_json(room.directory / "phone-volume.json", update)
 
     async def ack_phone_volume(self, room: RuntimeRoom, payload: dict):
@@ -951,6 +1487,7 @@ class Broker:
                     await room.client.volume(volume)
             if revision is not None and revision >= room.desired.revision:
                 room.desired = room.desired.model_copy(update={"volume": volume, "revision": revision})
+                await self._sync_worker_intent(room)
             room.phone_volume_update = room.phone_volume_next if accepted else None
             room.phone_volume_next = None
             if room.phone_volume_update:
@@ -995,7 +1532,7 @@ class Broker:
         self._session_operations.setdefault(session_id, set()).add(operation)
         self.pending_sessions.add(session_id)
         try:
-            result = await call_rpc(room.directory / "audio.sock", "speech", message, timeout=20)
+            result = await call_rpc(self._worker_socket(room), "speech", message, timeout=20)
         except BaseException:
             if previous is None:
                 self._forget_session(session_id, generation)
@@ -1031,7 +1568,8 @@ class Broker:
 
     async def _probe_room(self, room):
         try:
-            if room.removing and room.task and room.task.done() and not room.processes and not room.receiver:
+            if (room.removing and room.task and room.task.done()
+                    and not room.processes and not room.receiver and not room.bluetooth_admission):
                 self.rooms.pop(room.desired.id, None)
                 return
             if not room.desired.enabled:
@@ -1041,6 +1579,7 @@ class Broker:
                     and (
                         room.processes
                         or room.receiver
+                        or room.bluetooth_admission
                         or room.reserved_slot is not None
                         or room.desired.id in self.sender_users
                     )
@@ -1050,6 +1589,16 @@ class Broker:
             if room.status == "error" and asyncio.get_running_loop().time() >= room.retry_at:
                 room.wake.set()
             elif room.status in {"running", "degraded"}:
+                if room.bluetooth_admission:
+                    try:
+                        await asyncio.wait_for(room.bluetooth_admission.check(), timeout=8)
+                    except asyncio.TimeoutError as exc:
+                        raise RuntimeFailure("Bluetooth endpoint validation exceeded its deadline") from exc
+                if room.local_pin:
+                    try:
+                        room.local_pin.validate()
+                    except PCMIdentityError as exc:
+                        raise RuntimeFailure(str(exc)) from exc
                 if not all(
                     process.alive for process in room.processes.values()
                 ) or not await self.network.healthy(room.receiver):
@@ -1058,14 +1607,14 @@ class Broker:
                     return
                 try:
                     room.player = await room.client.request("GET", "/api/player")
-                    for name, socket in [("audio", "audio.sock"), ("local-output", "local-output.sock")]:
+                    for name in ["audio", "bluetooth-output"]:
                         if name in room.processes:
                             observed_sessions = {
                                 session_id: self.session_generations.get(session_id)
                                 for session_id, owner in self.sessions.items()
                                 if name == "audio" and owner == room.desired.id
                             }
-                            health = await call_rpc(room.directory / socket, "health", {}, timeout=2)
+                            health = await self._worker_rpc(room, name, "health", {}, timeout=2)
                             if health.get("ready") is False or health.get("error"):
                                 raise RuntimeFailure(
                                     health.get("error") or f"Room {name} worker is not ready"
@@ -1080,7 +1629,7 @@ class Broker:
                                         and session_id not in self.pending_sessions
                                     ):
                                         self._forget_session(session_id)
-                    if room.status == "degraded":
+                    if room.status == "degraded" and (not room.gain_pending or asyncio.get_running_loop().time() >= room.retry_at):
                         room.wake.set()
                 except (RuntimeFailure, RpcError) as exc:
                     room.error = str(exc)
@@ -1108,7 +1657,7 @@ class Broker:
             "cast_input": False,
             "ownTone_timing": True,
             "native_outputs": ["airplay1", "airplay2", "chromecast"],
-            "bluetooth": "Configured BlueALSA card required; pairing and VM Bluetooth passthrough are external setup",
+            "bluetooth": "Exact paired BlueALSA A2DP device required; descriptor bridge integration and physical playback remain validation gates",
             "cross_protocol_sync": "Best effort; calibrate OwnTone offsets, no universal phase-accurate guarantee",
         }
         return result
@@ -1143,6 +1692,8 @@ class Broker:
                 await self._stop_sender()
             except (RuntimeFailure, OSError) as exc:
                 errors.append(str(exc))
+        if self.unit_manager:
+            self.unit_manager.close()
         if self._lock_file:
             self._lock_file.close()
             self._lock_file = None

@@ -1,0 +1,141 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -1757,121 +1757,124 @@
+ 
+       retval = -2;
+       goto out;
+     }
+ 
+   if (status == OUTPUT_STATE_FAILED)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' failed to activate\n", device->type_name, device->name);
+ 
+       outputs_device_deselect(device);
+ 
+       if (retval != -2)
+ 	retval = -1;
+       goto out;
+     }
+ 
+   // If we were just probing or doing device verification this is a no-op, since
+   // there is no session any more
+   outputs_device_cb_set(device, device_streaming_cb);
+ 
+  out:
+   commands_exec_end(cmdbase, retval);
+ }
+ 
+ const char *
+ player_pmap(void *p)
+ {
+   if (p == device_activate_cb)
+     return "device_activate_cb";
+   else if (p == device_streaming_cb)
+     return "device_streaming_cb";
+   else if (p == device_volume_cb)
+     return "device_volume_cb";
+   else if (p == device_flush_cb)
+     return "device_flush_cb";
+   else if (p == device_shutdown_cb)
+     return "device_shutdown_cb";
+   else
+     return "unknown";
+ }
+ 
+ /* ------------------------- Internal playback routines --------------------- */
+ 
+ /* 1 means this tick may consume PCM; 0 waits on the same bounded existing
+  * timer. This function never creates an independent output scheduler. */
+ static int
+ pb_timer_native_prepare(void)
+ {
+   struct itimerspec tick;
+   struct timespec now, anchor;
+   uint64_t operation;
+   int state, ret;
+   state = input_pipe_shiri_state(&operation);
+   if (state != 1 || operation != pb_timer_native_operation)
+     return -1;
+   if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+     return -1;
+   if (pb_timer_native_anchored)
+     return timespec_cmp(now, pb_timer_native_anchor) < 0 ? 0 : 1;
+   ret = input_peek_sync(&anchor);
+-  if (ret < 0 || timespec_cmp(now, pb_timer_native_wait_until) >= 0)
++  /* The input mutex can wait across the native deadline. Admit the original
++   * anchor against a fresh clock after peek, including a missing marker. */
++  if (ret < 0 || clock_gettime(CLOCK_MONOTONIC, &now) < 0
++      || timespec_cmp(now, pb_timer_native_wait_until) >= 0)
+     return -1;
+   if (!ret)
+     return 0;
+   /* Never replace a late native anchor with the receive or timer clock. */
+   if (timespec_cmp(anchor, now) <= 0)
+     return -1;
+   tick.it_interval = player_tick_interval;
+   tick.it_value = anchor;
+ #ifdef HAVE_TIMERFD
+   ret = timerfd_settime(pb_timer_fd, TFD_TIMER_ABSTIME, &tick, NULL);
+ #else
+   ret = timer_settime(pb_timer, TIMER_ABSTIME, &tick, NULL);
+ #endif
+   if (ret < 0)
+     return -1;
+   pb_timer_native_anchor = anchor;
+   pb_timer_native_anchored = true;
+   /* Control/quality markers must not substitute CLOCK_MONOTONIC now for this
+    * first sample's anchor when the session has not read any PCM yet. */
+   pb_session.start_ts = anchor;
+   pb_session.pts = anchor;
+   return 0;
+ }
+ 
+ static int
+ pb_timer_start(void)
+ {
+   struct itimerspec tick;
+   int ret;
+ 
+   // The stop timers will be active if we have recently paused, but now that the
+   // playback loop has been kicked off, we deactivate them
+   outputs_stop_delayed_cancel();
+ 
+   ret = event_add(pb_timer_ev, NULL);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not add playback timer\n");
+ 
+       return -1;
+     }
+ 
+   pb_timer_native = false;
+   pb_timer_native_anchored = false;
+   pb_timer_native_operation = 0;
+   if (pb_session.reading_now && pb_session.reading_now->data_kind == DATA_KIND_PIPE)
+     {
+       ret = input_pipe_shiri_state(&pb_timer_native_operation);
+       if (ret < 0)
+         return -1;
+       pb_timer_native = (ret == 1);
+       if (pb_timer_native)
+         {
+           if (clock_gettime(CLOCK_MONOTONIC, &pb_timer_native_wait_until) < 0)
+             return -1;
+           pb_timer_native_wait_until.tv_sec += 5;
+         }
+     }
+   tick.it_interval = player_tick_interval;
+   tick.it_value = player_tick_interval;

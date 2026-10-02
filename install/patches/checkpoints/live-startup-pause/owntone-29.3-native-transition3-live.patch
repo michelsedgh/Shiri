@@ -1,0 +1,106 @@
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -372,10 +372,11 @@
+ static struct timespec player_tick_interval;
+ /* Framed input retains the native presentation clock. Reuse this player timer
+  * with an absolute first tick, fenced by the exact source admission operation. */
+ static bool pb_timer_native;
+ static bool pb_timer_native_anchored;
++static bool pb_timer_native_waiting_for_pcm;
+ static uint64_t pb_timer_native_operation;
+ static struct timespec pb_timer_native_anchor;
+ static struct timespec pb_timer_native_wait_until;
+ static int pb_timer_native_prepare(void);
+ 
+@@ -1810,12 +1811,14 @@
+           (intmax_t)anchor.tv_sec, anchor.tv_nsec, (intmax_t)now.tv_sec, now.tv_nsec,
+           (intmax_t)pb_timer_native_wait_until.tv_sec, pb_timer_native_wait_until.tv_nsec);
+   return -1;
+ }
+ 
+-/* 1 means this tick may consume PCM; 0 waits on the same bounded existing
+- * timer. This function never creates an independent output scheduler. */
++/* 1 means this tick may consume PCM; 0 waits on the same existing timer.
++ * Cold input admission is bounded. An accepted FLUSH may instead represent a
++ * phone pause, so an already-running source waits without aging a deadline
++ * while its exact newly armed generation contains no PCM. */
+ static int
+ pb_timer_native_prepare(void)
+ {
+   struct itimerspec tick;
+   struct timespec now = { 0 }, anchor = { 0 };
+@@ -1833,10 +1836,18 @@
+    * anchor against a fresh clock after peek, including a missing marker. */
+   if (ret < 0)
+     return pb_timer_native_reject("anchor_peek", state, operation, anchor, now);
+   if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+     return pb_timer_native_reject("anchor_clock_read", state, operation, anchor, now);
++  if (pb_timer_native_waiting_for_pcm)
++    {
++      if (!ret)
++        return 0; /* Valid paused source, not a missing cold-start anchor. */
++      pb_timer_native_waiting_for_pcm = false;
++      pb_timer_native_wait_until = now;
++      pb_timer_native_wait_until.tv_sec += 5;
++    }
+   if (timespec_cmp(now, pb_timer_native_wait_until) >= 0)
+     return pb_timer_native_reject("anchor_timeout", state, operation, anchor, now);
+   if (!ret)
+     return 0;
+   /* Never replace a late native anchor with the receive or timer clock. */
+@@ -1878,10 +1889,11 @@
+       return -1;
+     }
+ 
+   pb_timer_native = false;
+   pb_timer_native_anchored = false;
++  pb_timer_native_waiting_for_pcm = false;
+   pb_timer_native_operation = 0;
+   if (pb_session.reading_now && pb_session.reading_now->data_kind == DATA_KIND_PIPE)
+     {
+       ret = input_pipe_shiri_state(&pb_timer_native_operation);
+       if (ret < 0)
+@@ -1919,10 +1931,11 @@
+   int ret;
+ 
+   event_del(pb_timer_ev);
+   pb_timer_native = false;
+   pb_timer_native_anchored = false;
++  pb_timer_native_waiting_for_pcm = false;
+   pb_timer_native_operation = 0;
+ 
+   memset(&tick, 0, sizeof(struct itimerspec));
+ 
+ #ifdef HAVE_TIMERFD
+@@ -3215,13 +3228,14 @@
+     {
+       *retval = SHIRI_SOURCE_FAILURE;
+       return COMMAND_END;
+     }
+   *retval = input_pipe_shiri_arm(&param->request.owner, param->request.operation_generation);
+-  /* A successful current barrier gets a fresh first-anchor wait for its own
+-   * PCM. Reuse the original timer and presentation stamp; do not retime it.
+-   * A user stop/pause during the asynchronous output phase stays stopped. */
++  /* A successful running-source barrier may be a phone pause. Keep the
++   * existing pipe and warm outputs, and wait for this generation's first PCM
++   * without timing out an empty valid source. Its original P must still be
++   * future when PCM actually resumes. A user stop/pause stays stopped. */
+   if (*retval == 0 && param->restart_timer && player_state == PLAY_PLAYING)
+     {
+       if (shiri_zero(param->request.owner.session, 16))
+         pb_session_stop(); /* END leaves no running music timer waiting for PCM. */
+       else if (pb_timer_start() < 0)
+@@ -3230,10 +3244,12 @@
+            * failed, and seal only this exact already-armed input binding. */
+           pb_timer_stop();
+           input_pipe_shiri_disarm(&param->request.owner, param->request.operation_generation);
+           *retval = SHIRI_SOURCE_FAILURE;
+         }
++      else
++        pb_timer_native_waiting_for_pcm = true;
+     }
+   if (*retval == 0)
+     shiri_source_state.faulted = false;
+   return COMMAND_END;
+ }

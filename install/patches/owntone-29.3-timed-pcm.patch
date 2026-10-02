@@ -1,0 +1,937 @@
+diff --git a/configure.ac b/configure.ac
+index d4cae852..63549f31 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 28a8d6c9..bac545ff 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -116,7 +116,7 @@ owntone_SOURCES = main.c \
+ 	worker.c worker.h \
+ 	settings.c settings.h \
+ 	input.h input.c \
+-	inputs/file.c inputs/http.c inputs/pipe.c inputs/timer.c \
++	inputs/file.c inputs/http.c inputs/pipe.c inputs/shiri_pcm.h inputs/timer.c \
+ 	outputs.h outputs.c \
+ 	outputs/rtp_common.h outputs/rtp_common.c \
+ 	outputs/raop.c outputs/airplay.c $(PAIR_AP_SRC) \
+diff --git a/src/conffile.c b/src/conffile.c
+index 473172fa..407bfb33 100644
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -120,6 +120,7 @@ static cfg_opt_t sec_library[] =
+     CFG_STR_LIST("force_decode", NULL, CFGF_NONE),
+     CFG_STR("prefer_format", NULL, CFGF_NONE),
+     CFG_BOOL("pipe_autostart", cfg_true, CFGF_NONE),
++    CFG_BOOL("pipe_framed", cfg_false, CFGF_NONE),
+     CFG_INT("pipe_sample_rate", 44100, CFGF_NONE),
+     CFG_INT("pipe_bits_per_sample", 16, CFGF_NONE),
+     CFG_BOOL("rating_updates", cfg_false, CFGF_NONE),
+diff --git a/src/input.h b/src/input.h
+index 4059eb9a..6610d790 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -162,6 +162,18 @@ input_write(struct evbuffer *evbuf, struct media_quality *quality, short flags);
+ int
+ input_wait(void);
+ 
++/* Shiri framed-PCM source barrier. Seal before input/output flush; arm only
++ * after every output acknowledges that flush. Process-global, so initial idle
++ * admission is valid before a pipe input source exists. */
++struct shiri_pcm_owner;
++int input_pipe_shiri_seal(uint64_t operation_generation);
++int input_pipe_shiri_arm(const struct shiri_pcm_owner *owner, uint64_t operation_generation);
++
++int input_pipe_shiri_state(uint64_t *operation_generation);
++/* Copy, never consume, the first unread native SYNC anchor. 1 found, 0 waiting,
++ * -1 invalid/unanchored bytes. Thread-safe with the input producer. */
++int input_peek_sync(struct timespec *timestamp);
++
+ /* ---------------------- Interface towards player thread ------------------- */
+ /*                                Thread: player                              */
+ 
+diff --git a/src/inputs/pipe.c b/src/inputs/pipe.c
+index 83a0300a..ada8de28 100644
+--- a/src/inputs/pipe.c
++++ b/src/inputs/pipe.c
+@@ -53,6 +53,8 @@
+ #include <event2/buffer.h>
+ 
+ #include "input.h"
++#include "outputs.h"
++#include "shiri_pcm.h"
+ #include "misc.h"
+ #include "misc_xml.h"
+ #include "logger.h"
+@@ -100,6 +102,11 @@ struct pipe
+   event_callback_fn cb; // Callback when there is data to read
+   struct event *ev;     // Event for the callback
+ 
++  struct evbuffer *framed;
++  struct timespec sync_ts;
++  bool sequence_valid;
++  uint64_t sequence, next_frame;
++
+   struct pipe *next;
+ };
+ 
+@@ -148,6 +155,87 @@ static int pipe_bits_per_sample;
+ static int pipe_autostart;
+ // The mfi id of the pipe autostarted by the pipe thread
+ static int pipe_autostart_id;
++static bool pipe_framed;
++static pthread_mutex_t shiri_gate_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct shiri_pcm_owner shiri_owner;
++static uint64_t shiri_operation;
++static bool shiri_armed;
++static struct input_source *shiri_source;
++
++int
++input_pipe_shiri_seal(uint64_t operation_generation)
++{
++  uint8_t discarded[4096];
++  size_t drained = 0;
++  ssize_t n;
++  struct pipe *pipe;
++  if (!pipe_framed || !operation_generation || operation_generation > INT64_MAX)
++    return -1;
++  pthread_mutex_lock(&shiri_gate_lock);
++  if (operation_generation <= shiri_operation)
++    {
++      pthread_mutex_unlock(&shiri_gate_lock);
++      return -1;
++    }
++  shiri_operation = operation_generation;
++  shiri_armed = false;
++  if (shiri_source && (pipe = shiri_source->input_ctx))
++    {
++      evbuffer_drain(shiri_source->evbuf, evbuffer_get_length(shiri_source->evbuf));
++      evbuffer_drain(pipe->framed, evbuffer_get_length(pipe->framed));
++      pipe->sequence_valid = false;
++      /* Local producer writes are already fenced. Never wait for a writer. */
++      while (drained < 1048576 && (n = read(pipe->fd, discarded, sizeof(discarded))) > 0)
++        drained += (size_t)n;
++      if (drained >= 1048576)
++        {
++          pthread_mutex_unlock(&shiri_gate_lock);
++          return -1;
++        }
++    }
++  pthread_mutex_unlock(&shiri_gate_lock);
++  return 0;
++}
++
++int
++input_pipe_shiri_arm(const struct shiri_pcm_owner *owner, uint64_t operation_generation)
++{
++  int ret = -1;
++  if (!pipe_framed || !owner || !operation_generation || shiri_zero(owner->incarnation, 16) ||
++      owner->epoch > INT64_MAX || !owner->generation || owner->generation > INT64_MAX)
++    return -1;
++  pthread_mutex_lock(&shiri_gate_lock);
++  if (operation_generation == shiri_operation && !shiri_armed)
++    {
++      shiri_owner = *owner;
++      shiri_armed = true;
++      ret = 0;
++    }
++  pthread_mutex_unlock(&shiri_gate_lock);
++  return ret;
++}
++
++/* Snapshot the process-global admission operation. The player uses it to fence
++ * the native timer; source transitions execute on that same player thread. */
++int
++input_pipe_shiri_state(uint64_t *operation_generation)
++{
++  int state;
++  pthread_mutex_lock(&shiri_gate_lock);
++  *operation_generation = shiri_operation;
++  state = !pipe_framed ? 0 : (shiri_armed ? 1 : -1);
++  pthread_mutex_unlock(&shiri_gate_lock);
++  return state;
++}
++
++static bool
++shiri_packet_owned(const struct shiri_pcm_packet *packet)
++{
++  return shiri_armed && packet->epoch == shiri_owner.epoch &&
++    packet->generation == shiri_owner.generation &&
++    memcmp(packet->incarnation, shiri_owner.incarnation, 16) == 0 &&
++    memcmp(packet->session, shiri_owner.session, 16) == 0;
++}
+ 
+ // Global list of pipes we are watching (if watching/autostart is enabled)
+ static struct pipe *pipe_watch_list;
+@@ -192,6 +280,8 @@ pipe_create(const char *path, int id, enum pipetype type, event_callback_fn cb)
+ static void
+ pipe_free(struct pipe *pipe)
+ {
++  if (pipe->framed)
++    evbuffer_free(pipe->framed);
+   free(pipe->path);
+   free(pipe);
+ }
+@@ -1022,6 +1112,8 @@ pipe_listener_cb(short event_mask, void *ctx)
+ }
+ 
+ 
++static int stop(struct input_source *source);
++
+ /* --------------------------- PIPE INPUT INTERFACE ------------------------- */
+ /*                                Thread: input                               */
+ 
+@@ -1049,6 +1141,20 @@ setup(struct input_source *source)
+   source->quality.sample_rate = pipe_sample_rate;
+   source->quality.bits_per_sample = pipe_bits_per_sample;
+   source->quality.channels = 2;
++  if (pipe_framed)
++    {
++      pipe->framed = evbuffer_new();
++      if (!pipe->framed)
++        {
++          stop(source);
++          return -1;
++        }
++      pthread_mutex_lock(&shiri_gate_lock);
++      shiri_source = source;
++      pthread_mutex_unlock(&shiri_gate_lock);
++      source->quality.sample_rate = SHIRI_PCM_RATE;
++      source->quality.bits_per_sample = 16;
++    }
+ 
+   return 0;
+ }
+@@ -1060,6 +1166,13 @@ stop(struct input_source *source)
+   union pipe_arg *cmdarg;
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Stopping pipe\n");
++  if (pipe_framed)
++    {
++      pthread_mutex_lock(&shiri_gate_lock);
++      if (shiri_source == source)
++        shiri_source = NULL;
++      pthread_mutex_unlock(&shiri_gate_lock);
++    }
+ 
+   if (source->evbuf)
+     evbuffer_free(source->evbuf);
+@@ -1085,12 +1198,96 @@ stop(struct input_source *source)
+   return 0;
+ }
+ 
++static int
++play_framed(struct input_source *source)
++{
++  struct pipe *pipe = source->input_ctx;
++  struct shiri_pcm_packet packet;
++  uint8_t header[SHIRI_PCM_HEADER];
++  uint64_t delay_ns, stamp;
++  struct timespec now;
++  int ret = 0, n;
++  bool wait = false, eof = false;
++  size_t buffered;
++
++  pthread_mutex_lock(&shiri_gate_lock);
++  /* Retry the same already-validated block after input backpressure. */
++  if (evbuffer_get_length(source->evbuf))
++    {
++      if (shiri_armed)
++        ret = input_write(source->evbuf, &source->quality, INPUT_FLAG_SYNC);
++      else
++        evbuffer_drain(source->evbuf, evbuffer_get_length(source->evbuf));
++      goto done;
++    }
++  if (evbuffer_get_length(pipe->framed) > 2u * (SHIRI_PCM_HEADER + SHIRI_PCM_MAX_PAYLOAD))
++    { ret = -1; goto done; }
++  n = evbuffer_read(pipe->framed, pipe->fd, PIPE_READ_MAX);
++  if (n < 0 && errno != EAGAIN && errno != EINTR)
++    { ret = -1; goto done; }
++  buffered = evbuffer_get_length(pipe->framed);
++  if (buffered < SHIRI_PCM_HEADER)
++    { if (n == 0 && buffered) ret = -1;
++      wait = true; eof = (n == 0 && !buffered && pipe->is_autostarted); goto done; }
++  evbuffer_copyout(pipe->framed, header, sizeof(header));
++  if (shiri_pcm_decode(&packet, header, sizeof(header)) < 0 ||
++      packet.kind != SHIRI_PCM || packet.clock != SHIRI_MONOTONIC)
++    { ret = -1; goto done; }
++  if (buffered < SHIRI_PCM_HEADER + packet.payload)
++    { if (n == 0) ret = -1; else wait = true; goto done; }
++  evbuffer_drain(pipe->framed, SHIRI_PCM_HEADER);
++  if (!shiri_packet_owned(&packet))
++    {
++      evbuffer_drain(pipe->framed, packet.payload);
++      goto done;
++    }
++  if (pipe->sequence_valid &&
++      (packet.sequence <= pipe->sequence || packet.frame_index < pipe->next_frame ||
++       ((packet.sequence != pipe->sequence + 1 || packet.frame_index != pipe->next_frame) &&
++        !(packet.flags & SHIRI_PCM_GAP))))
++    { ret = -1; goto done; }
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  stamp = (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
++  delay_ns = outputs_buffer_duration_ms_get() * UINT64_C(1000000);
++  if (packet.presentation < delay_ns || packet.presentation <= stamp ||
++      packet.presentation - stamp > UINT64_C(10000000000))
++    { ret = -1; goto done; }
++  stamp = packet.presentation - delay_ns;
++  pipe->sync_ts.tv_sec = (time_t)(stamp / UINT64_C(1000000000));
++  pipe->sync_ts.tv_nsec = (long)(stamp % UINT64_C(1000000000));
++  evbuffer_remove_buffer(pipe->framed, source->evbuf, packet.payload);
++  pipe->sequence = packet.sequence;
++  pipe->next_frame = packet.frame_index + packet.frames;
++  pipe->sequence_valid = true;
++  ret = input_write(source->evbuf, &source->quality, INPUT_FLAG_SYNC);
++done:
++  pthread_mutex_unlock(&shiri_gate_lock);
++  if (ret < 0)
++    {
++      DPRINTF(E_LOG, L_PLAYER, "Malformed, stale-timed or discontinuous Shiri framed PCM; refusing retiming\n");
++      input_write(NULL, NULL, INPUT_FLAG_ERROR);
++      stop(source);
++      return -1;
++    }
++  if (eof)
++    {
++      input_write(NULL, NULL, INPUT_FLAG_EOF);
++      stop(source);
++      return -1;
++    }
++  if (wait || ret == EAGAIN || !evbuffer_get_length(pipe->framed))
++    input_wait();
++  return 0;
++}
++
+ static int
+ play(struct input_source *source)
+ {
+   struct pipe *pipe = source->input_ctx;
+   short flags;
+   int ret;
++  if (pipe_framed)
++    return play_framed(source);
+ 
+   ret = evbuffer_read(source->evbuf, pipe->fd, PIPE_READ_MAX);
+   if ((ret == 0) && (pipe->is_autostarted))
+@@ -1120,6 +1317,16 @@ play(struct input_source *source)
+   return 0;
+ }
+ 
++static int
++shiri_ts_get(struct timespec *ts, struct input_source *source)
++{
++  struct pipe *pipe = source->input_ctx;
++  if (!pipe_framed || !pipe || !ts)
++    return -1;
++  *ts = pipe->sync_ts; /* Copied synchronously under the gate by input_write. */
++  return 0;
++}
++
+ static int
+ metadata_get(struct input_metadata *metadata, struct input_source *source)
+ {
+@@ -1143,6 +1350,8 @@ init(void)
+ 
+   pipe_metadata.prepared.pict_tmpfile_fd = -1;
+ 
++  pipe_framed = cfg_getbool(cfg_getsec(cfg, "library"), "pipe_framed");
++
+   pipe_autostart = cfg_getbool(cfg_getsec(cfg, "library"), "pipe_autostart");
+   if (pipe_autostart)
+     {
+@@ -1188,6 +1397,7 @@ struct input_definition input_pipe =
+   .play = play,
+   .stop = stop,
+   .metadata_get = metadata_get,
++  .ts_get = shiri_ts_get,
+   .init = init,
+   .deinit = deinit,
+ };
+diff --git a/src/inputs/shiri_pcm.h b/src/inputs/shiri_pcm.h
+new file mode 100644
+index 00000000..97603edd
+--- /dev/null
++++ b/src/inputs/shiri_pcm.h
+@@ -0,0 +1,78 @@
++/* Shiri PCM v1: bounded provenance framing, independent of output scheduling. */
++#ifndef SHIRI_PCM_H
++#define SHIRI_PCM_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include <limits.h>
++
++#define SHIRI_PCM_HEADER 160u
++#define SHIRI_PCM_MAX_FRAMES 8192u
++#define SHIRI_PCM_RATE 48000u
++#define SHIRI_PCM_MAX_PAYLOAD (SHIRI_PCM_MAX_FRAMES * 4u)
++#define SHIRI_PCM_GAP 1u
++#define SHIRI_PCM_AIRPLAY2 2u
++#define SHIRI_PCM_GROUP_LEADER 4u
++#define SHIRI_PCM_SPEECH_ONLY 8u
++enum shiri_pcm_kind { SHIRI_BEGIN=1, SHIRI_PCM=2, SHIRI_FLUSH=3, SHIRI_END=4, SHIRI_VOLUME=5, SHIRI_GRANT=6 };
++enum shiri_pcm_clock { SHIRI_RAW=1, SHIRI_MONOTONIC=2 };
++struct shiri_pcm_owner {
++  uint8_t incarnation[16];
++  uint8_t session[16];
++  uint64_t epoch;
++  uint64_t generation;
++};
++struct shiri_pcm_packet {
++  uint8_t kind, clock;
++  uint32_t payload, frames, rtp, flags;
++  uint8_t session[16], incarnation[16], group[16];
++  uint64_t epoch, generation, sequence, frame_index, presentation;
++  uint64_t raw_sample, mono_before, mono_after;
++};
++static inline uint32_t shiri_u32(const uint8_t *p) {
++  return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
++}
++static inline uint64_t shiri_u64(const uint8_t *p) {
++  return ((uint64_t)shiri_u32(p)<<32)|shiri_u32(p+4);
++}
++static inline void shiri_put32(uint8_t *p, uint32_t n) {
++  p[0]=(uint8_t)(n>>24); p[1]=(uint8_t)(n>>16); p[2]=(uint8_t)(n>>8); p[3]=(uint8_t)n;
++}
++static inline void shiri_put64(uint8_t *p, uint64_t n) {
++  shiri_put32(p,(uint32_t)(n>>32)); shiri_put32(p+4,(uint32_t)n);
++}
++static inline int shiri_zero(const uint8_t *p, size_t n) {
++  size_t i; for(i=0;i<n;i++) if(p[i]) return 0; return 1;
++}
++/* 0 means valid header, -1 malformed. Payload is validated independently. */
++static inline int shiri_pcm_decode(struct shiri_pcm_packet *out, const uint8_t *p, size_t n) {
++  if(!out || !p || n<SHIRI_PCM_HEADER || memcmp(p,"SHRIPCM1",8) ||
++     p[8]<SHIRI_BEGIN || p[8]>SHIRI_GRANT || p[9]<SHIRI_RAW || p[9]>SHIRI_MONOTONIC ||
++     p[10] || p[11]!=1 || shiri_u32(p+12)!=SHIRI_PCM_HEADER || shiri_u32(p+20)!=SHIRI_PCM_RATE ||
++     !shiri_zero(p+148,12)) return -1;
++  memset(out,0,sizeof(*out));
++  out->kind=p[8]; out->clock=p[9]; out->payload=shiri_u32(p+16); out->frames=shiri_u32(p+24);
++  out->rtp=shiri_u32(p+28); out->flags=shiri_u32(p+32);
++  memcpy(out->session,p+36,16); memcpy(out->incarnation,p+52,16); memcpy(out->group,p+68,16);
++  out->epoch=shiri_u64(p+84); out->generation=shiri_u64(p+92); out->sequence=shiri_u64(p+100);
++  out->frame_index=shiri_u64(p+108); out->presentation=shiri_u64(p+116);
++  out->raw_sample=shiri_u64(p+124); out->mono_before=shiri_u64(p+132); out->mono_after=shiri_u64(p+140);
++  if(out->flags&~15u || !out->generation || out->generation>INT64_MAX || out->epoch>INT64_MAX ||
++     out->sequence>INT64_MAX || out->frame_index>INT64_MAX || out->presentation>INT64_MAX ||
++     out->raw_sample>INT64_MAX || out->mono_before>INT64_MAX || out->mono_after>INT64_MAX ||
++     (shiri_zero(out->session,16) && !(out->flags&SHIRI_PCM_SPEECH_ONLY))) return -1;
++  if(out->kind==SHIRI_PCM) {
++    if(!out->frames || out->frames>SHIRI_PCM_MAX_FRAMES || out->payload!=out->frames*4u || !out->presentation) return -1;
++  } else if(out->payload || out->frames>(out->kind==SHIRI_VOLUME?100u:0u)) return -1;
++  return 0;
++}
++static inline void shiri_pcm_encode(uint8_t p[SHIRI_PCM_HEADER], const struct shiri_pcm_packet *v) {
++  memset(p,0,SHIRI_PCM_HEADER); memcpy(p,"SHRIPCM1",8); p[8]=v->kind; p[9]=v->clock; p[11]=1;
++  shiri_put32(p+12,SHIRI_PCM_HEADER); shiri_put32(p+16,v->payload); shiri_put32(p+20,SHIRI_PCM_RATE);
++  shiri_put32(p+24,v->frames); shiri_put32(p+28,v->rtp); shiri_put32(p+32,v->flags);
++  memcpy(p+36,v->session,16); memcpy(p+52,v->incarnation,16); memcpy(p+68,v->group,16);
++  shiri_put64(p+84,v->epoch); shiri_put64(p+92,v->generation); shiri_put64(p+100,v->sequence);
++  shiri_put64(p+108,v->frame_index); shiri_put64(p+116,v->presentation); shiri_put64(p+124,v->raw_sample);
++  shiri_put64(p+132,v->mono_before); shiri_put64(p+140,v->mono_after);
++}
++#endif
+diff --git a/src/input.c b/src/input.c
+index cf0fee0e..e11c0a1e 100644
+--- a/src/input.c
++++ b/src/input.c
+@@ -777,71 +777,113 @@ play(evutil_socket_t fd, short flags, void *arg)
+ /* ---------------------- Interface towards player thread ------------------- */
+ /*                                Thread: player                              */
+ 
++int
++input_peek_sync(struct timespec *timestamp)
++{
++  struct marker *marker;
++  int ret = 0;
++  pthread_mutex_lock(&input_buffer.mutex);
++  for (marker = input_buffer.marker_tail; marker; marker = marker->prev)
++    {
++      if (marker->flag != INPUT_FLAG_SYNC)
++        continue;
++      /* A start/resume must never assign a later anchor to preceding PCM. */
++      if (!marker->data || marker->pos != input_buffer.bytes_read)
++        ret = -1;
++      else
++        {
++          *timestamp = *((struct timespec *)marker->data);
++          ret = (timestamp->tv_sec < 0 || timestamp->tv_nsec < 0 ||
++                 timestamp->tv_nsec >= 1000000000L) ? -1 : 1;
++        }
++      break;
++    }
++  if (!ret && evbuffer_get_length(input_buffer.evbuf))
++    ret = -1;
++  pthread_mutex_unlock(&input_buffer.mutex);
++  return ret;
++}
++
+ int
+ input_read(void *data, size_t size, short *flag, void **flagdata)
+ {
+   struct marker *marker;
+   int len;
+ 
+   *flag = 0;
+ 
+   pthread_mutex_lock(&input_buffer.mutex);
+ 
+   // First we check if there is a marker in the requested samples. If there is,
+   // we only return data up until that marker. That way we don't have to deal
+   // with multiple markers, and we don't return data that contains mixed sample
+   // rates, bits per sample or an EOF in the middle.
+   marker = input_buffer.marker_tail;
+-  if (marker && marker->pos <= input_buffer.bytes_read + size)
++  if (marker && marker->flag == INPUT_FLAG_SYNC && marker->pos == input_buffer.bytes_read)
+     {
++      /* This anchor belongs to the following sample, not the bytes preceding
++       * it. Return it with those samples; stop before the next marker. */
+       *flag = marker->flag;
+       *flagdata = marker->data;
+-
+-      size = marker->pos - input_buffer.bytes_read;
+       input_buffer.marker_tail = marker->prev;
+       free(marker);
++      marker = input_buffer.marker_tail;
++      if (marker && marker->pos <= input_buffer.bytes_read + size)
++        size = marker->pos - input_buffer.bytes_read;
++    }
++  else if (marker && marker->pos <= input_buffer.bytes_read + size)
++    {
++      size = marker->pos - input_buffer.bytes_read;
++      if (marker->flag != INPUT_FLAG_SYNC)
++        {
++          *flag = marker->flag;
++          *flagdata = marker->data;
++          input_buffer.marker_tail = marker->prev;
++          free(marker);
++        }
++      /* A future sync marker remains queued until its first sample is read. */
+     }
+ 
+   len = evbuffer_remove(input_buffer.evbuf, data, size);
+   if (len < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Error reading stream data from input buffer\n");
+       *flag = INPUT_FLAG_ERROR;
+       goto out_unlock;
+     }
+ 
+   input_buffer.bytes_read += len;
+ 
+ #ifdef DEBUG_INPUT
+   // Logs if flags present or each 10 seconds
+ 
+   if (*flag & INPUT_FLAG_QUALITY)
+     input_buffer.cur_read_quality = *((struct media_quality *)(*flagdata));
+ 
+   size_t one_sec_size = STOB(input_buffer.cur_read_quality.sample_rate, input_buffer.cur_read_quality.bits_per_sample, input_buffer.cur_read_quality.channels);
+   debug_elapsed += len;
+   if (*flag || (debug_elapsed > 10 * one_sec_size))
+     {
+       debug_elapsed = 0;
+       DPRINTF(E_DBG, L_PLAYER, "READ %zu bytes (%d/%d/%d), WROTE %zu bytes (%d/%d/%d), DIFF %zu, SIZE %zu/%d, FLAGS %04x\n",
+         input_buffer.bytes_read,
+         input_buffer.cur_read_quality.sample_rate,
+         input_buffer.cur_read_quality.bits_per_sample,
+         input_buffer.cur_read_quality.channels,
+         input_buffer.bytes_written,
+         input_buffer.cur_write_quality.sample_rate,
+         input_buffer.cur_write_quality.bits_per_sample,
+         input_buffer.cur_write_quality.channels,
+         input_buffer.bytes_written - input_buffer.bytes_read,
+         evbuffer_get_length(input_buffer.evbuf),
+         INPUT_BUFFER_THRESHOLD,
+         *flag);
+     }
+ #endif
+ 
+  out_unlock:
+   pthread_cond_signal(&input_buffer.cond);
+   pthread_mutex_unlock(&input_buffer.mutex);
+ 
+   return len;
+ }
+diff --git a/src/player.c b/src/player.c
+index f9ce6169..4da4ea7d 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -327,6 +327,15 @@ static struct event *pb_timer_ev;
+ 
+ // Time between ticks, i.e. time between when playback_cb() is invoked
+ static struct timespec player_tick_interval;
++/* Framed input retains the native presentation clock. Reuse this player timer
++ * with an absolute first tick, fenced by the exact source admission operation. */
++static bool pb_timer_native;
++static bool pb_timer_native_anchored;
++static uint64_t pb_timer_native_operation;
++static struct timespec pb_timer_native_anchor;
++static struct timespec pb_timer_native_wait_until;
++static int pb_timer_native_prepare(void);
++
+ // Timer resolution
+ static struct timespec player_timer_res;
+ 
+@@ -1196,74 +1205,87 @@ static inline int
+ source_read(int *nbytes, int *nsamples, uint8_t *buf, int len)
+ {
+   short flag;
+   void *flagdata;
++  unsigned int controls = 0;
+ 
+   // We can get into this condition if a) we finished reading, but are still
+   // playing (playing_now is non-null), or b) the calling loop tries to catch up
+   // with an overrun or a deficit, but playback ended in the first iteration (in
+   // which case playing_now is null). Note that a) also can occur if the input
+   // starts with input_write(NULL, NULL, INPUT_FLAG_ERROR).
+   if (!pb_session.reading_now)
+     {
+       // This is only for case a). If we are in case b) the session was zeroed,
+       // which means nsamples will become zero. Quality can be zero if the input
+       // failed immediately, i.e. never passed INPUT_FLAG_QUALITY.
+       *nbytes = len;
+       *nsamples = (len != 0) ? BTOS(*nbytes, pb_session.quality.bits_per_sample, pb_session.quality.channels) : 0;
+ 
+       // In case a) this advances playback position and possibly ends playback,
+       // i.e. sets playing_now to null
+       event_read(*nsamples);
+       if (!pb_session.playing_now)
+ 	{
+ 	  *nbytes = 0;
+ 	  *nsamples = 0;
+ 	  return 0;
+ 	}
+ 
+       // Stream silence if playback didn't end yet
+       memset(buf, 0, len);
+       return 0;
+     }
+ 
+   *nsamples = 0;
++ native_read:
+   *nbytes = input_read(buf, len, &flag, &flagdata);
+   if ((*nbytes < 0) || (flag == INPUT_FLAG_ERROR))
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Error reading source '%s' (id=%d)\n", pb_session.reading_now->path, pb_session.reading_now->id);
+       event_read_error();
+       return -1;
+     }
+   else if (flag == INPUT_FLAG_START_NEXT)
+     {
+       event_read_start_next();
+     }
+   else if (flag == INPUT_FLAG_EOF)
+     {
+       event_read_eof();
+     }
+   else if (flag == INPUT_FLAG_METADATA)
+     {
+       event_read_metadata((struct input_metadata *)flagdata);
+     }
+   else if (flag == INPUT_FLAG_QUALITY)
+     {
+       event_read_quality((struct media_quality *)flagdata);
+     }
+   else if (flag == INPUT_FLAG_SYNC)
+     {
+       event_read_ts((struct timespec *)flagdata);
+     }
+ 
+   if (*nbytes == 0 || pb_session.quality.channels == 0)
+     {
+       event_read(0); // This will set start_ts even if source isn't open yet
++      if (pb_timer_native && *nbytes == 0 &&
++          (flag == INPUT_FLAG_QUALITY || flag == INPUT_FLAG_METADATA ||
++           flag == INPUT_FLAG_START_NEXT || flag == INPUT_FLAG_SYNC))
++        {
++          if (++controls >= 16)
++            return -1; /* Never move an anchored sample to a later tick. */
++          /* Quality can allocate/reallocate the session buffer. */
++          buf = pb_session.buffer;
++          len = pb_session.bufsize;
++          goto native_read;
++        }
+       return 0;
+     }
+ 
+   *nsamples = BTOS(*nbytes, pb_session.quality.bits_per_sample, pb_session.quality.channels);
+ 
+   event_read(*nsamples);
+ 
+   return 0;
+ }
+@@ -1272,118 +1294,139 @@ static void
+ playback_cb(int fd, short what, void *arg)
+ {
+   struct timespec ts;
+   uint64_t overrun;
+   int nbytes;
+   int nsamples;
+   int i;
+   int ret;
++  size_t read_size;
+ 
+   // Check if we missed any timer expirations
+   overrun = 0;
+ #ifdef HAVE_TIMERFD
+   ret = read(fd, &overrun, sizeof(overrun));
+   if (ret <= 0)
+     DPRINTF(E_LOG, L_PLAYER, "Error reading timer\n");
+   else if (overrun > 0)
+     overrun--;
+ #else
+   ret = timer_getoverrun(pb_timer);
+   if (ret < 0)
+     DPRINTF(E_LOG, L_PLAYER, "Error getting timer overrun\n");
+   else
+     overrun = ret;
+ #endif /* HAVE_TIMERFD */
+ 
++  if (pb_timer_native)
++    {
++      ret = pb_timer_native_prepare();
++      if (ret < 0)
++        {
++          DPRINTF(E_LOG, L_PLAYER, "Native input missed or lost its initial presentation anchor\n");
++          pb_abort();
++          return;
++        }
++      if (ret == 0)
++        return; /* Waiting/rearmed: no PCM or output effects before the anchor. */
++    }
++
+   // We are too delayed, probably some output blocked: reset if first overrun or abort if second overrun
+   if (overrun > pb_write_deficit_max)
+     {
+       if (pb_write_recovery)
+ 	{
+ 	  DPRINTF(E_LOG, L_PLAYER, "Permanent output delay detected (behind=%" PRIu64 ", max=%d), aborting\n", overrun, pb_write_deficit_max);
+ 	  pb_abort();
+ 	  return;
+ 	}
+ 
+       DPRINTF(E_LOG, L_PLAYER, "Output delay detected (behind=%" PRIu64 ", max=%d), resetting all outputs\n", overrun, pb_write_deficit_max);
+       pb_write_recovery = true;
+       player_flush_pending = pb_suspend();
+       // No devices to wait for, just set the restart cb right away. Otherwise
+       // the trigger will be set by device_flush_cb.
+       if (player_flush_pending == 0)
+ 	input_buffer_full_cb(player_playback_start);
+ 
+       return;
+     }
+   else
+     {
+       if (overrun > 1) // An overrun of 1 is no big deal
+ 	DPRINTF(E_WARN, L_PLAYER, "Output delay detected: player is %" PRIu64 " ticks behind, catching up\n", overrun);
+ 
+       pb_write_recovery = false;
+     }
+ 
+ #ifdef DEBUG_PLAYER
+   session_dump(true);
+ #endif
+ 
+   // The pessimistic approach: Assume you won't get anything, then anything that
+   // comes your way is a positive surprise.
+-  pb_session.read_deficit += (1 + overrun) * pb_session.bufsize;
++  read_size = pb_session.bufsize;
++  pb_session.read_deficit += (1 + overrun) * read_size;
+ 
+   // If there was an overrun, we will try to read/write a corresponding number
+   // of times so we catch up. The read from the input is non-blocking, so it
+   // should not bring us further behind, even if there is no data.
+   for (i = 1 + overrun; i > 0; i--)
+     {
+       ret = source_read(&nbytes, &nsamples, pb_session.buffer, pb_session.bufsize);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_LOG, L_PLAYER, "Error reading from source\n");
+ 	  pb_session.read_deficit -= pb_session.bufsize;
+ 	  break;
+ 	}
+       if (nbytes == 0)
+ 	{
+ 	  break;
+ 	}
++      /* Initial native quality is consumed on this same anchored tick. */
++      if (pb_timer_native && read_size == 0 && pb_session.bufsize)
++        {
++          read_size = pb_session.bufsize;
++          pb_session.read_deficit += (1 + overrun) * read_size;
++        }
+ 
+       pb_session.read_deficit -= nbytes;
+ 
+       outputs_write(pb_session.buffer, nbytes, nsamples, &pb_session.quality, &pb_session.pts);
+ 
+       if (nbytes < pb_session.bufsize)
+ 	{
+ 	  // How much the number of samples we got corresponds to in time (nanoseconds)
+ 	  ts.tv_sec = 0;
+ 	  ts.tv_nsec = 1000000000UL * (uint64_t)nsamples / pb_session.quality.sample_rate;
+ 
+ 	  DPRINTF(E_DBG, L_PLAYER, "Incomplete read, wanted %zu, got %d (samples=%d/time=%lu), deficit %zu\n", pb_session.bufsize, nbytes, nsamples, ts.tv_nsec, pb_session.read_deficit);
+ 
+ 	  pb_session.pts = timespec_add(pb_session.pts, ts);
+ 	}
+       else
+ 	{
+ 	  // We got a full frame, so that means we can also advance the presentation timestamp by a full tick
+ 	  pb_session.pts = timespec_add(pb_session.pts, player_tick_interval);
+ 
+ 	  // It is going well, lets take another round to repay our debt
+ 	  if (i == 1 && pb_session.read_deficit > pb_session.bufsize)
+ 	    i = 2;
+ 	}
+     }
+ 
+   if (pb_session.read_deficit_max && pb_session.read_deficit > pb_session.read_deficit_max)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Source is not providing sufficient data, temporarily suspending playback (deficit=%zu/%zu bytes)\n",
+ 	pb_session.read_deficit, pb_session.read_deficit_max);
+ 
+       player_flush_pending = pb_suspend();
+       // No devices to wait for, just set the restart cb right away. Otherwise
+       // the trigger will be set by device_flush_cb.
+       if (player_flush_pending == 0)
+ 	input_buffer_full_cb(player_playback_start);
+     }
+ }
+ 
+ 
+ /* ----------------- Output device handling (add/remove etc) ---------------- */
+@@ -1681,38 +1724,96 @@ player_pmap(void *p)
+ 
+ /* ------------------------- Internal playback routines --------------------- */
+ 
++/* 1 means this tick may consume PCM; 0 waits on the same bounded existing
++ * timer. This function never creates an independent output scheduler. */
++static int
++pb_timer_native_prepare(void)
++{
++  struct itimerspec tick;
++  struct timespec now, anchor;
++  uint64_t operation;
++  int state, ret;
++  state = input_pipe_shiri_state(&operation);
++  if (state != 1 || operation != pb_timer_native_operation)
++    return -1;
++  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++    return -1;
++  if (pb_timer_native_anchored)
++    return timespec_cmp(now, pb_timer_native_anchor) < 0 ? 0 : 1;
++  ret = input_peek_sync(&anchor);
++  if (ret < 0 || timespec_cmp(now, pb_timer_native_wait_until) >= 0)
++    return -1;
++  if (!ret)
++    return 0;
++  /* Never replace a late native anchor with the receive or timer clock. */
++  if (timespec_cmp(anchor, now) <= 0)
++    return -1;
++  tick.it_interval = player_tick_interval;
++  tick.it_value = anchor;
++#ifdef HAVE_TIMERFD
++  ret = timerfd_settime(pb_timer_fd, TFD_TIMER_ABSTIME, &tick, NULL);
++#else
++  ret = timer_settime(pb_timer, TIMER_ABSTIME, &tick, NULL);
++#endif
++  if (ret < 0)
++    return -1;
++  pb_timer_native_anchor = anchor;
++  pb_timer_native_anchored = true;
++  /* Control/quality markers must not substitute CLOCK_MONOTONIC now for this
++   * first sample's anchor when the session has not read any PCM yet. */
++  pb_session.start_ts = anchor;
++  pb_session.pts = anchor;
++  return 0;
++}
++
+ static int
+ pb_timer_start(void)
+ {
+   struct itimerspec tick;
+   int ret;
+ 
+   // The stop timers will be active if we have recently paused, but now that the
+   // playback loop has been kicked off, we deactivate them
+   outputs_stop_delayed_cancel();
+ 
+   ret = event_add(pb_timer_ev, NULL);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not add playback timer\n");
+ 
+       return -1;
+     }
+ 
++  pb_timer_native = false;
++  pb_timer_native_anchored = false;
++  pb_timer_native_operation = 0;
++  if (pb_session.reading_now && pb_session.reading_now->data_kind == DATA_KIND_PIPE)
++    {
++      ret = input_pipe_shiri_state(&pb_timer_native_operation);
++      if (ret < 0)
++        return -1;
++      pb_timer_native = (ret == 1);
++      if (pb_timer_native)
++        {
++          if (clock_gettime(CLOCK_MONOTONIC, &pb_timer_native_wait_until) < 0)
++            return -1;
++          pb_timer_native_wait_until.tv_sec += 5;
++        }
++    }
+   tick.it_interval = player_tick_interval;
+   tick.it_value = player_tick_interval;
+ 
+ #ifdef HAVE_TIMERFD
+   ret = timerfd_settime(pb_timer_fd, 0, &tick, NULL);
+ #else
+   ret = timer_settime(pb_timer, 0, &tick, NULL);
+ #endif
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not arm playback timer: %s\n", strerror(errno));
+ 
+       return -1;
+     }
+ 
+   return 0;
+ }
+@@ -1721,24 +1822,27 @@ static int
+ pb_timer_stop(void)
+ {
+   struct itimerspec tick;
+   int ret;
+ 
+   event_del(pb_timer_ev);
++  pb_timer_native = false;
++  pb_timer_native_anchored = false;
++  pb_timer_native_operation = 0;
+ 
+   memset(&tick, 0, sizeof(struct itimerspec));
+ 
+ #ifdef HAVE_TIMERFD
+   ret = timerfd_settime(pb_timer_fd, 0, &tick, NULL);
+ #else
+   ret = timer_settime(pb_timer, 0, &tick, NULL);
+ #endif
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not disarm playback timer: %s\n", strerror(errno));
+       return -1;
+     }
+ 
+   return 0;
+ }
+ 
+ // Initiates the session and starts the input source

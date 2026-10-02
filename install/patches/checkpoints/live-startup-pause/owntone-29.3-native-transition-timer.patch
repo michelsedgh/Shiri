@@ -1,0 +1,124 @@
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -306,10 +306,11 @@
+ static int shiri_source_start_failed;
+ struct shiri_source_param {
+   struct shiri_source_request request;
+   bool replay;
+   bool restart_outputs;
++  bool restart_timer;
+ };
+ 
+ 
+ /* Speech preparation owns neither a music source nor an output scheduler. */
+ struct shiri_speech_output {
+@@ -1795,46 +1796,63 @@
+     return "unknown";
+ }
+ 
+ /* ------------------------- Internal playback routines --------------------- */
+ 
++/* Preserve the rejected original anchor and operation in diagnostics. */
++static int
++pb_timer_native_reject(const char *reason, int state, uint64_t operation,
++                       struct timespec anchor, struct timespec now)
++{
++  DPRINTF(E_LOG, L_PLAYER,
++          "Native anchor rejected: reason=%s state=%d operation=%" PRIu64
++          " timer_operation=%" PRIu64 " anchor=%jd.%09ld now=%jd.%09ld wait_until=%jd.%09ld\n",
++          reason, state, operation, pb_timer_native_operation,
++          (intmax_t)anchor.tv_sec, anchor.tv_nsec, (intmax_t)now.tv_sec, now.tv_nsec,
++          (intmax_t)pb_timer_native_wait_until.tv_sec, pb_timer_native_wait_until.tv_nsec);
++  return -1;
++}
++
+ /* 1 means this tick may consume PCM; 0 waits on the same bounded existing
+  * timer. This function never creates an independent output scheduler. */
+ static int
+ pb_timer_native_prepare(void)
+ {
+   struct itimerspec tick;
+-  struct timespec now, anchor;
++  struct timespec now = { 0 }, anchor = { 0 };
+   uint64_t operation;
+   int state, ret;
+   state = input_pipe_shiri_state(&operation);
+   if (state != 1 || operation != pb_timer_native_operation)
+-    return -1;
++    return pb_timer_native_reject("source_gate", state, operation, anchor, now);
+   if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+-    return -1;
++    return pb_timer_native_reject("clock_read", state, operation, anchor, now);
+   if (pb_timer_native_anchored)
+     return timespec_cmp(now, pb_timer_native_anchor) < 0 ? 0 : 1;
+   ret = input_peek_sync(&anchor);
+   /* The input mutex can wait across the native deadline. Admit the original
+    * anchor against a fresh clock after peek, including a missing marker. */
+-  if (ret < 0 || clock_gettime(CLOCK_MONOTONIC, &now) < 0
+-      || timespec_cmp(now, pb_timer_native_wait_until) >= 0)
+-    return -1;
++  if (ret < 0)
++    return pb_timer_native_reject("anchor_peek", state, operation, anchor, now);
++  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++    return pb_timer_native_reject("anchor_clock_read", state, operation, anchor, now);
++  if (timespec_cmp(now, pb_timer_native_wait_until) >= 0)
++    return pb_timer_native_reject("anchor_timeout", state, operation, anchor, now);
+   if (!ret)
+     return 0;
+   /* Never replace a late native anchor with the receive or timer clock. */
+   if (timespec_cmp(anchor, now) <= 0)
+-    return -1;
++    return pb_timer_native_reject("anchor_late", state, operation, anchor, now);
+   tick.it_interval = player_tick_interval;
+   tick.it_value = anchor;
+ #ifdef HAVE_TIMERFD
+   ret = timerfd_settime(pb_timer_fd, TFD_TIMER_ABSTIME, &tick, NULL);
+ #else
+   ret = timer_settime(pb_timer, TIMER_ABSTIME, &tick, NULL);
+ #endif
+   if (ret < 0)
+-    return -1;
++    return pb_timer_native_reject("timer_arm", state, operation, anchor, now);
+   pb_timer_native_anchor = anchor;
+   pb_timer_native_anchored = true;
+   /* Control/quality markers must not substitute CLOCK_MONOTONIC now for this
+    * first sample's anchor when the session has not read any PCM yet. */
+   pb_session.start_ts = anchor;
+@@ -3145,11 +3163,20 @@
+       param->replay = (result == SHIRI_SOURCE_REPLAY);
+       *retval = result;
+       return COMMAND_END;
+     }
+ 
++  param->restart_timer = (player_state == PLAY_PLAYING && pb_timer_native);
+   shiri_source_begin(&shiri_source_state, &param->request);
++  /* Output FLUSH may await a network reply. Quiesce this same player timer
++   * before sealing the input, so its tick cannot abort and replace the
++   * pending output callback while the exact source barrier is in flight. */
++  if (param->restart_timer && pb_timer_stop() < 0)
++    {
++      *retval = SHIRI_SOURCE_FAILURE;
++      return COMMAND_END;
++    }
+   *retval = input_pipe_shiri_seal(param->request.operation_generation);
+   if (*retval < 0)
+     return COMMAND_END;
+   input_flush(NULL);
+   outputs_resampling_reset();
+@@ -3185,10 +3212,15 @@
+     {
+       *retval = SHIRI_SOURCE_FAILURE;
+       return COMMAND_END;
+     }
+   *retval = input_pipe_shiri_arm(&param->request.owner, param->request.operation_generation);
++  /* A successful current barrier gets a fresh first-anchor wait for its own
++   * PCM. Reuse the original timer and presentation stamp; do not retime it.
++   * A user stop/pause during the asynchronous output phase stays stopped. */
++  if (*retval == 0 && param->restart_timer && player_state == PLAY_PLAYING)
++    *retval = pb_timer_start();
+   if (*retval == 0)
+     shiri_source_state.faulted = false;
+   return COMMAND_END;
+ }
+ 

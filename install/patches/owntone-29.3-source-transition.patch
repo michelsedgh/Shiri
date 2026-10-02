@@ -1,0 +1,3587 @@
+diff --git a/configure.ac b/configure.ac
+index 63549f31..42de6548 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index bac545ff..2ae19ab2 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -112,7 +112,7 @@ owntone_SOURCES = main.c \
+ 	misc_xml.c misc_xml.h \
+ 	rng.c rng.h \
+ 	smartpl_query.c smartpl_query.h \
+-	player.c player.h \
++	player.c player.h shiri_source.h shiri_source_json.h \
+ 	worker.c worker.h \
+ 	settings.c settings.h \
+ 	input.h input.c \
+diff --git a/src/player.c b/src/player.c
+index 4da4ea7d..9d44b494 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -160,280 +160,291 @@ struct speaker_attr_param
+   int metadata_fd;
+ 
+   const char *pin;
+ };
+ 
+ struct speaker_get_param
+ {
+   uint64_t spk_id;
+   uint32_t active_remote;
+   uint32_t index;
+   const char *address;
+   struct player_speaker_info *spk_info;
+ };
+ 
+ struct speaker_auth_param
+ {
+   enum output_types type;
+   char pin[5];
+ };
+ 
+ struct player_seek_param
+ {
+   int ms;
+   enum player_seek_mode mode;
+ };
+ 
+ union player_arg
+ {
+   struct output_device *device;
+   struct speaker_auth_param auth;
+   uint32_t id;
+   int intval;
+ };
+ 
+ struct player_source
+ {
+   // Id of the file/item in the files database
+   uint32_t id;
+ 
+   // Item-Id of the file/item in the queue
+   uint32_t item_id;
+ 
+   // Length of the file/item in milliseconds, 0 for endless (unless the input
+   // has given us a track length)
+   uint32_t len_ms;
+ 
+   // Set when opening the item based on initial track length (so is not changed
+   // by later input track length metadata)
+   bool is_seekable;
+ 
+   // Quality of the source (sample rate etc.)
+   struct media_quality quality;
+ 
+   enum data_kind data_kind;
+   enum media_kind media_kind;
+   char *path;
+ 
+   // This is the position (measured in samples) the session was at when we
+   // started reading from the input source.
+   uint64_t read_start;
+ 
+   // This is the position (measured in samples) the session was at when we got
+   // a EOF or error from the input.
+   uint64_t read_end;
+ 
+   // Same as the above, but added with samples equivalent to
+   // outputs_buffer_duration_ms. When the session position reaches play_start it
+   // means the media should actually be playing on your device.
+   uint64_t play_start;
+   uint64_t play_end;
+ 
+   // When we receive a metadata update from the input it shouldn't be pushed to
+   // clients until the speakers have reached the position that matches the
+   // position the player was reading at when it got INPUT_FLAG_METADATA.
+   uint64_t metadata_update;
+ 
+   // The number of milliseconds into the media that we started
+   uint32_t seek_ms;
+ 
+   // This should at any time match the millisecond position of the media that is
+   // coming out of your device. Will be 0 during initial buffering.
+   uint32_t pos_ms;
+ 
+   // How many samples the outputs buffer before playing (=delay)
+   int output_buffer_samples;
+ 
+   // Linked list, where next is the next item to play
+   struct player_source *prev;
+   struct player_source *next;
+ };
+ 
+ struct player_session
+ {
+   uint8_t *buffer;
+   size_t bufsize;
+ 
+   // The time the playback session started
+   struct timespec start_ts;
+ 
+   // The time the first sample in the buffer should be played by the output,
+   // without taking outputs_buffer_duration_ms into account.
+   // It will be equal to:
+   // pts = start_ts + ticks_elapsed * player_tick_interval
+   struct timespec pts;
+ 
+   // Equals current number of samples written to outputs
+   uint32_t pos;
+ 
+   // The player sources also have a quality property, but in some situations
+   // they may get cleared. So we also save it here.
+   struct media_quality quality;
+ 
+   // We try to read a fixed number of bytes from the source each clock tick,
+   // but if it gives us less we increase this correspondingly
+   size_t read_deficit;
+   size_t read_deficit_max;
+ 
+   // We send metadata when we start a session, everytime we end a track and if
+   // the input gives us a new metadata event. This value tracks if we have sent
+   // the starting metadata.
+   bool metadata_sent;
+ 
+   // Pointer to the head of the two-way linked list of items from the queue that
+   // we are either playing or going to play. When an item has been played it is
+   // removed from the list. The playing_now and reading_now pointers will point
+   // to items inside this list (or to NULL).
+   struct player_source *source_list;
+ 
+   // The item from the queue being played right now. It should only be NULL when
+   // there is no playback.
+   struct player_source *playing_now;
+ 
+   // The item from the queue which the player is currently doing input_read()
+   // for. So "reading" means reading from the input buffer - the source itself
+   // may already be closed by the input module.
+   struct player_source *reading_now;
+ };
+ 
+ static struct player_session pb_session;
+ 
++/* Only source takeover/seek/end uses this seam. Speech never requests it. */
++static struct shiri_source_state shiri_source_state;
++static pthread_mutex_t shiri_source_mutex = PTHREAD_MUTEX_INITIALIZER;
++static int shiri_source_flush_failed;
++static int shiri_source_start_failed;
++struct shiri_source_param {
++  struct shiri_source_request request;
++  bool replay;
++  bool restart_outputs;
++};
++
+ struct event_base *evbase_player;
+ 
+ static int player_exit;
+ static pthread_t tid_player;
+ static struct commands_base *cmdbase;
+ 
+ // Keep track of how many outputs need to call back when flushing internally
+ // from the player thread (where we can't use player_playback_pause)
+ static int player_flush_pending;
+ 
+ // Config values and player settings category
+ static int speaker_autoselect;
+ static int clear_queue_on_stop_disabled;
+ 
+ // Player status
+ static enum play_status player_state;
+ static enum repeat_mode repeat;
+ static char shuffle;
+ static char consume;
+ 
+ // Playback timer
+ #ifdef HAVE_TIMERFD
+ static int pb_timer_fd;
+ #else
+ timer_t pb_timer;
+ #endif
+ static struct event *pb_timer_ev;
+ 
+ // Time between ticks, i.e. time between when playback_cb() is invoked
+ static struct timespec player_tick_interval;
+ /* Framed input retains the native presentation clock. Reuse this player timer
+  * with an absolute first tick, fenced by the exact source admission operation. */
+ static bool pb_timer_native;
+ static bool pb_timer_native_anchored;
+ static uint64_t pb_timer_native_operation;
+ static struct timespec pb_timer_native_anchor;
+ static struct timespec pb_timer_native_wait_until;
+ static int pb_timer_native_prepare(void);
+ 
+ // Timer resolution
+ static struct timespec player_timer_res;
+ 
+ // PLAYER_WRITE_BEHIND_MAX converted to clock ticks
+ static int pb_write_deficit_max;
+ 
+ // True if we are trying to recover from a major playback timer overrun (write problems)
+ static bool pb_write_recovery;
+ 
+ // Audio source
+ static uint32_t cur_plid;
+ static uint32_t cur_plversion;
+ 
+ // Play history
+ static struct player_history *history;
+ 
+ // When we receive track metadata from the input we have to wait until playback
+ // has reached the position before using it. We use this to record the update.
+ struct metadata_pending_register
+ {
+   uint64_t pos;
+   struct input_metadata *metadata;
+ } metadata_pending[16];
+ 
+ 
+ /* -------------------------------- Forwards -------------------------------- */
+ 
+ static void
+ pb_abort(void);
+ 
+ static int
+ pb_suspend(void);
+ 
+ 
+ /* ----------------------- Misc helpers and callbacks ----------------------- */
+ 
+ // Callback from the worker thread (async operation as it may block)
+ static void
+ playcount_inc_cb(void *arg)
+ {
+   int *id = arg;
+ 
+   db_file_inc_playcount(*id);
+ }
+ 
+ static void
+ skipcount_inc_cb(void *arg)
+ {
+   int *id = arg;
+ 
+   db_file_inc_skipcount(*id);
+ }
+ 
+ // Callback from the worker thread (async operation as it may block)
+ static void
+ scrobble_cb(void *arg)
+ {
+   int *id = arg;
+ 
+ #ifdef LASTFM
+   lastfm_scrobble(*id);
+ #endif
+   listenbrainz_scrobble(*id);
+ }
+ 
+ // This is just to be able to log the caller in a simple way
+ #define status_update(x, y) status_update_impl((x), (y), __func__)
+ static void
+ status_update_impl(enum play_status status, short listener_events, const char *caller)
+ {
+   DPRINTF(E_DBG, L_PLAYER, "Status update - status: %d, events: %d, caller: %s\n", status, listener_events, caller);
+ 
+   player_state = status;
+ 
+   listener_notify(listener_events);
+ }
+ 
+ /*
+  * Add the song with the given id to the list of previously played songs
+  */
+ static void
+ history_add(uint32_t id, uint32_t item_id)
+ {
+   unsigned int cur_index;
+   unsigned int next_index;
+ 
+   // Check if the current song is already the last in the history to avoid duplicates
+   cur_index = (history->start_index + history->count - 1) % MAX_HISTORY_COUNT;
+   if (id == history->id[cur_index])
+     {
+       DPRINTF(E_DBG, L_PLAYER, "Current playing/streaming song already in history\n");
+       return;
+     }
+ 
+   // Calculate the next index and update the start-index and count for the id-buffer
+   next_index = (history->start_index + history->count) % MAX_HISTORY_COUNT;
+   if (next_index == history->start_index && history->count > 0)
+     history->start_index = (history->start_index + 1) % MAX_HISTORY_COUNT;
+ 
+   history->id[next_index] = id;
+   history->item_id[next_index] = item_id;
+@@ -1272,509 +1283,532 @@ source_read(int *nbytes, int *nsamples, uint8_t *buf, int len)
+       if (pb_timer_native && *nbytes == 0 &&
+           (flag == INPUT_FLAG_QUALITY || flag == INPUT_FLAG_METADATA ||
+            flag == INPUT_FLAG_START_NEXT || flag == INPUT_FLAG_SYNC))
+         {
+           if (++controls >= 16)
+             return -1; /* Never move an anchored sample to a later tick. */
+           /* Quality can allocate/reallocate the session buffer. */
+           buf = pb_session.buffer;
+           len = pb_session.bufsize;
+           goto native_read;
+         }
+       return 0;
+     }
+ 
+   *nsamples = BTOS(*nbytes, pb_session.quality.bits_per_sample, pb_session.quality.channels);
+ 
+   event_read(*nsamples);
+ 
+   return 0;
+ }
+ 
+ static void
+ playback_cb(int fd, short what, void *arg)
+ {
+   struct timespec ts;
+   uint64_t overrun;
+   int nbytes;
+   int nsamples;
+   int i;
+   int ret;
+   size_t read_size;
+ 
+   // Check if we missed any timer expirations
+   overrun = 0;
+ #ifdef HAVE_TIMERFD
+   ret = read(fd, &overrun, sizeof(overrun));
+   if (ret <= 0)
+     DPRINTF(E_LOG, L_PLAYER, "Error reading timer\n");
+   else if (overrun > 0)
+     overrun--;
+ #else
+   ret = timer_getoverrun(pb_timer);
+   if (ret < 0)
+     DPRINTF(E_LOG, L_PLAYER, "Error getting timer overrun\n");
+   else
+     overrun = ret;
+ #endif /* HAVE_TIMERFD */
+ 
+   if (pb_timer_native)
+     {
+       ret = pb_timer_native_prepare();
+       if (ret < 0)
+         {
+           DPRINTF(E_LOG, L_PLAYER, "Native input missed or lost its initial presentation anchor\n");
+           pb_abort();
+           return;
+         }
+       if (ret == 0)
+         return; /* Waiting/rearmed: no PCM or output effects before the anchor. */
+     }
+ 
+   // We are too delayed, probably some output blocked: reset if first overrun or abort if second overrun
+   if (overrun > pb_write_deficit_max)
+     {
+       if (pb_write_recovery)
+ 	{
+ 	  DPRINTF(E_LOG, L_PLAYER, "Permanent output delay detected (behind=%" PRIu64 ", max=%d), aborting\n", overrun, pb_write_deficit_max);
+ 	  pb_abort();
+ 	  return;
+ 	}
+ 
+       DPRINTF(E_LOG, L_PLAYER, "Output delay detected (behind=%" PRIu64 ", max=%d), resetting all outputs\n", overrun, pb_write_deficit_max);
+       pb_write_recovery = true;
+       player_flush_pending = pb_suspend();
+       // No devices to wait for, just set the restart cb right away. Otherwise
+       // the trigger will be set by device_flush_cb.
+       if (player_flush_pending == 0)
+ 	input_buffer_full_cb(player_playback_start);
+ 
+       return;
+     }
+   else
+     {
+       if (overrun > 1) // An overrun of 1 is no big deal
+ 	DPRINTF(E_WARN, L_PLAYER, "Output delay detected: player is %" PRIu64 " ticks behind, catching up\n", overrun);
+ 
+       pb_write_recovery = false;
+     }
+ 
+ #ifdef DEBUG_PLAYER
+   session_dump(true);
+ #endif
+ 
+   // The pessimistic approach: Assume you won't get anything, then anything that
+   // comes your way is a positive surprise.
+   read_size = pb_session.bufsize;
+   pb_session.read_deficit += (1 + overrun) * read_size;
+ 
+   // If there was an overrun, we will try to read/write a corresponding number
+   // of times so we catch up. The read from the input is non-blocking, so it
+   // should not bring us further behind, even if there is no data.
+   for (i = 1 + overrun; i > 0; i--)
+     {
+       ret = source_read(&nbytes, &nsamples, pb_session.buffer, pb_session.bufsize);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_LOG, L_PLAYER, "Error reading from source\n");
+ 	  pb_session.read_deficit -= pb_session.bufsize;
+ 	  break;
+ 	}
+       if (nbytes == 0)
+ 	{
+ 	  break;
+ 	}
+       /* Initial native quality is consumed on this same anchored tick. */
+       if (pb_timer_native && read_size == 0 && pb_session.bufsize)
+         {
+           read_size = pb_session.bufsize;
+           pb_session.read_deficit += (1 + overrun) * read_size;
+         }
+ 
+       pb_session.read_deficit -= nbytes;
+ 
+       outputs_write(pb_session.buffer, nbytes, nsamples, &pb_session.quality, &pb_session.pts);
+ 
+       if (nbytes < pb_session.bufsize)
+ 	{
+ 	  // How much the number of samples we got corresponds to in time (nanoseconds)
+ 	  ts.tv_sec = 0;
+ 	  ts.tv_nsec = 1000000000UL * (uint64_t)nsamples / pb_session.quality.sample_rate;
+ 
+ 	  DPRINTF(E_DBG, L_PLAYER, "Incomplete read, wanted %zu, got %d (samples=%d/time=%lu), deficit %zu\n", pb_session.bufsize, nbytes, nsamples, ts.tv_nsec, pb_session.read_deficit);
+ 
+ 	  pb_session.pts = timespec_add(pb_session.pts, ts);
+ 	}
+       else
+ 	{
+ 	  // We got a full frame, so that means we can also advance the presentation timestamp by a full tick
+ 	  pb_session.pts = timespec_add(pb_session.pts, player_tick_interval);
+ 
+-	  // It is going well, lets take another round to repay our debt
+-	  if (i == 1 && pb_session.read_deficit > pb_session.bufsize)
+-	    i = 2;
+ 	}
++
++      // Timed inputs may intentionally bound reads at each timestamp marker.
++      // Partial blocks must repay accumulated debt too, or an 8 ms producer
++      // consumed on the 10 ms player tick permanently falls behind.
++      if (i == 1 && pb_session.read_deficit > pb_session.bufsize)
++	i = 2;
+     }
+ 
+   if (pb_session.read_deficit_max && pb_session.read_deficit > pb_session.read_deficit_max)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Source is not providing sufficient data, temporarily suspending playback (deficit=%zu/%zu bytes)\n",
+ 	pb_session.read_deficit, pb_session.read_deficit_max);
+ 
+       player_flush_pending = pb_suspend();
+       // No devices to wait for, just set the restart cb right away. Otherwise
+       // the trigger will be set by device_flush_cb.
+       if (player_flush_pending == 0)
+ 	input_buffer_full_cb(player_playback_start);
+     }
+ }
+ 
+ 
+ /* ----------------- Output device handling (add/remove etc) ---------------- */
+ 
+ static enum command_state
+ device_add(void *arg, int *retval)
+ {
+   union player_arg *cmdarg = arg;
+   struct output_device *device = cmdarg->device;
+   bool new_deselect;
+ 
+   // Never turn on new devices during playback
+   new_deselect = (player_state == PLAY_PLAYING);
+ 
+   device = outputs_device_add(device, new_deselect);
+   if (!device)
+     {
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   status_update(player_state, LISTENER_SPEAKER | LISTENER_VOLUME);
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ device_remove_family(void *arg, int *retval)
+ {
+   union player_arg *cmdarg = arg;
+   struct output_device *remove;
+   struct output_device *device;
+ 
+   remove = cmdarg->device;
+ 
+   device = outputs_device_get(remove->id);
+   if (!device)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "The %s device '%s' stopped advertising, but not in our list\n", remove->type_name, remove->name);
+ 
+       outputs_device_free(remove);
+       *retval = 0;
+       return COMMAND_END;
+     }
+ 
+   // v{4,6}_port non-zero indicates the address family stopped advertising
+   if (remove->v4_port && device->v4_address)
+     {
+       free(device->v4_address);
+       device->v4_address = NULL;
+       device->v4_port = 0;
+     }
+ 
+   if (remove->v6_port && device->v6_address)
+     {
+       free(device->v6_address);
+       device->v6_address = NULL;
+       device->v6_port = 0;
+     }
+ 
+   if (!device->v4_address && !device->v6_address)
+     {
+       device->advertised = 0;
+ 
+       // If there is a session we will keep the device in the list until the
+       // backend gives us a callback with a failure. Then outputs.c will remove
+       // the device. If the output backend never gives a callback (can that
+       // happen?) then the device will never be removed.
+       if (!device->session)
+ 	outputs_device_remove(device);
+     }
+ 
+   outputs_device_free(remove);
+ 
+   status_update(player_state, LISTENER_SPEAKER | LISTENER_VOLUME);
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ device_auth_kickoff(void *arg, int *retval)
+ {
+   union player_arg *cmdarg = arg;
+   struct output_device *device;
+ 
+   // First find the device requiring verification
+   for (device = outputs_list(); device; device = device->next)
+     {
+       if (device->type == cmdarg->auth.type && device->state == OUTPUT_STATE_PASSWORD)
+ 	break;
+     }
+ 
+   if (!device)
+     {
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   // We're async, so we don't care about return values or callbacks with result
+   outputs_device_authorize(device, cmdarg->auth.pin, NULL);
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ 
+ /* -------- Output device callbacks executed in the player thread ----------- */
+ 
+ static void
+ device_streaming_cb(struct output_device *device, enum output_device_state status)
+ {
+   if (!device)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output device disappeared during streaming!\n");
+     }
+   else if (status == OUTPUT_STATE_FAILED)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "The %s device '%s' failed\n", device->type_name, device->name);
+ 
+       // The device can fail outside of playback, e.g. if it disconnects after a
+       // flush command
+       if (player_state != PLAY_PLAYING)
+ 	goto out;
+ 
+       if (outputs_sessions_count() == 0)
+ 	pb_suspend();
+ 
+       if (!device->resurrect)
+ 	goto out;
+ 
+       DPRINTF(E_LOG, L_PLAYER, "Attempting reconnection in %d sec to the %s device '%s'\n", PLAYER_SPEAKER_RESURRECT_TIME, device->type_name, device->name);
+ 
+       // TODO do this internally instead of through the worker
+       worker_execute(player_speaker_resurrect, &(device->id), sizeof(device->id), PLAYER_SPEAKER_RESURRECT_TIME);
+     }
+   else if (status == OUTPUT_STATE_STOPPED)
+     {
+       DPRINTF(E_INFO, L_PLAYER, "The %s device '%s' stopped\n", device->type_name, device->name);
+     }
+   else
+     {
+       DPRINTF(E_DBG, L_PLAYER, "Callback from %s device %s to device_streaming_cb (status %d)\n", device->type_name, device->name, status);
+       outputs_device_cb_set(device, device_streaming_cb);
+     }
+ 
+  out:
+   // We don't do this in the other cb's because they are triggered by a command
+   // and thus the update should be done as part of the command completion (which
+   // can better determine which type of listener event to use)
+   status_update(player_state, LISTENER_SPEAKER | LISTENER_VOLUME);
+ }
+ 
+ static void
+ device_volume_cb(struct output_device *device, enum output_device_state status)
+ {
+   if (!device)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output device disappeared before command completion!\n");
+       goto out;
+     }
+   else if (status == OUTPUT_STATE_FAILED)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' failed during execution of volume command\n", device->type_name, device->name);
+       goto out;
+     }
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Callback from %s device %s to device_volume_cb (status %d)\n", device->type_name, device->name, status);
+ 
+   outputs_device_cb_set(device, device_streaming_cb);
+ 
+  out:
+   // If a failure occurred when setting the volume, and we also don't have other
+   // active sessions, then we suspend playback
+   if (outputs_sessions_count() == 0)
+     pb_suspend();
+ 
+   commands_exec_end(cmdbase, 0);
+ }
+ 
+ static void
+ device_flush_cb(struct output_device *device, enum output_device_state status)
+ {
+   if (!device)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output device disappeared before flush completion!\n");
+       goto out;
+     }
+   else if (status == OUTPUT_STATE_FAILED)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' failed during execution of flush command\n", device->type_name, device->name);
+       goto out;
+     }
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Callback from %s device %s to device_flush_cb (status %d)\n", device->type_name, device->name, status);
+ 
+   // Used by pb_suspend - is basically the bottom half
+   if (player_flush_pending > 0)
+     {
+       player_flush_pending--;
+       if (player_flush_pending == 0)
+ 	input_buffer_full_cb(player_playback_start);
+     }
+ 
+   outputs_device_stop_delayed(device, device_streaming_cb);
+ 
+  out:
+   commands_exec_end(cmdbase, 0);
+ }
+ 
++static void
++device_shiri_flush_cb(struct output_device *device, enum output_device_state status)
++{
++  if (!device || status == OUTPUT_STATE_FAILED)
++    shiri_source_flush_failed = 1;
++  if (device)
++    outputs_device_stop_delayed(device, device_streaming_cb);
++  commands_exec_end(cmdbase, shiri_source_flush_failed ? SHIRI_SOURCE_FAILURE : 0);
++}
++
++static void
++device_shiri_start_cb(struct output_device *device, enum output_device_state status)
++{
++  if (!device || status == OUTPUT_STATE_FAILED || status == OUTPUT_STATE_PASSWORD)
++    shiri_source_start_failed = 1;
++  else
++    outputs_device_cb_set(device, device_streaming_cb);
++  commands_exec_end(cmdbase, shiri_source_start_failed ? SHIRI_SOURCE_FAILURE : 0);
++}
++
+ static void
+ device_shutdown_cb(struct output_device *device, enum output_device_state status)
+ {
+   int retval;
+ 
+   retval = commands_exec_returnvalue(cmdbase);
+   if (!device)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "Output device disappeared before shutdown completion!\n");
+ 
+       if (retval != -2)
+ 	retval = -1;
+       goto out;
+     }
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Callback from %s device %s to device_shutdown_cb (status %d)\n", device->type_name, device->name, status);
+ 
+  out:
+   commands_exec_end(cmdbase, retval);
+ }
+ 
+ static void
+ device_activate_cb(struct output_device *device, enum output_device_state status)
+ {
+   int retval;
+ 
+   retval = commands_exec_returnvalue(cmdbase);
+   if (!device)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "Output device disappeared during activation!\n");
+ 
+       if (retval != -2)
+ 	retval = -1;
+       goto out;
+     }
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Callback from %s device %s to device_activate_cb (status %d)\n", device->type_name, device->name, status);
+ 
+   if (status == OUTPUT_STATE_PASSWORD)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' requires a valid PIN or password\n", device->type_name, device->name);
+ 
+       outputs_device_deselect(device);
+ 
+       retval = -2;
+       goto out;
+     }
+ 
+   if (status == OUTPUT_STATE_FAILED)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' failed to activate\n", device->type_name, device->name);
+ 
+       outputs_device_deselect(device);
+ 
+       if (retval != -2)
+ 	retval = -1;
+       goto out;
+     }
+ 
+   // If we were just probing or doing device verification this is a no-op, since
+   // there is no session any more
+   outputs_device_cb_set(device, device_streaming_cb);
+ 
+  out:
+   commands_exec_end(cmdbase, retval);
+ }
+ 
+ const char *
+ player_pmap(void *p)
+ {
+   if (p == device_activate_cb)
+     return "device_activate_cb";
+   else if (p == device_streaming_cb)
+     return "device_streaming_cb";
+   else if (p == device_volume_cb)
+     return "device_volume_cb";
+   else if (p == device_flush_cb)
+     return "device_flush_cb";
+   else if (p == device_shutdown_cb)
+     return "device_shutdown_cb";
+   else
+     return "unknown";
+ }
+ 
+ /* ------------------------- Internal playback routines --------------------- */
+ 
+ /* 1 means this tick may consume PCM; 0 waits on the same bounded existing
+  * timer. This function never creates an independent output scheduler. */
+ static int
+ pb_timer_native_prepare(void)
+ {
+   struct itimerspec tick;
+   struct timespec now, anchor;
+   uint64_t operation;
+   int state, ret;
+   state = input_pipe_shiri_state(&operation);
+   if (state != 1 || operation != pb_timer_native_operation)
+     return -1;
+   if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+     return -1;
+   if (pb_timer_native_anchored)
+     return timespec_cmp(now, pb_timer_native_anchor) < 0 ? 0 : 1;
+   ret = input_peek_sync(&anchor);
+   if (ret < 0 || timespec_cmp(now, pb_timer_native_wait_until) >= 0)
+     return -1;
+   if (!ret)
+     return 0;
+   /* Never replace a late native anchor with the receive or timer clock. */
+   if (timespec_cmp(anchor, now) <= 0)
+     return -1;
+   tick.it_interval = player_tick_interval;
+   tick.it_value = anchor;
+ #ifdef HAVE_TIMERFD
+   ret = timerfd_settime(pb_timer_fd, TFD_TIMER_ABSTIME, &tick, NULL);
+ #else
+   ret = timer_settime(pb_timer, TIMER_ABSTIME, &tick, NULL);
+ #endif
+   if (ret < 0)
+     return -1;
+   pb_timer_native_anchor = anchor;
+   pb_timer_native_anchored = true;
+   /* Control/quality markers must not substitute CLOCK_MONOTONIC now for this
+    * first sample's anchor when the session has not read any PCM yet. */
+   pb_session.start_ts = anchor;
+   pb_session.pts = anchor;
+   return 0;
+ }
+ 
+ static int
+ pb_timer_start(void)
+ {
+   struct itimerspec tick;
+   int ret;
+ 
+   // The stop timers will be active if we have recently paused, but now that the
+   // playback loop has been kicked off, we deactivate them
+   outputs_stop_delayed_cancel();
+ 
+   ret = event_add(pb_timer_ev, NULL);
+   if (ret < 0)
+@@ -2489,280 +2523,338 @@ seek_calc_position_ms(struct db_queue_item **queue_item, int *position_ms, struc
+   *position_ms = seek_ms;
+   return 0;
+ }
+ 
+ static enum command_state
+ playback_seek_bh(void *arg, int *retval)
+ {
+   struct player_seek_param *seek_param = arg;
+   struct db_queue_item *queue_item;
+   int position_ms;
+   int ret;
+ 
+   // outputs_flush() in playback_pause() may have a caused a failure callback
+   // from the output, which in streaming_cb() can cause pb_abort()
+   if (player_state == PLAY_STOPPED)
+     {
+       goto error;
+     }
+ 
+   ret = seek_calc_position_ms(&queue_item, &position_ms, seek_param);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Error calculating new seek position\n");
+       goto error;
+     }
+ 
+   ret = pb_session_start(queue_item, position_ms);
+   free_queue_item(queue_item, 0);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Error seeking to %d, aborting playback\n", position_ms);
+       goto error;
+     }
+ 
+   // Silent status change - playback_start() sends the real status update
+   player_state = PLAY_PAUSED;
+ 
+   *retval = 0;
+   return COMMAND_END;
+ 
+  error:
+   pb_abort();
+   *retval = -1;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ playback_pause_bh(void *arg, int *retval)
+ {
+   struct db_queue_item *queue_item;
+   int ret;
+ 
+   // outputs_flush() in playback_pause() may have a caused a failure callback
+   // from the output, which in streaming_cb() can cause pb_abort()
+   if (player_state == PLAY_STOPPED)
+     {
+       goto error;
+     }
+ 
+   queue_item = db_queue_fetch_byitemid(pb_session.playing_now->item_id);
+   if (!queue_item)
+     {
+       DPRINTF(E_DBG, L_PLAYER, "Error pausing source, queue item has disappeared\n");
+       goto error;
+     }
+ 
+   ret = pb_session_start(queue_item, pb_session.playing_now->pos_ms);
+   free_queue_item(queue_item, 0);
+   if (ret < 0)
+     {
+       DPRINTF(E_DBG, L_PLAYER, "Error pausing source, aborting playback\n");
+       goto error;
+     }
+ 
+   status_update(PLAY_PAUSED, LISTENER_PLAYER);
+ 
+   *retval = 0;
+   return COMMAND_END;
+ 
+  error:
+   pb_abort();
+   *retval = -1;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ playback_pause(void *arg, int *retval)
+ {
+   if (player_state == PLAY_STOPPED)
+     {
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   if (player_state == PLAY_PAUSED)
+     {
+       *retval = 0;
+       return COMMAND_END;
+     }
+ 
+   pb_session_pause();
+ 
+   *retval = outputs_flush(device_flush_cb);
+   outputs_metadata_purge();
+ 
+   // We're async if we need to flush devices
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   // Otherwise, just run the bottom half
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ playback_flush(void *arg, int *retval)
+ {
+   if (player_state == PLAY_STOPPED)
+     {
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   if (player_state == PLAY_PAUSED)
+     {
+       *retval = 0;
+       return COMMAND_END;
+     }
+ 
+   input_flush(NULL);
+ 
+   *retval = outputs_flush(device_flush_cb);
+   outputs_metadata_purge();
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   // Otherwise we are done
+   return COMMAND_END;
+ }
+ 
++static enum command_state
++shiri_source_seal_flush(void *arg, int *retval)
++{
++  struct shiri_source_param *param = arg;
++  int result, pending;
++
++  result = shiri_source_check(&shiri_source_state, &param->request);
++  if (result <= 0)
++    {
++      param->replay = (result == SHIRI_SOURCE_REPLAY);
++      *retval = result;
++      return COMMAND_END;
++    }
++
++  shiri_source_begin(&shiri_source_state, &param->request);
++  *retval = input_pipe_shiri_seal(param->request.operation_generation);
++  if (*retval < 0)
++    return COMMAND_END;
++  input_flush(NULL);
++  pb_session.read_deficit = 0;
++  shiri_source_flush_failed = 0;
++  param->restart_outputs = (player_state == PLAY_PLAYING);
++  pending = outputs_shiri_flush(device_shiri_flush_cb, &shiri_source_flush_failed);
++  outputs_metadata_purge();
++  *retval = pending > 0 ? pending : (shiri_source_flush_failed ? SHIRI_SOURCE_FAILURE : 0);
++  return pending > 0 ? COMMAND_PENDING : COMMAND_END;
++}
++
++static enum command_state
++shiri_source_restart(void *arg, int *retval)
++{
++  int pending;
++  (void)arg;
++  shiri_source_start_failed = 0;
++  outputs_stop_delayed_cancel();
++  pending = outputs_shiri_start(device_shiri_start_cb, &shiri_source_start_failed);
++  *retval = pending > 0 ? pending : (shiri_source_start_failed ? SHIRI_SOURCE_FAILURE : 0);
++  return pending > 0 ? COMMAND_PENDING : COMMAND_END;
++}
++
++static enum command_state
++shiri_source_arm(void *arg, int *retval)
++{
++  struct shiri_source_param *param = arg;
++  if (!shiri_source_state.initialized || !shiri_source_state.faulted
++      || shiri_source_flush_failed || shiri_source_start_failed
++      || shiri_source_state.last.operation_generation != param->request.operation_generation
++      || !shiri_source_owner_equal(&shiri_source_state.last.owner, &param->request.owner))
++    {
++      *retval = SHIRI_SOURCE_FAILURE;
++      return COMMAND_END;
++    }
++  *retval = input_pipe_shiri_arm(&param->request.owner, param->request.operation_generation);
++  if (*retval == 0)
++    shiri_source_state.faulted = false;
++  return COMMAND_END;
++}
++
+ static enum command_state
+ playback_seek(void *arg, int *retval)
+ {
+   // Only check if the current playing track is seekable, other checks will be done in playback_pause()
+   if (pb_session.playing_now && !pb_session.playing_now->is_seekable)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "Failed to seek, track is not seekable\n");
+ 
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   return playback_pause(arg, retval);
+ }
+ 
+ static void
+ device_to_speaker_info(struct player_speaker_info *spk, struct output_device *device, uint32_t index)
+ {
+   memset(spk, 0, sizeof(struct player_speaker_info));
+   spk->id = device->id;
+   spk->index = index;
+   spk->active_remote = (uint32_t)device->id;
+   strncpy(spk->name, device->name, sizeof(spk->name));
+   spk->name[sizeof(spk->name) - 1] = '\0';
+   strncpy(spk->output_type, device->type_name, sizeof(spk->output_type));
+   spk->output_type[sizeof(spk->output_type) - 1] = '\0';
+   spk->relvol = device->relvol;
+   spk->absvol = device->volume;
+   spk->offset_ms = device->offset_ms;
+ 
+   spk->supported_formats = device->supported_formats;
+   // Devices supporting more than one format should at least have default_format set
+   if (device->selected_format != MEDIA_FORMAT_UNKNOWN)
+     spk->format = device->selected_format;
+   else if (device->default_format != MEDIA_FORMAT_UNKNOWN)
+     spk->format = device->default_format;
+   else
+     spk->format = device->supported_formats;
+ 
+   spk->selected = OUTPUTS_DEVICE_DISPLAY_SELECTED(device);
+ 
+   spk->has_password = device->has_password;
+   spk->has_video = device->has_video;
+   spk->requires_auth = device->requires_auth;
+   spk->needs_auth_key = (device->requires_auth && device->auth_key == NULL);
+   spk->prevent_playback = device->prevent_playback;
+   spk->busy = device->busy;
+ }
+ 
+ static enum command_state
+ speaker_enumerate(void *arg, int *retval)
+ {
+   struct spk_enum *spk_enum = arg;
+   struct output_device *device;
+   struct player_speaker_info spk;
+   int i;
+ 
+   for (device = outputs_list(), i = 0; device; device = device->next, i++)
+     {
+       device_to_speaker_info(&spk, device, i);
+       spk_enum->cb(&spk, spk_enum->arg);
+     }
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ speaker_get_byid(void *arg, int *retval)
+ {
+   struct speaker_get_param *spk_param = arg;
+   struct output_device *device;
+   int i;
+ 
+   for (device = outputs_list(), i = 0; device; device = device->next, i++)
+     {
+       if ((device->advertised || device->selected)
+ 	  && device->id == spk_param->spk_id)
+ 	{
+ 	  device_to_speaker_info(spk_param->spk_info, device, i);
+ 	  *retval = 0;
+ 	  return COMMAND_END;
+ 	}
+     }
+ 
+   // No output device found with matching id
+   *retval = -1;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ speaker_get_byactiveremote(void *arg, int *retval)
+ {
+   struct speaker_get_param *spk_param = arg;
+   struct output_device *device;
+   int i;
+ 
+   for (device = outputs_list(), i = 0; device; device = device->next, i++)
+     {
+       if ((uint32_t)device->id == spk_param->active_remote)
+ 	{
+ 	  device_to_speaker_info(spk_param->spk_info, device, i);
+ 	  *retval = 0;
+ 	  return COMMAND_END;
+ 	}
+     }
+ 
+   // No output device found with matching id
+   *retval = -1;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ speaker_get_byaddress(void *arg, int *retval)
+ {
+   struct speaker_get_param *spk_param = arg;
+   struct output_device *device;
+   bool match_v4;
+   bool match_v6;
+   int i;
+ 
+   for (device = outputs_list(), i = 0; device; device = device->next, i++)
+     {
+       match_v4 = device->v4_address && (strcmp(spk_param->address, device->v4_address) == 0);
+       match_v6 = device->v6_address && (strcmp(spk_param->address, device->v6_address) == 0);
+       if (match_v4 || match_v6)
+ 	{
+ 	  device_to_speaker_info(spk_param->spk_info, device, i);
+ 	  *retval = 0;
+ 	  return COMMAND_END;
+ 	}
+     }
+ 
+   *retval = -1;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ speaker_get_byindex(void *arg, int *retval)
+ {
+@@ -3069,280 +3161,299 @@ speaker_resurrect(void *arg, int *retval)
+   *retval = -1;
+ 
+   device = outputs_device_get(*param->device_ids);
+   if (!device)
+     goto out;
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Speaker resurrect: '%s' (id=%" PRIu64 ")\n", device->name, device->id);
+ 
+   if (device->busy || device->prevent_playback)
+     goto out;
+ 
+   if (player_state == PLAY_PAUSED)
+     {
+       // Playback was suspended by device_streaming_cb() because the speaker was
+       // the only one playing. In that case we need to first resume the source,
+       // then wait for the speaker to reactivate, and then run bottom half.
+       *retval = pb_resume();
+       if (*retval < 0)
+ 	goto out;
+     }
+   else if (player_state == PLAY_STOPPED)
+     {
+       // If PLAY_STOPPED there is nothing to do, we can't resurrect since the
+       // source is gone
+       goto out;
+     }
+ 
+   *retval = outputs_device_start(device, device_activate_cb, false);
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // Wait for speaker
+ 
+  out:
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ speaker_resurrect_bh(void *arg, int *retval)
+ {
+   // Playback was suspended by device_streaming_cb. We resumed the input in the
+   // top half, now we have to start the playback timer and update status
+   if (player_state == PLAY_PAUSED)
+     return playback_start_bh(arg, retval);
+ 
+   status_update(player_state, LISTENER_SPEAKER | LISTENER_VOLUME);
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ speaker_authorize(void *arg, int *retval)
+ {
+   struct speaker_attr_param *param = arg;
+   struct output_device *device;
+ 
+   device = outputs_device_get(param->spk_id);
+   if (!device)
+     return COMMAND_END;
+ 
+   *retval = outputs_device_authorize(device, param->pin, device_activate_cb);
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ speaker_start_all(void *arg, int *retval)
+ {
+   outputs_stop_delayed_cancel();
+ 
+   *retval = outputs_start(device_activate_cb, device_shutdown_cb, false);
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   // Otherwise we are done
+   return COMMAND_END;
+ }
+ 
+ // This is borderline misuse of the outputs_device interface, but the purpose is
+ // to register streaming session info with outputs/streaming.c via the player
+ // thread. It must be the player thread because session setup requires that
+ // outputs_quality_subscribe() is called, and by design it isn't thread safe.
+ static enum command_state
+ streaming_register(void *arg, int *retval)
+ {
+   struct speaker_attr_param *param = arg;
+   struct output_device device =
+   {
+     .type = OUTPUT_TYPE_STREAMING,
+     .type_name = "streaming",
+     .name = "streaming",
+     .quality = param->quality,
+     .selected_format = param->format,
+   };
+ 
+   *retval = outputs_device_start(&device, NULL, false);
+ 
+   param->spk_id = device.id;
+   param->audio_fd = device.audio_fd;
+   param->metadata_fd = device.metadata_fd;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ streaming_deregister(void *arg, int *retval)
+ {
+   struct speaker_attr_param *param = arg;
+   struct output_device device =
+   {
+     .type = OUTPUT_TYPE_STREAMING,
+     .type_name = "streaming",
+     .name = "streaming",
+     .id = param->spk_id,
+     .session = "dummy", // to pass check in outputs_device_stop()
+   };
+ 
+   *retval = outputs_device_stop(&device, NULL);
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ volume_set(void *arg, int *retval)
+ {
+   union player_arg *cmdarg = arg;
+   int volume;
+ 
+   volume = cmdarg->intval;
+ 
+   *retval = outputs_volume_set(volume, device_volume_cb);
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   return COMMAND_END;
+ }
+ 
++struct shiri_source_volume_param {
++  struct shiri_pcm_owner owner;
++  union player_arg value;
++};
++
++static enum command_state
++shiri_source_volume(void *arg, int *retval)
++{
++  struct shiri_source_volume_param *param = arg;
++  if (!shiri_source_state.initialized || shiri_source_state.faulted
++      || shiri_zero(param->owner.session, 16)
++      || !shiri_source_owner_equal(&shiri_source_state.last.owner, &param->owner))
++    {
++      *retval = SHIRI_SOURCE_CONFLICT;
++      return COMMAND_END;
++    }
++  return volume_set(&param->value, retval);
++}
++
+ static enum command_state
+ volume_setrel_speaker(void *arg, int *retval)
+ {
+   struct speaker_attr_param *vol_param = arg;
+   struct output_device *device;
+ 
+   device = outputs_device_get(vol_param->spk_id);
+   if (!device)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "Could not set volume for speaker id %" PRIu64 ", speaker disappeared\n", vol_param->spk_id);
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   outputs_device_volume_register(device, -1, vol_param->volume);
+ 
+   *retval = outputs_device_volume_set(device, device_volume_cb);
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ volume_setabs_speaker(void *arg, int *retval)
+ {
+   struct speaker_attr_param *vol_param = arg;
+   struct output_device *device;
+ 
+   device = outputs_device_get(vol_param->spk_id);
+   if (!device)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "Could not set volume for speaker id %" PRIu64 ", speaker disappeared\n", vol_param->spk_id);
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   outputs_device_volume_register(device, vol_param->volume, -1);
+ 
+   *retval = outputs_device_volume_set(device, device_volume_cb);
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ volume_setraw_speaker(void *arg, int *retval)
+ {
+   struct speaker_attr_param *vol_param = arg;
+   struct output_device *device;
+   int volume;
+ 
+   device = outputs_device_get(vol_param->spk_id);
+   if (!device)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "Could not set volume for speaker id %" PRIu64 ", speaker disappeared\n", vol_param->spk_id);
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   volume = outputs_device_volume_to_pct(device, vol_param->volstr); // Only converts
+   if (volume < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not parse volume '%s' in update_volume() for speaker '%s'\n", vol_param->volstr, device->name);
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   outputs_device_volume_register(device, volume, -1);
+ 
+   *retval = outputs_device_volume_set(device, device_volume_cb);
+ 
+   if (*retval > 0)
+     return COMMAND_PENDING; // async
+ 
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ volume_generic_bh(void *arg, int *retval)
+ {
+   status_update(player_state, LISTENER_VOLUME);
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ consume_set(void *arg, int *retval);
+ 
+ static enum command_state
+ repeat_set(void *arg, int *retval)
+ {
+   enum repeat_mode *mode = arg;
+   union player_arg consume_arg;
+ 
+   if (*mode == repeat)
+     {
+       *retval = 0;
+       return COMMAND_END;
+     }
+ 
+   switch (*mode)
+     {
+       case REPEAT_OFF:
+       case REPEAT_SONG:
+       case REPEAT_ALL:
+ 	repeat = *mode;
+ 	break;
+ 
+       default:
+ 	DPRINTF(E_LOG, L_PLAYER, "Invalid repeat mode: %d\n", *mode);
+ 	*retval = -1;
+ 	return COMMAND_END;
+     }
+ 
+   // Persist
+   SETTINGS_SETINT("player", PLAYER_SETTINGS_MODE_REPEAT, repeat);
+ 
+   if (repeat == REPEAT_ALL || repeat == REPEAT_SONG)
+     {
+       // Activating repeat requires repeat consume mode to be off
+       consume_arg.intval = 0;
+       consume_set(&consume_arg, retval);
+     }
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ shuffle_set(void *arg, int *retval)
+ {
+   union player_arg *cmdarg = arg;
+   char new_shuffle;
+ 
+   new_shuffle = (cmdarg->intval == 0) ? 0 : 1;
+ 
+   // Ignore unchanged shuffle mode requests
+@@ -3413,537 +3524,572 @@ playerqueue_clear_history(void *arg, int *retval)
+   cur_plversion++; // TODO [db_queue] need to update db queue version
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ playerqueue_plid(void *arg, int *retval)
+ {
+   union player_arg *cmdarg = arg;
+   cur_plid = cmdarg->id;
+ 
+   *retval = 0;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ playerqueue_generic_bh(void *arg, int *retval)
+ {
+   status_update(player_state, LISTENER_QUEUE);
+   return COMMAND_END;
+ }
+ 
+ /* ------------------------------- Player API ------------------------------- */
+ 
+ int
+ player_get_status(struct player_status *status)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, get_status, NULL, status);
+   return ret;
+ }
+ 
+ 
+ /* ------------------------------ Thread: httpd ----------------------------- */
+ 
+ /*
+  * Stores the now playing media item dbmfi-id in the given id pointer.
+  *
+  * @param id Pointer will hold the playing item (dbmfi) id if the function returns 0
+  * @return 0 on success, -1 on failure (e. g. no playing item found)
+  */
+ int
+ player_playing_now(uint32_t *id)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playing_now, NULL, id);
+   return ret;
+ }
+ 
+ /*
+  * Starts/resumes playback
+  *
+  * Depending on the player state, this will either resume playing the current
+  * item (player is paused) or begin playing the queue from the beginning.
+  *
+  * If shuffle is set, the queue is reshuffled prior to starting playback.
+  *
+  * @return 0 if successful, -1 if an error occurred
+  */
+ int
+ player_playback_start(void)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_start, playback_start_bh, NULL);
+ 
+   return ret;
+ }
+ 
+ /*
+  * Starts/resumes playback of the given queue_item
+  *
+  * If shuffle is set, the queue is reshuffled prior to starting playback.
+  *
+  * If a pointer is given as argument "itemid", its value will be set to the playing item id.
+  *
+  * @param queue_item to start playing
+  * @return 0 if successful, -1 if an error occurred
+  */
+ int
+ player_playback_start_byitem(struct db_queue_item *queue_item)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_start_item, playback_start_bh, queue_item);
+ 
+   return ret;
+ }
+ 
+ int
+ player_playback_start_byid(uint32_t id)
+ {
+   union player_arg cmdarg;
+   int ret;
+ 
+   cmdarg.id = id;
+ 
+   ret = commands_exec_sync(cmdbase, playback_start_id, playback_start_bh, &cmdarg);
+ 
+   return ret;
+ }
+ 
+ int
+ player_playback_stop(void)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_stop, NULL, NULL);
+   return ret;
+ }
+ 
+ int
+ player_playback_abort(void)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_abort, NULL, NULL);
+   return ret;
+ }
+ 
+ int
+ player_playback_pause(void)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_pause, playback_pause_bh, NULL);
+   return ret;
+ }
+ 
+ /**
+  * Flushes outputs and input buffer, but does not stop the input read loop. Used
+  * by the pipe input when a track change is registered. Flushing outputs will
+  * stop them, so the command is two-step, i.e. it starts them again.
+  *
+  * @return Returns 0 on success and a negative value on error
+  */
+ 
++int
++player_shiri_source_transition(const struct shiri_source_request *request)
++{
++  struct shiri_source_param param;
++  int ret;
++
++  if (!request)
++    return SHIRI_SOURCE_INVALID;
++  memset(&param, 0, sizeof(param));
++  param.request = *request;
++  CHECK_ERR(L_MAIN, pthread_mutex_lock(&shiri_source_mutex));
++  ret = commands_exec_sync(cmdbase, shiri_source_seal_flush, NULL, &param);
++  if (ret == 0 && !param.replay && param.restart_outputs)
++    ret = commands_exec_sync(cmdbase, shiri_source_restart, NULL, NULL);
++  if (ret == 0 && !param.replay)
++    ret = commands_exec_sync(cmdbase, shiri_source_arm, NULL, &param);
++  CHECK_ERR(L_MAIN, pthread_mutex_unlock(&shiri_source_mutex));
++  return ret;
++}
++
+ int
+ player_playback_flush(void)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_flush, NULL, NULL);
+   if (ret < 0)
+     return ret;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_start_all, NULL, NULL);
+   return ret;
+ }
+ 
+ /**
+  * Seeks to the position "seek_ms", depending on the given "seek_mode" seek_ms is
+  * either the new position in the current track (seek_mode == PLAYER_SEEK_POSITION)
+  * or a relative amount of milliseconds from the current playing position
+  * (seek_mode == PLAYER_SEEK_RELATIVE).
+  *
+  * Relative seeking switches tracks, if:
+  * - seeking behind the the current track and current playing position is not more than 3 seconds
+  * - seeking beyond the current track
+  *
+  * @param seek_ms Position or relative amount of milliseconds to seek to
+  * @param seek_mode If PLAYER_SEEK_POSITION seek_ms is a position in milliseconds,
+  * 		if PLAYER_SEEK_RELATIVE seek_ms is the relative amount of milliseconds
+  * @return Returns 0 on success and a negative value on error
+  */
+ int
+ player_playback_seek(int seek_ms, enum player_seek_mode seek_mode)
+ {
+   struct player_seek_param seek_param;
+   int ret;
+ 
+   seek_param.ms = seek_ms;
+   seek_param.mode = seek_mode;
+ 
+   ret = commands_exec_sync(cmdbase, playback_seek, playback_seek_bh, &seek_param);
+   return ret;
+ }
+ 
+ int
+ player_playback_next(void)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_pause, playback_next_bh, NULL);
+   return ret;
+ }
+ 
+ int
+ player_playback_prev(void)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, playback_pause, playback_prev_bh, NULL);
+   return ret;
+ }
+ 
+ void
+ player_speaker_enumerate(spk_enum_cb cb, void *arg)
+ {
+   struct spk_enum spk_enum;
+ 
+   spk_enum.cb = cb;
+   spk_enum.arg = arg;
+ 
+   commands_exec_sync(cmdbase, speaker_enumerate, NULL, &spk_enum);
+ }
+ 
+ int
+ player_speaker_set(uint64_t *ids)
+ {
+   struct speaker_set_param speaker_set_param;
+   int ret;
+ 
+   speaker_set_param.device_ids = ids;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_set, speaker_generic_bh, &speaker_set_param);
+ 
+   return ret;
+ }
+ 
+ int
+ player_speaker_get_byid(struct player_speaker_info *spk, uint64_t id)
+ {
+   struct speaker_get_param param;
+   int ret;
+ 
+   param.spk_id = id;
+   param.spk_info = spk;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_get_byid, NULL, &param);
+   return ret;
+ }
+ 
+ int
+ player_speaker_get_byactiveremote(struct player_speaker_info *spk, uint32_t active_remote)
+ {
+   struct speaker_get_param param;
+   int ret;
+ 
+   param.active_remote = active_remote;
+   param.spk_info = spk;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_get_byactiveremote, NULL, &param);
+   return ret;
+ }
+ 
+ int
+ player_speaker_get_byaddress(struct player_speaker_info *spk, const char *address)
+ {
+   struct speaker_get_param param;
+   int ret;
+ 
+   param.address = address;
+   param.spk_info = spk;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_get_byaddress, NULL, &param);
+   return ret;
+ }
+ 
+ int
+ player_speaker_get_byindex(struct player_speaker_info *spk, uint32_t index)
+ {
+   struct speaker_get_param param;
+   int ret;
+ 
+   param.index = index;
+   param.spk_info = spk;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_get_byindex, NULL, &param);
+   return ret;
+ }
+ 
+ int
+ player_speaker_enable(uint64_t id)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_enable, speaker_generic_bh, &id);
+ 
+   return ret;
+ }
+ 
+ int
+ player_speaker_disable(uint64_t id)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_disable, speaker_generic_bh, &id);
+ 
+   return ret;
+ }
+ 
+ int
+ player_speaker_prevent_playback_set(uint64_t id, bool prevent_playback)
+ {
+   struct speaker_attr_param param;
+   int ret;
+ 
+   param.spk_id = id;
+   param.prevent_playback = prevent_playback;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_prevent_playback_set, speaker_prevent_playback_set_bh, &param);
+ 
+   return ret;
+ }
+ 
+ int
+ player_speaker_busy_set(uint64_t id, bool busy)
+ {
+   struct speaker_attr_param param;
+   int ret;
+ 
+   param.spk_id = id;
+   param.busy = busy;
+ 
+   ret = commands_exec_sync(cmdbase, speaker_busy_set, speaker_prevent_playback_set_bh, &param);
+ 
+   return ret;
+ }
+ 
+ void
+ player_speaker_resurrect(void *arg)
+ {
+   struct speaker_set_param param;
+ 
+   param.device_ids = (uint64_t *)arg;
+ 
+   commands_exec_sync(cmdbase, speaker_resurrect, speaker_resurrect_bh, &param);
+ }
+ 
+ int
+ player_speaker_authorize(uint64_t id, const char *pin)
+ {
+   struct speaker_attr_param param;
+ 
+   param.spk_id = id;
+   param.pin = pin;
+ 
+   return commands_exec_sync(cmdbase, speaker_authorize, speaker_generic_bh, &param);
+ }
+ 
+ int
+ player_speaker_format_set(uint64_t id, enum media_format format)
+ {
+   struct speaker_attr_param param;
+ 
+   param.spk_id = id;
+   param.format = format;
+ 
+   return commands_exec_sync(cmdbase, speaker_format_set, speaker_generic_bh, &param);
+ }
+ 
+ int
+ player_speaker_offset_ms_set(uint64_t id, int offset_ms)
+ {
+   struct speaker_attr_param param;
+ 
+   param.spk_id = id;
+   param.offset_ms = offset_ms;
+ 
+   return commands_exec_sync(cmdbase, speaker_offset_ms_set, speaker_generic_bh, &param);
+ }
+ 
+ int
+ player_streaming_register(int *audio_fd, int *metadata_fd, enum media_format format, struct media_quality quality)
+ {
+   struct speaker_attr_param param;
+   int ret;
+ 
+   param.format = format;
+   param.quality = quality;
+ 
+   ret = commands_exec_sync(cmdbase, streaming_register, NULL, &param);
+   if (ret < 0)
+     return ret;
+ 
+   *audio_fd = param.audio_fd;
+   *metadata_fd = param.metadata_fd;
+   return param.spk_id;
+ }
+ 
+ int
+ player_streaming_deregister(int id)
+ {
+   struct speaker_attr_param param;
+   int ret;
+ 
+   param.spk_id = id;
+ 
+   ret = commands_exec_sync(cmdbase, streaming_deregister, NULL, &param);
+ 
+   return ret;
+ }
+ 
++int
++player_shiri_source_volume(const struct shiri_pcm_owner *owner, int volume)
++{
++  struct shiri_source_volume_param param;
++  int ret;
++  if (!owner || volume < 0 || volume > 100)
++    return SHIRI_SOURCE_INVALID;
++  param.owner = *owner;
++  param.value.intval = volume;
++  CHECK_ERR(L_MAIN, pthread_mutex_lock(&shiri_source_mutex));
++  ret = commands_exec_sync(cmdbase, shiri_source_volume, volume_generic_bh, &param);
++  CHECK_ERR(L_MAIN, pthread_mutex_unlock(&shiri_source_mutex));
++  return ret;
++}
++
+ int
+ player_volume_set(int vol)
+ {
+   union player_arg cmdarg;
+   int ret;
+ 
+   if (vol < 0 || vol > 100)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Volume (%d) for player_volume_set is out of range\n", vol);
+       return -1;
+     }
+ 
+   cmdarg.intval = vol;
+ 
+   ret = commands_exec_sync(cmdbase, volume_set, volume_generic_bh, &cmdarg);
+ 
+   return ret;
+ }
+ 
+ int
+ player_volume_setrel_speaker(uint64_t id, int relvol)
+ {
+   struct speaker_attr_param vol_param;
+   int ret;
+ 
+   if (relvol < 0 || relvol > 100)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Volume (%d) for player_volume_setrel_speaker is out of range\n", relvol);
+       return -1;
+     }
+ 
+   vol_param.spk_id = id;
+   vol_param.volume = relvol;
+ 
+   ret = commands_exec_sync(cmdbase, volume_setrel_speaker, volume_generic_bh, &vol_param);
+ 
+   return ret;
+ }
+ 
+ int
+ player_volume_setabs_speaker(uint64_t id, int vol)
+ {
+   struct speaker_attr_param vol_param;
+   int ret;
+ 
+   if (vol < 0 || vol > 100)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Volume (%d) for player_volume_setabs_speaker is out of range\n", vol);
+       return -1;
+     }
+ 
+   vol_param.spk_id = id;
+   vol_param.volume = vol;
+ 
+   ret = commands_exec_sync(cmdbase, volume_setabs_speaker, volume_generic_bh, &vol_param);
+ 
+   return ret;
+ }
+ 
+ int
+ player_volume_setraw_speaker(uint64_t id, const char *volstr)
+ {
+   struct speaker_attr_param vol_param;
+   int ret;
+ 
+   vol_param.spk_id = id;
+   vol_param.volstr  = volstr;
+ 
+   ret = commands_exec_sync(cmdbase, volume_setraw_speaker, volume_generic_bh, &vol_param);
+ 
+   return ret;
+ }
+ 
+ int
+ player_repeat_set(enum repeat_mode mode)
+ {
+   int ret;
+ 
+   ret = commands_exec_sync(cmdbase, repeat_set, options_generic_bh, &mode);
+ 
+   return ret;
+ }
+ 
+ int
+ player_shuffle_set(int enable)
+ {
+   union player_arg cmdarg;
+   int ret;
+ 
+   cmdarg.intval = enable;
+ 
+   ret = commands_exec_sync(cmdbase, shuffle_set, options_generic_bh, &cmdarg);
+ 
+   return ret;
+ }
+ 
+ int
+ player_consume_set(int enable)
+ {
+   union player_arg cmdarg;
+   int ret;
+ 
+   cmdarg.intval = enable;
+ 
+   ret = commands_exec_sync(cmdbase, consume_set, options_generic_bh, &cmdarg);
+ 
+   return ret;
+ }
+ 
+ void
+ player_queue_clear_history()
+ {
+   commands_exec_sync(cmdbase, playerqueue_clear_history, playerqueue_generic_bh, NULL);
+ }
+ 
+ void
+ player_queue_plid(uint32_t plid)
+ {
+   union player_arg cmdarg;
+ 
+   cmdarg.id = plid;
+ 
+   commands_exec_sync(cmdbase, playerqueue_plid, NULL, &cmdarg);
+ }
+ 
+ struct player_history *
+ player_history_get(void)
+ {
+   return history;
+ }
+ 
+ 
+ /* ------------------- Non-blocking commands used by mDNS ------------------- */
+ 
+ int
+ player_device_add(void *device)
+ {
+   union player_arg *cmdarg;
+   int ret;
+ 
+diff --git a/src/player.h b/src/player.h
+index 258d8e15..a2806abc 100644
+--- a/src/player.h
++++ b/src/player.h
+@@ -7,6 +7,7 @@
+ 
+ #include "db.h"
+ #include "misc.h" // for struct media_quality
++#include "shiri_source.h"
+ 
+ // Maximum number of previously played songs that are remembered
+ #define MAX_HISTORY_COUNT 20
+@@ -159,6 +160,12 @@ player_playback_pause(void);
+ int
+ player_playback_flush(void);
+ 
++int
++player_shiri_source_transition(const struct shiri_source_request *request);
++
++int
++player_shiri_source_volume(const struct shiri_pcm_owner *owner, int volume);
++
+ int
+ player_playback_seek(int seek_ms, enum player_seek_mode seek_mode);
+ 
+diff --git a/src/outputs.c b/src/outputs.c
+index ffa2cb1f..d3867a7e 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -1,242 +1,253 @@
+ /*
+  * Copyright (C) 2016 Espen Jürgensen <espenjurgensen@gmail.com>
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <string.h>
+ #include <errno.h>
+ #include <stdint.h>
+ #include <inttypes.h>
++#include <limits.h>
+ 
+ #include <event2/event.h>
+ 
+ #include "logger.h"
+ #include "misc.h"
+ #include "transcode.h"
+ #include "db.h"
+ #include "player.h" //TODO remove me when player_pmap is removed again
+ #include "worker.h"
+ #include "outputs.h"
+ #include "conffile.h"
+ 
+ extern struct output_definition output_raop;
+ extern struct output_definition output_airplay;
+ extern struct output_definition output_streaming;
+ extern struct output_definition output_dummy;
+ extern struct output_definition output_fifo;
+ extern struct output_definition output_rcp;
+ #ifdef HAVE_ALSA
+ extern struct output_definition output_alsa;
+ #endif
+ #ifdef HAVE_LIBPULSE
+ extern struct output_definition output_pulse;
+ #endif
+ #ifdef CHROMECAST
+ extern struct output_definition output_cast;
+ #endif
+ 
+ /* From player.c */
+ extern struct event_base *evbase_player;
+ 
+ // Must be in sync with enum output_types
+ static struct output_definition *outputs[] = {
+     &output_raop,
+     &output_airplay,
+     &output_streaming,
+     &output_dummy,
+     &output_fifo,
+     &output_rcp,
+ #ifdef HAVE_ALSA
+     &output_alsa,
+ #endif
+ #ifdef HAVE_LIBPULSE
+     &output_pulse,
+ #endif
+ #ifdef CHROMECAST
+     &output_cast,
+ #endif
+     NULL
+ };
+ 
+ // Default volume (must be from 0 - 100)
+ #define OUTPUTS_DEFAULT_VOLUME 50
+ 
+ // When we stop, we keep the outputs open for a while, just in case we are
+ // actually just restarting. This timeout determines how long we wait before
+ // full stop.
+ // (value is in seconds)
+ #define OUTPUTS_STOP_TIMEOUT 10
+ 
+ #define OUTPUTS_MAX_CALLBACKS 64
+ 
+ struct outputs_callback_register
+ {
++  int token; /* Never reused during this process lifetime. */
+   output_status_cb cb;
+   struct output_device *device;
+ 
+   // We have received the callback with the result from the backend
+   bool ready;
+ 
+   // We store a device_id to avoid the risk of dangling device pointer
+   uint64_t device_id;
+   enum output_device_state state;
+ };
+ 
+ struct output_quality_subscription
+ {
+   int count;
+   struct media_quality quality;
+   struct encode_ctx *encode_ctx;
+ };
+ 
+ // Buffer used to pass data to the backends
+ static struct output_buffer output_buffer;
+ 
+ static struct output_device *outputs_device_list;
+ static int outputs_master_volume;
+ static uint64_t outputs_buffer_duration_ms;
+ 
+ static bool outputs_exclusive_mode;
+ 
+ static struct outputs_callback_register outputs_cb_register[OUTPUTS_MAX_CALLBACKS];
++static uint32_t outputs_callback_token;
+ static struct event *outputs_deferredev;
+ static struct timeval outputs_stop_timeout = { OUTPUTS_STOP_TIMEOUT, 0 };
+ 
+ // Last element is a zero terminator
+ static struct output_quality_subscription output_quality_subscriptions[OUTPUTS_MAX_QUALITY_SUBSCRIPTIONS + 1];
+ static bool outputs_got_new_subscription;
+ 
+ 
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+ 
+ static output_status_cb
+ callback_get(struct output_device *device)
+ {
+   int callback_id;
+ 
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+       if (outputs_cb_register[callback_id].device == device)
+ 	return outputs_cb_register[callback_id].cb;
+     }
+ 
+   return NULL;
+ }
+ 
+ static void
+ callback_remove(struct output_device *device)
+ {
+   int callback_id;
+ 
+   if (!device)
+     return;
+ 
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+       if (outputs_cb_register[callback_id].device == device)
+ 	{
+ 	  DPRINTF(E_DBG, L_PLAYER, "Removing callback to %s, id %d\n", player_pmap(outputs_cb_register[callback_id].cb), callback_id);
+ 	  memset(&outputs_cb_register[callback_id], 0, sizeof(struct outputs_callback_register));
+ 	}
+     }
+ }
+ 
+ static int
+ callback_add(struct output_device *device, output_status_cb cb)
+ {
+   int callback_id;
+ 
+   if (!cb)
+     return -1;
+ 
++  if (outputs_callback_token >= INT_MAX)
++    {
++      DPRINTF(E_LOG, L_PLAYER, "Output callback identities exhausted; restart this backend\n");
++      return -1; /* Never wrap and mistake a late old callback for a new one. */
++    }
++
+   // We will replace any previously registered callbacks, since that's what the
+   // player expects
+   callback_remove(device);
+ 
+   // Find a free slot in the queue
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+       if (outputs_cb_register[callback_id].cb == NULL)
+ 	break;
+     }
+ 
+   if (callback_id == ARRAY_SIZE(outputs_cb_register))
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output callback queue is full! (size is %d)\n", OUTPUTS_MAX_CALLBACKS);
+       return -1;
+     }
+ 
++  outputs_cb_register[callback_id].token = (int)++outputs_callback_token;
++  outputs_cb_register[callback_id].device_id = device->id;
+   outputs_cb_register[callback_id].cb = cb;
+   outputs_cb_register[callback_id].device = device; // Don't dereference this later, it might become invalid!
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Registered callback to %s with id %d (device %p, %s)\n", player_pmap(cb), callback_id, device, device->name);
+ 
+   int active = 0;
+   for (int i = 0; i < ARRAY_SIZE(outputs_cb_register); i++)
+     if (outputs_cb_register[i].cb)
+       active++;
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Number of active callbacks: %d\n", active);
+ 
+-  return callback_id;
++  return outputs_cb_register[callback_id].token;
+ };
+ 
+ static void
+ deferred_cb(int fd, short what, void *arg)
+ {
+   struct output_device *device;
+   output_status_cb cb;
+   enum output_device_state state;
+   int callback_id;
+ 
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+       if (outputs_cb_register[callback_id].ready)
+ 	{
+ 	  // Must copy before making callback, since you never know what the
+ 	  // callback might result in (could call back in)
+ 	  cb = outputs_cb_register[callback_id].cb;
+ 	  state = outputs_cb_register[callback_id].state;
+ 
+ 	  // Will be NULL if the device has disappeared
+ 	  device = outputs_device_get(outputs_cb_register[callback_id].device_id);
+ 
+ 	  memset(&outputs_cb_register[callback_id], 0, sizeof(struct outputs_callback_register));
+ 
+ 	  // The device has left the building (stopped/failed), and the backend
+ 	  // is not using it any more
+ 	  if (device && !device->advertised && !device->session)
+ 	    {
+ 	      outputs_device_remove(device);
+ 	      device = NULL;
+ 	    }
+ 	  else if (device)
+ 	    device->state = state;
+ 
+ 	  DPRINTF(E_DBG, L_PLAYER, "Making deferred callback to %s, id was %d\n", player_pmap(cb), callback_id);
+ 
+ 	  cb(device, state);
+ 	}
+     }
+ 
+@@ -699,94 +710,96 @@ outputs_quality_subscribe(struct media_quality *quality)
+ 
+ void
+ outputs_quality_unsubscribe(struct media_quality *quality)
+ {
+   int i;
+ 
+   // Find subscription
+   for (i = 0; output_quality_subscriptions[i].count > 0; i++)
+     {
+       if (quality_is_equal(quality, &output_quality_subscriptions[i].quality))
+ 	break;
+     }
+ 
+   if (output_quality_subscriptions[i].count == 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Bug! Unsubscription request for a quality level that there is no subscription for\n");
+       return;
+     }
+ 
+   output_quality_subscriptions[i].count--;
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Unsubscription request for quality %d/%d/%d (now %d subscribers)\n",
+     quality->sample_rate, quality->bits_per_sample, quality->channels, output_quality_subscriptions[i].count);
+ 
+   if (output_quality_subscriptions[i].count > 0)
+     return;
+ 
+   transcode_encode_cleanup(&output_quality_subscriptions[i].encode_ctx);
+ 
+   // Shift elements
+   for (; i < ARRAY_SIZE(output_quality_subscriptions) - 1; i++)
+     output_quality_subscriptions[i] = output_quality_subscriptions[i + 1];
+ }
+ 
+ // Output backends call back through the below wrapper to make sure that:
+ // 1. Callbacks are always deferred
+ // 2. The callback never has a dangling pointer to a device (a device that has been removed from our list)
+ void
+ outputs_cb(int callback_id, uint64_t device_id, enum output_device_state state)
+ {
++  size_t slot;
++
+   if (callback_id < 0)
+     return;
+-
+-  if (!(callback_id < ARRAY_SIZE(outputs_cb_register)) || !outputs_cb_register[callback_id].cb)
++  for (slot = 0; slot < ARRAY_SIZE(outputs_cb_register); slot++)
++    if (outputs_cb_register[slot].cb && outputs_cb_register[slot].token == callback_id)
++      break;
++  if (slot == ARRAY_SIZE(outputs_cb_register)
++      || outputs_cb_register[slot].device_id != device_id)
+     {
+-      DPRINTF(E_LOG, L_PLAYER, "Bug! Output backend called us with an illegal callback id (%d)\n", callback_id);
++      DPRINTF(E_DBG, L_PLAYER, "Ignoring stale or mismatched output callback %d\n", callback_id);
+       return;
+     }
+ 
+-  DPRINTF(E_DBG, L_PLAYER, "Callback request received, id is %i\n", callback_id);
+-
+-  outputs_cb_register[callback_id].ready = true;
+-  outputs_cb_register[callback_id].device_id = device_id;
+-  outputs_cb_register[callback_id].state = state;
++  outputs_cb_register[slot].ready = true;
++  outputs_cb_register[slot].state = state;
+   event_active(outputs_deferredev, 0, 0);
+ }
+ 
+ void
+ outputs_metadata_free(struct output_metadata *metadata)
+ {
+   metadata_free(metadata);
+ }
+ 
+ struct output_buffer *
+ outputs_buffer_copy(struct output_buffer *buffer)
+ {
+   return buffer_copy(buffer);
+ }
+ 
+ void
+ outputs_buffer_free(struct output_buffer *buffer)
+ {
+   buffer_free(buffer);
+ }
+ 
+ /* ---------------------------- Called by player ---------------------------- */
+ 
+ struct output_device *
+ outputs_device_add(struct output_device *add, bool new_deselect)
+ {
+   struct output_device *device;
+   char *keep_name;
+   int keep_offset_ms;
+   int ret;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (device->id == add->id)
+ 	break;
+     }
+ 
+   // This is relevant for Airplay 1 and 2 where the same device can support both
+   if (device && device->type != add->type)
+     {
+@@ -1162,80 +1175,119 @@ outputs_stop(output_status_cb cb)
+       ret = outputs_device_stop(device, cb);
+       if (ret < 0)
+ 	continue;
+ 
+       pending += ret;
+     }
+ 
+   return pending;
+ }
+ 
+ int
+ outputs_stop_delayed_cancel(void)
+ {
+   struct output_device *device;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     event_del(device->stop_timer);
+ 
+   return 0;
+ }
+ 
+ int
+ outputs_flush(output_status_cb cb)
+ {
+   struct output_device *device;
+   int pending = 0;
+   int ret;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       ret = outputs_device_flush(device, cb);
+       if (ret < 0)
+ 	continue;
+ 
+       pending += ret;
+     }
+ 
+   return pending;
+ }
+ 
++int
++outputs_shiri_flush(output_status_cb cb, int *failed)
++{
++  struct output_device *device;
++  int ret, pending = 0;
++
++  *failed = 0;
++  for (device = outputs_device_list; device; device = device->next)
++    {
++      if (!device->session)
++        continue; /* No buffered output exists here. */
++      ret = outputs_device_flush(device, cb);
++      if (ret < 0)
++        *failed = 1;
++      else
++        pending += ret;
++    }
++  return pending;
++}
++
++int
++outputs_shiri_start(output_status_cb cb, int *failed)
++{
++  struct output_device *device;
++  int ret, pending = 0;
++  *failed = 0;
++  for (device = outputs_device_list; device; device = device->next)
++    {
++      if (!device->selected)
++        continue;
++      ret = outputs_device_start(device, cb, false);
++      if (ret < 0)
++        *failed = 1;
++      else
++        pending += ret;
++    }
++  return pending;
++}
++
+ int
+ outputs_volume_get(void)
+ {
+   return outputs_master_volume;
+ }
+ 
+ int
+ outputs_volume_set(int volume, output_status_cb cb)
+ {
+   struct output_device *device;
+   int pending = 0;
+   int ret;
+ 
+   if (outputs_master_volume == volume)
+     return 0;
+ 
+   outputs_master_volume = volume;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     {
+       if (!device->selected)
+ 	continue;
+ 
+       device->volume = rel_to_vol(device->relvol, outputs_master_volume);
+ 
+       ret = outputs_device_volume_set(device, cb);
+       if (ret < 0)
+ 	continue;
+ 
+       pending += ret;
+     }
+ 
+   return pending;
+ }
+ 
+ int
+ outputs_sessions_count(void)
+ {
+   struct output_device *device;
+   int count = 0;
+diff --git a/src/outputs.h b/src/outputs.h
+index e8474c92..d7aaab1f 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -367,6 +367,12 @@ outputs_stop(output_status_cb cb);
+ int
+ outputs_flush(output_status_cb cb);
+ 
++int
++outputs_shiri_flush(output_status_cb cb, int *failed);
++
++int
++outputs_shiri_start(output_status_cb cb, int *failed);
++
+ int
+ outputs_volume_get(void);
+ 
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index 619dfee0..710d6bd4 100644
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -52,6 +52,7 @@
+ #include "misc.h"
+ #include "misc_json.h"
+ #include "player.h"
++#include "shiri_source_json.h"
+ #include "remote_pairing.h"
+ #include "settings.h"
+ #include "smartpl_query.h"
+@@ -2034,6 +2035,64 @@ jsonapi_reply_player_stop(struct httpd_request *hreq)
+   return HTTP_NOCONTENT;
+ }
+ 
++static int
++jsonapi_reply_player_shiri_source(struct httpd_request *hreq)
++{
++  struct shiri_source_request request;
++  json_object *body;
++  const char *reply;
++  int ret;
++
++  if (evbuffer_get_length(hreq->in_body) > 1024)
++    return HTTP_BADREQUEST;
++  body = jparse_obj_from_evbuffer(hreq->in_body);
++  if (shiri_source_parse(body, &request) < 0)
++    {
++      if (body) json_object_put(body);
++      return HTTP_BADREQUEST;
++    }
++  ret = player_shiri_source_transition(&request);
++  if (ret != 0)
++    {
++      json_object_put(body);
++      if (ret == SHIRI_SOURCE_CONFLICT) return 409;
++      if (ret == SHIRI_SOURCE_INVALID) return HTTP_BADREQUEST;
++      return HTTP_SERVUNAVAIL;
++    }
++  /* Echo only the bounded, type-checked exact acknowledged owner/operation. */
++  reply = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
++  evbuffer_add(hreq->out_body, reply, strlen(reply));
++  json_object_put(body);
++  return HTTP_OK;
++}
++
++static int
++jsonapi_reply_player_shiri_volume(struct httpd_request *hreq)
++{
++  struct shiri_source_request request;
++  json_object *body;
++  const char *reply;
++  int ret;
++  if (evbuffer_get_length(hreq->in_body) > 1024)
++    return HTTP_BADREQUEST;
++  body = jparse_obj_from_evbuffer(hreq->in_body);
++  if (shiri_source_volume_parse(body, &request) < 0)
++    {
++      if (body) json_object_put(body);
++      return HTTP_BADREQUEST;
++    }
++  ret = player_shiri_source_volume(&request.owner, (int)request.operation_generation);
++  if (ret < 0)
++    {
++      json_object_put(body);
++      return ret == SHIRI_SOURCE_CONFLICT ? 409 : HTTP_SERVUNAVAIL;
++    }
++  reply = json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN);
++  evbuffer_add(hreq->out_body, reply, strlen(reply));
++  json_object_put(body);
++  return HTTP_OK;
++}
++
+ static int
+ jsonapi_reply_player_toggle(struct httpd_request *hreq)
+ {
+@@ -4696,6 +4755,8 @@ static struct httpd_uri_map adm_handlers[] =
+     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
+ 
++    { HTTPD_METHOD_POST,   "^/api/player/shiri-source$",                   jsonapi_reply_player_shiri_source },
++    { HTTPD_METHOD_POST,   "^/api/player/shiri-volume$",                   jsonapi_reply_player_shiri_volume },
+     { HTTPD_METHOD_GET,    "^/api/player$",                                jsonapi_reply_player },
+     { HTTPD_METHOD_PUT,    "^/api/player/play$",                           jsonapi_reply_player_play },
+     { HTTPD_METHOD_PUT,    "^/api/player/pause$",                          jsonapi_reply_player_pause },
+@@ -4792,6 +4853,9 @@ jsonapi_request(struct httpd_request *hreq)
+       case HTTP_BADREQUEST:          /* 400 Bad Request */
+ 	httpd_send_error(hreq, status_code, "Bad Request");
+ 	break;
++      case 409:
++        httpd_send_error(hreq, status_code, "Conflict");
++        break;
+       case 403:
+ 	httpd_send_error(hreq, status_code, "Forbidden");
+ 	break;
+diff --git a/src/shiri_source.h b/src/shiri_source.h
+new file mode 100644
+index 00000000..55eb9e07
+--- /dev/null
++++ b/src/shiri_source.h
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Source transition admission, separate from speaker scheduling and speech. */
++#ifndef SHIRI_SOURCE_H
++#define SHIRI_SOURCE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#include <limits.h>
++#include "inputs/shiri_pcm.h"
++
++struct shiri_source_request {
++  struct shiri_pcm_owner owner;
++  uint64_t operation_generation;
++};
++
++struct shiri_source_state {
++  struct shiri_source_request last;
++  bool initialized;
++  bool faulted;
++};
++
++enum shiri_source_result {
++  SHIRI_SOURCE_NEW = 1,
++  SHIRI_SOURCE_REPLAY = 0,
++  SHIRI_SOURCE_FAILURE = -1,
++  SHIRI_SOURCE_CONFLICT = -2,
++  SHIRI_SOURCE_INVALID = -3,
++  SHIRI_SOURCE_FAULTED = -4
++};
++
++static inline bool
++shiri_source_owner_equal(const struct shiri_pcm_owner *a, const struct shiri_pcm_owner *b)
++{
++  return !memcmp(a->incarnation, b->incarnation, 16)
++    && !memcmp(a->session, b->session, 16)
++    && a->epoch == b->epoch && a->generation == b->generation;
++}
++
++/* Check before sealing or flushing anything. No invalid/stale request has effects. */
++static inline int
++shiri_source_check(const struct shiri_source_state *state, const struct shiri_source_request *request)
++{
++  const struct shiri_pcm_owner *old, *next;
++  bool old_idle, next_idle;
++
++  if (!state || !request)
++    return SHIRI_SOURCE_INVALID;
++  next = &request->owner;
++  if (!request->operation_generation || request->operation_generation > INT64_MAX
++      || !next->generation || next->generation > INT64_MAX || next->epoch > INT64_MAX
++      || shiri_zero(next->incarnation, 16))
++    return SHIRI_SOURCE_INVALID;
++
++  next_idle = shiri_zero(next->session, 16);
++  if (!state->initialized)
++    return next_idle && next->epoch == 0 && next->generation == 1
++      && request->operation_generation == 1 ? SHIRI_SOURCE_NEW : SHIRI_SOURCE_CONFLICT;
++  old = &state->last.owner;
++  if (memcmp(old->incarnation, next->incarnation, 16))
++    return SHIRI_SOURCE_CONFLICT;
++  if (state->faulted)
++    return SHIRI_SOURCE_FAULTED;
++  if (request->operation_generation == state->last.operation_generation)
++    return shiri_source_owner_equal(old, next) ? SHIRI_SOURCE_REPLAY : SHIRI_SOURCE_CONFLICT;
++  if (state->last.operation_generation == INT64_MAX
++      || request->operation_generation != state->last.operation_generation + 1)
++    return SHIRI_SOURCE_CONFLICT;
++
++  old_idle = shiri_zero(old->session, 16);
++  if (next->epoch == old->epoch)
++    {
++      if (next_idle)
++        return !old_idle && next->generation == 1 ? SHIRI_SOURCE_NEW : SHIRI_SOURCE_CONFLICT;
++      return !old_idle && !memcmp(old->session, next->session, 16)
++        && old->generation < INT64_MAX && next->generation == old->generation + 1
++        ? SHIRI_SOURCE_NEW : SHIRI_SOURCE_CONFLICT;
++    }
++  return !next_idle && old->epoch < INT64_MAX && next->epoch == old->epoch + 1
++    && next->generation == 1 ? SHIRI_SOURCE_NEW : SHIRI_SOURCE_CONFLICT;
++}
++
++static inline void
++shiri_source_begin(struct shiri_source_state *state, const struct shiri_source_request *request)
++{
++  state->last = *request;
++  state->initialized = true;
++  state->faulted = true; /* Only the final confirmed arm clears this seal. */
++}
++
++#endif
+diff --git a/src/shiri_source_json.h b/src/shiri_source_json.h
+new file mode 100644
+index 00000000..53f9733c
+--- /dev/null
++++ b/src/shiri_source_json.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef SHIRI_SOURCE_JSON_H
++#define SHIRI_SOURCE_JSON_H
++#include <json-c/json.h>
++#include "shiri_source.h"
++
++static inline int
++shiri_source_hex(json_object *object, uint8_t out[16])
++{
++  const char *text;
++  int index, high, low;
++  if (!object || !json_object_is_type(object, json_type_string)
++      || json_object_get_string_len(object) != 32)
++    return -1;
++  text = json_object_get_string(object);
++  for (index = 0; index < 16; index++)
++    {
++      high = text[index * 2]; low = text[index * 2 + 1];
++      if (!((high >= '0' && high <= '9') || (high >= 'a' && high <= 'f'))
++          || !((low >= '0' && low <= '9') || (low >= 'a' && low <= 'f')))
++        return -1;
++      high = high <= '9' ? high - '0' : high - 'a' + 10;
++      low = low <= '9' ? low - '0' : low - 'a' + 10;
++      out[index] = (uint8_t)((high << 4) | low);
++    }
++  return 0;
++}
++
++static inline int
++shiri_source_integer(json_object *object, uint64_t *out, bool positive)
++{
++  if (!object || !json_object_is_type(object, json_type_int)
++      || json_object_get_int64(object) < 0 || json_object_get_uint64(object) > INT64_MAX)
++    return -1;
++  *out = json_object_get_uint64(object);
++  return positive && !*out ? -1 : 0;
++}
++
++static inline int
++shiri_source_parse_field(json_object *body, struct shiri_source_request *request, const char *field, bool positive)
++{
++  json_object *incarnation, *session, *epoch, *generation, *operation;
++  if (!body || !json_object_is_type(body, json_type_object)
++      || json_object_object_length(body) != 5
++      || !json_object_object_get_ex(body, "incarnation", &incarnation)
++      || !json_object_object_get_ex(body, "session_id", &session)
++      || !json_object_object_get_ex(body, "epoch", &epoch)
++      || !json_object_object_get_ex(body, "generation", &generation)
++      || !json_object_object_get_ex(body, field, &operation))
++    return -1;
++  memset(request, 0, sizeof(*request));
++  if (shiri_source_hex(incarnation, request->owner.incarnation) < 0
++      || (session && shiri_source_hex(session, request->owner.session) < 0)
++      || shiri_source_integer(epoch, &request->owner.epoch, false) < 0
++      || shiri_source_integer(generation, &request->owner.generation, true) < 0
++      || shiri_source_integer(operation, &request->operation_generation, positive) < 0)
++    return -1;
++  /* Zero is the wire's idle identity and must be spelled null, not a UUID. */
++  if (shiri_zero(request->owner.incarnation, 16)
++      || (session && shiri_zero(request->owner.session, 16)))
++    return -1;
++  return 0;
++}
++static inline int
++shiri_source_parse(json_object *body, struct shiri_source_request *request)
++{
++  return shiri_source_parse_field(body, request, "operation_generation", true);
++}
++
++static inline int
++shiri_source_volume_parse(json_object *body, struct shiri_source_request *request)
++{
++  return shiri_source_parse_field(body, request, "volume", false) < 0
++    || request->operation_generation > 100 || shiri_zero(request->owner.session, 16) ? -1 : 0;
++}
++#endif
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+index 9ba74109..8b128b0c 100644
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -228,280 +228,282 @@ struct airplay_master_session
+   // Session characteristics
+   struct media_quality quality;
+   bool use_ptp;
+ 
+   // Number of samples that we tell the output to buffer (this will mean that
+   // the position that we send in the sync packages are offset by this amount
+   // compared to the rtptimes of the corresponding RTP packages we are sending)
+   uint32_t output_buffer_samples;
+ 
+   struct airplay_master_session *next;
+ };
+ 
+ struct airplay_session
+ {
+   uint64_t device_id;
+   int callback_id;
+ 
+   struct airplay_master_session *master_session;
+ 
+   struct evrtsp_connection *ctrl;
+ 
+   enum airplay_state state;
+ 
+   enum airplay_seq_type next_seq;
+ 
+   uint64_t statusflags;
+   uint16_t wanted_metadata;
+   bool req_has_auth;
+   bool supports_auth_setup;
+   bool supports_encryption;
+ 
+   struct event *deferredev;
+ 
+   int reqs_in_flight;
+   int cseq;
+ 
+   uint32_t session_id;
+   char session_url[128];
+   char session_uuid[37];
+ 
+   char group_uuid[37];
+ 
+   char *realm;
+   char *nonce;
+   const char *password;
+ 
+   char *devname;
+   char *address;
+   int family;
+ 
+   union net_sockaddr naddr;
+ 
+   int volume;
+ 
+   // device->offset_ms in samples (user config for correction of static
+   // amplifier or DSP delays)
+   int offset_samples;
+ 
+   char *local_v4_address;
+   char *local_v6_address;
+   char local_mac_address[18];
+ 
+   unsigned short data_port;
+   unsigned short control_port;
+   unsigned short events_port;
+ 
+   /* Pairing, see pair.h */
+   enum pair_type pair_type;
+   struct pair_cipher_context *control_cipher_ctx;
+   struct pair_verify_context *pair_verify_ctx;
+   struct pair_setup_context *pair_setup_ctx;
+ 
+   uint8_t shared_secret[64];
+   size_t shared_secret_len; // 32 or 64, see AIRPLAY_AUDIO_KEY_LEN for comment
+ 
+   gcry_cipher_hd_t packet_cipher_hd;
+ 
+   int server_fd;
+ 
+   struct airplay_service *timing_svc;
+   struct airplay_service *control_svc;
+ 
+   uint32_t ptpd_slave_id;
+ 
+   struct airplay_session *next;
+ };
+ 
+ struct airplay_metadata
+ {
+   struct evbuffer *metadata;
+   struct evbuffer *artwork;
+   int artwork_fmt;
+ };
+ 
+ struct airplay_service
+ {
+   struct net_socket socket;
+   unsigned short port;
+   struct event *ev4;
+   struct event *ev6;
+ };
+ 
+ /* NTP timestamp definitions */
+ #define FRAC             4294967296. /* 2^32 as a double */
+ #define NTP_EPOCH_DELTA  0x83aa7e80  /* 2208988800 - that's 1970 - 1900 in seconds */
+ 
+ // TODO move to rtp_common
+ struct ntp_stamp
+ {
+   uint32_t sec;
+   uint32_t frac;
+ };
+ 
+ 
+ /* --------------------------- SEQUENCE DEFINITIONS ------------------------- */
+ 
+ struct airplay_seq_definition
+ {
+   enum airplay_seq_type seq_type;
+ 
+   // Called when a sequence ends, successfully or not. Shoulds also, if
+   // required, take care of notifying  player and free the session.
+   void (*on_success)(struct airplay_session *session);
+   void (*on_error)(struct airplay_session *session);
+ };
+ 
+ struct airplay_seq_request
+ {
+   enum airplay_seq_type seq_type;
+   const char *name; // Name of request (for logging)
+   enum evrtsp_cmd_type rtsp_type;
+   int (*payload_make)(struct evrtsp_request *req, struct airplay_session *session, void *arg);
+   enum airplay_seq_type (*response_handler)(struct evrtsp_request *req, struct airplay_session *session);
+   const char *content_type;
+   const char *uri;
+   bool proceed_on_rtsp_not_ok; // If true return code != RTSP_OK will not abort the sequence
+ };
+ 
+ struct airplay_seq_ctx
+ {
++  int callback_id; /* Exact output operation which admitted this sequence. */
++  bool owns_callback;
+   struct airplay_seq_request *cur_request;
+   void (*on_success)(struct airplay_session *session);
+   void (*on_error)(struct airplay_session *session);
+   struct airplay_session *session;
+   void *payload_make_arg;
+   const char *log_caller;
+ };
+ 
+ 
+ /* ------------------------------ MISC GLOBALS ------------------------------ */
+ 
+ #if AIRPLAY_USE_AUTH_SETUP
+ static const uint8_t airplay_auth_setup_pubkey[] =
+   "\x59\x02\xed\xe9\x0d\x4e\xf2\xbd\x4c\xb6\x8a\x63\x30\x03\x82\x07"
+   "\xa9\x4d\xbd\x50\xd8\xaa\x46\x5b\x5d\x8c\x01\x2a\x0c\x7e\x1d\x4e";
+ #endif
+ 
+ struct features_type_map
+ {
+   uint32_t bit;
+   char *name;
+ };
+ 
+ // List of features announced by AirPlay 2 speakers
+ // Credit @invano, see https://emanuelecozzi.net/docs/airplay2
+ static const struct features_type_map features_map[] =
+   {
+     { 0, "SupportsAirPlayVideoV1" },
+     { 1, "SupportsAirPlayPhoto" },
+     { 5, "SupportsAirPlaySlideshow" },
+     { 7, "SupportsAirPlayScreen" },
+     { 9, "SupportsAirPlayAudio" },
+     { 11, "AudioRedunant" },
+     { 14, "Authentication_4" }, // FairPlay authentication
+     { 15, "MetadataFeatures_0" }, // Send artwork image to receiver
+     { 16, "MetadataFeatures_1" }, // Send track progress status to receiver
+     { 17, "MetadataFeatures_2" }, // Send NowPlaying info via DAAP
+     { 18, "AudioFormats_0" },
+     { 19, "AudioFormats_1" },
+     { 20, "AudioFormats_2" },
+     { 21, "AudioFormats_3" },
+     { 23, "Authentication_1" }, // RSA authentication (NA)
+     { 26, "Authentication_8" }, // 26 || 51, MFi authentication
+     { 27, "SupportsLegacyPairing" },
+     { 30, "HasUnifiedAdvertiserInfo" },
+     { 32, "IsCarPlay" },
+     { 32, "SupportsVolume" }, // !32
+     { 33, "SupportsAirPlayVideoPlayQueue" },
+     { 34, "SupportsAirPlayFromCloud" }, // 34 && flags_6_SupportsAirPlayFromCloud
+     { 35, "SupportsTLS_PSK" },
+     { 38, "SupportsUnifiedMediaControl" },
+     { 40, "SupportsBufferedAudio" }, // srcvers >= 354.54.6 && 40
+     { 41, "SupportsPTP" }, // srcvers >= 366 && 41
+     { 42, "SupportsScreenMultiCodec" },
+     { 43, "SupportsSystemPairing" },
+     { 44, "IsAPValeriaScreenSender" },
+     { 46, "SupportsHKPairingAndAccessControl" },
+     { 48, "SupportsCoreUtilsPairingAndEncryption" }, // 38 || 46 || 43 || 48
+     { 49, "SupportsAirPlayVideoV2" },
+     { 50, "MetadataFeatures_3" }, // Send NowPlaying info via bplist
+     { 51, "SupportsUnifiedPairSetupAndMFi" },
+     { 52, "SupportsSetPeersExtendedMessage" },
+     { 54, "SupportsAPSync" },
+     { 55, "SupportsWoL" }, // 55 || 56
+     { 56, "SupportsWoL" }, // 55 || 56
+     { 58, "SupportsHangdogRemoteControl" }, // ((isAppleTV || isAppleAudioAccessory) && 58) || (isThirdPartyTV && flags_10)
+     { 59, "SupportsAudioStreamConnectionSetup" }, // 59 && !disableStreamConnectionSetup
+     { 60, "SupportsAudioMediaDataControl" }, // 59 && 60 && !disableMediaDataControl
+     { 61, "SupportsRFC2198Redundancy" },
+   };
+ 
+ /* Keep in sync with enum airplay_devtype */
+ static const char *airplay_devtype[] =
+ {
+   "AirPort Express 2 - 802.11n",
+   "AirPort Express 3 - 802.11n",
+   "AppleTV",
+   "AppleTV4",
+   "HomePod",
+   "Other",
+ };
+ 
+ /* Struct with default quality levels */
+ static struct media_quality airplay_quality_default =
+ {
+   AIRPLAY_QUALITY_SAMPLE_RATE_DEFAULT,
+   AIRPLAY_QUALITY_BITS_PER_SAMPLE_DEFAULT,
+   AIRPLAY_QUALITY_CHANNELS_DEFAULT
+ };
+ 
+ /* From player.c */
+ extern struct event_base *evbase_player;
+ 
+ /* AirTunes v2 time synchronization */
+ static struct airplay_service airplay_timing_svc;
+ 
+ /* AirTunes v2 playback synchronization / control */
+ static struct airplay_service airplay_control_svc;
+ 
+ /* Metadata */
+ static struct output_metadata *airplay_cur_metadata;
+ 
+ /* Keep-alive timer - hack for ATV's with tvOS 10 */
+ static struct event *keep_alive_timer;
+ static struct timeval keep_alive_tv = { AIRPLAY_KEEP_ALIVE_INTERVAL, 0 };
+ 
+ /* Sessions */
+ static struct airplay_master_session *airplay_master_sessions;
+ static struct airplay_session *airplay_sessions;
+ 
+ /* Our own device ID, name and user agent */
+ static uint64_t airplay_device_id;
+ static const char *airplay_client_name;
+ static const char *airplay_user_agent;
+ 
+ /* Precision Time Protocol */
+ static char airplay_ptp_clock_uuid[37];
+ static bool airplay_ptp_is_disabled;
+ 
+ // Forwards
+ static int
+ airplay_device_start(struct output_device *device, int callback_id);
+ static void
+ sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller);
+ static void
+ sequence_continue(struct airplay_seq_ctx *seq_ctx);
+ 
+ 
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+ 
+ static inline int
+ alac_encode(struct evbuffer *evbuf, struct encode_ctx *encode_ctx, uint8_t *rawbuf, size_t rawbuf_size, int nsamples, struct media_quality *quality)
+ {
+   transcode_frame *frame;
+   int len;
+ 
+   frame = transcode_frame_new(rawbuf, rawbuf_size, nsamples, quality);
+   if (!frame)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not convert raw PCM to frame (bufsize=%zu)\n", rawbuf_size);
+@@ -3578,415 +3580,428 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
+     return AIRPLAY_SEQ_ABORT;
+ 
+   // Clear auth_key, the device did not accept it, or some other unexpected error
+   free(device->auth_key);
+   device->auth_key = NULL;
+ 
+   session->state = AIRPLAY_STATE_AUTH;
+ 
+   return AIRPLAY_SEQ_ABORT;
+ }
+ 
+ 
+ /* ---------------------- Request/response sequence control ----------------- */
+ 
+ /*
+  * Request queueing HOWTO
+  *
+  * Sending:
+  * - increment session->reqs_in_flight
+  * - set evrtsp connection closecb to NULL
+  *
+  * Request callback:
+  * - decrement session->reqs_in_flight first thing, even if the callback is
+  *   called for error handling (req == NULL or HTTP error code)
+  * - if session->reqs_in_flight == 0, setup evrtsp connection closecb
+  *
+  * When a request fails, the whole AirPlay session is declared failed and
+  * torn down by calling session_failure(), even if there are requests
+  * queued on the evrtsp connection. There is no reason to think pending
+  * requests would work out better than the one that just failed and recovery
+  * would be tricky to get right.
+  *
+  * evrtsp behaviour with queued requests:
+  * - request callback is called with req == NULL to indicate a connection
+  *   error; if there are several requests queued on the connection, this can
+  *   happen for each request if the connection isn't destroyed
+  * - the connection is reset, and the closecb is called if the connection was
+  *   previously connected. There is no closecb set when there are requests in
+  *   flight
+  */
+ 
+ static struct airplay_seq_definition airplay_seq_definition[] =
+ {
+   { AIRPLAY_SEQ_START, NULL, start_retry },
+   { AIRPLAY_SEQ_START_PLAYBACK, session_connected, start_failure },
+   { AIRPLAY_SEQ_PROBE, session_success, session_failure },
+   { AIRPLAY_SEQ_FLUSH, session_status, session_failure },
+   { AIRPLAY_SEQ_STOP, session_success, session_failure },
+   { AIRPLAY_SEQ_FAILURE, session_success, session_failure},
+   { AIRPLAY_SEQ_PIN_START, session_success, session_failure },
+   { AIRPLAY_SEQ_SEND_VOLUME, session_status, session_failure },
+   { AIRPLAY_SEQ_SEND_TEXT, NULL, session_failure },
+   { AIRPLAY_SEQ_SEND_PROGRESS, NULL, session_failure },
+   { AIRPLAY_SEQ_SEND_ARTWORK, NULL, session_failure },
+   { AIRPLAY_SEQ_PAIR_SETUP, session_pair_success, session_failure },
+   { AIRPLAY_SEQ_PAIR_VERIFY, session_pair_success, session_failure },
+   { AIRPLAY_SEQ_PAIR_TRANSIENT, session_pair_success, session_failure },
+   { AIRPLAY_SEQ_FEEDBACK, NULL, session_failure },
+ };
+ 
+ // The size of the second array dimension MUST at least be the size of largest
+ // sequence + 1, because then we can count on a zero terminator when iterating
+ static struct airplay_seq_request airplay_seq_request[][7] =
+ {
+   {
+     { AIRPLAY_SEQ_START, "GET /info", EVRTSP_REQ_GET, NULL, response_handler_info_start, NULL, "/info", false },
+   },
+   {
+ #if AIRPLAY_USE_AUTH_SETUP
+     { AIRPLAY_SEQ_START_PLAYBACK, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
+ #endif
+     // proceed_on_rtsp_not_ok is true because a device may reply with 401 Unauthorized
+     // and a WWW-Authenticate header, and then we may need re-run with password auth
+     { AIRPLAY_SEQ_START_PLAYBACK, "SETUP (session)", EVRTSP_REQ_SETUP, payload_make_setup_session, response_handler_setup_session, "application/x-apple-binary-plist", NULL, true },
+     { AIRPLAY_SEQ_START_PLAYBACK, "RECORD", EVRTSP_REQ_RECORD, payload_make_record, response_handler_record, NULL, NULL, false },
+     { AIRPLAY_SEQ_START_PLAYBACK, "SETPEERS", EVRTSP_REQ_SETPEERS, payload_make_setpeers, NULL, "/peer-list-changed", NULL, false },
+     { AIRPLAY_SEQ_START_PLAYBACK, "SETUP (stream)", EVRTSP_REQ_SETUP, payload_make_setup_stream, response_handler_setup_stream, "application/x-apple-binary-plist", NULL, false },
+     // Some devices (e.g. Sonos Symfonisk) don't register the volume if it isn't last
+     { AIRPLAY_SEQ_START_PLAYBACK, "SET_PARAMETER (volume)", EVRTSP_REQ_SET_PARAMETER, payload_make_set_volume, response_handler_volume_start, "text/parameters", NULL, true },
+   },
+   {
+     { AIRPLAY_SEQ_PROBE, "GET /info (probe)", EVRTSP_REQ_GET, NULL, response_handler_info_probe, NULL, "/info", false },
+   },
+   {
+     { AIRPLAY_SEQ_FLUSH, "FLUSH", EVRTSP_REQ_FLUSH, payload_make_flush, response_handler_flush, NULL, NULL, false },
+   },
+   {
+     { AIRPLAY_SEQ_STOP, "TEARDOWN", EVRTSP_REQ_TEARDOWN, payload_make_teardown, response_handler_teardown, NULL, NULL, true },
+   },
+   {
+     { AIRPLAY_SEQ_FAILURE, "TEARDOWN (failure)", EVRTSP_REQ_TEARDOWN, payload_make_teardown, response_handler_teardown_failure, NULL, NULL, false },
+   },
+   {
+     { AIRPLAY_SEQ_PIN_START, "PIN start", EVRTSP_REQ_POST, payload_make_pin_start, response_handler_pin_start, NULL, "/pair-pin-start", false },
+   },
+   {
+     { AIRPLAY_SEQ_SEND_VOLUME, "SET_PARAMETER (volume)", EVRTSP_REQ_SET_PARAMETER, payload_make_set_volume, NULL, "text/parameters", NULL, true },
+   },
+   {
+     { AIRPLAY_SEQ_SEND_TEXT, "SET_PARAMETER (text)", EVRTSP_REQ_SET_PARAMETER, payload_make_send_text, NULL, "application/x-dmap-tagged", NULL, true },
+   },
+   {
+     { AIRPLAY_SEQ_SEND_PROGRESS, "SET_PARAMETER (progress)", EVRTSP_REQ_SET_PARAMETER, payload_make_send_progress, NULL, "text/parameters", NULL, true },
+   },
+   {
+     { AIRPLAY_SEQ_SEND_ARTWORK, "SET_PARAMETER (artwork)", EVRTSP_REQ_SET_PARAMETER, payload_make_send_artwork, NULL, NULL, NULL, true },
+   },
+   {
+     { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 1", EVRTSP_REQ_POST, payload_make_pair_setup1, response_handler_pair_setup1, "application/octet-stream", "/pair-setup", false },
+     { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 2", EVRTSP_REQ_POST, payload_make_pair_setup2, response_handler_pair_setup2, "application/octet-stream", "/pair-setup", false },
+     { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 3", EVRTSP_REQ_POST, payload_make_pair_setup3, response_handler_pair_setup3, "application/octet-stream", "/pair-setup", false },
+   },
+   {
+     // Proceed on error is true because we want to delete the device key in the response handler if the verification fails
+     { AIRPLAY_SEQ_PAIR_VERIFY, "pair verify 1", EVRTSP_REQ_POST, payload_make_pair_verify1, response_handler_pair_verify1, "application/octet-stream", "/pair-verify", true },
+     { AIRPLAY_SEQ_PAIR_VERIFY, "pair verify 2", EVRTSP_REQ_POST, payload_make_pair_verify2, response_handler_pair_verify2, "application/octet-stream", "/pair-verify", false },
+   },
+   {
+     // Some devices (i.e. my ATV4) gives a 470 when trying transient, so we proceed on that so the handler can trigger PIN setup sequence
+     { AIRPLAY_SEQ_PAIR_TRANSIENT, "pair setup 1", EVRTSP_REQ_POST, payload_make_pair_setup1, response_handler_pair_setup1, "application/octet-stream", "/pair-setup", true },
+     { AIRPLAY_SEQ_PAIR_TRANSIENT, "pair setup 2", EVRTSP_REQ_POST, payload_make_pair_setup2, response_handler_pair_setup2, "application/octet-stream", "/pair-setup", false },
+   },
+   {
+     { AIRPLAY_SEQ_FEEDBACK, "POST /feedback", EVRTSP_REQ_POST, NULL, NULL, NULL, "/feedback", true },
+   },
+ };
+ 
+ 
+ static void
+ sequence_continue_cb(struct evrtsp_request *req, void *arg)
+ {
+   struct airplay_seq_ctx *seq_ctx = arg;
+   struct airplay_seq_request *cur_request = seq_ctx->cur_request;
+   struct airplay_session *session = seq_ctx->session;
+   enum airplay_seq_type seq_type;
+ 
+   session->reqs_in_flight--;
+   if (!session->reqs_in_flight)
+     evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
+ 
++  // A prior volume/control reply must not consume a later FLUSH or STOP
++  // callback, or mutate its playback state before the real reply arrives.
++  // Metadata/feedback sequences do not own a player output operation.
++  if (seq_ctx->owns_callback && seq_ctx->callback_id != session->callback_id)
++    {
++      free(seq_ctx);
++      return;
++    }
++
+   if (!req)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "No response to %s from '%s'\n", cur_request->name, session->devname);
+       goto error;
+     }
+ 
+   if (req->response_code != RTSP_OK)
+     {
+       if (!cur_request->proceed_on_rtsp_not_ok)
+ 	{
+ 	  DPRINTF(E_LOG, L_AIRPLAY, "Response to %s from '%s' was negative, aborting (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
+ 	  goto error;
+ 	}
+ 
+       DPRINTF(E_WARN, L_AIRPLAY, "Response to %s from '%s' was negative, proceeding anyway (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
+     }
+ 
+   // We don't check that the reply CSeq matches the request CSeq, because some
+   // targets like Reflector and AirFoil don't return the CSeq according to the
+   // rtsp spec. And the CSeq is not really important anyway.
+ 
+   if (cur_request->response_handler)
+     {
+       seq_type = cur_request->response_handler(req, session);
+       if (seq_type != AIRPLAY_SEQ_CONTINUE)
+ 	{
+ 	  if (seq_type == AIRPLAY_SEQ_ABORT)
+ 	    goto error;
+ 
+ 	  // Handler wanted to start a new sequence
+ 	  sequence_start(seq_type, seq_ctx->session, seq_ctx->payload_make_arg, seq_ctx->log_caller);
+ 	  free(seq_ctx);
+ 	  return;
+ 	}
+     }
+ 
+   seq_ctx->cur_request++;
+ 
+   if (seq_ctx->cur_request->name)
+     {
+       sequence_continue(seq_ctx);
+       return;
+     }
+ 
+   if (seq_ctx->on_success)
+     seq_ctx->on_success(session);
+ 
+   free(seq_ctx);
+   return;
+ 
+  error:
+   if (seq_ctx->on_error)
+     seq_ctx->on_error(session);
+ 
+   free(seq_ctx);
+ }
+ 
+ static void
+ sequence_continue(struct airplay_seq_ctx *seq_ctx)
+ {
+   struct airplay_session *session = seq_ctx->session;
+   struct airplay_seq_request *cur_request = seq_ctx->cur_request;
+   struct evrtsp_request *req = NULL;
+   const char *uri;
+   int ret;
+ 
+   req = evrtsp_request_new(sequence_continue_cb, seq_ctx);
+   if (!req)
+     goto error;
+ 
+   ret = request_headers_add(req, session, cur_request->rtsp_type);
+   if (ret < 0)
+     goto error;
+ 
+   if (cur_request->content_type)
+     evrtsp_add_header(req->output_headers, "Content-Type", cur_request->content_type);
+ 
+   if (cur_request->payload_make)
+     {
+       ret = cur_request->payload_make(req, session, seq_ctx->payload_make_arg);
+       if (ret > 0) // Skip to next request in sequence, if none -> error
+         {
+ 	  seq_ctx->cur_request++;
+ 	  if (!seq_ctx->cur_request->name)
+ 	    {
+ 	      DPRINTF(E_LOG, L_AIRPLAY, "Bug! payload_make signaled skip request, but there is nothing to skip to\n");
+ 	      goto error;
+ 	    }
+ 
+ 	  evrtsp_request_free(req);
+ 	  sequence_continue(seq_ctx);
+ 	  return;
+         }
+       else if (ret < 0)
+ 	goto error;
+     }
+ 
+   uri = (cur_request->uri) ? cur_request->uri : session->session_url;
+ 
+   DPRINTF(E_DBG, L_AIRPLAY, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, session->devname);
+ 
+   ret = evrtsp_make_request(session->ctrl, req, cur_request->rtsp_type, uri);
+   if (ret < 0)
+     goto error;
+ 
+   evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
+ 
+   session->reqs_in_flight++;
+ 
+   return;
+ 
+  error:
+   DPRINTF(E_LOG, L_AIRPLAY, "%s: Error sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, session->devname);
+ 
+   if (req)
+     evrtsp_request_free(req);
+ 
+   // Sets status to FAILED, gives status to player and frees session. Must be
+   // deferred, otherwise sequence_start() could invalidate the session, meaning
+   // any dereference of the session by the caller after sequence_start() would
+   // segfault.
+   deferred_session_failure(session);
+ 
+   free(seq_ctx);
+ }
+ 
+ // All errors that may occur during a sequence are called back async
+ static void
+ sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
+ {
+   struct airplay_seq_ctx *seq_ctx;
+ 
+   CHECK_NULL(L_AIRPLAY, seq_ctx = calloc(1, sizeof(struct airplay_seq_ctx)));
+ 
+   seq_ctx->session = session;
++  seq_ctx->callback_id = session->callback_id;
++  seq_ctx->owns_callback = (seq_type != AIRPLAY_SEQ_SEND_TEXT
++    && seq_type != AIRPLAY_SEQ_SEND_PROGRESS && seq_type != AIRPLAY_SEQ_SEND_ARTWORK
++    && seq_type != AIRPLAY_SEQ_FEEDBACK);
+   seq_ctx->cur_request = &airplay_seq_request[seq_type][0]; // First step of the sequence
+   seq_ctx->on_success = airplay_seq_definition[seq_type].on_success;
+   seq_ctx->on_error = airplay_seq_definition[seq_type].on_error;
+   seq_ctx->payload_make_arg = arg;
+   seq_ctx->log_caller = log_caller;
+ 
+   sequence_continue(seq_ctx); // Ownership transferred
+ }
+ 
+ 
+ /* ---------------- Airplay devices discovery - mDNS callback --------------- */
+ /*                              Thread: main (mdns)                           */
+ 
+ static int
+ features_parse(struct keyval *features_kv, const char *features_txt, const char *name)
+ {
+   uint64_t features = 0;
+   const char *delim_ptr;
+   int i, j;
+ 
+   // Even though features_txt may be two commaseparated values we can pass it to
+   // safe_hextou32() which will only convert the first value.
+   if ( safe_hextou32(features_txt, (uint32_t *)&features) < 0 ||
+        ((delim_ptr = strchr(features_txt, ',')) && safe_hextou32(delim_ptr + 1, ((uint32_t *)&features) + 1) < 0) )
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "AirPlay '%s': unexpected features field '%s' in TXT record\n", name, features_txt);
+       return -1;
+     }
+ 
+   // Walk through the bits
+   for (i = 0; i < (sizeof(features) * CHAR_BIT); i++)
+     {
+       if (((features >> i) & 0x01) == 0)
+         continue;
+ 
+       // Check if we have it in the features map
+       for (j = 0; j < ARRAY_SIZE(features_map); j++)
+ 	{
+ 	  if (i == features_map[j].bit)
+ 	    {
+ 	      DPRINTF(E_SPAM, L_AIRPLAY, "Speaker '%s' announced feature %d: '%s'\n", name, i, features_map[j].name);
+               keyval_add(features_kv, features_map[j].name, "1");
+ 	      break;
+ 	    }
+ 	}
+ 
+       if (j == ARRAY_SIZE(features_map))
+ 	DPRINTF(E_SPAM, L_AIRPLAY, "Speaker '%s' announced feature %d: 'Unknown'\n", name, i);
+     }
+ 
+   return 0;
+ }
+ 
+ 
+ /* Examples of txt content:
+  * Airport Express 2:
+      ["pk=7de...39" "gcgl=0" "gid=0fd...4" "pi=0fd...a4" "srcvers=366.0" "protovers=1.1" "serialNumber=C8...R" "manufacturer=Apple Inc." "model=AirPort10,115" "flags=0x4" "fv=p20.78100.3" "rsf=0x0" "features=0x445D0A00,0x1C340" "deviceid=74:1B:B2:D1:1A:B7" "acl=0"]
+  * Apple TV 4:
+      ["vv=2" "osvers=14.2" "srcvers=525.38.42" "pk=c4e...c88" "psi=67C...DBC" "pi=b0b...da0" "protovers=1.1" "model=AppleTV5,3" "gcgl=1" "igl=1" "gid=B...73" "flags=0x244" "features=0x5A7FDFD5,0x3C155FDE" "fex=1d9/Wt5fFTw" "deviceid=AA:BB:CC:DD:EE:FF" "btaddr=D0:00:44:66:BB:66" "acl=0"]
+   * Roku
+      ["pk=xxxxxxxxx” "gcgl=0" "gid=xxxxxxx” "psi=xxxxx” "pi=8A:71:CA:EF:xxxx" "srcvers=377.28.01" "protovers=1.1" "serialNumber=xxxxxxx” "manufacturer=Roku" "model=3810X" "flags=0x644" "at=0x3" "fv=p20.9.40.4190" "rsf=0x3" "features=0x7F8AD0,0x10BCF46" "deviceid=8A:71:CA:xxxxx” "acl=0"]
+   * Samsung TV
+      ["pk=7xxxxxxxxxx” "gcgl=0" "gid=xxxxxxxxxxx” "psi=xxxxxxx” "pi=4C:6F:64:xxxxxxx” "srcvers=377.17.24.6" "protovers=1.1" "serialNumber=xxxxxxx” "manufacturer=Samsung" "model=UNU7090" "flags=0x244" "fv=p20.0.1" "rsf=0x3" "features=0x7F8AD0,0x38BCB46" "deviceid=64:1C:AE:xxxxx” "acl=0"]
+   * HomePod
+      ["vv=2" "osvers=14.3" "srcvers=530.6" "pk=..." "psi=31...D3" "pi=fd...87" "protovers=1.1" "model=AudioAccessory1,1" "tsid=4...E" "gpn=name" "gcgl=1" "igl=1" "gid=4...E" "flags=0x1a404" "features=0x4A7FCA00,0x3C356BD0" "fex=AMp/StBrNTw" "deviceid=D4:...:C1" "btaddr=5E:...:F1" "acl=0"]
+   * Sonos Symfonisk
+      ["pk=e5...1c" "gcgl=0" "gid=[uuid]" "pi=[uuid]" "srcvers=366.0" "protovers=1.1" "serialNumber=xx" "manufacturer=Sonos" "model=Bookshelf" "flags=0x4" "fv=p20.63.2-88230" "rsf=0x0" "features=0x445F8A00,0x1C340" "deviceid=11:22:33:44:55:66" "acl=0"]
+   * Marantz NR1607 and SR6009 (which don't support pairing)
+      ["srcvers=190.9.p6" "model=NR1607" "fv=p105321.1400.0" "flags=0x4" "features=0x444F8A00" "deviceid=00:06:12:12:12:12"]
+      ["srcvers=190.9" "seed=99" "model=SR6009" "flags=0x4" "features=0x444F8A00" "deviceid=00:06:12:12:12:12"]
+   * Apple TV 3 (pairing supported, but not encryption)
+      ["vv=2" "srcvers=220.68" "pi=24...08" "pk=4b...48" "pw=1" "model=AppleTV3,1" "flags=0xc4" "features=0x5A7FFFF7,0xE" "deviceid=70:73:12:12:12:12"]
+   * Libratone Loop
+      ["srcvers=190.9" "seed=99" "model=LibratoneLoop1" "flags=0x4" "features=0x444C0A00" "deviceid=XX:XX:XX:XX:XX:XX"]
+  */
+ static void
+ airplay_device_cb(const char *name, const char *type, const char *domain, const char *hostname, int family, const char *address, int port, struct keyval *txt)
+ {
+   struct output_device *device;
+   struct airplay_extra *extra;
+   struct keyval features_kv = { 0 };
+   cfg_t *devcfg;
+   cfg_opt_t *cfgopt;
+   const char *p;
+   const char *nickname = NULL;
+   const char *password = NULL;
+   const char *features;
+   uint64_t id;
+   int ret;
+ 
+   if (port > 0)
+     {
+       p = keyval_get(txt, "deviceid");
+       if (!p)
+ 	{
+ 	  DPRINTF(E_LOG, L_AIRPLAY, "AirPlay device '%s' is missing a device ID\n", name);
+ 	  return;
+ 	}
+ 
+       ret = device_id_colon_parse(&id, p);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_LOG, L_AIRPLAY, "Could not extract AirPlay device ID ('%s'): %s\n", name, p);
+ 	  return;
+ 	}
+     }
+   else
+     {
+       ret = device_id_find_byname(&id, name);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_WARN, L_AIRPLAY, "Could not remove, AirPlay device '%s' not in our list\n", name);
+ 	  return;
+ 	}
+     }
+ 
+   DPRINTF(E_DBG, L_AIRPLAY, "Event for AirPlay device '%s' (port %d, id %" PRIx64 ", Active-Remote %" PRIu32 ")\n", name, port, id, (uint32_t)id);
+ 
+   devcfg = cfg_gettsec(cfg, "airplay", name);
+   if (devcfg && cfg_getbool(devcfg, "exclude"))
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Excluding AirPlay device '%s' as set in config\n", name);
+       return;
+     }
+   if (devcfg && cfg_getbool(devcfg, "permanent") && (port < 0))
+     {
+       DPRINTF(E_INFO, L_AIRPLAY, "AirPlay device '%s' disappeared, but set as permanent in config\n", name);
+       return;
+     }
+   if (outputs_exclusive_mode_get() && !(devcfg && cfg_getbool(devcfg, "exclusive")))
+     {
+       DPRINTF(E_INFO, L_AIRPLAY, "AirPlay device '%s' ignored, other speaker(s) set as exclusive\n", name);
+       return;
+     }
+   if (devcfg && cfg_getbool(devcfg, "airplay2_disable"))
+     {
+       DPRINTF(E_INFO, L_AIRPLAY, "Disabling AirPlay 2 for device '%s' as set in config\n", name);
+       return;
+     }
+   if (devcfg && cfg_getstr(devcfg, "nickname"))

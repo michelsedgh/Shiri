@@ -8,9 +8,10 @@ connection generation, keeping it stable only for replay of that admission.
 The returned token must accompany that producer's end/volume callbacks and
 all grant/revoke actions. Session IDs alone are insufficient after reuse.
 
-Persist the epoch high-water mark before acknowledging grants, and begin a
-new actor incarnation after restart. Do not restore an old live owner from
-saved intent. A new incarnation prevents old callbacks and queued actions
+Begin a fresh actor incarnation after restart. Do not restore an old live
+owner or incarnation from saved intent. If an adapter retains an incarnation
+across a crash, it must durably persist its epoch high-water mark before
+acknowledging grants. A fresh incarnation prevents old callbacks and queued actions
 from matching a fresh session even if native IDs or epochs are reused.
 
 Commit the returned state before applying actions in actor order. Revoke only

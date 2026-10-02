@@ -127,3 +127,40 @@ async def test_unauthorized_local_peer_does_not_reach_handler(rpcdir):
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_operation_authority_uses_kernel_uid_before_scheduling_handler(rpcdir, monkeypatch):
+    import socket
+    import shiri.rpc as rpc
+    peer = {"uid": 202}
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(rpc, "peer_uid", lambda writer: peer["uid"])
+    called = []
+    async def handler(operation, payload):
+        called.append((operation, payload))
+        return {"ok": True}
+    path = rpcdir / "restricted.sock"
+    server = await serve_rpc(path, handler, allowed_uids={0, 202}, operation_uids={"control-intent": {0}})
+    try:
+        assert await call_rpc(path, "health") == {"ok": True}
+        with pytest.raises(RpcError) as rejected:
+            await call_rpc(path, "control-intent", {"uid": 0, "revision": 2})
+        assert rejected.value.code == "forbidden"
+        assert called == [("health", {})]
+        peer["uid"] = 0
+        await call_rpc(path, "control-intent", {"revision": 2})
+        assert called[-1] == ("control-intent", {"revision": 2})
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_operation_authority_cannot_start_without_peer_credentials(rpcdir, monkeypatch):
+    import socket
+    monkeypatch.delattr(socket, "SO_PEERCRED", raising=False)
+    path = rpcdir / "restricted.sock"
+    with pytest.raises(RuntimeError, match="peer credentials"):
+        await serve_rpc(path, lambda *_: None, operation_uids={"control-intent": {0}})
+    assert not path.exists()

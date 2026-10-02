@@ -57,7 +57,10 @@
       <label class="field" for="airplay-name">AirPlay name <span class="optional">optional</span></label><input id="airplay-name" type="text" maxlength="50" autocomplete="off" placeholder="Same as room name"><p class="hint">The name you choose when playing music from an Apple device.</p>
       <label class="field" for="nobly-room-id">Nobly room ID <span class="optional">optional</span></label><input id="nobly-room-id" type="text" maxlength="128" autocomplete="off" placeholder="Use the room ID from Nobly"><p class="hint">This mapping lets Nobly address the right room. It does not confirm a connection to Nobly.</p>
       <label class="field" for="room-interface">Speaker network</label><select id="room-interface" required></select><p class="hint">Choose the network interface that reaches this room’s speakers.</p>
-      <label class="field" for="local-audio-device">Local or Bluetooth audio device <span class="optional">optional</span></label><input id="local-audio-device" type="text" maxlength="128" autocomplete="off" placeholder="Leave blank for network speakers"><p class="hint">For a configured ALSA output, such as <code>hw:CARD=USB,DEV=0</code>. Bluetooth needs a paired adapter and a BlueALSA device, such as <code>bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp</code>. Leave blank to disable local output.</p>
+      <label class="field" for="local-speaker">Local speaker <span class="optional">optional</span></label><select id="local-speaker" aria-describedby="local-speaker-status"></select>
+      <div class="local-speaker-toolbar"><p id="local-speaker-status" class="hint" role="status"></p><button id="refresh-local-speakers" class="button quiet" type="button">Refresh devices</button></div>
+      <div id="local-binding-fields" hidden><label class="field" for="local-speaker-binding">Identify this speaker by</label><select id="local-speaker-binding" aria-describedby="local-binding-help"></select><p id="local-binding-help" class="hint"></p></div>
+      <details id="local-audio-advanced" class="local-audio-advanced"><summary>Advanced Bluetooth or existing audio setup</summary><label class="field" for="local-audio-device">Local or Bluetooth audio device <span class="optional">optional</span></label><input id="local-audio-device" type="text" maxlength="128" autocomplete="off" placeholder="Paired Bluetooth device"><p class="hint">For an already paired Bluetooth adapter, enter its BlueALSA endpoint, such as <code>bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp</code>. Existing named ALSA setups are retained here. Choose a discovered local speaker above for a verified physical binding.</p></details>
       <label class="field" for="room-duck">Music reduction during speech</label><div class="range-control"><input id="room-duck" type="range" min="0" max="100" step="1" value="72"><output id="room-duck-value" for="room-duck">72%</output></div><p class="hint">Lower the music while a spoken reply plays, then restore it.</p>
       <p id="room-form-error" class="notice error" role="alert" hidden></p>
       <button id="reload-room-draft" class="button quiet" type="button" hidden>Reload current room settings</button>
@@ -77,7 +80,55 @@
       <p id="speaker-form-error" class="notice error" role="alert" hidden></p>
       <button id="reload-speaker-draft" class="button quiet" type="button" hidden>Reload current speaker selection</button>
       <div class="sheet-footer"><button id="refresh-speakers" class="button quiet" type="button">Refresh discovery</button><button id="save-speakers" class="button primary" type="submit">Save speakers</button></div>
+      <div class="room-connection-details"><button id="measure-timing" class="button quiet" type="button">Measure speaker timing</button><p class="hint">Two microphones on one capture device can measure relative arrival. Calibration never changes a delay automatically.</p></div>
     </form>
+  </dialog>
+
+  <dialog id="calibration-dialog" class="side-sheet" aria-labelledby="calibration-title">
+    <div class="sheet-heading"><div><span class="eyebrow">Recorded timing evidence</span><h2 id="calibration-title">Speaker calibration</h2></div><button class="close-button" data-close="calibration" type="button" aria-label="Close speaker calibration">×</button></div>
+    <div class="sheet-body">
+      <p class="form-intro">Record one speaker on each channel of a stereo capture device. Both microphones must share one ADC clock. A single microphone hearing both speakers, or separate phone recordings, cannot identify their delays.</p>
+      <p id="calibration-error" class="notice error" role="alert" hidden></p>
+      <div id="calibration-history-controls" hidden><label class="field" for="calibration-history">Saved measurements in this room</label><select id="calibration-history"></select><button id="calibration-new" class="button quiet" type="button">Start another measurement</button></div>
+      <form id="calibration-form">
+        <label class="field" for="calibration-reference-room">Reference zone</label><select id="calibration-reference-room" required></select>
+        <label class="field" for="calibration-reference">Reference speaker · channel 1</label><select id="calibration-reference" required></select>
+        <label class="field" for="calibration-target">Speaker to adjust · channel 2</label><select id="calibration-target" required></select>
+        <label class="field" for="calibration-device">Capture device</label><input id="calibration-device" type="text" maxlength="256" placeholder="Two-channel USB recorder" required>
+        <label class="field" for="calibration-geometry">Microphone placement and test conditions</label><input id="calibration-geometry" type="text" maxlength="512" placeholder="Equal distances, near each speaker, quiet room" required><p class="hint">Keep positions, gain and capture processing fixed. Document network load and playback restarts in your exported evidence.</p>
+        <label class="field" for="calibration-context">Common playback and grouping context</label><input id="calibration-context" type="text" maxlength="512" placeholder="iPhone grouped Kitchen + Living room, same source"><p class="hint">For different zones, play the same probe through both using the phone's native grouping controls. Describe that group here. Shiri records your declaration; it cannot certify the phone group from imported audio.</p>
+        <details class="room-connection-details"><summary>Measurement bounds</summary>
+          <label class="field" for="calibration-max-lag">Maximum relative delay (ms)</label><input id="calibration-max-lag" type="number" min="1" max="2000" step="1" value="500" required>
+          <label class="field" for="calibration-geometry-correction">Target minus reference acoustic travel time (ms)</label><input id="calibration-geometry-correction" type="number" min="-100" max="100" step="0.001" value="0" required><p class="hint">Use zero for matched distances. This declared geometry correction is subtracted from the measured lag; it is not inferred from the recording.</p>
+        </details>
+        <div class="sheet-footer"><button id="calibration-start" class="button primary" type="submit">Start measurement session</button></div>
+      </form>
+      <section id="calibration-session" hidden>
+        <p id="calibration-status" class="notice" role="status"></p>
+        <ol class="calibration-instructions">
+          <li><a id="calibration-probe" class="button quiet" download>Download quiet test probe</a><p id="calibration-playback-help" class="hint">Play this WAV through the measured room or native grouped zones from one music source. Stop normal music first. The test has eight distinct bursts; do not mix in spoken replies.</p></li>
+          <li><p class="hint">Capture both speakers simultaneously. Use uncompressed 16-bit stereo WAV, 16–96 kHz, no larger than 2 MiB. Keep the first and last burst complete. Make at least three fresh takes across playback restarts.</p></li>
+          <li><p class="hint">Import each take below. Raw audio is discarded after analysis. Measurement summaries survive restarts: unfinished sessions last one hour; saved correction receipts last up to 90 days, within a 128-session history limit. Export evidence you need to keep.</p></li>
+        </ol>
+        <form id="calibration-upload">
+          <label class="field" for="calibration-file">Stereo WAV recording</label><input id="calibration-file" type="file" accept=".wav,audio/wav,audio/x-wav" required>
+          <label class="calibration-confirm"><input id="calibration-verify-confirm" type="checkbox"><span>This is a fresh post-change recording, captured after re-enabling the room with the saved delay.</span></label>
+          <button id="calibration-import" class="button primary" type="submit">Analyze recording</button>
+        </form>
+        <div id="calibration-result" class="calibration-result" aria-live="polite"></div>
+        <p id="calibration-apply-help" class="hint"></p>
+        <div class="calibration-actions">
+          <button id="calibration-off" class="button quiet" type="button">Turn room off for timing change</button>
+          <button id="calibration-apply" class="button primary" type="button">Save candidate delay</button>
+          <button id="calibration-on" class="button quiet" type="button">Turn room on for verification</button>
+          <button id="calibration-reference-on" class="button quiet" type="button">Turn reference zone on for verification</button>
+          <button id="calibration-rollback" class="button danger" type="button">Restore previous delay</button>
+          <button id="calibration-refresh" class="button quiet" type="button">Refresh measurement</button>
+          <a id="calibration-export" class="button quiet" download>Export evidence</a>
+          <button id="calibration-end" class="button quiet" type="button">Delete measurement evidence</button>
+        </div>
+      </section>
+    </div>
   </dialog>
 
   <div id="toast" class="toast" role="status" hidden></div>

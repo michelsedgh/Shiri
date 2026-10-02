@@ -23,6 +23,10 @@ install -d -o shiri -g shiri -m 0750 /var/lib/shiri
 install -d -o root -g shiri -m 0750 /run/shiri
 install -d -o root -g root -m 0700 /var/lib/shiri-runtime
 install -d -o root -g shiri -m 0750 /etc/shiri
+INSTALLATION_ID=$("$PREFIX/venv/bin/python" -I -c 'from pathlib import Path; from shiri.runtime.network import NetworkManager; from shiri.runtime.system import Runner,root_directory; p=Path("/var/lib/shiri-runtime"); root_directory(p); print(NetworkManager(p,Runner()).installation_id)')
+/usr/bin/python3 -I "$SOURCE/deploy/provision_daemons.py" \
+  --installation-id "$INSTALLATION_ID" --runtime-state-dir /var/lib/shiri-runtime \
+  --runtime-dir /run/shiri --output /etc/shiri/daemon-identities.json --locked
 [[ ! -L /etc/shiri/api-token && ! -L /etc/shiri/shiri.env ]] || { echo "Refusing symlink service credentials/config" >&2; exit 1; }
 if [[ ! -f /etc/shiri/api-token ]]; then
   TOKEN_FILE=$(mktemp /etc/shiri/.token.XXXXXX)
@@ -40,6 +44,7 @@ SHIRI_RUNTIME_DIR=/run/shiri
 SHIRI_RUNTIME_SOCKET=/run/shiri/runtime.sock
 SHIRI_BINARY_DIR=$PREFIX
 SHIRI_API_TOKEN_FILE=/etc/shiri/api-token
+SHIRI_DAEMON_IDENTITY_FILE=/etc/shiri/daemon-identities.json
 SHIRI_HOST=127.0.0.1
 SHIRI_PORT=8080
 LD_LIBRARY_PATH=$PREFIX/lib

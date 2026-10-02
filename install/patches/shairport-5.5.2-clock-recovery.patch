@@ -1,0 +1,193 @@
+diff --git a/audio_shiri.c b/audio_shiri.c
+--- a/audio_shiri.c
++++ b/audio_shiri.c
+@@ -21,19 +21,37 @@
+ static char *socket_path;
+ static int peer_uid = -1, fd = -1, connection = -1, gap;
+ static unsigned int configured;
++/* The inner sampler's local ordering fence must also span fresh batches.
++ * Callback serialization already holds lock; other clock users stay unchanged. */
++static struct {
++  int active;
++  uint64_t monotonic, raw;
++} clock_order;
+ 
+ static uint64_t monotonic_ns(void) {
+   struct timespec ts;
++  uint64_t value;
+   if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0;
+-  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++  value = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++  if (clock_order.active) {
++    if (value < clock_order.monotonic) return 0;
++    clock_order.monotonic = value;
++  }
++  return value;
+ }
+ static uint64_t raw_ns(void) {
+ #ifdef CLOCK_MONOTONIC_RAW
+   struct timespec ts;
++  uint64_t value;
+   /* The pinned shared get_absolute_time_in_ns() ignores clock_gettime errors.
+    * Native Linux playtime uses this exact clock; check its read here. */
+   if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts)) return 0;
+-  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++  value = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++  if (clock_order.active) {
++    if (value < clock_order.raw) return 0;
++    clock_order.raw = value;
++  }
++  return value;
+ #else
+   return 0; /* Never substitute a different clock for native RAW playtime. */
+ #endif
+@@ -61,6 +79,87 @@
+     previous_raw = raw;
+   }
+   return ETIMEDOUT;
++}
++/* A refused clock candidate never owns media or changes its source calendar.
++ * Retry only ETIMEDOUT under one callback deadline; each inner sampler retains
++ * its original four-attempt, five-millisecond and one-millisecond bounds. */
++#define SHIRI_CLOCK_RECOVERY_BATCHES 4u
++#define SHIRI_CLOCK_RECOVERY_NS UINT64_C(20000000)
++static struct {
++  uint64_t started_ns, checked_ns, elapsed_ns;
++  unsigned int batches, refused;
++  int last_batch_result, result;
++} clock_recovery;
++static uint64_t recovered_packets, refused_batches;
++
++static int clock_recovery_deadline(void) {
++  uint64_t now = monotonic_ns();
++  if (!now || now < clock_recovery.checked_ns) {
++    clock_recovery.result = EIO;
++    return EIO;
++  }
++  clock_recovery.checked_ns = now;
++  clock_recovery.elapsed_ns = now - clock_recovery.started_ns;
++  if (clock_recovery.elapsed_ns >= SHIRI_CLOCK_RECOVERY_NS) {
++    clock_recovery.result = ETIMEDOUT;
++    return ETIMEDOUT;
++  }
++  return 0;
++}
++
++static int sample_clocks_recovered(struct shiri_pcm_packet *packet) {
++  unsigned int batch;
++  memset(&clock_recovery, 0, sizeof(clock_recovery));
++  memset(&clock_order, 0, sizeof(clock_order));
++  clock_order.active = 1;
++  clock_recovery.started_ns = monotonic_ns();
++  clock_recovery.checked_ns = clock_recovery.started_ns;
++  if (!clock_recovery.started_ns) {
++    clock_recovery.result = EIO;
++    return EIO;
++  }
++  for (batch = 0; batch < SHIRI_CLOCK_RECOVERY_BATCHES; batch++) {
++    int result = clock_recovery_deadline();
++    uint64_t entered_ns = clock_recovery.checked_ns;
++    if (result) return result;
++    result = sample_clocks(packet);
++    clock_recovery.batches++;
++    clock_recovery.last_batch_result = result;
++    if (result == ETIMEDOUT) {
++      clock_recovery.refused++;
++      if (refused_batches < UINT64_MAX) refused_batches++;
++    } else if (result) {
++      clock_recovery.result = result;
++      return result; /* Invalid/backwards/read failures are never retryable. */
++    }
++    /* A valid narrow pair cannot waive either the original entry deadline or
++     * monotonic ordering across the surrounding recovery transaction. */
++    if (!result && (packet->mono_before < entered_ns ||
++                    packet->mono_after < packet->mono_before)) {
++      clock_recovery.result = EIO;
++      return EIO;
++    }
++    if (clock_recovery_deadline()) return clock_recovery.result;
++    if (!result && packet->mono_after > clock_recovery.checked_ns) {
++      clock_recovery.result = EIO;
++      return EIO;
++    }
++    if (!result) return 0;
++  }
++  clock_recovery.result = ETIMEDOUT;
++  return ETIMEDOUT;
++}
++
++static void clock_recovery_sent(void) {
++  if (!clock_recovery.refused) return;
++  if (recovered_packets < UINT64_MAX) recovered_packets++;
++  /* At most 64 summaries per exact session, rather than a log per PCM block. */
++  if (recovered_packets == 1 || !(recovered_packets & (recovered_packets - 1)))
++    warn("Shiri native PCM clock recovered: packets=%llu refused_batches=%llu "
++         "batches=%u refused=%u elapsed_ns=%llu; original PCM retained.",
++         (unsigned long long)recovered_packets, (unsigned long long)refused_batches,
++         clock_recovery.batches, clock_recovery.refused,
++         (unsigned long long)clock_recovery.elapsed_ns);
+ }
+ static int random_session(uint8_t id[16]) {
+   int random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+@@ -141,6 +240,7 @@
+   pthread_mutex_lock(&lock);
+   close_route();
+   memset(&state, 0, sizeof(state));
++  recovered_packets = refused_batches = 0;
+   state.kind = SHIRI_BEGIN; state.clock = SHIRI_RAW; state.generation = 1;
+   state.flags = (ap2 ? SHIRI_PCM_AIRPLAY2 : 0) | (leader ? SHIRI_PCM_GROUP_LEADER : 0);
+   parse_group(group, state.group);
+@@ -212,21 +312,33 @@
+   packet.kind = SHIRI_PCM; packet.frames = (uint32_t)samples; packet.payload = (uint32_t)samples * 4u;
+   packet.rtp = rtp; packet.presentation = playtime;
+   packet.flags |= gap ? SHIRI_PCM_GAP : 0;
+-  ret = sample_clocks(&packet);
+-  if (ret) {
+-    warn("Shiri native PCM clock sampling failed; this exact producer remains fenced.");
+-    close_route();
+-    goto done;
+-  }
+-  packet.sequence = ++state.sequence;
++  ret = sample_clocks_recovered(&packet);
++  if (ret) goto clock_failed;
++  packet.sequence = state.sequence + 1;
+   shiri_pcm_encode(message, &packet);
+   memcpy(message + SHIRI_PCM_HEADER, pcm, packet.payload);
++  /* Encoding/copying cannot refresh the deadline or advance unsent media. */
++  ret = clock_recovery_deadline();
++  if (ret) goto clock_failed;
++  state.sequence = packet.sequence;
+   n = send(fd, message, SHIRI_PCM_HEADER + packet.payload, MSG_DONTWAIT | MSG_NOSIGNAL);
+   state.frame_index += (uint64_t)samples;
+-  if (n == (ssize_t)(SHIRI_PCM_HEADER + packet.payload)) gap = 0;
++  if (n == (ssize_t)(SHIRI_PCM_HEADER + packet.payload)) {
++    gap = 0;
++    clock_recovery_sent();
++  }
+   else if (n < 0 && (errno == EAGAIN || errno == ENOBUFS)) gap = 1;
+   else { ret = EPIPE; close_route(); }
++  goto done;
++clock_failed:
++  warn("Shiri native PCM clock sampling failed; this exact producer remains fenced.");
++  warn("Shiri native PCM clock recovery refused: result=%d last_batch_result=%d "
++       "batches=%u refused=%u elapsed_ns=%llu.", ret, clock_recovery.last_batch_result,
++       clock_recovery.batches, clock_recovery.refused,
++       (unsigned long long)clock_recovery.elapsed_ns);
++  close_route();
+ done:
++  clock_order.active = 0;
+   pthread_mutex_unlock(&lock);
+   pthread_setcancelstate(old_cancel, NULL);
+   return ret;
+diff --git a/common.c b/common.c
+--- a/common.c
++++ b/common.c
+@@ -1949,7 +1949,7 @@
+     strcat(version_string, "-pipe");
+ #endif
+ #ifdef CONFIG_SHIRI
+-    strcat(version_string, "-shiri-timed2");
++    strcat(version_string, "-shiri-timed3");
+ #endif
+ #ifdef CONFIG_SOXR
+     strcat(version_string, "-soxr");

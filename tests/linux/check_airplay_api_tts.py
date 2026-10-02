@@ -980,6 +980,7 @@ async def exercise(broker, state, source, source_client, target, queue_id, api, 
 
 
 async def check():
+    require(base.NATIVE_LAB is None, 'Standalone API AirPlay fixture has no admitted clean-VM network supervisor')
     report = {'started_at': datetime.now(timezone.utc).isoformat(), 'passed': False,
               'scope': 'Synthetic AirPlay2 input plus authenticated rootless API->broker->worker Opus speech->actual OwnTone ALSA reverseLoopback7 PCM',
               'stock_phone_verified': False, 'physical_speaker_output_verified': False,

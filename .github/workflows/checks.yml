@@ -11,13 +11,14 @@ jobs:
         with:
           node-version: '22'
       - name: Linux audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-venv python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-alsa
+        run: sudo apt-get update && sudo apt-get install -y python3-venv python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-alsa libjson-c-dev libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libsbc-dev pkg-config
       - name: Enable ALSA loopback when the runner kernel provides it
         run: sudo modprobe snd-aloop || echo 'This runner lacks snd-aloop; the ALSA bridge check will explicitly skip.'
       - name: Install project and verification tools
         run: |
           /usr/bin/python3 -m venv --system-site-packages .venv
-          .venv/bin/pip install -e '.[audio,test]'
+          .venv/bin/pip install --require-hashes --only-binary=:all: -r install/build_requirements.lock
+          .venv/bin/pip install --no-build-isolation -e '.[audio,test]'
           .venv/bin/python -m playwright install --with-deps chromium
       - name: Python validation and real PCM mixer
         env:
@@ -25,6 +26,14 @@ jobs:
         run: |
           .venv/bin/ruff check shiri tests
           .venv/bin/pytest -q
+      - name: Native source and volume parser checks
+        run: |
+          .venv/bin/python tests/native/check_source_transition.py --require-json --compiler /usr/bin/cc
+          .venv/bin/python tests/native/check_native_anchor.py --compiler /usr/bin/cc
+          .venv/bin/python tests/native/check_packet_timestamps.py --compiler /usr/bin/cc
+          .venv/bin/python tests/native/check_framed_output.py --compiler /usr/bin/cc
+          .venv/bin/python tests/native/check_alsa_partial_write.py --compiler /usr/bin/cc
+          .venv/bin/python tests/native/check_bluealsa_drop_sync.py --compiler /usr/bin/cc --require-sbc
       - name: Browser and frontend validation
         env:
           SHIRI_BROWSER_TESTS: '1'

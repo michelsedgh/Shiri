@@ -133,9 +133,12 @@ async def test_rpc_timeout_cancels_offer_and_does_not_leave_a_room_owned(valid_s
     worker = AudioWorker(RecordingMixer(), peer_factory=lambda: peer)
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(worker.dispatch("speech", request(valid_sdp)), timeout=0.03)
+    assert worker.session is None
+    # The canceled RPC does not own teardown. Join the worker's retained task
+    # before asserting actual resource completion rather than assuming it is instant.
+    await asyncio.wait_for(worker.close(), 1)
     assert worker.session is None and peer.connectionState == "closed"
     assert peer.close_calls == 1
-    await worker.close()
 
 
 async def test_simultaneous_worker_shutdown_and_client_close_is_idempotent(valid_sdp):
@@ -182,9 +185,10 @@ async def test_media_less_peer_expires_and_music_returns_to_normal():
     worker.session = SpeechSession("owner", "request", peer, 0.1, created=time.monotonic() - 1)
     worker.music_active = True
     await worker.tick(0.01)
-    assert worker.session is None and peer.close_calls == 1
+    assert worker.session is None
     assert mixer.ticks[-1]["music_active"] and not mixer.ticks[-1]["speech_active"]
     await worker.close()
+    assert peer.close_calls == 1
 
 
 async def test_silent_transport_frames_do_not_hold_music_ducked():
@@ -209,15 +213,36 @@ async def test_silent_transport_frames_do_not_hold_music_ducked():
     await asyncio.wait_for(worker.close(), 1)
 
 
-async def test_continuous_silence_has_a_bounded_room_lease():
+@pytest.mark.parametrize("created", [1.0, 17.0, 100000.0])
+async def test_continuous_silence_has_a_bounded_room_lease(monkeypatch, created):
+    from shiri.runtime import audio
+
+    # Create the session at a valid monotonic origin, then advance its clock.
+    # Subtracting31s from the real host uptime invents a negative origin on a
+    # fresh boot, where last_audible's zero sentinel masks that artificial age.
+    clock = SimpleNamespace(now=created)
+    monkeypatch.setattr(audio, "time", SimpleNamespace(monotonic=lambda: clock.now))
     mixer = RecordingMixer()
     worker = AudioWorker(mixer, idle_seconds=10)
     peer = FakePeer()
-    worker.session = SpeechSession("owner", "request", peer, 0.1,
-                                   created=time.monotonic() - 31, last_media=time.monotonic())
-    await worker.tick(0.01)
-    assert worker.session is None and peer.close_calls == 1
-    await worker.close()
+    session = SpeechSession("owner", "request", peer, 0.1, created=created, last_media=created)
+    worker.session = session
+    worker.music_active = True
+    try:
+        for age in (0.0, 29.0, 30.0):
+            clock.now = created+age
+            session.last_media = clock.now  # Fresh silence keeps transport alive.
+            await worker.tick(0.01)
+            assert worker.session is session and peer.close_calls == 0
+            assert mixer.ticks[-1]["music_active"] and not mixer.ticks[-1]["speech_active"]
+        clock.now = created+30.001
+        session.last_media = clock.now
+        await worker.tick(0.01)
+        assert worker.session is None  # The30s audible lease, not media idle.
+        assert mixer.ticks[-1]["music_active"] and not mixer.ticks[-1]["speech_active"]
+    finally:
+        await worker.close()
+    assert peer.close_calls == 1
 
 
 async def test_multiple_media_sections_and_rejected_audio_are_not_accepted(valid_sdp):

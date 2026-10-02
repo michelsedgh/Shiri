@@ -34,7 +34,8 @@ from shiri.domain import Room
 from shiri.rpc import RpcError, call_rpc
 from shiri.runtime.broker import Broker
 from shiri.runtime.network import NetworkManager
-from shiri.runtime.system import Runner, atomic_json, process_birth, root_directory
+from shiri.runtime.system import Runner, atomic_json, boot_id, process_birth, root_directory
+from shiri.runtime.units import UNIT_RE, UnitManager
 from shiri.settings import Settings
 
 pytestmark = pytest.mark.skipif(
@@ -169,6 +170,56 @@ async def assert_clean(installation, baseline):
     assert await kernel_snapshot() == baseline, "Host links, addresses or namespaces changed after cleanup"
 
 
+async def assert_recorded_daemons_retired(saved, manager, *, installation_id, room_id):
+    """Read independently: saved immutable unit, retired manager state and old cgroup.
+
+    PID/birth remains the original assertion for a direct process. A systemd
+    unit has no PID authority in its durable record; its invocation and cgroup
+    are the ownership boundary. This helper sends no stop/signal/control call.
+    """
+    assert type(saved) is dict and type(saved.get("processes")) is dict
+    assert saved.get("installation_id") == installation_id
+    retired = []
+    for key, entry in saved["processes"].items():
+        assert type(entry) is dict, "Malformed recorded room daemon"
+        if entry.get("kind") != "systemd-unit":
+            assert entry.get("kind") is None and type(entry.get("pid")) is int and entry["pid"] > 1
+            assert type(entry.get("birth")) is str and entry["birth"], "Malformed direct daemon PID/birth"
+            assert process_birth(entry["pid"]) != entry["birth"], "A recorded room daemon survived recovery"
+            retired.append({"kind": "process", "pid": entry["pid"], "birth": entry["birth"], "retired": True})
+            continue
+        UnitManager.validate_saved(entry)
+        identity = UNIT_RE.fullmatch(entry["unit"])
+        owner, separator, role = key.partition(":")
+        assert (separator and owner in {"sender", room_id} and role == entry["name"]
+                and identity["installation"] == UUID(installation_id).hex[:8]
+                and identity["owner"] == ("sender" if owner == "sender" else UUID(room_id).hex)
+                and identity["role"] == role), "Recorded daemon belongs to another installation/room"
+        assert entry["boot_id"] == boot_id(), "Recorded daemon belongs to another boot"
+        assert (type(entry.get("invocation_id")) is str and entry["invocation_id"] != "0"*32
+                and entry.get("control_group") == f"/system.slice/{entry['unit']}"
+                and type(entry.get("cgroup_inode")) is int and entry["cgroup_inode"] > 0), (
+            "Running daemon record lacks its original invocation/cgroup ownership proof"
+        )
+        assert manager is not None, "Recorded unit requires the actual system manager"
+        actual = await manager.inspect(entry["unit"])
+        if actual is not None:
+            assert type(actual) is dict and actual.get("ActiveState") in {"inactive", "failed"}, (
+                "A recorded room daemon unit survived recovery"
+            )
+            assert all(type(actual.get(field)) is int and actual[field] == 0 for field in ("MainPID", "ControlPID")), (
+                "A retired room daemon still has a main/control process"
+            )
+            manager.verify(entry, actual)  # Exact immutable policy, invocation and cgroup, including reuse refusal.
+        assert manager.cgroup_empty(entry) is True, "A recorded daemon old cgroup is not provably empty"
+        retired.append({"kind": "systemd-unit", "unit": entry["unit"], "invocation_id": entry["invocation_id"],
+            "control_group": entry["control_group"], "cgroup_inode": entry["cgroup_inode"],
+            "observed_state": None if actual is None else actual["ActiveState"],
+            "main_pid": None if actual is None else actual["MainPID"],
+            "control_pid": None if actual is None else actual["ControlPID"], "old_cgroup_empty": True})
+    return retired
+
+
 async def test_fifty_enable_disable_cycles_release_owned_runtime_and_preserve_host(installation):
     baseline = await kernel_snapshot()
     service = Broker(installation.config)
@@ -261,8 +312,8 @@ async def test_sigkill_broker_recovers_dedicated_installation_without_touching_f
             health = await recovering.start(serve=False)
             assert health["ready"], health["error"]
             await assert_clean(installation, baseline)
-            for entry in saved["processes"].values():
-                assert process_birth(entry["pid"]) != entry["birth"], "A recorded room daemon survived recovery"
+            retired = await assert_recorded_daemons_retired(saved, recovering.unit_manager,
+                installation_id=installation.installation_id, room_id=enabled.id)
             assert sentinel.returncode is None and process_birth(sentinel.pid), "Recovery touched a foreign process"
             await recovering.reconcile({"rooms": [enabled.model_dump()]})
             async def recovered_snapshot():
@@ -288,6 +339,7 @@ async def test_sigkill_broker_recovers_dedicated_installation_without_touching_f
     await assert_clean(installation, baseline)
     installation.report(f"recovery-{phase}", {
         "phase": phase, "recorded_processes": len(saved["processes"]),
+        "recorded_daemon_retirement": retired,
         "recorded_networks": len(saved["networks"]), "recovered": True,
         "foreign_process_untouched": True, "versions": recovering.versions,
     })

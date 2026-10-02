@@ -241,6 +241,10 @@ cryptography==50.0.1 \
     # via
     #   aiortc
     #   pyopenssl
+dbus-next==0.2.3 \
+    --hash=sha256:58948f9aff9db08316734c0be2a120f6dc502124d9642f55e90ac82ffb16a18b \
+    --hash=sha256:f4eae26909332ada528c0a3549dda8d4f088f9b365153952a408e28023a626a5
+    # via shiri-audio
 dnspython==2.8.0 \
     --hash=sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af \
     --hash=sha256:181d3c6996452cb1189c4046c61599b84a5a86e099562ffde77d26984ff26d0f

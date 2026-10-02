@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import Field, field_validator
 
 from shiri.auth import Auth, COOKIE, SESSION_SECONDS
-from shiri.domain import Conflict, DomainError, NotFound, RoomCreate, RoomPatch, StrictModel
+from shiri.domain import Conflict, DomainError, NotFound, Room, RoomCreate, RoomPatch, StrictModel
 from shiri.rpc import RpcError
 from shiri.runtime_port import SimulatedRuntime, SocketRuntime
 from shiri.service import RoomService
@@ -39,6 +39,57 @@ class AssignmentRequest(StrictModel):
 class OffsetRequest(StrictModel):
     expected_revision: int = Field(ge=1)
     offset_ms: int = Field(ge=-2000, le=2000)
+
+
+class BalanceRequest(StrictModel):
+    expected_revision: int = Field(ge=1)
+    balance_percent: int = Field(ge=0, le=100)
+
+
+class LocalDeviceBinding(StrictModel):
+    selection_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    binding: str
+    conversion: bool = True
+
+    @field_validator("binding")
+    @classmethod
+    def validate_binding(cls, value):
+        if value not in {"serial", "port", "path", "loopback"}:
+            raise ValueError("Choose a supported physical speaker binding")
+        return value
+
+
+class CalibrationCreate(StrictModel):
+    expected_revision: int = Field(ge=1)
+    target_id: str = Field(pattern=r"^(0|[1-9][0-9]{0,19})$")
+    reference_id: str = Field(pattern=r"^(0|[1-9][0-9]{0,19})$")
+    reference_room_id: str | None = None
+    expected_reference_revision: int | None = Field(default=None, ge=1)
+    playback_context: str | None = Field(default=None, min_length=1, max_length=512)
+    capture_device: str = Field(min_length=1, max_length=256)
+    geometry: str = Field(min_length=1, max_length=512)
+    max_lag_ms: int = Field(default=500, ge=1, le=2000)
+    geometry_correction_ms: float = Field(default=0.0, ge=-100, le=100, allow_inf_nan=False)
+
+    @field_validator("reference_room_id")
+    @classmethod
+    def validate_reference_room(cls, value):
+        return Room.validate_id(value) if value is not None else None
+
+    @field_validator("capture_device", "geometry", "playback_context")
+    @classmethod
+    def validate_description(cls, value):
+        if value is None:
+            return value
+        if value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("Use a description without control characters or surrounding whitespace")
+        return value
+
+
+class CalibrationApply(StrictModel):
+    expected_revision: int = Field(ge=1)
+    expected_generation: int = Field(ge=1)
+    expected_reference_revision: int | None = Field(default=None, ge=1)
 
 
 class SessionRequest(StrictModel):
@@ -226,6 +277,14 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     async def state():
         return await service.state()
 
+    @app.get("/api/v1/local-devices")
+    async def local_devices():
+        return await service.local_devices()
+
+    @app.post("/api/v1/local-devices/bind", status_code=201)
+    async def bind_local_device(body: LocalDeviceBinding):
+        return await service.bind_local_device(body.selection_id, body.binding, body.conversion)
+
     @app.post("/api/v1/rooms", status_code=201)
     async def create_room(body: RoomCreate):
         return await service.create(body)
@@ -250,6 +309,53 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     @app.patch("/api/v1/rooms/{room_id}/speakers/{speaker_id}/offset")
     async def speaker_offset(room_id: str, speaker_id: str, body: OffsetRequest):
         return await service.offset(room_id, speaker_id, body.offset_ms, body.expected_revision)
+
+    @app.patch("/api/v1/rooms/{room_id}/speakers/{speaker_id}/balance")
+    async def speaker_balance(room_id: str, speaker_id: str, body: BalanceRequest):
+        return await service.balance(room_id, speaker_id, body.balance_percent, body.expected_revision)
+
+    @app.post("/api/v1/rooms/{room_id}/calibration", status_code=201)
+    async def calibration_create(room_id: str, body: CalibrationCreate):
+        return await service.calibration_create(room_id, body)
+
+    @app.get("/api/v1/rooms/{room_id}/calibration")
+    async def calibration_list(room_id: str):
+        return await service.calibration_list(room_id)
+
+    @app.get("/api/v1/rooms/{room_id}/calibration/{session_id}")
+    async def calibration_session(room_id: str, session_id: str):
+        return await service.calibration_get(room_id, session_id)
+
+    @app.get("/api/v1/rooms/{room_id}/calibration/{session_id}/probe.wav")
+    async def calibration_probe(room_id: str, session_id: str):
+        return Response(await service.calibration_probe(room_id, session_id), media_type="audio/wav",
+                        headers={"Content-Disposition": 'attachment; filename="shiri-calibration-probe.wav"'})
+
+    @app.post("/api/v1/rooms/{room_id}/calibration/{session_id}/recordings")
+    async def calibration_recording(room_id: str, session_id: str, request: Request,
+                                    verification: bool = Query(default=False)):
+        if request.headers.get("content-type", "").split(";", 1)[0].lower() not in {"audio/wav", "audio/x-wav"}:
+            raise HTTPException(415, "Upload the recording as audio/wav")
+        return await service.calibration_recording(room_id, session_id, await request.body(), verification)
+
+    @app.post("/api/v1/rooms/{room_id}/calibration/{session_id}/apply")
+    async def calibration_apply(room_id: str, session_id: str, body: CalibrationApply):
+        return await service.calibration_apply(room_id, session_id, body.expected_revision, expected_generation=body.expected_generation,
+                                               expected_reference_revision=body.expected_reference_revision)
+
+    @app.post("/api/v1/rooms/{room_id}/calibration/{session_id}/rollback")
+    async def calibration_rollback(room_id: str, session_id: str, body: CalibrationApply):
+        return await service.calibration_apply(room_id, session_id, body.expected_revision, rollback=True, expected_generation=body.expected_generation,
+                                               expected_reference_revision=body.expected_reference_revision)
+
+    @app.get("/api/v1/rooms/{room_id}/calibration/{session_id}/export")
+    async def calibration_export(room_id: str, session_id: str):
+        return JSONResponse(await service.calibration_get(room_id, session_id),
+                            headers={"Content-Disposition": 'attachment; filename="shiri-calibration-evidence.json"'})
+
+    @app.delete("/api/v1/rooms/{room_id}/calibration/{session_id}")
+    async def calibration_delete(room_id: str, session_id: str):
+        return await service.calibration_delete(room_id, session_id)
 
     @app.post("/api/v1/rooms/{room_id}/player")
     async def player(room_id: str, body: PlayerRequest):

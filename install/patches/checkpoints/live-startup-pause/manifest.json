@@ -1,0 +1,8 @@
+{
+  "pin": "d6fb3edf5831de38134ebd92fcf09a730ddd37aa",
+  "ordered_additive_patches": {
+    "owntone-29.3-native-transition-timer.patch": "30fd51dcbc26595d2d5a2cbf845296fac3605da6a76b505aee1dad099b6fe4b3",
+    "owntone-29.3-native-transition2-live.patch": "12214b7ce5a836a1432c84517c263708db9daec9a346a8a6cebac97fa92efbb0",
+    "owntone-29.3-native-transition3-live.patch": "84e1247b892ece84168d6c25509d55ebbd21c450d7386c07a221e1e2c415644a"
+  }
+}

@@ -20,6 +20,7 @@ import stat
 from uuid import UUID, uuid4
 
 from .system import Runner, RuntimeFailure, atomic_json, boot_id, process_args, process_birth, read_json
+from .units import UNIT_RE, UnitManager
 
 log = logging.getLogger(__name__)
 DHCP_ROOT = Path("/etc/dhcp/shiri")
@@ -134,6 +135,31 @@ class NetworkManager:
             except (ValueError, TypeError, KeyError) as exc:
                 raise RuntimeFailure(f"Invalid network ownership record {key}: {exc}") from exc
         for key, entry in self.manifest["processes"].items():
+            if isinstance(entry, dict) and entry.get("kind") == "systemd-unit":
+                if not isinstance(key, str):
+                    raise RuntimeFailure("Invalid daemon reservation key")
+                UnitManager.validate_saved(entry)
+                if entry.get("gate", {}).get("directory") not in {
+                    None, str(self.state_dir / "launch-gates" / entry["unit"]),
+                }:
+                    raise RuntimeFailure("Daemon gate belongs to another installation's state directory")
+                owner, separator, role = key.partition(":")
+                try:
+                    canonical_owner = 'sender' if owner == 'sender' else str(UUID(owner))
+                    unit_owner = 'sender' if owner == 'sender' else UUID(owner).hex
+                except ValueError:
+                    raise RuntimeFailure("Daemon reservation has an invalid canonical room owner") from None
+                identity = UNIT_RE.fullmatch(entry['unit'])
+                if (not separator or owner != canonical_owner or entry.get("name") != role
+                        or identity['installation'] != self.installation_tag
+                        or identity['owner'] != unit_owner or identity['role'] != role):
+                    raise RuntimeFailure("Daemon unit reservation belongs to another installation or room")
+                publication = entry.get("socket_publication")
+                if publication:
+                    directory = Path(publication["directory"])
+                    if directory.parent != self.state_dir / "rooms" / owner / "bridge-published":
+                        raise RuntimeFailure("Bridge socket publication belongs to another room or installation")
+                continue
             if (
                 not isinstance(key, str)
                 or not isinstance(entry, dict)
@@ -158,10 +184,33 @@ class NetworkManager:
 
     def remember_process(self, key: str, process, *, identity=None):
         identity = identity if identity is not None else process.identity()
+        if identity.get("kind") == "systemd-unit":
+            self.remember_unit(key, identity)
+            return
         if not identity.get("boot_id") or not identity.get("executable") or not identity.get("argv"):
             raise RuntimeFailure("A backend process exited before its complete identity could be recorded")
         self.manifest.setdefault("processes", {})[key] = identity
         self.save()
+
+    def reserve_unit(self, key: str, entry: dict):
+        UnitManager.validate_saved(entry)
+        if key in self.manifest["processes"]:
+            raise RuntimeFailure("An earlier daemon reservation still owns this room role")
+        self.manifest["processes"][key] = entry
+        self.save()
+
+    def remember_unit(self, key: str, entry: dict):
+        UnitManager.validate_saved(entry)
+        previous = self.manifest["processes"].get(key)
+        if (not previous or previous.get("kind") != "systemd-unit"
+                or previous.get("unit") != entry["unit"]
+                or (previous.get("invocation_id") and previous["invocation_id"] != entry["invocation_id"])):
+            raise RuntimeFailure("Daemon unit ownership changed while recording its identity")
+        self.manifest["processes"][key] = entry
+        self.save()
+
+    def forget_unit(self, key: str):
+        self.forget_process(key)
 
     def forget_process(self, key: str):
         self.manifest.setdefault("processes", {}).pop(key, None)
@@ -226,6 +275,8 @@ class NetworkManager:
     async def healthy(self, record: dict) -> bool:
         if not await self.owned_namespace(record) or not await self.owned_macvlan(record):
             return False
+        if record.get("role") == "sender":
+            await self.validate_sender_ephemeral_range(record)
         if not await self.ipv4(record["namespace"], record["interface"]):
             return False
         try:
@@ -237,6 +288,23 @@ class NetworkManager:
             and record["pid_file"] in process_args(pid)
             and pid in await self.namespace_pids(record["namespace"])
         )
+
+    async def validate_sender_ephemeral_range(self, record: dict):
+        # listen() without an explicit bind can autoallocate a port without
+        # passing the cgroup bind hook. Never allow that allocation to reach
+        # another room's fixed authenticated HTTP endpoint.
+        if record.get("role") != "sender" or not await self.owned_namespace(record):
+            raise RuntimeFailure("Cannot validate an unowned sender namespace")
+        result = await self.runner.run([
+            "ip", "netns", "exec", record["namespace"], "/usr/bin/cat",
+            "/proc/sys/net/ipv4/ip_local_port_range",
+        ])
+        values = result.stdout.split()
+        if (len(values) != 2 or any(not value.isdecimal() for value in values)
+                or not 1024 <= int(values[0]) <= int(values[1]) <= 65535
+                or (int(values[0]) <= 3939 and int(values[1]) >= 3869)):
+            raise RuntimeFailure("Sender automatic port range overlaps room control ports; refusing daemon launch")
+        return tuple(map(int, values))
 
     def new_record(self, role: str, parent: str, *, room_id: str | None = None):
         suffix = UUID(room_id).hex[:12] if room_id else self.installation_tag
@@ -394,6 +462,7 @@ class NetworkManager:
                 ns + ["ip", "addr", "add", f"{record['api_ip']}/{subnet.prefixlen}", "dev", peer]
             )
             await self.runner.run(ns + ["ip", "link", "set", peer, "up"])
+            await self.validate_sender_ephemeral_range(record)
             return record
         except BaseException:
             await asyncio.shield(self.remove("sender"))
@@ -542,23 +611,13 @@ class NetworkManager:
                 await self.release_dhcp(record)
             except RuntimeFailure as exc:
                 log.warning("DHCP release failed: %s", exc)
-            pids = {pid: process_birth(pid) for pid in await self.namespace_pids(namespace)}
-            for pid, birth in pids.items():
-                if birth and process_birth(pid) == birth:
-                    with suppress(ProcessLookupError):
-                        os.kill(pid, signal.SIGTERM)
-            if pids:
-                await asyncio.sleep(0.3)
-            for pid, birth in pids.items():
-                if birth and process_birth(pid) == birth:
-                    with suppress(ProcessLookupError):
-                        os.kill(pid, signal.SIGKILL)
+            await self._stop_dhcp_survivors(record)
             for _ in range(20):
                 if not await self.namespace_pids(namespace):
                     break
                 await asyncio.sleep(0.1)
             else:
-                raise RuntimeFailure(f"Processes remain in {namespace}; resources stay reserved")
+                raise RuntimeFailure(f"Unrecorded processes remain in {namespace}; resources stay reserved")
             await self.runner.run(["ip", "netns", "delete", namespace])
         else:
             await asyncio.to_thread(self._remove_inactive_namespace_file, namespace)
@@ -582,6 +641,53 @@ class NetworkManager:
             )
         self.manifest["networks"].pop(key, None)
         self.save()
+
+    async def _stop_dhcp_survivors(self, record):
+        """Stop only the exact private DHCP client through a captured pidfd.
+
+        Room units were already proven empty. Unknown namespace occupants do
+        not become signal authority merely because the namespace is ours.
+        """
+        pids = await self.namespace_pids(record["namespace"])
+        if not pids:
+            return
+        try:
+            descriptor = os.open(record["pid_file"], os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(descriptor)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1):
+                    raise RuntimeFailure("DHCP process reservation is unsafe; resources stay reserved")
+                pid = int(os.read(descriptor, 32).strip())
+            finally:
+                os.close(descriptor)
+        except (OSError, ValueError, KeyError) as exc:
+            raise RuntimeFailure("Unrecorded namespace occupants require inspection; nothing was signalled") from exc
+        if pids != [pid]:
+            raise RuntimeFailure("Unrecorded namespace occupants require inspection; nothing was signalled")
+        birth = process_birth(pid)
+        args = process_args(pid)
+        if (not birth or not args or Path(args[0]).name != "dhclient"
+                or record["pid_file"] not in args):
+            raise RuntimeFailure("Namespace DHCP identity changed; nothing was signalled")
+        handle, namespace_fd = None, None
+        try:
+            handle = os.pidfd_open(pid, 0)
+            namespace_fd = os.open(f"/proc/{pid}/ns/net", os.O_RDONLY)
+            if (process_birth(pid) != birth or os.fstat(namespace_fd).st_ino != record["inode"]
+                    or not await self.owned_namespace(record)):
+                raise RuntimeFailure("DHCP namespace or process changed before signal admission")
+            signal.pidfd_send_signal(handle, signal.SIGTERM)
+            await asyncio.sleep(0.3)
+            with suppress(ProcessLookupError):
+                signal.pidfd_send_signal(handle, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            raise RuntimeFailure("Cannot stop the captured owned DHCP client; resources stay reserved") from exc
+        finally:
+            for descriptor in [handle, namespace_fd]:
+                if descriptor is not None:
+                    os.close(descriptor)
 
     async def _remove_host_link(
         self,

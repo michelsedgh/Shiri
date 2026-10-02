@@ -16,7 +16,7 @@ typedef struct { size_t frame_bytes; } snd_pcm_t;
 struct media_quality { int bits_per_sample; int channels; };
 struct alsa_mixer { int unused; };
 struct alsa_extra {
-  const char *card_name, *mixer_name, *mixer_device_name;
+  const char *card_name, *mixer_name, *mixer_device_name, *pcm_identity_file;
   bool software_volume;
 };
 struct alsa_playback_session;
@@ -24,7 +24,7 @@ struct alsa_session {
   bool software_volume;
   int volume, state, callback_id;
   uint64_t device_id, delay_ms;
-  const char *devname, *mixer_name, *mixer_device_name;
+  const char *devname, *mixer_name, *mixer_device_name, *pcm_identity_file;
   struct alsa_mixer mixer;
   struct alsa_session *next;
   struct alsa_playback_session *pb;

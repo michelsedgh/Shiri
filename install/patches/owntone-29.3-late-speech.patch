@@ -1,0 +1,507 @@
+diff --git a/configure.ac b/configure.ac
+index 7db4642..b09b894 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 5542cab..c706e66 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -112,7 +112,7 @@ owntone_SOURCES = main.c \
+ 	misc_xml.c misc_xml.h \
+ 	rng.c rng.h \
+ 	smartpl_query.c smartpl_query.h \
+-	player.c player.h shiri_source.h shiri_source_json.h \
++	player.c player.h shiri_source.h shiri_source_json.h shiri_speech.c shiri_speech.h \
+ 	worker.c worker.h \
+ 	settings.c settings.h \
+ 	input.h input.c \
+diff --git a/src/conffile.c b/src/conffile.c
+index 287e24a..1ccae21 100644
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -77,6 +77,10 @@ static cfg_opt_t sec_general[] =
+     CFG_BOOL("ssl_verifypeer", cfg_true, CFGF_NONE),
+     CFG_BOOL("timer_test", cfg_false, CFGF_NONE),
+     CFG_INT("start_buffer_ms", 2250, CFGF_NONE),
++    CFG_STR("shiri_speech_socket", NULL, CFGF_NONE),
++    CFG_INT("shiri_speech_peer_uid", 0, CFGF_NONE),
++    CFG_STR("shiri_speech_room_id", NULL, CFGF_NONE),
++    CFG_STR("shiri_speech_launch_generation", NULL, CFGF_NONE),
+     CFG_END()
+   };
+ 
+diff --git a/src/player.c b/src/player.c
+index 192d7c2..6d581ce 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -86,6 +86,7 @@
+ 
+ // Audio and metadata input
+ #include "input.h"
++#include "shiri_speech.h"
+ 
+ // Scrobbling
+ #ifdef LASTFM
+@@ -1312,6 +1313,9 @@ playback_cb(int fd, short what, void *arg)
+   int ret;
+   size_t read_size;
+ 
++  /* One bounded nonblocking receive burst per existing playback tick. */
++  shiri_speech_poll();
++
+   // Check if we missed any timer expirations
+   overrun = 0;
+ #ifdef HAVE_TIMERFD
+@@ -1403,6 +1407,10 @@ playback_cb(int fd, short what, void *arg)
+ 
+       pb_session.read_deficit -= nbytes;
+ 
++      /* Mix only this player-owned PCM, before shared conversion/encoding.
++       * This changes no program position, anchor, source or output state. */
++      shiri_speech_mix(pb_session.buffer, nbytes, nsamples, pb_session.quality.sample_rate,
++                       pb_session.quality.bits_per_sample, pb_session.quality.channels);
+       outputs_write(pb_session.buffer, nbytes, nsamples, &pb_session.quality, &pb_session.pts);
+ 
+       if (nbytes < pb_session.bufsize)
+@@ -4267,6 +4275,17 @@ player_init(void)
+       goto error_outputs_deinit;
+     }
+ 
++  ret = shiri_speech_init(cfg_getstr(cfg_getsec(cfg, "general"), "shiri_speech_socket"),
++                          cfg_getint(cfg_getsec(cfg, "general"), "shiri_speech_peer_uid"),
++                          cfg_getstr(cfg_getsec(cfg, "general"), "shiri_speech_room_id"),
++                          cfg_getstr(cfg_getsec(cfg, "general"), "shiri_speech_launch_generation"),
++                          cfg_getbool(cfg_getsec(cfg, "library"), "pipe_framed"));
++  if (ret < 0)
++    {
++      DPRINTF(E_FATAL, L_PLAYER, "Private speech overlay admission failed\n");
++      goto error_input_deinit;
++    }
++
+   ret = pthread_create(&tid_player, NULL, player, NULL);
+   if (ret < 0)
+     {
+@@ -4277,6 +4296,7 @@ player_init(void)
+   return 0;
+ 
+  error_input_deinit:
++  shiri_speech_deinit();
+   input_deinit();
+  error_outputs_deinit:
+   outputs_deinit();
+@@ -4323,6 +4343,7 @@ player_deinit(void)
+       return;
+     }
+ 
++  shiri_speech_deinit();
+   free(history);
+ 
+   event_free(pb_timer_ev);
+diff --git a/src/shiri_speech.c b/src/shiri_speech.c
+new file mode 100644
+index 0000000..1d78520
+--- /dev/null
++++ b/src/shiri_speech.c
+@@ -0,0 +1,371 @@
++/* Fixed, authenticated late speech mixing for the explicit Shiri framed
++ * profile. PCM stays on the player's existing 10 ms clock. Source frame
++ * counts, timestamps, output queues and transport state are never changed.
++ * All state below belongs exclusively to the player thread after init. */
++#ifdef HAVE_CONFIG_H
++# include <config.h>
++#endif
++
++#include <stdint.h>
++#include <limits.h>
++#include <string.h>
++#include <stdlib.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <errno.h>
++#include <math.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#ifdef __linux__
++# include <sys/socket.h>
++# include <sys/un.h>
++#endif
++
++#include "shiri_speech.h"
++
++#define SPEECH_HEADER 80u
++#define SPEECH_FRAMES 960u
++#define SPEECH_RATE 48000u
++#define SPEECH_QUEUE 12000u
++#define SPEECH_BURST 25u
++#define SPEECH_AGE_NS UINT64_C(250000000)
++#define SPEECH_FUTURE_NS UINT64_C(5000000)
++#define SPEECH_FULL_GAIN 65536u
++
++struct speech_state {
++  uint8_t room[16], launch[16];
++  int16_t samples[SPEECH_QUEUE];
++  uint8_t audible[SPEECH_QUEUE];
++  uint32_t gains[SPEECH_QUEUE];
++  uint64_t expires[SPEECH_QUEUE];
++  unsigned head, count;
++  uint64_t sequence, lease;
++  uint64_t refused, expired, admitted;
++  uint32_t duck;
++  double gain;
++  int active;
++};
++
++static struct speech_state speech;
++static int speech_fd = -1, speech_directory = -1;
++static char speech_basename[64];
++static dev_t speech_dev;
++static ino_t speech_ino;
++#ifdef __linux__
++static uid_t speech_peer;
++#endif
++
++static void
++speech_counter(uint64_t *counter)
++{
++  if (*counter < UINT64_MAX)
++    ++*counter;
++}
++
++static uint64_t
++speech_now(void)
++{
++  struct timespec ts;
++  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0 || ts.tv_sec < 0 ||
++      ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L ||
++      (uint64_t)ts.tv_sec > (UINT64_MAX - (uint64_t)ts.tv_nsec) / UINT64_C(1000000000))
++    return 0;
++  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++}
++
++static uint32_t
++speech_u32(const uint8_t *p)
++{
++  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++static uint64_t
++speech_u64(const uint8_t *p)
++{
++  return ((uint64_t)speech_u32(p) << 32) | speech_u32(p + 4);
++}
++
++static int
++speech_hex(const char *text, uint8_t id[16], int uuid)
++{
++  unsigned i, n = 0, high = 0, value;
++  uint8_t result[16], any = 0;
++  if (!text || strlen(text) != (uuid ? 36u : 32u))
++    return -1;
++  for (i = 0; text[i]; ++i) {
++    if (uuid && (i == 8 || i == 13 || i == 18 || i == 23)) {
++      if (text[i] != '-') return -1;
++      continue;
++    }
++    if (text[i] >= '0' && text[i] <= '9') value = (unsigned)(text[i] - '0');
++    else if (text[i] >= 'a' && text[i] <= 'f') value = (unsigned)(text[i] - 'a') + 10;
++    else return -1;
++    if (n % 2) { result[n / 2] = (uint8_t)((high << 4) | value); any |= result[n / 2]; }
++    else high = value;
++    ++n;
++  }
++  if (n != 32 || !any) return -1;
++  memcpy(id, result, 16);
++  return 0;
++}
++
++static void
++speech_expire(struct speech_state *s, uint64_t now)
++{
++  if (!now) {
++    s->head = s->count = 0;
++    s->active = 0;
++    return;
++  }
++  while (s->count && now >= s->expires[s->head]) {
++    s->head = (s->head + 1) % SPEECH_QUEUE;
++    --s->count;
++    speech_counter(&s->expired);
++  }
++  if (now >= s->lease)
++    s->active = 0;
++}
++
++/* Atomic validation/admission. A refused packet cannot update sequence,
++ * refresh ducking, replace an existing queue, or partially admit samples. */
++static int
++speech_receive(struct speech_state *s, const uint8_t *packet, size_t bytes, uint64_t now)
++{
++  uint64_t sequence, emitted, expires;
++  uint32_t frames, payload, duck, flags;
++  unsigned i, pos;
++  uint8_t op;
++  if (!packet || bytes < SPEECH_HEADER || !now || now > UINT64_MAX - SPEECH_AGE_NS)
++    goto refused;
++  sequence = speech_u64(packet + 16); emitted = speech_u64(packet + 56);
++  frames = speech_u32(packet + 64); payload = speech_u32(packet + 12);
++  duck = speech_u32(packet + 68); flags = speech_u32(packet + 72); op = packet[9];
++  if (memcmp(packet, "SHRITTS1", 8) || packet[8] != 1 || packet[10] != 0 || packet[11] != SPEECH_HEADER ||
++      memcmp(packet + 24, s->room, 16) || memcmp(packet + 40, s->launch, 16) ||
++      !sequence || sequence > INT64_MAX || sequence <= s->sequence ||
++      !emitted || emitted > UINT64_MAX - SPEECH_AGE_NS ||
++      (emitted > now ? emitted - now > SPEECH_FUTURE_NS : now - emitted >= SPEECH_AGE_NS) ||
++      duck > SPEECH_FULL_GAIN || (flags & ~1u) || speech_u32(packet + 76) ||
++      payload != bytes - SPEECH_HEADER)
++    goto refused;
++  if (op == 1) {
++    if (!frames || frames > SPEECH_FRAMES || payload != frames * 2u ||
++        frames > SPEECH_QUEUE - s->count)
++      goto refused;
++  } else if (op == 2) {
++    if (frames || payload) goto refused;
++  } else goto refused;
++
++  expires = emitted + SPEECH_AGE_NS;
++  if (expires > now + SPEECH_AGE_NS) expires = now + SPEECH_AGE_NS;
++  if (op == 1) {
++    for (i = 0; i < frames; ++i) {
++      pos = (s->head + s->count + i) % SPEECH_QUEUE;
++      /* Avoid implementation-defined unsigned-to-signed conversion. */
++      unsigned value = packet[SPEECH_HEADER + 2 * i] | ((unsigned)packet[SPEECH_HEADER + 2 * i + 1] << 8);
++      s->samples[pos] = (int16_t)(value & 32768u ? (int)value - 65536 : (int)value);
++      s->audible[pos] = (uint8_t)flags;
++      s->gains[pos] = duck;
++      s->expires[pos] = expires;
++    }
++    s->count += frames;
++  }
++  /* Normal EOF ends the active lease, not already-admitted audio. Keep valid
++   * queued samples until their own deadline; a short cold utterance must not
++   * be erased by an EOF control arriving before the first player tick. */
++  s->sequence = sequence;
++  /* A quiet PCM packet describes its own samples only. It cannot extend,
++   * clear, or replace an existing audible lease. Explicit controls can. */
++  if (op == 2 || flags) {
++    s->active = (int)flags; s->duck = duck; s->lease = expires;
++  }
++  speech_counter(&s->admitted);
++  return 0;
++refused:
++  speech_counter(&s->refused);
++  return -1;
++}
++
++static void
++speech_mix(struct speech_state *s, uint8_t *pcm, size_t bytes, int frames, unsigned rate,
++           unsigned bits, unsigned channels, uint64_t now)
++{
++  unsigned i, channel;
++  int voice, value, mixed;
++  double target, step;
++  if (!pcm || frames <= 0 || frames > (int)(SPEECH_RATE / 5) || rate != SPEECH_RATE || bits != 16 || channels != 2 ||
++      (uint64_t)(unsigned)frames * 4 != bytes)
++    return;
++  speech_expire(s, now);
++  for (i = 0; i < (unsigned)frames; ++i) {
++    speech_expire(s, now);
++    /* Already-admitted speech retains its own session policy through normal
++     * EOF or later controls. Only an audible head may override the lease. */
++    target = (s->count && s->audible[s->head]) ? (double)s->gains[s->head] / SPEECH_FULL_GAIN :
++             (s->active ? (double)s->duck / SPEECH_FULL_GAIN : 1.0);
++    step = 1.0 / (SPEECH_RATE * (target < s->gain ? 0.04 : 0.25));
++    if (target < s->gain) { s->gain -= step; if (s->gain < target) s->gain = target; }
++    else if (target > s->gain) { s->gain += step; if (s->gain > target) s->gain = target; }
++    voice = 0;
++    if (s->count) {
++      voice = s->samples[s->head]; s->head = (s->head + 1) % SPEECH_QUEUE; --s->count;
++    }
++    for (channel = 0; channel < 2; ++channel) {
++      unsigned offset = i * 4u + channel * 2u;
++      unsigned raw = pcm[offset] | ((unsigned)pcm[offset + 1] << 8);
++      value = raw & 32768u ? (int)raw - 65536 : (int)raw;
++      mixed = (int)lround((double)value * s->gain) + voice;
++      if (mixed > 32767) mixed = 32767;
++      if (mixed < -32768) mixed = -32768;
++      raw = (unsigned)(mixed < 0 ? mixed + 65536 : mixed);
++      pcm[offset] = (uint8_t)raw; pcm[offset + 1] = (uint8_t)(raw >> 8);
++    }
++  }
++}
++
++int
++shiri_speech_init(const char *path, long peer_uid, const char *room, const char *launch, int framed)
++{
++  if (!path || !*path)
++    return (peer_uid || (room && *room) || (launch && *launch)) ? -1 : 0;
++#ifdef __linux__
++  struct sockaddr_un addr;
++  struct stat directory, node;
++  char parent[sizeof(addr.sun_path)], held[sizeof(addr.sun_path)];
++  const char *base;
++  size_t length;
++  int passcred = 1, size = 65536;
++  if (speech_fd >= 0 || speech_directory >= 0 || !framed || !geteuid() || peer_uid <= 0 ||
++      (uint64_t)peer_uid > UINT_MAX || (uid_t)peer_uid == geteuid() ||
++      path[0] != '/' || strlen(path) >= sizeof(addr.sun_path) ||
++      speech_hex(room, speech.room, 1) < 0 || speech_hex(launch, speech.launch, 0) < 0)
++    return -1;
++  base = strrchr(path, '/') + 1; length = (size_t)(base - path - 1);
++  if (!length || !*base || strlen(base) >= sizeof(speech_basename) ||
++      strspn(base, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != strlen(base) ||
++      !strcmp(base, ".") || !strcmp(base, ".."))
++    return -1;
++  memcpy(parent, path, length); parent[length] = 0;
++  speech_directory = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++  if (speech_directory < 0 || fstat(speech_directory, &directory) < 0 ||
++      !S_ISDIR(directory.st_mode) || directory.st_uid != geteuid() ||
++      (directory.st_mode & 07777) != 02710)
++    goto failed;
++  if (fstatat(speech_directory, base, &node, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
++    goto failed;
++  speech_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++  if (speech_fd < 0 || setsockopt(speech_fd, SOL_SOCKET, SO_PASSCRED, &passcred, sizeof(passcred)) < 0 ||
++      setsockopt(speech_fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) < 0)
++    goto failed;
++  memset(&addr, 0, sizeof(addr)); addr.sun_family = AF_UNIX;
++  if (snprintf(held, sizeof(held), "/proc/self/fd/%d/%s", speech_directory, base) >= (int)sizeof(held))
++    goto failed;
++  memcpy(addr.sun_path, held, strlen(held) + 1);
++  if (bind(speech_fd, (struct sockaddr *)&addr, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(held) + 1)) < 0)
++    goto failed;
++  if (fstatat(speech_directory, base, &node, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISSOCK(node.st_mode) ||
++      node.st_uid != geteuid() || node.st_nlink != 1)
++    goto failed;
++  speech_dev = node.st_dev; speech_ino = node.st_ino;
++  memcpy(speech_basename, base, strlen(base) + 1);
++  /* Retain this own newly-created inode before checking inherited metadata,
++   * so later failure can retire it without touching a substituted endpoint. */
++  if (node.st_gid != directory.st_gid)
++    goto failed;
++  if (fchmodat(speech_directory, base, 0660, 0) < 0 ||
++      fstatat(speech_directory, base, &node, AT_SYMLINK_NOFOLLOW) < 0 ||
++      node.st_dev != speech_dev || node.st_ino != speech_ino ||
++      node.st_uid != geteuid() || node.st_gid != directory.st_gid || (node.st_mode & 07777) != 0660)
++    goto failed;
++  speech_peer = (uid_t)peer_uid;
++  speech.gain = 1.0;
++  return 0;
++failed:
++  shiri_speech_deinit();
++  return -1;
++#else
++  (void)peer_uid; (void)room; (void)launch; (void)framed;
++  return -1; /* Never silently enable an unauthenticated portable fallback. */
++#endif
++}
++
++void
++shiri_speech_poll(void)
++{
++#ifdef __linux__
++  uint8_t packet[SPEECH_HEADER + 2 * SPEECH_FRAMES];
++  union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(16 * sizeof(int))]; } control;
++  struct iovec iov;
++  struct msghdr message;
++  struct cmsghdr *cmsg;
++  struct ucred credentials;
++  unsigned i, found;
++  ssize_t bytes;
++  uint64_t now;
++  if (speech_fd < 0) return;
++  now = speech_now(); speech_expire(&speech, now);
++  for (i = 0; i < SPEECH_BURST; ++i) {
++    memset(&message, 0, sizeof(message)); memset(&control, 0, sizeof(control));
++    iov.iov_base = packet; iov.iov_len = sizeof(packet);
++    message.msg_iov = &iov; message.msg_iovlen = 1;
++    message.msg_control = control.bytes; message.msg_controllen = sizeof(control.bytes);
++    bytes = recvmsg(speech_fd, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
++    if (bytes < 0) { if (errno == EINTR) continue; break; }
++    found = 0;
++    memset(&credentials, 0, sizeof(credentials));
++    for (cmsg = CMSG_FIRSTHDR(&message); cmsg; cmsg = CMSG_NXTHDR(&message, cmsg)) {
++      if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_CREDENTIALS &&
++          cmsg->cmsg_len == CMSG_LEN(sizeof(credentials))) {
++        memcpy(&credentials, CMSG_DATA(cmsg), sizeof(credentials)); ++found;
++      } else {
++        /* A malicious producer may attach descriptors even to a malformed or
++         * wrong-UID packet. Reap every delivered FD; truncated excess rights
++         * are closed by recvmsg itself. No ancillary authority is accepted. */
++        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
++            cmsg->cmsg_len >= CMSG_LEN(0)) {
++          size_t n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int), j;
++          for (j = 0; j < n; ++j) {
++            int fd;
++            memcpy(&fd, (uint8_t *)CMSG_DATA(cmsg) + j * sizeof(int), sizeof(fd));
++            if (fd >= 0) close(fd);
++          }
++        }
++        found += 2;
++      }
++    }
++    if ((message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || found != 1 ||
++        credentials.uid != speech_peer || credentials.pid <= 0) {
++      speech_counter(&speech.refused); continue;
++    }
++    now = speech_now();
++    speech_receive(&speech, packet, (size_t)bytes, now);
++  }
++#endif
++}
++
++void
++shiri_speech_mix(void *pcm, size_t bytes, int frames, unsigned rate, unsigned bits, unsigned channels)
++{
++  if (speech_fd >= 0)
++    speech_mix(&speech, pcm, bytes, frames, rate, bits, channels, speech_now());
++}
++
++void
++shiri_speech_deinit(void)
++{
++  struct stat node;
++  if (speech_fd >= 0) close(speech_fd);
++  speech_fd = -1;
++  if (speech_directory >= 0) {
++    if (*speech_basename && fstatat(speech_directory, speech_basename, &node, AT_SYMLINK_NOFOLLOW) == 0 &&
++        S_ISSOCK(node.st_mode) && node.st_uid == geteuid() && node.st_nlink == 1 &&
++        node.st_dev == speech_dev && node.st_ino == speech_ino)
++      unlinkat(speech_directory, speech_basename, 0);
++    close(speech_directory);
++  }
++  speech_directory = -1; *speech_basename = 0; speech_dev = 0; speech_ino = 0;
++  memset(&speech, 0, sizeof(speech));
++}
+diff --git a/src/shiri_speech.h b/src/shiri_speech.h
+new file mode 100644
+index 0000000..d4c5af7
+--- /dev/null
++++ b/src/shiri_speech.h
+@@ -0,0 +1,16 @@
++/* Room-local speech overlay. The existing player/output clocks remain owned
++ * by OwnTone; this module never opens an output or changes a source. */
++#ifndef SHIRI_SPEECH_H
++#define SHIRI_SPEECH_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++int shiri_speech_init(const char *path, long peer_uid, const char *room,
++                      const char *launch, int framed);
++void shiri_speech_poll(void);
++void shiri_speech_mix(void *pcm, size_t bytes, int frames, unsigned rate,
++                     unsigned bits, unsigned channels);
++void shiri_speech_deinit(void);
++
++#endif

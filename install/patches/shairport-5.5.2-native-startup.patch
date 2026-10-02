@@ -1,0 +1,356 @@
+diff --git a/player.c b/player.c
+--- a/player.c
++++ b/player.c
+@@ -3351,6 +3351,60 @@
+ }
+ #endif
+ 
++#ifdef CONFIG_AIRPLAY_2
++/* Only a successful pthread_create transfers a receive thread to this conn.
++ * Clear ownership before joining so failed SETUP and normal player teardown
++ * share one cleanup path without joining absent or already-retired handles. */
++static void player_ap2_receivers_stop(rtsp_conn_info *conn) {
++  if (conn->rtp_realtime_audio_started) {
++    conn->rtp_realtime_audio_started = 0;
++    pthread_cancel(conn->rtp_realtime_audio_thread);
++    pthread_join(conn->rtp_realtime_audio_thread, NULL);
++  }
++  if (conn->rtp_buffered_audio_started) {
++    conn->rtp_buffered_audio_started = 0;
++    pthread_cancel(conn->rtp_buffered_audio_thread);
++    pthread_join(conn->rtp_buffered_audio_thread, NULL);
++  }
++  if (conn->rtp_ap2_control_started) {
++    conn->rtp_ap2_control_started = 0;
++    pthread_cancel(conn->rtp_ap2_control_thread);
++    pthread_join(conn->rtp_ap2_control_thread, NULL);
++  }
++}
++#endif
++
++static void player_unstarted_session_abort_locked(rtsp_conn_info *conn) {
++  int old_state;
++  if (!conn || conn->player_thread)
++    return; /* A published player owns its receive threads and exact route. */
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
++  if (config.output->session_end)
++    config.output->session_end(conn->connection_number);
++#ifdef CONFIG_AIRPLAY_2
++  if (conn->airplay_type == ap_2) {
++    int receiving = conn->rtp_realtime_audio_started || conn->rtp_buffered_audio_started ||
++                    conn->rtp_ap2_control_started;
++    player_ap2_receivers_stop(conn);
++    if (receiving)
++      ptp_send_control_message_string("E");
++    conn->rtp_running = 0;
++  }
++#endif
++  pthread_setcancelstate(old_state, NULL);
++}
++
++void player_unstarted_session_abort(rtsp_conn_info *conn) {
++  if (!conn)
++    return;
++  /* player_stop clears player_thread before joining it while holding this
++   * mutex. A canceled RTSP thread must wait for that existing cleanup rather
++   * than race its receive-thread joins after seeing a transient NULL pointer. */
++  pthread_mutex_lock_and_cleanup_push(&conn->player_create_delete_mutex);
++  player_unstarted_session_abort_locked(conn);
++  pthread_cleanup_pop(1);
++}
++
+ void player_thread_cleanup_handler(void *arg) {
+   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+   // debug(1, "Connection %d: player_thread_cleanup_handler start.", conn->connection_number);
+@@ -3407,28 +3461,7 @@
+ #ifdef CONFIG_AIRPLAY_2
+   if (conn->airplay_type == ap_2) {
+     debug(2, "Cancelling AP2 timing, control and audio threads...");
+-    if (conn->airplay_stream_type == realtime_stream) {
+-      debug(2, "Connection %d: Delete Realtime Audio Stream thread", conn->connection_number);
+-      pthread_cancel(conn->rtp_realtime_audio_thread);
+-      pthread_join(conn->rtp_realtime_audio_thread, NULL);
+-
+-    } else if (conn->airplay_stream_type == buffered_stream) {
+-
+-      debug(3,
+-            "Connection %d: Delete Buffered Audio Stream thread by player_thread_cleanup_handler",
+-            conn->connection_number);
+-      pthread_cancel(conn->rtp_buffered_audio_thread);
+-      pthread_join(conn->rtp_buffered_audio_thread, NULL);
+-      debug(3,
+-            "Connection %d: Deleted Buffered Audio Stream thread by player_thread_cleanup_handler",
+-            conn->connection_number);
+-    } else {
+-      die("Unrecognised Stream Type");
+-    }
+-
+-    debug(2, "Connection %d: Delete AirPlay 2 Control thread", conn->connection_number);
+-    pthread_cancel(conn->rtp_ap2_control_thread);
+-    pthread_join(conn->rtp_ap2_control_thread, NULL);
++    player_ap2_receivers_stop(conn);
+   } else {
+     debug(2, "Cancelling AP1-compatible timing, control and audio threads...");
+ #else
+@@ -3641,15 +3674,6 @@
+     debug(1, "ffmpeg flush at start!");
+ #endif
+ 
+-  if (config.output->session_begin) {
+-#ifdef CONFIG_AIRPLAY_2
+-    config.output->session_begin(conn->connection_number, conn->airplay_gid,
+-                                 conn->groupContainsGroupLeader, conn->airplay_type == ap_2,
+-                                 conn->own_airplay_volume);
+-#else
+-    config.output->session_begin(conn->connection_number, NULL, 0, 0, conn->own_airplay_volume);
+-#endif
+-  }
+ 
+   // leave this relic -- jack and soundio still use it
+   if (config.output->start != NULL)
+@@ -5314,7 +5338,23 @@
+ #endif
+ }
+ 
++/* A native BEGIN may now be admitted while the synchronous AP2 SETUP is
++ * waiting for its exact source barrier. Until the player thread is published,
++ * this scope owns both that route and the already-created AP2 receive threads.
++ * Cancellation or failed admission must not leave either using a freed conn. */
++struct player_unstarted_session {
++  rtsp_conn_info *conn;
++  pthread_t *thread;
++};
++
++static void player_unstarted_session_cleanup(void *arg) {
++  struct player_unstarted_session *pending = arg;
++  player_unstarted_session_abort_locked(pending->conn);
++  free(pending->thread);
++}
++
+ int player_play(rtsp_conn_info *conn) {
++  int result = 0;
+   debug(2, "Connection %d: player_play.", conn->connection_number);
+   command_start(); // before startup, and before the prepare() method runs
+   // give the output device as much advance warning as possible to get ready
+@@ -5330,16 +5370,40 @@
+     if (pt == NULL)
+       die("Couldn't allocate space for pthread_t");
+ 
+-    int rc = named_pthread_create_with_priority(pt, 3, player_thread_func, (void *)conn,
+-                                                "player_%d", conn->connection_number);
+-    if (rc)
+-      debug(1, "Connection %d: error creating player_thread: %s", conn->connection_number,
+-            strerror(errno));
+-    conn->player_thread = pt; // set _after_ creation of thread
++    struct player_unstarted_session pending = {conn, pt};
++    pthread_cleanup_push(player_unstarted_session_cleanup, (void *)&pending);
++    /* Complete BEGIN and its exact selected-output START barrier before the
++     * stream SETUP response lets the sender establish the first presentation
++     * anchor. Reuse the existing fenced route; do not create a warm-up owner. */
++    if (config.output->session_begin) {
++#ifdef CONFIG_AIRPLAY_2
++      config.output->session_begin(conn->connection_number, conn->airplay_gid,
++                                   conn->groupContainsGroupLeader, conn->airplay_type == ap_2,
++                                   suggested_volume(conn));
++#else
++      config.output->session_begin(conn->connection_number, NULL, 0, 0, suggested_volume(conn));
++#endif
++    }
++
++    if (config.output->session_retired && config.output->session_retired(conn->connection_number)) {
++      warn("Connection %d: output preparation failed before playback.", conn->connection_number);
++      result = EIO;
++    } else {
++      result = named_pthread_create_with_priority(pt, 3, player_thread_func, (void *)conn,
++                                                  "player_%d", conn->connection_number);
++      if (result)
++        debug(1, "Connection %d: error creating player_thread: %s", conn->connection_number,
++              strerror(result));
++      else
++        conn->player_thread = pt; // transfer cleanup ownership after creation
++    }
++    pthread_cleanup_pop(result != 0);
+   } else {
+     debug(1, "Connection %d: player thread already exists.", conn->connection_number);
+   }
+   pthread_cleanup_pop(1); // release the player_create_delete_mutex
++  if (result)
++    return result;
+ #ifdef CONFIG_METADATA
+   send_ssnc_metadata('pbeg', NULL, 0, 1); // contains cancellation points
+ #endif
+diff --git a/player.h b/player.h
+--- a/player.h
++++ b/player.h
+@@ -426,6 +426,7 @@
+   pthread_t rtp_ap2_control_thread;
+   pthread_t rtp_realtime_audio_thread;
+   pthread_t rtp_buffered_audio_thread;
++  int rtp_ap2_control_started, rtp_realtime_audio_started, rtp_buffered_audio_started;
+   pthread_mutex_t event_sender_mutex;
+   int event_channel_fd; // zero if closed, controlled by event_sender_mutex
+ 
+@@ -598,6 +599,7 @@
+ void ab_resync(rtsp_conn_info *conn);
+ 
+ int player_play(rtsp_conn_info *conn);
++void player_unstarted_session_abort(rtsp_conn_info *conn);
+ int player_stop(rtsp_conn_info *conn);
+ 
+ void player_volume(double f, rtsp_conn_info *conn);
+diff --git a/rtsp.c b/rtsp.c
+--- a/rtsp.c
++++ b/rtsp.c
+@@ -917,7 +917,12 @@
+       warn("Connection %d: RECORD: Duplicate RECORD message -- ignored", conn->connection_number);
+     else {
+       activity_monitor_signify_activity(1);
+-      player_play(conn); // the thread better be 0
++      if (player_play(conn)) {
++        resp->respcode = 503;
++        conn->stop = 1;
++        activity_monitor_signify_activity(0);
++        return;
++      }
+     }
+ 
+     resp->respcode = 200;
+@@ -2380,7 +2385,7 @@
+ #endif
+ 
+ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
+-  int err;
++  int err, play_result = 0;
+   
+   debug(4, "Connection %d from \"%s\": SETUP (AP2) %s Content-Length %d", conn->connection_number, conn->ap2_client_name, req->path, req->contentlength);
+   debug_log_rtsp_message_conn(conn, 4, "SETUP (AP2)", req);
+@@ -2754,6 +2759,12 @@
+         debug(1, "stopping a running player during setup phase 2");
+         player_stop(conn); // this nulls the player_thread and cancels the threads...
+         activity_monitor_signify_activity(0); // inactive, and should be after command_stop()
++      } else if (conn->rtp_realtime_audio_started || conn->rtp_buffered_audio_started ||
++                 conn->rtp_ap2_control_started) {
++        /* A prior PTP type130 SETUP can own a control receiver without a
++         * player. Retire it before this SETUP replaces any socket or handle. */
++        player_unstarted_session_abort(conn);
++        activity_monitor_signify_activity(0);
+       }
+ 
+       set_client_as_ptp_clock(conn);
+@@ -2820,8 +2831,11 @@
+       debug(2, "Connection %d: UDP control port opened: %u.", conn->connection_number,
+             conn->local_ap2_control_port);
+ 
+-      named_pthread_create(&conn->rtp_ap2_control_thread, NULL, &rtp_ap2_control_receiver,
+-                           (void *)conn, "ap2_cn_%d", conn->connection_number);
++      err = named_pthread_create(&conn->rtp_ap2_control_thread, NULL, &rtp_ap2_control_receiver,
++                                 (void *)conn, "ap2_cn_%d", conn->connection_number);
++      conn->rtp_ap2_control_started = (err == 0);
++      if (err)
++        play_result = err;
+ 
+       // get the DACP-ID and Active Remote for remote control stuff
+ 
+@@ -2909,17 +2923,23 @@
+         debug(2, "Connection %d: UDP realtime audio port opened: %u.", conn->connection_number,
+               conn->local_realtime_audio_port);
+ 
+-        named_pthread_create(&conn->rtp_realtime_audio_thread, NULL, &rtp_realtime_audio_receiver,
+-                             (void *)conn, "ap2_ra_%d", conn->connection_number);
++        err = named_pthread_create(&conn->rtp_realtime_audio_thread, NULL, &rtp_realtime_audio_receiver,
++                                   (void *)conn, "ap2_ra_%d", conn->connection_number);
++        conn->rtp_realtime_audio_started = (err == 0);
++        if (err)
++          play_result = err;
+         plist_dict_set_item(stream0dict, "type", plist_new_uint(96));
+         plist_dict_set_item(stream0dict, "dataPort",
+                             plist_new_uint(conn->local_realtime_audio_port));
+ 
+         debug(2, "Realtime Stream Play");
+         activity_monitor_signify_activity(1);
+-        player_play(conn);
+-
+-        conn->rtp_running = 1; // hack!
++        if (!play_result)
++          play_result = player_play(conn);
++        else
++          player_unstarted_session_abort(conn);
++
++        conn->rtp_running = (play_result == 0);
+       } break;
+       case 103: {
+         debug_log_rtsp_message(3, "Buffered Audio Stream SETUP incoming message", req);
+@@ -2955,9 +2975,12 @@
+ 
+         // debug(1, "Connection %d: create rtp_buffered_audio_thread", conn->connection_number);
+ 
+-        named_pthread_create_with_priority(&conn->rtp_buffered_audio_thread, 2,
+-                                           &rtp_buffered_audio_processor, (void *)conn, "ap2_ba_%d",
+-                                           conn->connection_number);
++        err = named_pthread_create_with_priority(&conn->rtp_buffered_audio_thread, 2,
++                                                 &rtp_buffered_audio_processor, (void *)conn, "ap2_ba_%d",
++                                                 conn->connection_number);
++        conn->rtp_buffered_audio_started = (err == 0);
++        if (err)
++          play_result = err;
+ 
+         plist_dict_set_item(stream0dict, "type", plist_new_uint(103));
+         plist_dict_set_item(stream0dict, "dataPort",
+@@ -2968,8 +2991,11 @@
+         // this should be cancelled by an activity_monitor_signify_activity(1)
+         // call in the SETRATEANCHORI handler, which should come up right away
+         activity_monitor_signify_activity(0);
+-        player_play(conn);
+-        conn->rtp_running = 1; // hack!
++        if (!play_result)
++          play_result = player_play(conn);
++        else
++          player_unstarted_session_abort(conn);
++        conn->rtp_running = (play_result == 0);
+       } break;
+       case 130: {
+         debug(1, "Remote Control Setup Received on a PTP connection.");
+@@ -2986,7 +3012,11 @@
+       plist_array_append_item(streams_array, stream0dict);
+       plist_dict_set_item(setupResponsePlist, "streams", streams_array);
+ 
+-      resp->respcode = 200;
++      resp->respcode = play_result == 0 ? 200 : 503;
++      if (play_result) {
++        conn->stop = 1;
++        activity_monitor_signify_activity(0);
++      }
+     } else if (conn->airplay_stream_category == remote_control_stream) {
+       debug(3, "Connection %d (RC): SETUP: Remote Control Only with stream received from %s.",
+             conn->connection_number, conn->client_ip_string);
+@@ -3064,9 +3094,9 @@
+ 
+   if (resp->respcode == 200) {
+     plist_to_bin(setupResponsePlist, &resp->content, &resp->contentlength);
+-    plist_free(setupResponsePlist);
+     msg_add_header(resp, "Content-Type", "application/x-apple-binary-plist");
+   }
++  plist_free(setupResponsePlist);
+   plist_free(messagePlist);
+ }
+ #endif
+@@ -4003,6 +4033,8 @@
+     if (conn->player_thread) {
+       player_stop(conn); // this nulls the player_thread and cancels the threads...
+       activity_monitor_signify_activity(0); // inactive, and should be after command_stop()
++    } else {
++      player_unstarted_session_abort(conn); // partial SETUP never published a player
+     }
+ 
+     if (conn->fd > 0) {
+diff --git a/common.c b/common.c
+--- a/common.c
++++ b/common.c
+@@ -1950,6 +1950,7 @@
+ #endif
+ #ifdef CONFIG_SHIRI
+     strcat(version_string, "-shiri-timed3");
++    strcat(version_string, "-startup1");
+ #endif
+ #ifdef CONFIG_SOXR
+     strcat(version_string, "-soxr");

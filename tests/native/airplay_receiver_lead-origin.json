@@ -1,0 +1,17 @@
+{
+  "own_source": "/tmp/shiri-own33-composed-qybhqotv/owntone",
+  "shairport_source": "/tmp/shiri-shairport-timing",
+  "pinned_owntone_commit": "d6fb3edf5831de38134ebd92fcf09a730ddd37aa",
+  "pinned_shairport_commit": "7bad231c18368dbd26f298577f6210e36e4b0797",
+  "scope": "Exact source timestamp/wire functions and AP2 consumer statements; no network or receiver hardware",
+  "source_sha256": {
+    "/tmp/shiri-own33-composed-qybhqotv/owntone/src/outputs.c": "5af9fdfbb300087233c32cceaecbbabb031bae49e9fb056ad9c31f67de7e4d5f",
+    "/tmp/shiri-own33-composed-qybhqotv/owntone/src/outputs/raop.c": "5e09dc1c5b1b1329fccedd2eb800be53746595e444bc7649d92d6f4e8d7213cb",
+    "/tmp/shiri-own33-composed-qybhqotv/owntone/src/outputs/airplay.c": "395d6f7b12c937327f145399107cee4354d5df09a022a82282255b7d7365475b",
+    "/tmp/shiri-own33-composed-qybhqotv/owntone/src/outputs/rtp_common.c": "5584631eabc22991f7d5d1d5109d0350a6d168a1bf6c6235508726093e66f311",
+    "/tmp/shiri-shairport-timing/rtp.c": "15cc76cd4ef3ef03758aecc184dc58ef36a033032d77f03bb1986316ccd37d6d",
+    "/tmp/shiri-shairport-timing/player.h": "a20cd49716056b160881893b152b740de040baa760898ceeca166d4e8e5e4e8e",
+    "/tmp/shiri-shairport-timing/audio_shiri.c": "8ac92d3f145580f212992b4c61e24689a4edc8930a4d990f1db6164000dca76f"
+  },
+  "excerpt_sha256": "32fa324881ca118b63ff1d9edd00a144683f2fd9ad6e0d1560c3ed57930cc765"
+}

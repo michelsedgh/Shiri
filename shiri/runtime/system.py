@@ -274,6 +274,12 @@ class Runner:
         return owned
 
     async def stop_saved(self, entry: dict):
+        if entry.get("kind") == "systemd-unit":
+            manager = getattr(self, "unit_manager", None)
+            if manager is None:
+                raise RuntimeFailure("Daemon unit recovery requires the verified system manager boundary")
+            await manager.stop_saved(entry)
+            return
         pid, birth, pgid = entry.get("pid"), entry.get("birth"), entry.get("pgid")
 
         # PID, group and start ticks can repeat after reboot. A durable identity

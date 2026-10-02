@@ -100,6 +100,15 @@ def local_audio_device_key(value: str) -> str:
     """
     if not isinstance(value, str) or not value or len(value) > 128:
         raise ValueError("Local audio device must be an explicit hardware or BlueALSA endpoint")
+    if value.startswith("shiri:device="):
+        raw = value.removeprefix("shiri:device=")
+        try:
+            identifier = str(UUID(raw))
+        except ValueError as exc:
+            raise ValueError("Local speaker binding must use its exact saved device identifier") from exc
+        if identifier != raw:
+            raise ValueError("Local speaker binding must use its exact saved device identifier")
+        return value
     card = r"(?P<card>[A-Za-z0-9_][A-Za-z0-9_-]{0,63})"
     number = r"(?:0|[1-9][0-9]{0,2})"
     match = re.fullmatch(
@@ -142,6 +151,7 @@ class SpeakerRef(StrictModel):
     name: str
     protocol: Protocol
     offset_ms: int = Field(default=0, ge=-2000, le=2000)
+    balance_percent: int = Field(default=100, ge=0, le=100)
 
     @field_validator("id")
     @classmethod

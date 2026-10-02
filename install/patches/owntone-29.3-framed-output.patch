@@ -1,0 +1,797 @@
+diff --git a/configure.ac b/configure.ac
+index 99658222..52ca8328 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 2186ad21..5542cab5 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -30,7 +30,7 @@ PAIR_AP_SRC = \
+ AM_CPPFLAGS += -DCONFIG_GCRYPT
+ 
+ if COND_ALSA
+-ALSA_SRC=outputs/alsa.c outputs/pcm_volume.h outputs/pcm_identity.h
++ALSA_SRC=outputs/alsa.c outputs/pcm_volume.h outputs/pcm_identity.h outputs/shiri_pcm_output.c outputs/shiri_out_wire.h
+ endif
+ 
+ if COND_PULSEAUDIO
+diff --git a/src/conffile.c b/src/conffile.c
+index bb3d20d7..287e24a0 100644
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -147,6 +147,13 @@ static cfg_opt_t sec_audio[] =
+     CFG_STR("mixer_device", NULL, CFGF_NONE),
+     CFG_BOOL("software_volume", cfg_false, CFGF_NONE),
+     CFG_STR("pcm_identity_file", NULL, CFGF_NONE),
++    CFG_STR("shiri_pcm_socket", NULL, CFGF_NONE),
++    CFG_INT("shiri_pcm_peer_uid", 0, CFGF_NONE),
++    CFG_STR("shiri_pcm_room_id", NULL, CFGF_NONE),
++    CFG_STR("shiri_pcm_launch_generation", NULL, CFGF_NONE),
++    CFG_INT("shiri_pcm_rate", 0, CFGF_NONE),
++    CFG_INT("shiri_pcm_channels", 0, CFGF_NONE),
++    CFG_INT("shiri_pcm_format", 0, CFGF_NONE),
+     CFG_BOOL("sync_disable", cfg_false, CFGF_NONE),
+     CFG_INT("offset", 0, CFGF_DEPRECATED),
+     CFG_INT("offset_ms", 0, CFGF_DEPRECATED),
+diff --git a/src/outputs.c b/src/outputs.c
+index d6bb09f2..a56bc4b9 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -49,6 +49,7 @@ extern struct output_definition output_fifo;
+ extern struct output_definition output_rcp;
+ #ifdef HAVE_ALSA
+ extern struct output_definition output_alsa;
++extern struct output_definition output_shiri_pcm;
+ #endif
+ #ifdef HAVE_LIBPULSE
+ extern struct output_definition output_pulse;
+@@ -1434,6 +1435,14 @@ outputs_init(void)
+   int i;
+   int j;
+ 
++#ifdef HAVE_ALSA
++  // Explicit profile only; all default and network routing remains unchanged.
++  outputs[OUTPUT_TYPE_ALSA] = &output_alsa;
++  if (cfg_getstr(cfg_getsec(cfg, "audio"), "type")
++      && strcmp(cfg_getstr(cfg_getsec(cfg, "audio"), "type"), "shiri-pcm") == 0)
++    outputs[OUTPUT_TYPE_ALSA] = &output_shiri_pcm;
++#endif
++
+   outputs_master_volume = -1;
+ 
+   // Number of milliseconds the outputs should buffer before starting playback.
+diff --git a/src/outputs/shiri_out_wire.h b/src/outputs/shiri_out_wire.h
+new file mode 100644
+index 00000000..74a30ac1
+--- /dev/null
++++ b/src/outputs/shiri_out_wire.h
+@@ -0,0 +1,169 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef OWNTONE_SHIRI_OUT_WIRE_H
++#define OWNTONE_SHIRI_OUT_WIRE_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include "pcm_volume.h"
++
++#define SHIRI_OUT_HEADER 112u
++#define SHIRI_OUT_PAYLOAD_MAX 16384u
++#define SHIRI_OUT_PACKET_MAX (SHIRI_OUT_HEADER + SHIRI_OUT_PAYLOAD_MAX)
++#define SHIRI_OUT_START 1u
++#define SHIRI_OUT_DATA 2u
++#define SHIRI_OUT_FLUSH 3u
++#define SHIRI_OUT_END 4u
++#define SHIRI_OUT_READY 5u
++#define SHIRI_OUT_DROP_ACK 6u
++#define SHIRI_OUT_S16LE 0x8210u
++#define SHIRI_OUT_S24LE 0x8318u
++#define SHIRI_OUT_S24_32LE 0x8418u
++#define SHIRI_OUT_S32LE 0x8420u
++
++struct shiri_out_header {
++  uint16_t op, format, channels;
++  uint8_t room[16], launch[16], stream[16];
++  uint64_t generation, sequence, pts_ns, first_frame;
++  uint32_t rate, frames, payload_bytes;
++};
++
++static inline unsigned
++shiri_out_width(unsigned format)
++{
++  switch (format) {
++    case SHIRI_OUT_S16LE: return 2;
++    case SHIRI_OUT_S24LE: return 3;
++    case SHIRI_OUT_S24_32LE: case SHIRI_OUT_S32LE: return 4;
++    default: return 0;
++  }
++}
++
++/* FFmpeg represents PCM24 with signed S32 samples. Both admitted 24-bit
++ * formats therefore subscribe to S32 and pack only at the private final copy. */
++static inline unsigned
++shiri_out_source_width(unsigned format)
++{
++  return format == SHIRI_OUT_S24LE ? 4 : shiri_out_width(format);
++}
++
++static inline void
++shiri_out_put(uint8_t *p, uint64_t value, unsigned bytes)
++{
++  while (bytes) { p[--bytes] = (uint8_t)value; value >>= 8; }
++}
++
++static inline uint64_t
++shiri_out_get(const uint8_t *p, unsigned bytes)
++{
++  uint64_t value = 0;
++  while (bytes--) value = (value << 8) | *p++;
++  return value;
++}
++
++static inline int
++shiri_out_nonzero(const uint8_t *id)
++{
++  unsigned i, any=0;
++  for(i=0;i<16;i++) any|=id[i];
++  return any!=0;
++}
++
++static inline int
++shiri_out_valid(const struct shiri_out_header *h)
++{
++  unsigned width;
++  uint64_t bytes;
++  if (!h || !shiri_out_nonzero(h->room) || !shiri_out_nonzero(h->launch)
++      || !shiri_out_nonzero(h->stream) || h->op < SHIRI_OUT_START || h->op > SHIRI_OUT_DROP_ACK
++      || !h->generation || h->generation > INT64_MAX || h->sequence > INT64_MAX
++      || h->rate < 1 || h->rate > 384000 || h->channels < 1 || h->channels > 8
++      || !(width = shiri_out_width(h->format))) return -1;
++  if (h->op == SHIRI_OUT_DATA) {
++    bytes = (uint64_t)h->frames * h->channels * width;
++    return (!h->frames || !h->sequence || !h->pts_ns || h->pts_ns > INT64_MAX
++      || bytes != h->payload_bytes || bytes > SHIRI_OUT_PAYLOAD_MAX
++      || h->first_frame > INT64_MAX || h->frames > INT64_MAX - h->first_frame) ? -1 : 0;
++  }
++  if (h->pts_ns || h->first_frame || h->payload_bytes) return -1;
++  if (h->op == SHIRI_OUT_DROP_ACK)
++    return (h->generation < 2 || !h->sequence
++      || (h->frames != SHIRI_OUT_FLUSH && h->frames != SHIRI_OUT_END)) ? -1 : 0;
++  if (h->frames) return -1;
++  if (h->op == SHIRI_OUT_START || h->op == SHIRI_OUT_READY)
++    return (h->generation != 1 || h->sequence) ? -1 : 0;
++  return (h->generation < 2 || !h->sequence) ? -1 : 0;
++}
++
++static inline int
++shiri_out_encode(uint8_t *dst, size_t capacity, const struct shiri_out_header *h)
++{
++  if (!dst || capacity < SHIRI_OUT_HEADER || shiri_out_valid(h) < 0) return -1;
++  memcpy(dst, "SHRIOUT1", 8);
++  shiri_out_put(dst+8, 1, 2); shiri_out_put(dst+10, h->op, 2);
++  shiri_out_put(dst+12, SHIRI_OUT_HEADER, 4);
++  memcpy(dst+16, h->room, 16); memcpy(dst+32, h->launch, 16); memcpy(dst+48, h->stream, 16);
++  shiri_out_put(dst+64, h->generation, 8); shiri_out_put(dst+72, h->sequence, 8);
++  shiri_out_put(dst+80, h->pts_ns, 8); shiri_out_put(dst+88, h->rate, 4);
++  shiri_out_put(dst+92, h->format, 2); shiri_out_put(dst+94, h->channels, 2);
++  shiri_out_put(dst+96, h->frames, 4); shiri_out_put(dst+100, h->payload_bytes, 4);
++  shiri_out_put(dst+104, h->first_frame, 8);
++  return 0;
++}
++
++static inline int
++shiri_out_decode(struct shiri_out_header *h, const uint8_t *src, size_t bytes)
++{
++  if (!h || !src || bytes < SHIRI_OUT_HEADER || memcmp(src, "SHRIOUT1", 8)
++      || shiri_out_get(src+8, 2) != 1 || shiri_out_get(src+12, 4) != SHIRI_OUT_HEADER) return -1;
++  memset(h, 0, sizeof(*h));
++  h->op=shiri_out_get(src+10,2); h->generation=shiri_out_get(src+64,8);
++  h->sequence=shiri_out_get(src+72,8); h->pts_ns=shiri_out_get(src+80,8);
++  h->rate=shiri_out_get(src+88,4); h->format=shiri_out_get(src+92,2);
++  h->channels=shiri_out_get(src+94,2); h->frames=shiri_out_get(src+96,4);
++  h->payload_bytes=shiri_out_get(src+100,4); h->first_frame=shiri_out_get(src+104,8);
++  memcpy(h->room, src+16,16); memcpy(h->launch,src+32,16); memcpy(h->stream,src+48,16);
++  if (shiri_out_valid(h) < 0 || bytes != SHIRI_OUT_HEADER + h->payload_bytes) return -1;
++  return 0;
++}
++
++static inline int
++shiri_out_same(const struct shiri_out_header *a, const struct shiri_out_header *b)
++{
++  return a && b && !memcmp(a->room,b->room,16) && !memcmp(a->launch,b->launch,16)
++    && !memcmp(a->stream,b->stream,16) && a->rate==b->rate && a->format==b->format
++    && a->channels==b->channels;
++}
++
++/* bytes is the destination byte count. Both 24-bit formats consume canonical
++ * S32; packed S24 writes three bytes and S24-in-32 sign-extends into four.
++ * Apply cubic gain exactly once before defined arithmetic down-conversion. */
++static inline int
++shiri_out_gain(uint8_t *dst, const uint8_t *src, size_t bytes, unsigned format, int volume)
++{
++  size_t offset, source_bytes, samples;
++  uint32_t raw, encoded;
++  int64_t sample, converted, gain;
++  unsigned width = shiri_out_width(format), byte;
++  uintptr_t dst_addr=(uintptr_t)dst, src_addr=(uintptr_t)src;
++  if (!width || bytes%width) return -1;
++  if (format != SHIRI_OUT_S24LE && format != SHIRI_OUT_S24_32LE)
++    return pcm_volume_scale_copy(dst,src,bytes,width*8,volume);
++  samples=bytes/width;
++  if(samples>SIZE_MAX/4) return -1;
++  source_bytes=samples*4;
++  if(!bytes) return 0;
++  if(!dst || !src || bytes>UINTPTR_MAX-dst_addr || source_bytes>UINTPTR_MAX-src_addr
++    || (dst_addr<src_addr+source_bytes && src_addr<dst_addr+bytes)) return -1;
++  volume=pcm_volume_clamp(volume); gain=(int64_t)volume*volume*volume;
++  for (offset=0; offset<samples; offset++) {
++    raw=(uint32_t)src[offset*4] | (uint32_t)src[offset*4+1]<<8
++      | (uint32_t)src[offset*4+2]<<16 | (uint32_t)src[offset*4+3]<<24;
++    sample=(raw & UINT32_C(0x80000000)) ? (int64_t)raw-INT64_C(4294967296) : raw;
++    sample=sample*gain/INT64_C(1000000);
++    converted=sample < 0 ? -((-sample+255)/256) : sample/256;
++    encoded=(uint32_t)(int32_t)converted;
++    for(byte=0;byte<width;byte++) dst[offset*width+byte]=(uint8_t)(encoded>>(byte*8));
++  }
++  return 0;
++}
++#endif
+diff --git a/src/outputs/shiri_pcm_output.c b/src/outputs/shiri_pcm_output.c
+new file mode 100644
+index 00000000..5d9c8cd4
+--- /dev/null
++++ b/src/outputs/shiri_pcm_output.c
+@@ -0,0 +1,545 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Explicit Shiri local-output profile. OwnTone remains the sole paced producer;
++ * the isolated sink admits exact caps and confirms queue/device Drop. */
++#ifdef HAVE_CONFIG_H
++# include <config.h>
++#endif
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/random.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <event2/event.h>
++#include "misc.h"
++#include "logger.h"
++#include "conffile.h"
++#include "player.h"
++#include "outputs.h"
++#include "shiri_out_wire.h"
++
++extern struct event_base *evbase_player;
++
++#define SHIRI_QUEUE_MAX 512u
++#define SHIRI_QUEUE_NS UINT64_C(5000000000)
++#define SHIRI_STALL_NS UINT64_C(200000000)
++#define SHIRI_ACK_NS UINT64_C(500000000)
++/* map_native_time admits a <=1ms bracket and a <=2s RAW projection. At
++ * 500ppm, each mapped anchor has <=1.5ms uncertainty. Consecutive anchors
++ * may differ by both brackets; frame continuity remains separately exact. */
++#define SHIRI_CLOCK_CORRECTION_NS UINT64_C(3000000)
++#define SHIRI_CONVERTER_BACKLOG_NS UINT64_C(200000000)
++
++struct shiri_packet {
++  struct shiri_packet *next;
++  uint64_t pts, first_frame;
++  uint32_t frames, bytes, raw_bytes;
++  uint8_t samples[];
++};
++struct shiri_session {
++  struct shiri_session *next;
++  uint64_t device_id, frame_count, sequence, deadline, blocked_since, next_pts, stream_pts;
++  int fd, callback_id, volume;
++  enum output_device_state state;
++  unsigned queued;
++  uint64_t queued_bytes, delay_ns;
++  uint64_t native_frames, native_last_pts, native_origin_pts;
++  uint64_t last_packet_pts, last_packet_duration;
++  unsigned native_last_frames;
++  struct media_quality native_quality;
++  int pending, control_sent, probe;
++  struct shiri_out_header identity, control;
++  struct shiri_packet *head, *tail;
++  struct event *reader, *writer, *timer;
++};
++static struct shiri_session *shiri_sessions;
++static struct media_quality shiri_quality;
++static struct shiri_out_header shiri_config;
++static const char *shiri_socket_path;
++static uid_t shiri_peer_uid;
++
++static void shiri_session_fail(struct shiri_session *s);
++static int shiri_schedule(struct shiri_session *s);
++static void shiri_pump(struct shiri_session *s);
++
++static uint64_t
++shiri_now(void)
++{
++  struct timespec ts;
++  if (clock_gettime(CLOCK_MONOTONIC,&ts)<0 || ts.tv_sec<0 || ts.tv_nsec<0
++      || ts.tv_nsec>=1000000000 || (uint64_t)ts.tv_sec > INT64_MAX/UINT64_C(1000000000)) return 0;
++  return (uint64_t)ts.tv_sec*UINT64_C(1000000000)+(uint64_t)ts.tv_nsec;
++}
++
++static int
++shiri_hex(uint8_t out[16], const char *text, int uuid)
++{
++  size_t i, n=0;
++  unsigned digit, half=0;
++  if (!text || strlen(text)!=(uuid?36u:32u)) return -1;
++  for (i=0;text[i];i++) {
++    if (uuid && (i==8||i==13||i==18||i==23)) { if(text[i]!='-') return -1; continue; }
++    if(text[i]>='0'&&text[i]<='9') digit=(unsigned)(text[i]-'0');
++    else if(text[i]>='a'&&text[i]<='f') digit=(unsigned)(text[i]-'a'+10);
++    else return -1;
++    if(!(n&1)) half=digit<<4; else out[n/2]=(uint8_t)(half|digit);
++    n++;
++  }
++  return n==32?0:-1;
++}
++
++static void
++shiri_queue_clear(struct shiri_session *s)
++{
++  struct shiri_packet *p;
++  while((p=s->head)) { s->head=p->next; free(p); }
++  s->tail=NULL; s->queued=0; s->queued_bytes=0; s->blocked_since=0;
++}
++
++static void
++shiri_session_free(struct shiri_session *s)
++{
++  if(!s) return;
++  if(s->reader) event_free(s->reader);
++  if(s->writer) event_free(s->writer);
++  if(s->timer) event_free(s->timer);
++  if(s->fd>=0) close(s->fd);
++  shiri_queue_clear(s);
++  outputs_quality_unsubscribe(&shiri_quality);
++  free(s);
++}
++
++static void
++shiri_session_cleanup(struct shiri_session *s)
++{
++  struct shiri_session **cursor=&shiri_sessions;
++  while(*cursor && *cursor!=s) cursor=&(*cursor)->next;
++  if(*cursor) *cursor=s->next;
++  outputs_device_session_remove(s->device_id);
++  shiri_session_free(s);
++}
++
++static void
++shiri_status(struct shiri_session *s)
++{
++  int callback=s->callback_id;
++  s->callback_id=-1;
++  outputs_cb(callback,s->device_id,s->state);
++  if(s->state==OUTPUT_STATE_FAILED || s->state==OUTPUT_STATE_STOPPED) shiri_session_cleanup(s);
++}
++
++static void
++shiri_session_fail(struct shiri_session *s)
++{
++  DPRINTF(E_LOG,L_LAUDIO,"Framed local output failed closed\n");
++  s->state=OUTPUT_STATE_FAILED;
++  shiri_status(s);
++}
++
++static int
++shiri_schedule(struct shiri_session *s)
++{
++  uint64_t now=shiri_now(), target, delta;
++  struct timeval tv;
++  if(!now) return -1;
++  if(s->pending) target=s->deadline;
++  else if(s->head) target=s->head->pts;
++  else { event_del(s->timer); return 0; }
++  if(s->blocked_since) {
++    uint64_t stall=s->blocked_since+SHIRI_STALL_NS;
++    if(target<=now || stall<target) target=stall;
++  }
++  delta=target>now?target-now:0;
++  tv.tv_sec=delta/UINT64_C(1000000000);
++  tv.tv_usec=(delta%UINT64_C(1000000000)+999)/1000;
++  if(tv.tv_usec==1000000) { tv.tv_sec++; tv.tv_usec=0; }
++  return evtimer_add(s->timer,&tv);
++}
++
++/* Return 1 for a complete packet, 0 for a retained EAGAIN, -1 for all short or
++ * other failures. A sequence packet has no valid partial-success path. */
++static int
++shiri_send(struct shiri_session *s, const uint8_t *packet, size_t bytes)
++{
++  ssize_t sent;
++  unsigned attempts=0;
++  do { sent=send(s->fd,packet,bytes,MSG_DONTWAIT|MSG_NOSIGNAL); }
++  while(sent<0 && errno==EINTR && ++attempts<4);
++  if(sent==(ssize_t)bytes) { s->blocked_since=0; event_del(s->writer); return 1; }
++  if(sent<0 && (errno==EAGAIN||errno==EWOULDBLOCK)) {
++    if(!s->blocked_since) s->blocked_since=shiri_now();
++    if(!s->blocked_since || event_add(s->writer,NULL)<0) return -1;
++    return 0;
++  }
++  return -1;
++}
++
++static void
++shiri_pump(struct shiri_session *s)
++{
++  struct shiri_packet *p;
++  struct shiri_out_header h;
++  uint8_t packet[SHIRI_OUT_PACKET_MAX];
++  uint64_t now=shiri_now();
++  int ret;
++  unsigned handled=0;
++  if(!now || (s->blocked_since && now-s->blocked_since>=SHIRI_STALL_NS)
++      || (s->pending && now>=s->deadline)) { shiri_session_fail(s); return; }
++  if(s->pending) {
++    if(!s->control_sent) {
++      if(shiri_out_encode(packet,sizeof(packet),&s->control)<0) { shiri_session_fail(s); return; }
++      ret=shiri_send(s,packet,SHIRI_OUT_HEADER);
++      if(ret<0) { shiri_session_fail(s); return; }
++      if(ret==1) s->control_sent=1;
++    }
++  } else while((p=s->head) && handled++<SHIRI_QUEUE_MAX && p->pts<=now) {
++    if(now-p->pts>=SHIRI_STALL_NS || s->sequence>=INT64_MAX) { shiri_session_fail(s); return; }
++    h=s->identity; h.op=SHIRI_OUT_DATA; h.sequence=s->sequence+1;
++    h.pts_ns=p->pts; h.frames=p->frames; h.payload_bytes=p->bytes; h.first_frame=p->first_frame;
++    if(shiri_out_encode(packet,sizeof(packet),&h)<0
++        || shiri_out_gain(packet+SHIRI_OUT_HEADER,p->samples,p->bytes,h.format,s->volume)<0) {
++      shiri_session_fail(s); return;
++    }
++    ret=shiri_send(s,packet,SHIRI_OUT_HEADER+p->bytes);
++    if(ret<0) { shiri_session_fail(s); return; }
++    if(ret==0) break;
++    s->sequence=h.sequence;
++    s->head=p->next; if(!s->head) s->tail=NULL;
++    s->queued--; s->queued_bytes-=p->raw_bytes; free(p);
++  }
++  if(shiri_schedule(s)<0) shiri_session_fail(s);
++}
++
++static int
++shiri_control(struct shiri_session *s, unsigned op, int callback)
++{
++  uint64_t now=shiri_now();
++  if(s->pending || !now || s->identity.generation>=INT64_MAX || s->sequence>=INT64_MAX) return -1;
++  shiri_queue_clear(s); /* No old DATA can follow the admitted Drop request. */
++  s->control=s->identity; s->control.op=op;
++  s->control.generation=s->identity.generation+1;
++  s->control.sequence=s->sequence+1;
++  s->callback_id=callback; s->pending=1; s->control_sent=0;
++  s->deadline=now+SHIRI_ACK_NS;
++  return 0;
++}
++
++static void
++shiri_io(int fd, short what, void *arg)
++{
++  struct shiri_session *s=arg;
++  struct shiri_out_header h;
++  uint8_t packet[SHIRI_OUT_HEADER];
++  ssize_t bytes;
++  int acknowledge;
++  uint64_t now=shiri_now();
++  /* A readable reply can win event dispatch over an overdue timer. Its exact
++   * identity does not permit admission after the operation's total deadline. */
++  if(!now || (s->pending && now>=s->deadline)) { shiri_session_fail(s); return; }
++  if(what&EV_READ) {
++    bytes=recv(fd,packet,sizeof(packet),MSG_DONTWAIT|MSG_TRUNC);
++    if(bytes<0 && (errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR)) return;
++    if(bytes!=(ssize_t)SHIRI_OUT_HEADER || shiri_out_decode(&h,packet,SHIRI_OUT_HEADER)<0
++      || !s->pending || !s->control_sent || !shiri_out_same(&h,&s->control)
++      || h.generation!=s->control.generation || h.sequence!=s->control.sequence) {
++      shiri_session_fail(s); return;
++    }
++    acknowledge=s->control.op;
++    if((acknowledge==SHIRI_OUT_START && h.op!=SHIRI_OUT_READY)
++      || (acknowledge!=SHIRI_OUT_START && (h.op!=SHIRI_OUT_DROP_ACK || h.frames!=(unsigned)acknowledge))) {
++      shiri_session_fail(s); return;
++    }
++    /* Recheck after receive/validation, before committing a new generation. */
++    now=shiri_now();
++    if(!now || now>=s->deadline) { shiri_session_fail(s); return; }
++    s->pending=0; s->control_sent=0; s->deadline=0;
++    s->identity.generation=h.generation; s->sequence=h.sequence; s->frame_count=0; s->next_pts=0; s->stream_pts=0;
++    s->native_frames=0; s->native_last_pts=0; s->native_origin_pts=0; s->native_last_frames=0;
++    s->last_packet_pts=0; s->last_packet_duration=0;
++    memset(&s->native_quality,0,sizeof(s->native_quality));
++    if(acknowledge==SHIRI_OUT_END) { s->state=OUTPUT_STATE_STOPPED; shiri_status(s); return; }
++    if(s->probe) {
++      if(shiri_control(s,SHIRI_OUT_END,s->callback_id)<0) { shiri_session_fail(s); return; }
++    } else { s->state=OUTPUT_STATE_CONNECTED; shiri_status(s); }
++  }
++  shiri_pump(s);
++}
++
++static struct shiri_session *
++shiri_session_make(struct output_device *device, int callback, int probe)
++{
++  struct shiri_session *s;
++  struct sockaddr_un address;
++  struct ucred peer;
++  socklen_t peer_bytes=sizeof(peer);
++  size_t random_bytes=0;
++  ssize_t got;
++  unsigned attempts=0;
++  uint64_t base=outputs_buffer_duration_ms_get(), now=shiri_now();
++  if(!now || device->offset_ms < -2000 || device->offset_ms > 2000
++    || (device->offset_ms<0 && base<(uint64_t)(-(int64_t)device->offset_ms))
++    || base>5000 || (device->offset_ms>0 && base>5000-(unsigned)device->offset_ms)) return NULL;
++  if(outputs_quality_subscribe(&shiri_quality)<0) return NULL;
++  s=calloc(1,sizeof(*s));
++  if(!s) { outputs_quality_unsubscribe(&shiri_quality); return NULL; }
++  s->fd=-1; s->device_id=device->id; s->callback_id=callback; s->probe=probe;
++  s->volume=pcm_volume_clamp(device->volume); s->state=OUTPUT_STATE_STARTUP;
++  s->identity=shiri_config; s->identity.generation=1;
++  s->delay_ns=(base+device->offset_ms)*UINT64_C(1000000);
++  while(random_bytes<16 && attempts++<8) {
++    got=getrandom(s->identity.stream+random_bytes,16-random_bytes,GRND_NONBLOCK);
++    if(got>0) random_bytes+=(size_t)got;
++    else if(got<0 && errno==EINTR) continue;
++    else goto fail;
++  }
++  if(random_bytes!=16) goto fail;
++  s->fd=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
++  if(s->fd<0) goto fail;
++  memset(&address,0,sizeof(address)); address.sun_family=AF_UNIX;
++  memcpy(address.sun_path,shiri_socket_path,strlen(shiri_socket_path)+1);
++  if(connect(s->fd,(struct sockaddr *)&address,sizeof(address))<0
++    || getsockopt(s->fd,SOL_SOCKET,SO_PEERCRED,&peer,&peer_bytes)<0
++    || peer_bytes!=sizeof(peer) || peer.uid!=shiri_peer_uid) goto fail;
++  s->reader=event_new(evbase_player,s->fd,EV_READ|EV_PERSIST,shiri_io,s);
++  s->writer=event_new(evbase_player,s->fd,EV_WRITE|EV_PERSIST,shiri_io,s);
++  s->timer=evtimer_new(evbase_player,shiri_io,s);
++  if(!s->reader||!s->writer||!s->timer||event_add(s->reader,NULL)<0) goto fail;
++  s->control=s->identity; s->control.op=SHIRI_OUT_START;
++  s->pending=1; s->deadline=now+SHIRI_ACK_NS;
++  s->next=shiri_sessions; shiri_sessions=s;
++  outputs_device_session_add(device->id,s);
++  return s;
++ fail:
++  shiri_session_free(s); return NULL;
++}
++
++static int
++shiri_device_start(struct output_device *device, int callback)
++{
++  struct shiri_session *s=shiri_session_make(device,callback,0);
++  if(!s) return -1;
++  shiri_pump(s); return 1;
++}
++static int
++shiri_device_probe(struct output_device *device, int callback)
++{
++  struct shiri_session *s=shiri_session_make(device,callback,1);
++  if(!s) return -1;
++  shiri_pump(s); return 1;
++}
++static int
++shiri_device_flush(struct output_device *device, int callback)
++{
++  struct shiri_session *s=device->session;
++  if(!s || shiri_control(s,SHIRI_OUT_FLUSH,callback)<0) return -1;
++  shiri_pump(s); return 1;
++}
++static int
++shiri_device_stop(struct output_device *device, int callback)
++{
++  struct shiri_session *s=device->session;
++  if(!s || shiri_control(s,SHIRI_OUT_END,callback)<0) return -1;
++  shiri_pump(s); return 1;
++}
++static int
++shiri_device_volume(struct output_device *device, int callback)
++{
++  struct shiri_session *s=device->session;
++  if(!s) return 0;
++  if(s->pending) return -1; /* Never replace a still-pending Drop completion. */
++  s->volume=pcm_volume_clamp(device->volume);
++  s->callback_id=callback; shiri_status(s); return 1;
++}
++static void
++shiri_device_cb_set(struct output_device *device, int callback)
++{
++  struct shiri_session *s=device->session;
++  if(s && !s->pending) s->callback_id=callback;
++}
++
++static int
++shiri_frames_ns(uint64_t *ns, uint64_t frames, unsigned rate)
++{
++  uint64_t seconds=frames/rate, remainder=frames%rate;
++  if(seconds>INT64_MAX/UINT64_C(1000000000)) return -1;
++  *ns=seconds*UINT64_C(1000000000)+remainder*UINT64_C(1000000000)/rate;
++  return *ns>INT64_MAX?-1:0;
++}
++
++/* buffer_fill carries one raw-input PTS. FFmpeg has no per-converted-block
++ * PTS here and can retain fractional samples. Keep both count domains: the
++ * next converted sample corresponds to emitted/outRate-consumed/nativeRate
++ * relative to THIS fresh native anchor, never a receive/startup clock. */
++static int
++shiri_native_anchor(struct shiri_session *s, struct output_data *raw, struct timespec pts,
++                    uint64_t *anchor)
++{
++  uint64_t native_ns, previous_native_ns, converted_ns, duration, expected, correction, projected;
++  unsigned width;
++  if(!raw->buffer || raw->samples<=0 || raw->quality.sample_rate<1 || raw->quality.sample_rate>384000
++    || raw->quality.channels<1 || raw->quality.channels>8
++    || (raw->quality.bits_per_sample!=16 && raw->quality.bits_per_sample!=24 && raw->quality.bits_per_sample!=32)
++    || pts.tv_sec<0 || pts.tv_nsec<0 || pts.tv_nsec>=1000000000
++    || (uint64_t)pts.tv_sec>INT64_MAX/UINT64_C(1000000000)) return -1;
++  width=(unsigned)raw->quality.bits_per_sample/8*(unsigned)raw->quality.channels;
++  if(raw->bufsize!=(uint64_t)(unsigned)raw->samples*width
++    || s->native_frames>(uint64_t)INT64_MAX-(uint64_t)(unsigned)raw->samples) return -1;
++  projected=(uint64_t)pts.tv_sec*UINT64_C(1000000000)+(uint64_t)pts.tv_nsec;
++  if(!projected || projected>INT64_MAX-s->delay_ns) return -1;
++  if(shiri_frames_ns(&native_ns,s->native_frames,(unsigned)raw->quality.sample_rate)<0
++    || shiri_frames_ns(&converted_ns,s->frame_count,s->identity.rate)<0) return -1;
++  if(s->native_last_pts) {
++    if(!quality_is_equal(&s->native_quality,&raw->quality)
++      || projected<=s->native_last_pts
++      || shiri_frames_ns(&previous_native_ns,s->native_frames-s->native_last_frames,(unsigned)raw->quality.sample_rate)<0)
++      return -1;
++    duration=native_ns-previous_native_ns;
++    if(duration>INT64_MAX-s->native_last_pts) return -1;
++    expected=s->native_last_pts+duration;
++    correction=projected>expected?projected-expected:expected-projected;
++    if(correction>SHIRI_CLOCK_CORRECTION_NS+duration/2000+1) return -1;
++    /* A locally valid correction cannot walk the program away from its
++     * original presentation timeline through repeated staircase steps. */
++    if(native_ns>INT64_MAX-s->native_origin_pts) return -1;
++    expected=s->native_origin_pts+native_ns;
++    correction=projected>expected?projected-expected:expected-projected;
++    if(correction>SHIRI_CLOCK_CORRECTION_NS+native_ns/2000+1) return -1;
++  }
++  projected+=s->delay_ns;
++  if(converted_ns>=native_ns) {
++    if(converted_ns-native_ns>INT64_MAX-projected) return -1;
++    *anchor=projected+(converted_ns-native_ns);
++  } else {
++    if(native_ns-converted_ns>=projected) return -1;
++    *anchor=projected-(native_ns-converted_ns);
++  }
++  return 0;
++}
++
++static int
++shiri_enqueue(struct shiri_session *s, struct output_data *data, uint64_t anchor)
++{
++  struct shiri_packet *p;
++  uint64_t now=shiri_now(), offset_frames=0, payload=0, offset_ns, begin_ns, end_ns, error, expected, packet_end_ns;
++  size_t frame_bytes=shiri_out_width(s->identity.format)*s->identity.channels;
++  size_t source_frame_bytes=shiri_out_source_width(s->identity.format)*s->identity.channels;
++  unsigned frames, chunk_max=SHIRI_OUT_PAYLOAD_MAX/source_frame_bytes;
++  if(!now || !data->buffer || data->samples<=0 || data->bufsize!=(uint64_t)data->samples*source_frame_bytes
++    || s->frame_count>(uint64_t)INT64_MAX-(uint64_t)(unsigned)data->samples) return -1;
++  if(anchor>now+SHIRI_QUEUE_NS || (anchor<now && now-anchor>=SHIRI_STALL_NS)) return -1;
++  if(shiri_frames_ns(&begin_ns,s->frame_count,s->identity.rate)<0
++    || shiri_frames_ns(&end_ns,s->frame_count+(unsigned)data->samples,s->identity.rate)<0
++    || end_ns-begin_ns>INT64_MAX-anchor) return -1;
++  if(s->next_pts) {
++    if(anchor<=s->last_packet_pts) return -1;
++    error=anchor>s->next_pts?anchor-s->next_pts:s->next_pts-anchor;
++    if(error>SHIRI_CLOCK_CORRECTION_NS+(s->last_packet_duration+SHIRI_CONVERTER_BACKLOG_NS)/2000+1)
++      return -1;
++  }
++  if(s->stream_pts) {
++    if(begin_ns>INT64_MAX-s->stream_pts) return -1;
++    expected=s->stream_pts+begin_ns;
++    error=anchor>expected?anchor-expected:expected-anchor;
++    if(error>SHIRI_CLOCK_CORRECTION_NS+(begin_ns+SHIRI_CONVERTER_BACKLOG_NS)/2000+1) return -1;
++  } else s->stream_pts=anchor;
++  while(offset_frames<(unsigned)data->samples) {
++    if(s->queued>=SHIRI_QUEUE_MAX) return -1;
++    frames=(unsigned)data->samples-offset_frames; if(frames>chunk_max) frames=chunk_max;
++    payload=(uint64_t)frames*frame_bytes;
++    p=malloc(sizeof(*p)+(size_t)frames*source_frame_bytes); if(!p) return -1;
++    p->next=NULL;
++    if(shiri_frames_ns(&offset_ns,s->frame_count+offset_frames,s->identity.rate)<0) { free(p); return -1; }
++    p->pts=anchor+(offset_ns-begin_ns);
++    p->first_frame=s->frame_count+offset_frames; p->frames=frames; p->bytes=payload;
++    p->raw_bytes=frames*source_frame_bytes;
++    memcpy(p->samples,data->buffer+offset_frames*source_frame_bytes,p->raw_bytes);
++    if(s->tail) s->tail->next=p; else s->head=p;
++    s->tail=p; s->queued++; s->queued_bytes+=p->raw_bytes; offset_frames+=frames;
++    if(shiri_frames_ns(&packet_end_ns,p->first_frame+p->frames,s->identity.rate)<0) return -1;
++    s->last_packet_pts=p->pts; s->last_packet_duration=packet_end_ns-offset_ns;
++  }
++  s->frame_count+=(unsigned)data->samples;
++  s->next_pts=anchor+(end_ns-begin_ns);
++  return 0;
++}
++
++static void
++shiri_write(struct output_buffer *obuf)
++{
++  struct shiri_session *s=shiri_sessions, *next;
++  struct output_data *raw=&obuf->data[0], *data;
++  uint64_t anchor, native_ns, converted_ns;
++  unsigned i;
++  while(s) {
++    next=s->next;
++    if(obuf->conversion_error || s->pending || shiri_native_anchor(s,raw,obuf->pts,&anchor)<0) {
++      shiri_session_fail(s); s=next; continue;
++    }
++    for(i=0;obuf->data[i].buffer;i++)
++      if(quality_is_equal(&shiri_quality,&obuf->data[i].quality)) break;
++    data=obuf->data[i].buffer?&obuf->data[i]:NULL;
++    /* A real resampler may emit nothing during bounded warmup. Count its raw
++     * input without losing the original presentation origin, but reject a
++     * persistent encoder failure or an impossible ahead-of-input output. */
++    if((data && data->samples<=0)
++      || shiri_frames_ns(&native_ns,s->native_frames+(unsigned)raw->samples,(unsigned)raw->quality.sample_rate)<0
++      || shiri_frames_ns(&converted_ns,s->frame_count+(data?(unsigned)data->samples:0),s->identity.rate)<0
++      || (native_ns>converted_ns && native_ns-converted_ns>SHIRI_CONVERTER_BACKLOG_NS)
++      || (converted_ns>native_ns && converted_ns-native_ns>(UINT64_C(1000000000)+s->identity.rate-1)/s->identity.rate)
++      || (data && shiri_enqueue(s,data,anchor)<0)) { shiri_session_fail(s); s=next; continue; }
++    s->native_frames+=(unsigned)raw->samples;
++    s->native_quality=raw->quality;
++    s->native_last_pts=(uint64_t)obuf->pts.tv_sec*UINT64_C(1000000000)+(uint64_t)obuf->pts.tv_nsec;
++    if(!s->native_origin_pts) s->native_origin_pts=s->native_last_pts;
++    s->native_last_frames=(unsigned)raw->samples;
++    if(data) s->state=OUTPUT_STATE_STREAMING;
++    shiri_pump(s);
++    s=next;
++  }
++}
++
++static int
++shiri_init(void)
++{
++  cfg_t *audio=cfg_getsec(cfg,"audio");
++  struct output_device *device;
++  struct sockaddr_un address;
++  const char *nickname=cfg_getstr(audio,"nickname");
++  long rate=cfg_getint(audio,"shiri_pcm_rate"), channels=cfg_getint(audio,"shiri_pcm_channels");
++  long format=cfg_getint(audio,"shiri_pcm_format"), uid=cfg_getint(audio,"shiri_pcm_peer_uid");
++  shiri_socket_path=cfg_getstr(audio,"shiri_pcm_socket");
++  if(!nickname || !*nickname || !shiri_socket_path || shiri_socket_path[0]!='/' || strlen(shiri_socket_path)>=sizeof(address.sun_path)
++    || rate<1||rate>384000||channels<1||channels>8||format<0||format>UINT16_MAX||uid<1||uid>UINT32_MAX
++    || !shiri_out_width((unsigned)format)) return -1;
++  memset(&shiri_config,0,sizeof(shiri_config));
++  if(shiri_hex(shiri_config.room,cfg_getstr(audio,"shiri_pcm_room_id"),1)<0
++    || shiri_hex(shiri_config.launch,cfg_getstr(audio,"shiri_pcm_launch_generation"),0)<0) return -1;
++  if(!shiri_out_nonzero(shiri_config.room)||!shiri_out_nonzero(shiri_config.launch)) return -1;
++  shiri_config.rate=rate; shiri_config.channels=channels; shiri_config.format=format; shiri_peer_uid=uid;
++  memset(&shiri_quality,0,sizeof(shiri_quality));
++  shiri_quality.sample_rate=rate; shiri_quality.channels=channels;
++  shiri_quality.bits_per_sample=shiri_out_source_width(format)*8;
++  device=calloc(1,sizeof(*device)); if(!device) return -1;
++  device->id=0; device->name=strdup(nickname);
++  if(!device->name) { free(device); return -1; }
++  device->type=OUTPUT_TYPE_ALSA; device->type_name=outputs_name(device->type);
++  device->quality=shiri_quality; device->supported_formats=MEDIA_FORMAT_PCM;
++  if(player_device_add(device)<0) { outputs_device_free(device); return -1; }
++  return 0;
++}
++static void
++shiri_deinit(void)
++{
++  while(shiri_sessions) shiri_session_cleanup(shiri_sessions);
++}
++struct output_definition output_shiri_pcm = {
++  .name="ALSA", .cfg_name="audio", .type=OUTPUT_TYPE_ALSA, .priority=3,
++  .init=shiri_init, .deinit=shiri_deinit, .device_start=shiri_device_start,
++  .device_stop=shiri_device_stop, .device_flush=shiri_device_flush,
++  .device_probe=shiri_device_probe, .device_volume_set=shiri_device_volume,
++  .device_cb_set=shiri_device_cb_set, .write=shiri_write,
++};

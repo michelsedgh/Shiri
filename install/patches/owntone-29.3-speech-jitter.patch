@@ -1,0 +1,320 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -3057,6 +3057,28 @@
+   return ret;
+ }
+ 
++/* Diagnostic reads execute on the same player thread as ingress/mix/source
++ * fencing. Copy the current source binding without mutating any media state. */
++static enum command_state
++shiri_speech_status_get(void *arg, int *retval)
++{
++  struct player_shiri_speech_status *out = arg;
++  shiri_speech_status(&out->media);
++  out->source = shiri_source_state.last;
++  out->source_initialized = shiri_source_state.initialized;
++  out->source_faulted = shiri_source_state.faulted;
++  *retval = out->media.observed_monotonic_ns ? 0 : SHIRI_SOURCE_FAILURE;
++  return COMMAND_END;
++}
++
++int
++player_shiri_speech_status(struct player_shiri_speech_status *status)
++{
++  if (!status) return SHIRI_SOURCE_INVALID;
++  memset(status, 0, sizeof(*status));
++  return commands_exec_sync(cmdbase, shiri_speech_status_get, NULL, status);
++}
++
+ static enum command_state
+ shiri_source_seal_flush(void *arg, int *retval)
+ {
+diff --git a/src/player.h b/src/player.h
+--- a/src/player.h
++++ b/src/player.h
+@@ -9,6 +9,7 @@
+ #include "misc.h" // for struct media_quality
+ #include "shiri_source.h"
+ #include "shiri_speech_ready.h"
++#include "shiri_speech.h"
+ 
+ // Maximum number of previously played songs that are remembered
+ #define MAX_HISTORY_COUNT 20
+@@ -161,6 +162,13 @@
+ int
+ player_playback_flush(void);
+ 
++struct player_shiri_speech_status {
++  struct shiri_speech_status media;
++  struct shiri_source_request source;
++  bool source_initialized, source_faulted;
++};
++int player_shiri_speech_status(struct player_shiri_speech_status *status);
++
+ int
+ player_shiri_source_transition(const struct shiri_source_request *request);
+ 
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -2102,6 +2102,64 @@
+   return HTTP_OK;
+ }
+ 
++static json_object *
++shiri_speech_status_hex(const uint8_t id[16])
++{
++  static const char hex[] = "0123456789abcdef";
++  char text[33]; unsigned i;
++  for (i = 0; i < 16; ++i) { text[2*i] = hex[id[i] >> 4]; text[2*i+1] = hex[id[i] & 15]; }
++  text[32] = 0;
++  return json_object_new_string(text);
++}
++
++static json_object *
++shiri_speech_status_integer(uint64_t value)
++{
++  return json_object_new_int64(value > INT64_MAX ? INT64_MAX : (int64_t)value);
++}
++
++static int
++jsonapi_reply_player_shiri_speech_status(struct httpd_request *hreq)
++{
++  struct player_shiri_speech_status status;
++  struct shiri_speech_status *m = &status.media;
++  json_object *reply;
++  const char *text;
++  if (player_shiri_speech_status(&status) < 0) return HTTP_SERVUNAVAIL;
++  CHECK_NULL(L_WEB, reply = json_object_new_object());
++  json_object_object_add(reply, "version", json_object_new_int(1));
++  json_object_object_add(reply, "scope", json_object_new_string("room_launch_lifetime; current_source_at_read_only_snapshot"));
++  json_object_object_add(reply, "reserve_ns", json_object_new_int(20000000));
++  json_object_object_add(reply, "configured", json_object_new_boolean(m->configured));
++  json_object_object_add(reply, "room_id", shiri_speech_status_hex(m->room));
++  json_object_object_add(reply, "launch_generation", shiri_speech_status_hex(m->launch));
++  json_object_object_add(reply, "source_initialized", json_object_new_boolean(status.source_initialized));
++  json_object_object_add(reply, "source_faulted", json_object_new_boolean(status.source_faulted));
++  json_object_object_add(reply, "incarnation", shiri_speech_status_hex(status.source.owner.incarnation));
++  json_object_object_add(reply, "session_id", shiri_zero(status.source.owner.session, 16) ? NULL : shiri_speech_status_hex(status.source.owner.session));
++  json_object_object_add(reply, "epoch", shiri_speech_status_integer(status.source.owner.epoch));
++  json_object_object_add(reply, "generation", shiri_speech_status_integer(status.source.owner.generation));
++  json_object_object_add(reply, "operation_generation", shiri_speech_status_integer(status.source.operation_generation));
++  json_object_object_add(reply, "active", json_object_new_boolean(m->active));
++  json_object_object_add(reply, "running", json_object_new_boolean(m->running));
++  json_object_object_add(reply, "priming", json_object_new_boolean(m->priming));
++#define FIELD(name, field) json_object_object_add(reply, name, shiri_speech_status_integer(m->field))
++  FIELD("observed_monotonic_ns", observed_monotonic_ns); FIELD("sequence", sequence); FIELD("queued_frames", queue_frames);
++  FIELD("admitted_packets", admitted); FIELD("refused_packets", refused); FIELD("expired_frames", expired);
++  FIELD("pcm_packets", pcm_packets); FIELD("admitted_frames", admitted_frames); FIELD("mixed_frames", mixed_frames);
++  FIELD("priming_events", priming_events); FIELD("priming_frames", priming_frames); FIELD("empty_frames", empty_frames);
++  FIELD("underflow_events", underflow_events); FIELD("underflow_frames", underflow_frames);
++  FIELD("priming_until_monotonic_ns", priming_until); FIELD("current_run_first_pcm_admitted_monotonic_ns", first_admission_ns);
++  FIELD("last_pcm_admitted_monotonic_ns", last_admission_ns); FIELD("last_pcm_emitted_monotonic_ns", last_emitted_ns);
++  FIELD("last_mix_monotonic_ns", last_mix_ns); FIELD("last_underflow_monotonic_ns", last_underflow_ns);
++  FIELD("last_resume_monotonic_ns", last_resume_ns); FIELD("max_pcm_admission_age_ns", max_admission_age_ns);
++  FIELD("max_pcm_interarrival_ns", max_interarrival_ns);
++#undef FIELD
++  text = json_object_to_json_string_ext(reply, JSON_C_TO_STRING_PLAIN);
++  evbuffer_add(hreq->out_body, text, strlen(text)); json_object_put(reply);
++  return HTTP_OK;
++}
++
+ static int
+ jsonapi_reply_player_shiri_volume(struct httpd_request *hreq)
+ {
+@@ -4793,6 +4851,7 @@
+ 
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-source$",                   jsonapi_reply_player_shiri_source },
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-speech-ready$",             jsonapi_reply_player_shiri_speech_ready },
++    { HTTPD_METHOD_GET,    "^/api/player/shiri-speech-status$",            jsonapi_reply_player_shiri_speech_status },
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-volume$",                   jsonapi_reply_player_shiri_volume },
+     { HTTPD_METHOD_GET,    "^/api/player$",                                jsonapi_reply_player },
+     { HTTPD_METHOD_PUT,    "^/api/player/play$",                           jsonapi_reply_player_play },
+diff --git a/src/shiri_speech.c b/src/shiri_speech.c
+--- a/src/shiri_speech.c
++++ b/src/shiri_speech.c
+@@ -34,6 +34,7 @@
+ #define SPEECH_AGE_NS UINT64_C(250000000)
+ #define SPEECH_FUTURE_NS UINT64_C(5000000)
+ #define SPEECH_FULL_GAIN 65536u
++#define SPEECH_RESERVE_NS UINT64_C(20000000)
+ 
+ struct speech_state {
+   uint8_t room[16], launch[16];
+@@ -44,6 +45,11 @@
+   unsigned head, count;
+   uint64_t sequence, lease;
+   uint64_t refused, expired, admitted;
++  uint64_t pcm_packets, admitted_frames, mixed_frames;
++  uint64_t priming_events, priming_frames, empty_frames, underflow_events, underflow_frames;
++  uint64_t priming_until, first_admission_ns, last_admission_ns, last_emitted_ns, last_mix_ns;
++  uint64_t last_underflow_ns, last_resume_ns, max_admission_age_ns, max_interarrival_ns;
++  int running, underflowing;
+   uint32_t duck;
+   double gain;
+   int active;
+@@ -65,6 +71,12 @@
+     ++*counter;
+ }
+ 
++static void
++speech_add(uint64_t *counter, uint64_t value)
++{
++  *counter = value > UINT64_MAX - *counter ? UINT64_MAX : *counter + value;
++}
++
+ static uint64_t
+ speech_now(void)
+ {
+@@ -117,7 +129,8 @@
+ {
+   if (!now) {
+     s->head = s->count = 0;
+-    s->active = 0;
++    s->active = s->running = s->underflowing = 0;
++    s->priming_until = 0;
+     return;
+   }
+   while (s->count && now >= s->expires[s->head]) {
+@@ -127,6 +140,10 @@
+   }
+   if (now >= s->lease)
+     s->active = 0;
++  if (!s->count && !s->active) {
++    s->running = s->underflowing = 0;
++    s->priming_until = 0;
++  }
+ }
+ 
+ /* Atomic validation/admission. A refused packet cannot update sequence,
+@@ -162,6 +179,22 @@
+   expires = emitted + SPEECH_AGE_NS;
+   if (expires > now + SPEECH_AGE_NS) expires = now + SPEECH_AGE_NS;
+   if (op == 1) {
++    /* Delay only this voice queue by one 20 ms packet. The player's program
++     * continues on its unchanged clock; no source/output command is issued.
++     * A 960-sample first packet is already 20 ms of media, so a count >= 960 gate
++     * alone would add no arrival-jitter reserve. Use actual admission time. */
++    if (!s->running) {
++      s->running = 1; s->priming_until = now + SPEECH_RESERVE_NS;
++      s->first_admission_ns = now; s->underflowing = 0;
++      speech_counter(&s->priming_events);
++    }
++    if (s->last_admission_ns && now >= s->last_admission_ns &&
++        now - s->last_admission_ns > s->max_interarrival_ns)
++      s->max_interarrival_ns = now - s->last_admission_ns;
++    if (now >= emitted && now - emitted > s->max_admission_age_ns)
++      s->max_admission_age_ns = now - emitted;
++    s->last_admission_ns = now; s->last_emitted_ns = emitted;
++    speech_counter(&s->pcm_packets); speech_add(&s->admitted_frames, frames);
+     for (i = 0; i < frames; ++i) {
+       pos = (s->head + s->count + i) % SPEECH_QUEUE;
+       /* Avoid implementation-defined unsigned-to-signed conversion. */
+@@ -194,12 +227,14 @@
+            unsigned bits, unsigned channels, uint64_t now)
+ {
+   unsigned i, channel;
+-  int voice, value, mixed;
++  int voice, value, mixed, playing;
+   double target, step;
+   if (!pcm || frames <= 0 || frames > (int)(SPEECH_RATE / 5) || rate != SPEECH_RATE || bits != 16 || channels != 2 ||
+       (uint64_t)(unsigned)frames * 4 != bytes)
+     return;
+   speech_expire(s, now);
++  playing = s->running && now >= s->priming_until;
++  s->last_mix_ns = now;
+   for (i = 0; i < (unsigned)frames; ++i) {
+     speech_expire(s, now);
+     /* Already-admitted speech retains its own session policy through normal
+@@ -210,8 +245,23 @@
+     if (target < s->gain) { s->gain -= step; if (s->gain < target) s->gain = target; }
+     else if (target > s->gain) { s->gain += step; if (s->gain > target) s->gain = target; }
+     voice = 0;
+-    if (s->count) {
++    if (playing && s->count) {
+       voice = s->samples[s->head]; s->head = (s->head + 1) % SPEECH_QUEUE; --s->count;
++      speech_counter(&s->mixed_frames);
++      if (s->underflowing) s->last_resume_ns = now;
++      s->underflowing = 0;
++    } else if (!playing && s->running) {
++      speech_counter(&s->priming_frames);
++    } else {
++      speech_counter(&s->empty_frames);
++      /* An ended lease with no pending audio is normal retirement. Count
++       * underflow only while this admitted run still expects audible speech. */
++      if (playing && s->active) {
++        if (!s->underflowing) {
++          speech_counter(&s->underflow_events); s->last_underflow_ns = now;
++        }
++        s->underflowing = 1; speech_counter(&s->underflow_frames);
++      }
+     }
+     for (channel = 0; channel < 2; ++channel) {
+       unsigned offset = i * 4u + channel * 2u;
+@@ -224,6 +274,31 @@
+       pcm[offset] = (uint8_t)raw; pcm[offset + 1] = (uint8_t)(raw >> 8);
+     }
+   }
++  if (!s->count && !s->active) {
++    s->running = s->underflowing = 0; s->priming_until = 0;
++  }
++}
++
++/* A read-only player-thread snapshot. Querying diagnostics must not expire,
++ * prime, drain or otherwise alter admitted media or gain state. Counters are
++ * room-launch lifetime totals; current source binding is supplied by player. */
++void
++shiri_speech_status(struct shiri_speech_status *out)
++{
++  if (!out) return;
++  memset(out, 0, sizeof(*out));
++  out->observed_monotonic_ns = speech_now();
++  out->configured = speech_fd >= 0;
++  memcpy(out->room, speech.room, 16); memcpy(out->launch, speech.launch, 16);
++  out->sequence = speech.sequence; out->queue_frames = speech.count;
++  out->active = speech.active; out->running = speech.running;
++  out->priming = speech.running && speech.priming_until && out->observed_monotonic_ns && out->observed_monotonic_ns < speech.priming_until;
++#define COPY(field) out->field = speech.field
++  COPY(refused); COPY(expired); COPY(admitted); COPY(pcm_packets); COPY(admitted_frames); COPY(mixed_frames);
++  COPY(priming_events); COPY(priming_frames); COPY(empty_frames); COPY(underflow_events); COPY(underflow_frames);
++  COPY(priming_until); COPY(first_admission_ns); COPY(last_admission_ns); COPY(last_emitted_ns); COPY(last_mix_ns);
++  COPY(last_underflow_ns); COPY(last_resume_ns); COPY(max_admission_age_ns); COPY(max_interarrival_ns);
++#undef COPY
+ }
+ 
+ int
+diff --git a/src/shiri_speech.h b/src/shiri_speech.h
+--- a/src/shiri_speech.h
++++ b/src/shiri_speech.h
+@@ -5,6 +5,18 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++
++/* Immutable copy of bounded launch-lifetime diagnostics; never PCM/secrets. */
++struct shiri_speech_status {
++  uint8_t room[16], launch[16];
++  uint64_t observed_monotonic_ns, sequence, queue_frames;
++  uint64_t refused, expired, admitted, pcm_packets, admitted_frames, mixed_frames;
++  uint64_t priming_events, priming_frames, empty_frames, underflow_events, underflow_frames;
++  uint64_t priming_until, first_admission_ns, last_admission_ns, last_emitted_ns, last_mix_ns;
++  uint64_t last_underflow_ns, last_resume_ns, max_admission_age_ns, max_interarrival_ns;
++  int configured, active, running, priming;
++};
++void shiri_speech_status(struct shiri_speech_status *out);
+ 
+ int shiri_speech_init(const char *path, long peer_uid, const char *room,
+                       const char *launch, int framed);

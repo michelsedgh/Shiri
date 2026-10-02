@@ -1,0 +1,384 @@
+diff --git a/configure.ac b/configure.ac
+index 52ca8328..7db46420 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/outputs/alsa.c b/src/outputs/alsa.c
+index 0cea8e9d..7e759b45 100644
+--- a/src/outputs/alsa.c
++++ b/src/outputs/alsa.c
+@@ -97,35 +97,36 @@ struct alsa_mixer
+ struct alsa_playback_session
+ {
+   snd_pcm_t *pcm;
+   struct alsa_session *session;
+   uint8_t *volume_buf;
+   size_t volume_bufsize;
+ 
+   int buffer_nsamp;
++  bool startup_done; // Initial prebuffering is never repeated after pos wraps.
+ 
+   uint32_t pos;
+ 
+   uint32_t last_pos;
+   uint32_t last_buflen;
+ 
+   struct media_quality quality;
+   struct timespec last_pts;
+ 
+   // Used for syncing with the clock
+   struct timespec stamp_pts;
+   uint64_t stamp_pos;
+ 
+   // Array of latency calculations, where latency_counter tells how many are
+   // currently in the array
+   double *latency_history;
+   int latency_counter;
+ 
+   int sync_resample_step;
+ 
+   // Here we buffer samples during startup
+   struct ringbuffer prebuf;
+ 
+   struct alsa_playback_session *next;
+ };
+ 
+ // Info about the device, which is not required by the player, only internally
+@@ -837,108 +838,144 @@ static snd_pcm_sframes_t
+ pcm_write(struct alsa_playback_session *pb, const uint8_t *buf, snd_pcm_sframes_t nsamp)
+ {
+   struct alsa_session *as = pb->session;
+   uint8_t *allocated;
+   ssize_t bytes;
+   size_t frame_bytes;
+ 
+   if (!as->software_volume)
+     return snd_pcm_writei(pb->pcm, buf, nsamp);
+   if (nsamp < 0 || pb->quality.channels <= 0
+       || (pb->quality.bits_per_sample != 16 && pb->quality.bits_per_sample != 24
+           && pb->quality.bits_per_sample != 32))
+     return -EINVAL;
+   if (nsamp == 0)
+     return 0;
+   if ((size_t)pb->quality.channels > SIZE_MAX / (pb->quality.bits_per_sample / 8))
+     return -EINVAL;
+   frame_bytes = (size_t)(pb->quality.bits_per_sample / 8) * pb->quality.channels;
+   if ((uint64_t)nsamp > (uint64_t)SSIZE_MAX / frame_bytes)
+     return -EINVAL;
+   bytes = snd_pcm_frames_to_bytes(pb->pcm, nsamp);
+   if (bytes < 0 || (size_t)bytes != (size_t)nsamp * frame_bytes)
+     return -EINVAL;
+   if ((size_t)bytes > pb->volume_bufsize)
+     {
+       allocated = realloc(pb->volume_buf, bytes);
+       if (!allocated)
+         return -ENOMEM;
+       pb->volume_buf = allocated;
+       pb->volume_bufsize = bytes;
+     }
+   if (pcm_volume_scale_copy(pb->volume_buf, buf, bytes, pb->quality.bits_per_sample, as->volume) < 0)
+     return -EINVAL;
+ 
+   return snd_pcm_writei(pb->pcm, pb->volume_buf, nsamp);
+ }
+ 
++/* Transfer only acknowledged frames. A positive ALSA short write, EINTR or
++ * EAGAIN must not consume the raw tail that a later callback still owns.
++ * Bound work per callback; the existing OwnTone output timer supplies retries. */
++static int
++buffer_transfer(struct alsa_playback_session *pb, snd_pcm_sframes_t *avail)
++{
++  uint8_t *buf, *consumed;
++  ssize_t bytes, submitted;
++  snd_pcm_sframes_t nsamp, ret;
++  unsigned attempts = 0;
++
++  while (*avail > 0 && pb->prebuf.read_avail && attempts++ < 8)
++    {
++      bytes = snd_pcm_frames_to_bytes(pb->pcm, *avail);
++      if (bytes <= 0)
++        return -EINVAL;
++      if ((size_t)bytes > pb->prebuf.read_avail)
++        bytes = pb->prebuf.read_avail;
++      if ((size_t)bytes > pb->prebuf.size - pb->prebuf.read_pos)
++        bytes = pb->prebuf.size - pb->prebuf.read_pos;
++      nsamp = snd_pcm_bytes_to_frames(pb->pcm, bytes);
++      if (nsamp <= 0 || nsamp > *avail || snd_pcm_frames_to_bytes(pb->pcm, nsamp) != bytes)
++        return -EINVAL;
++      buf = pb->prebuf.buffer + pb->prebuf.read_pos;
++      ret = pcm_write(pb, buf, nsamp);
++      if (ret == 0 || ret == -EAGAIN || ret == -EINTR)
++        return 0;
++      if (ret < 0)
++        return ret;
++      if (ret > nsamp)
++        return -EIO;
++      submitted = snd_pcm_frames_to_bytes(pb->pcm, ret);
++      if (submitted <= 0 || submitted > bytes)
++        return -EINVAL;
++      if (ringbuffer_read(&consumed, submitted, &pb->prebuf) != (size_t)submitted || consumed != buf)
++        return -EIO;
++      *avail -= ret;
++    }
++  return 0;
++}
++
++/* The prebuffer is the bounded per-playback raw queue. Never silently accept a
++ * partially appended source block when a device stops making enough progress. */
++static int
++buffer_append(struct alsa_playback_session *pb, const uint8_t *buf, size_t bytes)
++{
++  if (bytes > pb->prebuf.write_avail)
++    {
++      DPRINTF(E_LOG, L_LAUDIO, "ALSA raw queue has insufficient capacity; refusing to discard audio\n");
++      return -ENOBUFS;
++    }
++  if (bytes && ringbuffer_write(&pb->prebuf, buf, bytes) != bytes)
++    return -EIO;
++  return 0;
++}
++
+ // This function writes the sample buf into either the prebuffer or directly to
+ // ALSA, depending on how much room there is in ALSA, and whether we are
+ // prebuffering or not. It also transfers from the the prebuffer to ALSA, if
+ // needed. Returns 0 on success, negative on error.
+ static int
+ buffer_write(struct alsa_playback_session *pb, struct output_data *odata, snd_pcm_sframes_t avail)
+ {
+-  uint8_t *buf;
+-  ssize_t bufsize;
+-  size_t wrote;
+-  snd_pcm_sframes_t nsamp;
++  ssize_t bytes, submitted;
+   snd_pcm_sframes_t ret;
++  int result;
++
++  if (odata->samples < 0 || avail < 0)
++    return -EINVAL;
++  bytes = snd_pcm_frames_to_bytes(pb->pcm, odata->samples);
++  if (bytes < 0 || (size_t)bytes != odata->bufsize || (bytes && !odata->buffer))
++    return -EINVAL;
+ 
+   // Prebuffering, no actual writing
+   if (avail == 0)
+     {
+-      wrote = ringbuffer_write(&pb->prebuf, odata->buffer, odata->bufsize);
+-      if (wrote < odata->bufsize)
+-	DPRINTF(E_WARN, L_LAUDIO, "Bug! Partial prebuf write %zu/%zu\n", wrote, odata->bufsize);
+-
+-      nsamp = snd_pcm_bytes_to_frames(pb->pcm, wrote);
+-      return nsamp;
+-    }
+-
+-  // Read from prebuffer if it has data and write to device
+-  if (pb->prebuf.read_avail != 0)
+-    {
+-      // Maximum amount of bytes we want to read
+-      bufsize = snd_pcm_frames_to_bytes(pb->pcm, avail);
+-
+-      bufsize = ringbuffer_read(&buf, bufsize, &pb->prebuf);
+-      if (bufsize == 0)
+-	return 0;
+-
+-//      DPRINTF(E_DBG, L_LAUDIO, "Writing prebuffer (read_avail=%zu, bufsize=%zu, avail=%li)\n", pb->prebuf.read_avail, bufsize, avail);
+-
+-      nsamp = snd_pcm_bytes_to_frames(pb->pcm, bufsize);
+-
+-      ret = pcm_write(pb, buf, nsamp);
+-      if (ret < 0)
+-	return ret;
+-
+-      avail -= ret;
++      result = buffer_append(pb, odata->buffer, odata->bufsize);
++      return result < 0 ? result : odata->samples;
+     }
+ 
+-  // Write to prebuffer if device buffer does not have availability or if we are
+-  // still prebuffering. Note that if the prebuffer doesn't have enough room,
+-  // which can happen if avail stays low, i.e. device buffer is overrunning,
+-  // then the extra samples get dropped
++  result = buffer_transfer(pb, &avail);
++  if (result < 0)
++    return result;
++  // Existing queued frames always precede this block, including their tails.
+   if (odata->samples > avail || pb->prebuf.read_avail != 0)
+     {
+-      wrote = ringbuffer_write(&pb->prebuf, odata->buffer, odata->bufsize);
+-      if (wrote < odata->bufsize)
+-	DPRINTF(E_WARN, L_LAUDIO, "Dropped %zu bytes of audio - device is overrunning!\n", odata->bufsize - wrote);
+-
+-      return odata->samples;
++      result = buffer_append(pb, odata->buffer, odata->bufsize);
++      return result < 0 ? result : odata->samples;
+     }
+ 
+-  nsamp = snd_pcm_bytes_to_frames(pb->pcm, odata->bufsize);
+-
+-  ret = pcm_write(pb, odata->buffer, nsamp);
+-  if (ret < 0)
++  ret = pcm_write(pb, odata->buffer, odata->samples);
++  if (ret == -EAGAIN || ret == -EINTR)
++    ret = 0;
++  else if (ret < 0)
+     return ret;
+-
+-  if (ret != odata->samples)
+-    DPRINTF(E_WARN, L_LAUDIO, "ALSA partial write detected\n");
+-
+-  return ret;
++  if (ret > odata->samples)
++    return -EIO;
++  submitted = snd_pcm_frames_to_bytes(pb->pcm, ret);
++  if (submitted < 0 || submitted > bytes)
++    return -EINVAL;
++  result = buffer_append(pb, odata->buffer ? odata->buffer + submitted : NULL, bytes - submitted);
++  // pb.pos counts source frames admitted to PCM plus its retained raw queue,
++  // not only the frames that this particular driver call accepted.
++  return result < 0 ? result : odata->samples;
+ }
+ 
+ static enum alsa_sync_state
+@@ -1066,46 +1103,34 @@ sync_correct(struct alsa_playback_session *pb, double drift, double latency, str
+ static int
+ playback_drain(struct alsa_playback_session *pb)
+ {
+-  uint8_t *buf;
+-  ssize_t bufsize;
+   snd_pcm_state_t state;
+   snd_pcm_sframes_t avail;
+   snd_pcm_sframes_t delay;
+-  snd_pcm_sframes_t nsamp;
+   int ret;
+ 
+   state = snd_pcm_state(pb->pcm);
+   if (state == SND_PCM_STATE_DRAINING)
+     return 0;
+   else if (state != SND_PCM_STATE_RUNNING)
+     return ALSA_ERROR_SESSION; // We are probably done draining, so this makes the caller close the pb session
+ 
+   // If the prebuffer is empty we are done writing to this pcm
+   if (pb->prebuf.read_avail == 0)
+     {
+-      snd_pcm_drain(pb->pcm); // Plays pending frames and then stops the pcm
+-      return 0;
++      ret = snd_pcm_drain(pb->pcm); // Plays pending frames and then stops the pcm
++      return (ret < 0 && ret != -EAGAIN && ret != -EINTR) ? ALSA_ERROR_SESSION : 0;
+     }
+ 
+   ret = snd_pcm_avail_delay(pb->pcm, &avail, &delay);
++  if (ret == -EAGAIN || ret == -EINTR)
++    return 0;
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Error getting avail/delay: %s\n", snd_strerror(ret));
+       return ALSA_ERROR_SESSION;
+     }
+ 
+-  // Maximum amount of bytes we want to read
+-  bufsize = snd_pcm_frames_to_bytes(pb->pcm, avail);
+-
+-  bufsize = ringbuffer_read(&buf, bufsize, &pb->prebuf);
+-  if (bufsize == 0)
+-    return 0; // avail too low to actually write anything
+-
+-//  DPRINTF(E_DBG, L_LAUDIO, "Draining prebuffer (read_avail=%zu, bufsize=%zu, avail=%li)\n", pb->prebuf.read_avail / 4, bufsize, avail);
+-
+-  nsamp = snd_pcm_bytes_to_frames(pb->pcm, bufsize);
+-
+-  ret = pcm_write(pb, buf, nsamp);
++  ret = buffer_transfer(pb, &avail);
+ 
+   return ((ret < 0) ? ALSA_ERROR_SESSION : 0);
+ }
+@@ -1114,67 +1139,80 @@ static int
+ playback_write(struct alsa_playback_session *pb, struct output_buffer *obuf)
+ {
+   snd_pcm_sframes_t avail;
+   snd_pcm_sframes_t delay;
+   enum alsa_sync_state sync;
+   double drift;
+   double latency;
+   bool prebuffering;
+   int ret;
+   int i;
+ 
+   // Find the quality we want
+   for (i = 0; obuf->data[i].buffer; i++)
+     {
+       if (quality_is_equal(&pb->quality, &obuf->data[i].quality))
+ 	break;
+     }
+ 
+   if (!obuf->data[i].buffer)
+     {
+       DPRINTF(E_LOG, L_LAUDIO, "Output not delivering required data quality, aborting\n");
+       return -1;
+     }
+ 
+-  prebuffering = (pb->pos + obuf->data[i].samples <= pb->buffer_nsamp);
++  if (obuf->data[i].samples < 0 || pb->buffer_nsamp < 0)
++    {
++      ret = -EINVAL;
++      goto alsa_error;
++    }
++  prebuffering = !pb->startup_done
++    && ((uint64_t)pb->pos + (uint64_t)obuf->data[i].samples <= (uint64_t)pb->buffer_nsamp);
+   if (prebuffering)
+     {
+-      // Can never fail since we don't actually write to the device
+-      pb->pos += buffer_write(pb, &obuf->data[i], 0);
++      ret = buffer_write(pb, &obuf->data[i], 0);
++      if (ret < 0)
++        goto alsa_error;
++      pb->pos += ret;
+       return 0;
+     }
+ 
++  // This session has crossed its initial buffer horizon. Keep modulo pos for
++  // the existing sync calculation, but never infer startup from that counter.
++  pb->startup_done = true;
+   ret = snd_pcm_avail_delay(pb->pcm, &avail, &delay);
+   if (ret < 0)
+     goto alsa_error;
+ 
+   // Check sync each second (or if this is first write where last_pts is zero)
+   if (!alsa_sync_disable && (obuf->pts.tv_sec != pb->last_pts.tv_sec))
+     {
+       sync = sync_check(&drift, &latency, pb, delay);
+       if (sync != ALSA_SYNC_OK)
+ 	sync_correct(pb, drift, latency, obuf->pts, delay);
+ 
+       pb->last_pts = obuf->pts;
+     }
+ 
+   ret = buffer_write(pb, &obuf->data[i], avail);
+   if (ret < 0)
+     goto alsa_error;
+ 
++  // Count frames admitted to PCM plus the retained raw queue, not only the
++  // immediate short-positive driver submission. sync_check subtracts that queue.
+   pb->pos += ret;
+ 
+   return 0;
+ 
+  alsa_error:
+   if (ret == -EPIPE)
+     {
+       DPRINTF(E_WARN, L_LAUDIO, "ALSA buffer underrun, restarting session\n");
+       return ALSA_ERROR_UNDERRUN;
+     }
+ 
+   DPRINTF(E_LOG, L_LAUDIO, "ALSA write error: %s\n", snd_strerror(ret));
+   return ALSA_ERROR_WRITE;
+ }
+ 
+ 
+ /* ---------------------------- SESSION HANDLING ---------------------------- */

@@ -1,8 +1,8 @@
 # Shiri
 
-Shiri's production goal is to turn each configured zone into **both an AirPlay 2 receiver and a Chromecast receiver**. Phones use their existing casting controls, without a Shiri phone app. Shiri sends the incoming audio to that zone's assigned speakers, which can use different supported output protocols. TTS targets the same zones, lowering music volume while music keeps playing, then smoothly restoring it. The authoritative behavior and release requirements are in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md).
+Shiri turns each configured zone into an **AirPlay 2 receiver**. Phones use their existing AirPlay controls, without a Shiri phone app. Shiri sends the incoming audio to that zone's assigned speakers, which can use different supported output protocols. TTS targets the same zones, lowering music volume while music keeps playing, then smoothly restoring it. The user deferred Chromecast input on October 1; Chromecast speaker outputs remain supported through OwnTone. The authoritative behavior and release requirements are in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md).
 
-This branch is an **incomplete replacement under validation**. The candidate currently implements AirPlay input and OwnTone output; Chromecast input and source arbitration are required work still missing. The previous application and live Ubuntu deployment are preserved. Passing software checks does not establish native phone compatibility or synchronization at the final speakers. The review loop, completed checks, and remaining release gates are recorded in [docs/REBUILD.md](docs/REBUILD.md).
+This branch is an **incomplete replacement under validation**. The candidate implements AirPlay input, exact source ownership, OwnTone output, targeted speech and recorded timing calibration. Chromecast input is deferred pending a viable receiver; [receiver feasibility](docs/CAST_INPUT_FEASIBILITY.md) records the evidence. The previous application and live Ubuntu deployment are preserved. Passing software checks does not establish native phone compatibility or synchronization at the final speakers. The review loop, completed checks, and remaining release gates are recorded in [docs/REBUILD.md](docs/REBUILD.md).
 
 ## Candidate paths and missing requirements
 
@@ -12,13 +12,13 @@ This branch is an **incomplete replacement under validation**. The candidate cur
 | Room-addressed speech | Authenticated WebRTC audio API, one active producer per room | Nobly is a future external client; it is not installed |
 | AirPlay output | OwnTone 29.3 | Device authorization may require setup |
 | Google Cast output | OwnTone's Cast implementation | Cross-protocol synchronization is approximate; device support varies |
-| Wired/local output | Explicit ALSA device | Requires a usable Linux audio device |
-| Bluetooth output | Paired Bluetooth device exposed through ALSA, such as BlueALSA | Pairing, adapter setup, and VM USB passthrough are external setup |
-| Google Cast input | **Required; missing from this candidate** | Receiver authentication, native phone compatibility and audio capture must be verified |
+| Wired/local output | Enrolled physical ALSA device, with opened-device identity checks | Requires a usable Linux audio device; isolated Linux playback validation is in progress |
+| Bluetooth output | Exact paired A2DP endpoint through maintained BlueALSA and a descriptor-only worker | Combined route and physical acceptance remain open; pairing, adapter setup and VM USB passthrough are external setup |
+| Google Cast input | **Deferred by the user for this release** | Any future receiver needs authentication, stock-phone compatibility and audio/control validation |
 
-One OwnTone instance currently delivers one zone's mixed program to its selected outputs. Different zones can receive different programs. Native iPhone selection of several Shiri receivers is a required use case, but synchronization across the candidate's independent output instances is **not yet verified**. The relay must preserve or reconstruct the source's shared timeline through to the final speakers. See [architecture](docs/ARCHITECTURE.md).
+One OwnTone instance delivers each zone's mixed program to its selected outputs. Different zones can receive different programs. When a phone selects several Shiri receivers, the patched receiver, mixer and OwnTone input preserve the common presentation timeline instead of starting each relay from its arrival time. The short synthetic Ubuntu grouped-audio check passed through final digital PCM, including speech, source takeover and end-of-stream. Stock-phone grouping, physical-speaker timing and longer playback remain acceptance gates. See [architecture](docs/ARCHITECTURE.md).
 
-OwnTone supports per-output timing offsets from −2000 to +2000 ms. Positive values add delay. Shiri preserves these profiles across deselection and verifies backend readback. Applying a changed delay during playback briefly pauses and resumes that room because OwnTone applies the offset when it starts an output session. Readback confirms the setting; acoustic measurement confirms the physical result. The proposed microphone calibration workflow is documented in [docs/CALIBRATION.md](docs/CALIBRATION.md).
+OwnTone supports per-output timing offsets from −2000 to +2000 ms. Positive values add delay. Shiri preserves these profiles across deselection and verifies backend readback. Recorded calibration measures speakers within one zone or across grouped zones, retains reviewable results and applies or rolls back a correction with the target zone off. Direct administrative offset changes during playback restart that room's output session because OwnTone applies the offset when a session starts. Speech never invokes that operation. Readback confirms the setting; verification recordings confirm the measured result. See [docs/CALIBRATION.md](docs/CALIBRATION.md).
 
 ## Development
 
@@ -91,10 +91,13 @@ The rootless HTTP service owns validated room intent in SQLite. A separate privi
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/v1/state` | Saved rooms, observed runtime, discovery, capabilities |
+| `GET /api/v1/local-devices` | Current local audio devices and supported physical bindings |
+| `POST /api/v1/local-devices/bind` | Enroll an exact serial, port or platform binding |
 | `POST /api/v1/rooms` | Create a disabled room |
 | `PATCH /api/v1/rooms/{id}` | Update with `expected_revision` and `changes` |
 | `PUT /api/v1/rooms/{id}/speakers` | Assign discovered speaker IDs with a revision |
 | `PATCH /api/v1/rooms/{id}/speakers/{speaker}/offset` | Save an offset with a revision |
+| `/api/v1/rooms/{id}/calibration` | Recorded timing sessions, analysis, guarded correction and rollback |
 | `POST /api/v1/rooms/{id}/speech` | Negotiate or close explicitly identified speech |
 | `POST /api/v1/nobly/rooms/{external_id}/speech` | Route by an exact configured Nobly room binding |
 | `GET /api/v1/health/live` | HTTP process liveness |

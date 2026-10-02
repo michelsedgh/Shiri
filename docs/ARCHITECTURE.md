@@ -1,7 +1,7 @@
 # Shiri architecture
 
-Every Shiri zone must expose both an AirPlay 2 input receiver and a Chromecast
-input receiver, routing native phone playback to its explicitly assigned mixed
+Every Shiri zone must expose an AirPlay 2 input receiver,
+routing native phone playback to its explicitly assigned mixed
 speaker outputs. Listeners use existing phone casting controls; the admin web
 interface is not a playback prerequisite. Room configuration is
 durable intent; running processes, discovered devices and acknowledged backend
@@ -14,8 +14,11 @@ synchronization through the final output stage. These requirements are defined
 in [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md).
 
 This document distinguishes the required architecture from the current clean
-candidate on `codex/shiri-rebuild`. Cast input, cross-input ownership and verified
-native multi-zone output timing are missing required capabilities. The release
+candidate on `codex/shiri-rebuild`. Verified native multi-zone output timing
+remains a release gate. The user explicitly deferred Cast input on October 1;
+its future adapter must meet the same source ownership boundary. Cast speaker
+outputs remain supported. The source actor and AirPlay
+runtime ownership boundary are implemented. The release
 gates in [REBUILD.md](REBUILD.md) remain open.
 
 ## Required receiver and source boundary
@@ -23,23 +26,23 @@ gates in [REBUILD.md](REBUILD.md) remain open.
 ```mermaid
 flowchart LR
     iPhone[Native iPhone AirPlay controls] --> AP[Zone AirPlay 2 receiver]
-    Phone[Existing phone Cast controls] --> CI[Zone Chromecast receiver]
     AP --> Owner[One explicit zone music owner]
-    CI --> Owner
     Owner --> Mix[Zone music and TTS mix]
     Nobly[Exact-zone TTS] --> Mix
     Mix --> Engine[Output engine preserving required group timing]
     Engine --> Speakers[Assigned mixed speaker outputs]
 ```
 
-AirPlay and Cast must share an explicit source policy. Takeover, rejection,
+AirPlay and any future Cast adapter must share an explicit source policy. Takeover, rejection,
 volume, pause, stop and disconnect need source/session identities; callbacks
 from a superseded producer must not affect the current owner. TTS remains a
 separate bounded overlay: lower the music gain while its timeline continues,
 mix speech, then restore gain smoothly. It must not pause, seek, restart or
-reconnect music, or disconnect the phone. A pure preparatory policy now exists
-in `shiri/source.py`, but no receiver/runtime adapter consumes it. Phone-volume
-receipts also do not supply this cross-protocol ownership boundary.
+reconnect music, or disconnect the phone. `shiri/source.py` defines the policy;
+`runtime/source.py` serializes grants, downstream barriers and final writes.
+`runtime/native.py` binds exact AirPlay transport handles and forwards native
+volume through durable receipts. A future supported Cast input adapter must
+use this same ownership boundary; no Cast receiver is currently installed.
 
 The policy grants the newest serialized input request and issues an exact
 token containing zone, actor incarnation, protocol, producer session identity
@@ -54,8 +57,9 @@ replay of the live producer. That generated ID remains stable for retries of
 one genuine admission, and exact native identifiers are never guessed.
 
 Adapters must serialize genuine admission requests, commit state before
-actions, preserve the epoch high-water across restart and begin a fresh actor
-incarnation. Takeover emits `revoke_input` for the old token before
+actions, advance epochs within an actor and begin a fresh actor incarnation
+after restart. Retired incarnations cannot regain authority. Takeover emits
+`revoke_input` for the old token before
 `grant_input` for the new token. Before admitting new PCM, the adapter must
 acknowledge the old route's quiescence, or atomically fence it and discard its
 buffered PCM. Media can arrive before a control callback and stopping a producer
@@ -84,11 +88,12 @@ Turning a delayed playback-status callback into a new admission would bypass
 the policy. The reducer's tests establish event and action rules, not native
 receiver enforcement, atomic physical takeover or acoustic behavior.
 
-Inbound Cast discovery, authentication, media playback and streaming must be
+Before future Cast input is enabled, discovery, authentication, media playback and streaming must be
 validated using stock phones and existing apps. An OwnTone Chromecast output
 is not an inbound receiver; advertising mDNS alone or demonstrating a custom
 sender does not pass this requirement. No Cast input adapter has passed the
-required admission tests. [Receiver evaluation](RECEIVER_RESEARCH.md)
+admission tests. Cast input is deferred for this release.
+[Receiver evaluation](RECEIVER_RESEARCH.md), [current feasibility](CAST_INPUT_FEASIBILITY.md)
 
 ## Implemented candidate process and audio boundaries
 
@@ -100,17 +105,19 @@ flowchart LR
     API -->|bounded Unix socket RPC| Broker[Privileged Linux broker]
     Broker --> Receiver[Per-room Shairport Sync + NQPTP]
     Phone[AirPlay source] --> Receiver
-    Receiver --> ALSA[ALSA Loopback room slot]
-    ALSA --> Mixer[Per-room GStreamer audio worker]
+    Receiver --> Native[Private credential-checked timestamped PCM]
+    Native --> Mixer[Per-room native music and speech worker]
     AI -->|negotiated WebRTC audio| Mixer
-    Mixer --> FIFO[Bounded nonblocking PCM FIFO]
+    Mixer --> FIFO[Bounded framed PCM FIFO preserving presentation time]
     FIFO --> OwnTone[Per-room OwnTone sender]
     OwnTone --> AirPlay[AirPlay outputs]
     OwnTone --> Cast[Chromecast outputs]
     OwnTone --> Local[Configured wired ALSA device]
-    OwnTone --> Return[ALSA Loopback return]
-    Return --> Bridge[Host BlueALSA output worker]
-    Bridge --> Bluetooth[Paired Bluetooth speaker]
+    OwnTone --> Final[Identity-checked final PCM socket]
+    Final --> Bridge[Descriptor-only Bluetooth output worker]
+    Broker -->|exact PCM and restricted controller descriptors| Bridge
+    Bridge --> BlueALSA[Maintained BlueALSA SBC encoder]
+    BlueALSA --> Bluetooth[Paired Bluetooth speaker]
 ```
 
 The product API imports no GStreamer or privileged networking code. It validates
@@ -119,41 +126,41 @@ through a small RPC contract. The broker alone creates namespaces and starts
 owned processes. Each audio worker mixes music with one speech producer; it
 does not discover or open network speakers.
 
-The API is rootless, but the current candidate's backend and audio daemons
-still retain UID 0/capabilities after namespace and mount setup. Least-privilege
-daemon execution is therefore an unresolved production gate. The root broker
-must retain its singleton, manifest and setup/cleanup authority while launching
-input, output and decoding workers with separate nonroot room credentials and
-only the narrowly required capabilities. Executables/configuration must be
-read-only to those workers; their database, cache and FIFO write permissions
-must be scoped to their private state. Network input daemons must not retain
-root DAC authority or access to the host system D-Bus.
+The root broker retains its singleton, manifest and setup/cleanup authority.
+The current launcher uses fixed separate non-root room identities for input,
+output and decoding workers, private mount views and exact device grants.
+OwnTone waits behind a root-controlled launch gate until its exact cgroup has
+verified persistent kernel bind policies and those identities are saved. Local
+outputs inherit a filter allowing only libasound's necessary read/preference
+control ioctls; hardware parameters follow an opened-PCM identity check.
+Executables and configuration are read-only to workers; writable database,
+cache and FIFO paths are private. Network input workers have no root DAC
+authority or host system D-Bus access. The combined boundary passed actual
+Ubuntu kernel and guarded virtual PCM checks; full playback and crash coverage
+remain explicit in [REBUILD.md](REBUILD.md).
 
-Hook RPC must admit only the expected daemon UID and its exact room's bounded
-music/volume signals. Those credentials must not authorize every broker
-operation or be interchangeable with the rootless administration API's socket
-rights. The current unrestricted root-daemon path has not met that boundary;
-the large permission change remains required work after current foundation
-checks stabilize.
+Hook RPC admits only the expected daemon UID and its exact room's bounded
+music/volume signals. Those credentials do not authorize general broker
+operations and differ from the rootless administration API's socket rights.
+The native socket checks the exact receiver UID and every media callback
+requires the admitted incarnation, session, epoch and native generation.
 
 The PCM contract is 48 kHz, stereo, signed 16-bit little-endian between mixer
 and OwnTone. Speech is decoded and resampled to 48 kHz mono before mixing.
-The pinned Shairport ALSA backend looks up fixed receiver rate, format and
-channels under `alsa`, where the candidate sets `48000`, `"S16_LE"` and `2`.
-Moving those settings to `general` would leave them unread. Its verbose
-automatic-selection lines still read legacy flags initialized true rather
-than the parser's actual permitted rate/format sets; those lines cannot prove
-whether the constraint was applied. A runtime format claim needs actual ALSA
-hardware-parameter or negotiated capture evidence.
-[Pinned audio option parser](https://github.com/mikebrady/shairport-sync/blob/7bad231c18368dbd26f298577f6210e36e4b0797/audio.c#L239-L251),
-[ALSA parser invocation](https://github.com/mikebrady/shairport-sync/blob/7bad231c18368dbd26f298577f6210e36e4b0797/audio_alsa.c#L1215-L1223)
+The patched Shairport backend delivers the actual first-sample presentation
+anchor with 48 kHz stereo S16 PCM through a private versioned socket. Input
+format, complete frame count and clock provenance are checked at this boundary;
+the foundation's ALSA receiver capture path remains earlier evidence rather
+than proof of this new path.
 Queues and FIFO writes are bounded. If the reader vanishes or the pipe fills,
 the worker drops live audio and records counters instead of retaining an
 unbounded backlog of stale speech.
 
 Explicit local outputs request `audio.software_volume = true` from the
-maintained OwnTone 29.3 extension; preflight requires its
-`29.3-shiri-swvol1` build marker. Upstream's hardware-mixer path rejects
+maintained OwnTone 29.3 extension. The validated foundation used the
+`29.3-shiri-swvol1` build marker; subsequent timing, source-transition and
+opened-PCM identity extensions have separate reviewed patches and exact markers.
+Preflight must require the exact features used by its profile. Upstream's hardware-mixer path rejects
 mixerless Loopback and can reuse a PCM address as an invalid control address.
 The extension scales a private copy at final PCM submission using the current
 local session's volume, including buffered and draining audio. It leaves other
@@ -168,13 +175,16 @@ stable. Exact results and the synthetic/Loopback scope are recorded in
 [REBUILD.md](REBUILD.md). Physical speaker and Bluetooth verification remain
 required.
 
-Bluetooth uses a separate host-side output worker. OwnTone writes its local
-output to the return side of the room's ALSA Loopback slot; the worker forwards
-that audio to the validated BlueALSA endpoint using the host system bus. This
-keeps the private Avahi/D-Bus discovery environment isolated while allowing the
-Bluetooth adapter to reach the actual host `org.bluealsa` service. The extra
-output buffering is part of the delay that must be measured. BlueALSA's client
-uses the system D-Bus connection. [BlueALSA D-Bus client implementation](https://github.com/arkq/bluez-alsa/blob/master/src/shared/dbus-client.c#L36-L57)
+Bluetooth uses a separate descriptor-only output worker. The root broker
+admits one exact paired A2DP endpoint through the maintained BlueALSA service
+and hands only its validated PCM pipe and restricted controller descriptors to
+that worker. OwnTone sends its clocked, volume-adjusted final PCM over an exact
+published socket; the worker forwards it without another scheduler or sample
+conversion. It has no host D-Bus connection or ALSA nodes. The prior Loopback
+return/host-bus worker route is replaced. Real private-daemon SBC/controller
+and separate kernel publication checks passed; the combined broker/OwnTone/
+BlueALSA route and physical device remain acceptance gates. See
+[BLUETOOTH_OUTPUT.md](BLUETOOTH_OUTPUT.md) for ownership, bounds and evidence.
 
 OwnTone owns speaker delivery, buffering and playback timing. Its documented
 pipe input supports an AirPlay receiver forwarding audio into an OwnTone
@@ -326,9 +336,9 @@ replaced by this runtime.
 | AirPlay 1 / AirPlay 2 speaker | OwnTone network output | Protocol timing within one sender; physical accuracy still measured |
 | Chromecast speaker | OwnTone network output | Approximate alignment; precise mixed-protocol sync is not promised |
 | Wired ALSA speaker | Explicit Linux hardware endpoint | Device buffering and drift must be measured |
-| Paired Bluetooth speaker | OwnTone local loopback output → host BlueALSA worker | Device/adapter buffering and drift must be measured; physical verification pending |
+| Paired Bluetooth speaker | OwnTone final PCM → descriptor-only worker → maintained BlueALSA SBC encoder | Combined route still under validation; device/adapter buffering, drift and physical verification pending |
 | PulseAudio | Recognized backend capability | Requires an installed/configured adapter; not enabled by the ALSA runtime automatically |
-| Google Cast as an input | Required receiver adapter is missing | Stock-phone discovery, authentication, media and streaming interoperability are mandatory gates |
+| Google Cast as an input | Deferred by the user | A future adapter needs stock-phone discovery, authentication, media and streaming validation |
 | WebRTC speech | One bounded room audio session | Mixed into that room before OwnTone delivery |
 
 OwnTone's Chromecast documentation explicitly excludes precise synchronization
@@ -348,30 +358,78 @@ That is an explicit administrative calibration operation; no speech admission,
 media, close or failure path may invoke it.
 Failure during that sequence must remain visible. [OwnTone 29.3 player implementation](https://github.com/owntone/owntone-server/blob/29.3/src/player.c#L2743-L2771)
 
-## Required native grouping and the independent-player gap
+## Required native grouping and the timestamp-preserving candidate
 
 The current unit of playback is one room's OwnTone instance. Speakers selected
 by that instance receive one room program. Different room instances remain
-independent playback timelines even when they share a LAN namespace or PTP
+independent players even when they share a LAN namespace or PTP
 daemon. Playing the same file independently in two rooms does not synchronize
 those rooms. Receiver-side synchronization from an iPhone also does not prove
 that independent FIFO/player relay stages preserve that common presentation
 timeline at the final speakers.
 
 Native iPhone multi-zone selection is required behavior. The implementation
-must preserve the group's shared presentation timeline through capture, mixing
-and output delivery, then measure the final speakers during startup, regrouping
-and long playback. That path has not been verified by the current architecture.
-It must be corrected if independent relays discard the necessary timing.
+preserves the group's shared presentation timeline through capture, mixing
+and OwnTone's existing timestamped input seam. It must still verify final
+outputs during startup, regrouping and long playback. The
+[timing audit and bounded experiment](TIMING_RESEARCH.md) records the original
+clock-provenance loss and the maintained correction. Portable callback tests
+and successful native builds establish that correction's exercised contracts;
+the two-zone final-PCM test and later phone/acoustic evidence remain required.
 
-A shared-program abstraction with one sender/player for grouped outputs is one
-candidate design; a backend that accepts a shared timestamped timeline is
-another. Evaluate those against actual phone group identity, timing provenance,
-independent-zone playback and targeted TTS. Per-speaker clock shims around
-independent players do not by themselves create a common program timeline.
-This gap is required implementation work, not an accepted future exclusion.
-The [timing audit and bounded experiment](TIMING_RESEARCH.md) records where
-clock provenance is currently lost and how to evaluate a transport correction.
+The next native candidate implements a timestamp-preserving boundary instead
+of scheduling speakers outside OwnTone. Its pinned Shairport backend receives
+the native first-sample presentation time and original RTP frame position from
+the actual playback callback, after resampling and partial-frame skipping.
+Every connection has a fresh producer identity; flushes advance an exact native
+generation. An authenticated source transition fences and discards old queued
+music, waits for downstream output acknowledgments, then grants the new route.
+Every final music write checks that exact live token. Speech admission, media
+and close never invoke this source transition or replace its music owner.
+
+Each block carries a fresh paired `CLOCK_MONOTONIC_RAW`/`CLOCK_MONOTONIC`
+measurement. The `shiri-timed2` producer retries a scheduling-disrupted clock
+triple at most four times and admits only samples completed before a total
+five-millisecond deadline. OS preemption can return later, in which case the
+sample fails. The receiving
+limit stays at one millisecond; retries preserve the native presentation time,
+RTP position and exact PCM payload. Exhaustion closes the exact producer route
+without sending an invalid mapping or advancing its timed-frame counters. The
+mixer preserves the mapped native deadline and adds one frozen common relay
+horizon. The current low-latency candidate uses 1000 ms for ordinary zones;
+selected negative speaker corrections can raise the common horizon. Every
+enabled zone shares that horizon, including zones with different output leads.
+The framed OwnTone input subtracts
+its existing output buffer duration before supplying `INPUT_FLAG_SYNC`; the
+existing player timer starts absolutely at that program anchor. Its output
+buffer then adds the duration back. This avoids inventing independent
+receive-time origins or accidentally adding another two seconds to the declared
+horizon. Late or missing first anchors, stale operations, repeated native
+presentation times and old flush generations fail closed.
+
+Portable tests compile the actual patched callbacks, pipe reader, input-marker
+boundary and both player timer variants under address/undefined-behavior
+sanitizers. Two independent receiver connections with different arrival times
+and RTP origins retain the same native group deadline; modeled transport delays
+still require explicit compensation. These tests establish the exercised code
+contracts, not real output scheduling or acoustic alignment. New-profile Linux
+PCM evidence and stock-phone/physical-speaker acceptance remain mandatory.
+OwnTone's Cast output does not currently provide a proven precise presentation
+clock or a receiver-queue flush acknowledgment. Constant offsets cannot remove
+unmeasured jitter or drift.
+
+The speech producer now uses a separate bounded Unix datagram endpoint. The
+output daemon owns its private directory and authenticates the exact audio UID,
+room UUID and launch generation. OwnTone polls it without blocking on its player
+thread and mixes mono speech into the shared stereo PCM immediately before
+output conversion. This removes the native-ingress wait from announcements;
+it does not bypass device buffers or cold playback activation. A 250 ms packet
+age/queue bound prevents stale accumulation. Ordinary EOF drains valid voice
+samples, and absent media cannot hold music ducked indefinitely. Producer health
+distinguishes input activity and datagram delivery from actual backend gain;
+final-output measurements remain authoritative. A concurrent source-only flush
+can still discard already-transmitted speech in device buffers; seamless takeover
+remains a separate gate. Speech itself never invokes that flush.
 
 The pinned Shairport configuration documents an optional progress metadata
 anchor containing an RTP frame position and its intended local
@@ -382,7 +440,9 @@ concrete research path for carrying receiver timing provenance across the
 relay. Baseline metadata is enabled using a private `metadata/shairport.pipe`,
 with cover art disabled and a 100 ms pipe timeout. Disabling metadata in the
 pinned receiver caused an actual startup crash and was reverted. Progress
-anchors remain disabled, unconsumed and unpreserved by the current FIFO.
+anchors remain disabled and unconsumed. The next framed profile carries the
+actual native playback callback anchor directly rather than parsing these
+optional progress messages; the validated foundation's raw FIFO erased it.
 The anchor option has not been validated in this candidate and does not
 establish final-output synchronization or justify
 a new speaker scheduler without evidence.

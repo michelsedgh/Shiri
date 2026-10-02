@@ -54,7 +54,20 @@ def run_tests(*, source=None, compiler=None, sanitize=True):
         if source:
             header = (source / "src/outputs/pcm_volume.h").read_text()
             alsa = (source / "src/outputs/alsa.c").read_text()
-            if "[29.3-shiri-swvol1]" not in (source / "configure.ac").read_text():
+            marker = re.search(r"AC_INIT\(\[owntone\], \[([^\]]+)\]\)", (source / "configure.ac").read_text())
+            if marker is None or marker.group(1) not in {
+                "29.3-shiri-swvol1", "29.3-shiri-swvol1-timed1-source1", "29.3-shiri-swvol1-timed1-source1-guard1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-framed1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1",
+                "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1",
+            }:
                 raise ValueError("The supplied source does not carry the expected patch marker")
         else:
             header = additions("src/outputs/pcm_volume.h")

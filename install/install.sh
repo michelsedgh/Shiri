@@ -6,7 +6,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PYTHONPATH PYTHONHOME LD_LIBRARY_PATH LD_PRELOAD
 SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${SHIRI_INSTALL_PREFIX:-/opt/shiri}"
-[[ "$PREFIX" == /* && "$PREFIX" != / ]] || { echo "Use an absolute installation prefix" >&2; exit 2; }
+[[ "$PREFIX" =~ ^/[A-Za-z0-9_./-]+$ && "$PREFIX" != / ]] || { echo "Use a canonical absolute prefix without spaces or shell expansion characters" >&2; exit 2; }
 [[ $(id -u) == 0 && $(uname -s) == Linux ]] || { echo "Run as root on Ubuntu/Debian" >&2; exit 1; }
 /usr/bin/python3 -I "$SOURCE/install/validate_installation.py" --create "$PREFIX"
 case "${1:-}" in
@@ -14,17 +14,20 @@ case "${1:-}" in
   "") ;;
   *) echo "Usage: $0 [--with-backends]" >&2; exit 2 ;;
 esac
-apt-get update
-apt-get install -y python3-venv python3-pip python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+/usr/bin/python3 -I "$SOURCE/install/apt_dependencies.py" build-essential python3-venv python3-pip python3-gi python3-cairo gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
   iproute2 isc-dhcp-client iputils-ping util-linux coreutils dbus avahi-daemon alsa-utils \
   gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-alsa
+/usr/bin/python3 -I "$SOURCE/install/kernel_modules.py"
+SHIRI_INSTALL_PREFIX="$PREFIX" bash "$SOURCE/install/build_helpers.sh"
 mkdir -p "$PREFIX"
 /usr/bin/python3 -I -m venv --system-site-packages "$PREFIX/venv"
 /usr/bin/python3 -I "$SOURCE/install/validate_installation.py" "$PREFIX"
-"$PREFIX/venv/bin/python" -m pip install --require-hashes -r "$SOURCE/install/requirements.lock"
-"$PREFIX/venv/bin/python" -m pip install --no-deps "$SOURCE"
+"$PREFIX/venv/bin/python" -m pip install --require-hashes --only-binary=:all: -r "$SOURCE/install/build_requirements.lock"
+"$PREFIX/venv/bin/python" -m pip install --require-hashes --only-binary=:all: -r "$SOURCE/install/requirements.lock"
+"$PREFIX/venv/bin/python" -m pip install --no-index --no-build-isolation --no-deps "$SOURCE"
 /usr/bin/python3 -I "$SOURCE/install/validate_installation.py" "$PREFIX"
+"$PREFIX/venv/bin/python" -m pip check
 "$PREFIX/venv/bin/python" - <<'PY'
 import gi
 import aiortc
@@ -56,7 +59,7 @@ if [[ "${SHIRI_INSTALL_BLUETOOTH:-0}" == 1 ]]; then
   apt-cache show bluez-alsa-utils >/dev/null 2>&1 || {
     echo "This distro has no bluez-alsa-utils package; install a supported BlueALSA adapter first" >&2; exit 1;
   }
-  apt-get install -y bluez bluez-alsa-utils
+  /usr/bin/python3 -I "$SOURCE/install/apt_dependencies.py" bluez bluez-alsa-utils
 fi
 install -d -m 0755 /etc/modules-load.d
 printf '%s\n' snd-aloop > /etc/modules-load.d/shiri.conf

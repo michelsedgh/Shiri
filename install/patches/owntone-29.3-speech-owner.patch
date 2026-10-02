@@ -1,0 +1,1114 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,104 +1,104 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+ AC_CONFIG_AUX_DIR([build-aux])
+ AC_CONFIG_HEADERS([config.h])
+ AM_INIT_AUTOMAKE([foreign subdir-objects 1.11])
+ AM_SILENT_RULES([yes])
+ 
+ dnl Requires autoconf 2.60
+ AC_USE_SYSTEM_EXTENSIONS
+ 
+ dnl Checks for programs.
+ AC_PROG_CC
+ AC_PROG_CC_C_O
+ AC_PROG_SED
+ AC_PROG_MKDIR_P
+ LT_INIT([disable-static])
+ 
+ AC_PATH_PROG([GPERF], [[gperf]])
+ AS_IF([[test -z "$GPERF"]],
+ 	[AS_IF([[test -f "$srcdir/src/dmap_fields_hash.h"]],
+ 		[AM_MISSING_PROG([GPERF], [[gperf]])
+ 		AC_MSG_NOTICE([[
+ 
+ GNU gperf not found, but its output appears to be present.
+ If you modify any .gperf files, you will need to install it.]])],
+ 		[AC_MSG_ERROR([[GNU gperf required, please install it.]])])
+ 	])
+ 
+ AX_PROG_FLEX([AC_DEFINE([LEX], [flex], [flex found])],
+ 	[AS_IF([test ! -f "$srcdir/src/parsers/smartpl_lexer.c"],
+ 		[AC_MSG_ERROR([flex required, please install it])])
+ 	])
+ AX_PROG_BISON([AC_DEFINE([YACC], [bison], [GNU bison found])],
+ 	[AS_IF([test ! -f "$srcdir/src/parsers/smartpl_parser.c"],
+ 		[AC_MSG_ERROR([GNU bison required, please install it])])
+ 	])
+ 
+ dnl Enable all warnings by default.
+ AM_CPPFLAGS="-Wall"
+ AC_SUBST([AM_CPPFLAGS])
+ 
+ dnl Checks for header files.
+ AC_CHECK_HEADERS_ONCE([regex.h pthread_np.h])
+ AC_CHECK_HEADERS([sys/wait.h sys/param.h dirent.h getopt.h stdint.h], [],
+ 	[AC_MSG_ERROR([[Missing header required to build OwnTone]])])
+ AC_CHECK_HEADERS([time.h], [],
+ 	[AC_MSG_ERROR([[Missing header required to build OwnTone]])])
+ AC_CHECK_FUNCS_ONCE([posix_fadvise pipe2 gettid])
+ AC_CHECK_FUNCS([strptime strtok_r], [],
+ 	[AC_MSG_ERROR([[Missing function required to build OwnTone]])])
+ 
+ dnl check for clock_gettime or replace it
+ AC_SEARCH_LIBS([clock_gettime], [rt],
+ 	[AC_DEFINE([HAVE_CLOCK_GETTIME], 1,
+ 		[Define to 1 if have clock_gettime function])],
+ 	[AC_CHECK_HEADER([mach/mach_time.h],
+ 	[AC_DEFINE([HAVE_MACH_CLOCK], 1,
+ 		[Define to 1 if mach kernel clock replacement available])],
+ 	[AC_MSG_ERROR([[Missing clock_gettime and any replacement]])])])
+ 
+ dnl check for timer_settime or replace it
+ AC_SEARCH_LIBS([timer_settime], [rt],
+ 	[AC_DEFINE([HAVE_TIMER_SETTIME], 1,
+ 		[Define to 1 if have timer_settime function])],
+ 	[AC_CHECK_HEADER([mach/mach_time.h],
+ 	[AC_DEFINE([HAVE_MACH_TIMER], 1,
+ 		[Define to 1 if mach kernel clock replacement available])],
+ 	[AC_MSG_ERROR([[Missing timer_settime and any replacement]])])])
+ 
+ AC_SEARCH_LIBS([pthread_exit], [pthread], [],
+ 	[AC_MSG_ERROR([[pthreads library is required]])])
+ AC_SEARCH_LIBS([pthread_setname_np], [pthread],
+ 	[AC_MSG_CHECKING([[for two-parameter pthread_setname_np]])
+ 	 AC_LINK_IFELSE([AC_LANG_PROGRAM([[@%:@include <pthread.h>]],
+ 		[[pthread_setname_np(pthread_self(), "name");]])],
+ 		[AC_MSG_RESULT([yes])
+ 		 AC_DEFINE([HAVE_PTHREAD_SETNAME_NP], 1,
+ 			[Define to 1 if you have pthread_setname_np with 2 args])],
+ 		[AC_MSG_RESULT([[no]])])
+ 	 AC_MSG_CHECKING([[for MacOS single-parameter pthread_setname_np]])
+ 	 AC_LINK_IFELSE([AC_LANG_PROGRAM([[@%:@include <pthread.h>]],
+ 		[[pthread_setname_np("name");]])],
+ 		[AC_MSG_RESULT([yes])
+ 		 AC_DEFINE([HAVE_PTHREAD_SETNAME_NP_MACOS], 1,
+ 			[Define to 1 if you have pthread_setname_np with 1 arg])],
+ 		[AC_MSG_RESULT([[no]])])])
+ AC_SEARCH_LIBS([pthread_set_name_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_SET_NAME_NP], 1,
+ 		[Define to 1 if you have pthread_set_name_np])])
+ AC_SEARCH_LIBS([pthread_getname_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_GETNAME_NP], 1,
+ 		[Define to 1 if you have pthread_getname_np])])
+ AC_SEARCH_LIBS([pthread_get_name_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_GET_NAME_NP], 1,
+ 		[Define to 1 if you have pthread_get_name_np])])
+ AC_SEARCH_LIBS([pthread_getthreadid_np], [pthread],
+ 	[AC_DEFINE([HAVE_PTHREAD_GETTHREADID_NP], 1,
+ 		[Define to 1 if you have pthread_getthreadid_np])])
+ 
+diff --git a/src/shiri_speech.c b/src/shiri_speech.c
+--- a/src/shiri_speech.c
++++ b/src/shiri_speech.c
+@@ -1,264 +1,319 @@
+ /* Fixed, authenticated late speech mixing for the explicit Shiri framed
+  * profile. PCM stays on the player's existing 10 ms clock. Source frame
+  * counts, timestamps, output queues and transport state are never changed.
+  * All state below belongs exclusively to the player thread after init. */
+ #ifdef HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <stdint.h>
+ #include <limits.h>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <errno.h>
+ #include <math.h>
+ #include <time.h>
+ #include <unistd.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #ifdef __linux__
+ # include <sys/socket.h>
+ # include <sys/un.h>
+ #endif
+ 
+ #include "shiri_speech.h"
+ 
+-#define SPEECH_HEADER 80u
++#define SPEECH_HEADER 96u
+ #define SPEECH_FRAMES 960u
+ #define SPEECH_RATE 48000u
+ #define SPEECH_QUEUE 12000u
+ #define SPEECH_BURST 25u
+ #define SPEECH_AGE_NS UINT64_C(250000000)
+ #define SPEECH_FUTURE_NS UINT64_C(5000000)
+ #define SPEECH_FULL_GAIN 65536u
+ #define SPEECH_RESERVE_NS UINT64_C(20000000)
+ 
+ struct speech_state {
+-  uint8_t room[16], launch[16];
++  uint8_t room[16], launch[16], owner[16];
++  int owner_set, accepting;
+   int16_t samples[SPEECH_QUEUE];
+   uint8_t audible[SPEECH_QUEUE];
+   uint32_t gains[SPEECH_QUEUE];
+   uint64_t expires[SPEECH_QUEUE];
+   unsigned head, count;
+   uint64_t sequence, lease;
+   uint64_t refused, expired, admitted;
+   uint64_t pcm_packets, admitted_frames, mixed_frames;
+   uint64_t priming_events, priming_frames, empty_frames, underflow_events, underflow_frames;
+   uint64_t priming_until, first_admission_ns, last_admission_ns, last_emitted_ns, last_mix_ns;
+   uint64_t last_underflow_ns, last_resume_ns, max_admission_age_ns, max_interarrival_ns;
+   int running, underflowing;
+   uint32_t duck;
+   double gain;
+   int active;
+ };
+ 
+ static struct speech_state speech;
+ static int speech_fd = -1, speech_directory = -1;
+ static char speech_basename[64];
+ static dev_t speech_dev;
+ static ino_t speech_ino;
+ #ifdef __linux__
+ static uid_t speech_peer;
+ #endif
+ 
+ static void
+ speech_counter(uint64_t *counter)
+ {
+   if (*counter < UINT64_MAX)
+     ++*counter;
+ }
+ 
+ static void
+ speech_add(uint64_t *counter, uint64_t value)
+ {
+   *counter = value > UINT64_MAX - *counter ? UINT64_MAX : *counter + value;
+ }
+ 
+ static uint64_t
+ speech_now(void)
+ {
+   struct timespec ts;
+   if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0 || ts.tv_sec < 0 ||
+       ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L ||
+       (uint64_t)ts.tv_sec > (UINT64_MAX - (uint64_t)ts.tv_nsec) / UINT64_C(1000000000))
+     return 0;
+   return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+ }
+ 
+ static uint32_t
+ speech_u32(const uint8_t *p)
+ {
+   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+ }
+ 
+ static uint64_t
+ speech_u64(const uint8_t *p)
+ {
+   return ((uint64_t)speech_u32(p) << 32) | speech_u32(p + 4);
+ }
+ 
+ static int
+ speech_hex(const char *text, uint8_t id[16], int uuid)
+ {
+   unsigned i, n = 0, high = 0, value;
+   uint8_t result[16], any = 0;
+   if (!text || strlen(text) != (uuid ? 36u : 32u))
+     return -1;
+   for (i = 0; text[i]; ++i) {
+     if (uuid && (i == 8 || i == 13 || i == 18 || i == 23)) {
+       if (text[i] != '-') return -1;
+       continue;
+     }
+     if (text[i] >= '0' && text[i] <= '9') value = (unsigned)(text[i] - '0');
+     else if (text[i] >= 'a' && text[i] <= 'f') value = (unsigned)(text[i] - 'a') + 10;
+     else return -1;
+     if (n % 2) { result[n / 2] = (uint8_t)((high << 4) | value); any |= result[n / 2]; }
+     else high = value;
+     ++n;
+   }
+   if (n != 32 || !any) return -1;
+   memcpy(id, result, 16);
+   return 0;
+ }
+ 
+ static void
+ speech_expire(struct speech_state *s, uint64_t now)
+ {
+   if (!now) {
+     s->head = s->count = 0;
+     s->active = s->running = s->underflowing = 0;
+     s->priming_until = 0;
+     return;
+   }
+   while (s->count && now >= s->expires[s->head]) {
+     s->head = (s->head + 1) % SPEECH_QUEUE;
+     --s->count;
+     speech_counter(&s->expired);
+   }
+   if (now >= s->lease)
+     s->active = 0;
+   if (!s->count && !s->active) {
+     s->running = s->underflowing = 0;
+     s->priming_until = 0;
+   }
+ }
+ 
++/* One admitted session owns the entire queue. A terminal ID remains fenced
++ * until a definitively completed successor BEGIN replaces it. The controller
++ * joins its single owned BEGIN before cancellation; uncertain control results
++ * hold admission closed rather than overwriting this fence. */
++static int
++speech_owner_matches(const struct speech_state *s, const uint8_t owner[16])
++{
++  return owner && s->owner_set && !memcmp(s->owner, owner, 16);
++}
++
++static int
++speech_begin(struct speech_state *s, const uint8_t owner[16], uint64_t now)
++{
++  uint8_t any = 0; unsigned i;
++  if (!owner || !now) return -1;
++  for (i = 0; i < 16; ++i) any |= owner[i];
++  if (!any) return -1;
++  if (speech_owner_matches(s, owner)) return s->accepting ? 0 : -1;
++  /* Retain every admitted natural-EOF sample and its original expiry/gain.
++   * A successor may retry after the player drains or expires the old tail. */
++  speech_expire(s, now);
++  if (s->owner_set && (s->accepting || s->count || s->active)) return 1;
++  memcpy(s->owner, owner, 16); s->owner_set = s->accepting = 1;
++  s->head = s->count = 0; s->active = s->running = s->underflowing = 0;
++  s->lease = s->priming_until = 0;
++  return 0;
++}
++
++static int
++speech_finish(struct speech_state *s, const uint8_t owner[16])
++{
++  if (!speech_owner_matches(s, owner)) return -1;
++  s->accepting = s->active = 0; s->lease = 0;
++  if (!s->count) { s->running = s->underflowing = 0; s->priming_until = 0; }
++  return 0;
++}
++
++static int
++speech_cancel(struct speech_state *s, const uint8_t owner[16])
++{
++  uint8_t any = 0; unsigned i;
++  if (!owner) return -1;
++  for (i = 0; i < 16; ++i) any |= owner[i];
++  if (!any || (s->owner_set && !speech_owner_matches(s, owner))) return -1;
++  /* A cancel before a lost BEGIN installs the same terminal fence. */
++  memcpy(s->owner, owner, 16); s->owner_set = 1; s->accepting = 0;
++  s->head = s->count = 0; s->active = s->running = s->underflowing = 0;
++  s->lease = s->priming_until = 0;
++  /* Leave gain unchanged: the original 250ms restoration ramp continues on
++   * the program clock without pausing, flushing or reconnecting music. */
++  return 0;
++}
++
+ /* Atomic validation/admission. A refused packet cannot update sequence,
+  * refresh ducking, replace an existing queue, or partially admit samples. */
+ static int
+ speech_receive(struct speech_state *s, const uint8_t *packet, size_t bytes, uint64_t now)
+ {
+   uint64_t sequence, emitted, expires;
+   uint32_t frames, payload, duck, flags;
+   unsigned i, pos;
+   uint8_t op;
+   if (!packet || bytes < SPEECH_HEADER || !now || now > UINT64_MAX - SPEECH_AGE_NS)
+     goto refused;
+   sequence = speech_u64(packet + 16); emitted = speech_u64(packet + 56);
+   frames = speech_u32(packet + 64); payload = speech_u32(packet + 12);
+   duck = speech_u32(packet + 68); flags = speech_u32(packet + 72); op = packet[9];
+-  if (memcmp(packet, "SHRITTS1", 8) || packet[8] != 1 || packet[10] != 0 || packet[11] != SPEECH_HEADER ||
++  if (memcmp(packet, "SHRITTS1", 8) || packet[8] != 2 || packet[10] != 0 || packet[11] != SPEECH_HEADER ||
+       memcmp(packet + 24, s->room, 16) || memcmp(packet + 40, s->launch, 16) ||
++      !s->accepting || !speech_owner_matches(s, packet + 80) ||
+       !sequence || sequence > INT64_MAX || sequence <= s->sequence ||
+       !emitted || emitted > UINT64_MAX - SPEECH_AGE_NS ||
+       (emitted > now ? emitted - now > SPEECH_FUTURE_NS : now - emitted >= SPEECH_AGE_NS) ||
+       duck > SPEECH_FULL_GAIN || (flags & ~1u) || speech_u32(packet + 76) ||
+       payload != bytes - SPEECH_HEADER)
+     goto refused;
+   if (op == 1) {
+     if (!frames || frames > SPEECH_FRAMES || payload != frames * 2u ||
+         frames > SPEECH_QUEUE - s->count)
+       goto refused;
+   } else if (op == 2) {
+     if (frames || payload) goto refused;
+   } else goto refused;
+ 
+   expires = emitted + SPEECH_AGE_NS;
+   if (expires > now + SPEECH_AGE_NS) expires = now + SPEECH_AGE_NS;
+   if (op == 1) {
+     /* Delay only this voice queue by one 20 ms packet. The player's program
+      * continues on its unchanged clock; no source/output command is issued.
+      * A 960-sample first packet is already 20 ms of media, so a count >= 960 gate
+      * alone would add no arrival-jitter reserve. Use actual admission time. */
+     if (!s->running) {
+       s->running = 1; s->priming_until = now + SPEECH_RESERVE_NS;
+       s->first_admission_ns = now; s->underflowing = 0;
+       speech_counter(&s->priming_events);
+     }
+     if (s->last_admission_ns && now >= s->last_admission_ns &&
+         now - s->last_admission_ns > s->max_interarrival_ns)
+       s->max_interarrival_ns = now - s->last_admission_ns;
+     if (now >= emitted && now - emitted > s->max_admission_age_ns)
+       s->max_admission_age_ns = now - emitted;
+     s->last_admission_ns = now; s->last_emitted_ns = emitted;
+     speech_counter(&s->pcm_packets); speech_add(&s->admitted_frames, frames);
+     for (i = 0; i < frames; ++i) {
+       pos = (s->head + s->count + i) % SPEECH_QUEUE;
+       /* Avoid implementation-defined unsigned-to-signed conversion. */
+       unsigned value = packet[SPEECH_HEADER + 2 * i] | ((unsigned)packet[SPEECH_HEADER + 2 * i + 1] << 8);
+       s->samples[pos] = (int16_t)(value & 32768u ? (int)value - 65536 : (int)value);
+       s->audible[pos] = (uint8_t)flags;
+       s->gains[pos] = duck;
+       s->expires[pos] = expires;
+     }
+     s->count += frames;
+   }
+   /* Normal EOF ends the active lease, not already-admitted audio. Keep valid
+    * queued samples until their own deadline; a short cold utterance must not
+    * be erased by an EOF control arriving before the first player tick. */
+   s->sequence = sequence;
+   /* A quiet PCM packet describes its own samples only. It cannot extend,
+    * clear, or replace an existing audible lease. Explicit controls can. */
+   if (op == 2 || flags) {
+     s->active = (int)flags; s->duck = duck; s->lease = expires;
+   }
+   speech_counter(&s->admitted);
+   return 0;
+ refused:
+   speech_counter(&s->refused);
+   return -1;
+ }
+ 
+ static void
+ speech_mix(struct speech_state *s, uint8_t *pcm, size_t bytes, int frames, unsigned rate,
+            unsigned bits, unsigned channels, uint64_t now)
+ {
+   unsigned i, channel;
+   int voice, value, mixed, playing;
+   double target, step;
+   if (!pcm || frames <= 0 || frames > (int)(SPEECH_RATE / 5) || rate != SPEECH_RATE || bits != 16 || channels != 2 ||
+       (uint64_t)(unsigned)frames * 4 != bytes)
+     return;
+   speech_expire(s, now);
+   playing = s->running && now >= s->priming_until;
+   s->last_mix_ns = now;
+   for (i = 0; i < (unsigned)frames; ++i) {
+     speech_expire(s, now);
+     /* Already-admitted speech retains its own session policy through normal
+      * EOF or later controls. Only an audible head may override the lease. */
+     target = (s->count && s->audible[s->head]) ? (double)s->gains[s->head] / SPEECH_FULL_GAIN :
+              (s->active ? (double)s->duck / SPEECH_FULL_GAIN : 1.0);
+     step = 1.0 / (SPEECH_RATE * (target < s->gain ? 0.04 : 0.25));
+     if (target < s->gain) { s->gain -= step; if (s->gain < target) s->gain = target; }
+     else if (target > s->gain) { s->gain += step; if (s->gain > target) s->gain = target; }
+     voice = 0;
+     if (playing && s->count) {
+       voice = s->samples[s->head]; s->head = (s->head + 1) % SPEECH_QUEUE; --s->count;
+       speech_counter(&s->mixed_frames);
+       if (s->underflowing) s->last_resume_ns = now;
+       s->underflowing = 0;
+     } else if (!playing && s->running) {
+       speech_counter(&s->priming_frames);
+     } else {
+       speech_counter(&s->empty_frames);
+       /* An ended lease with no pending audio is normal retirement. Count
+        * underflow only while this admitted run still expects audible speech. */
+       if (playing && s->active) {
+         if (!s->underflowing) {
+           speech_counter(&s->underflow_events); s->last_underflow_ns = now;
+         }
+         s->underflowing = 1; speech_counter(&s->underflow_frames);
+       }
+@@ -337,116 +392,135 @@
+     goto failed;
+   memset(&addr, 0, sizeof(addr)); addr.sun_family = AF_UNIX;
+   if (snprintf(held, sizeof(held), "/proc/self/fd/%d/%s", speech_directory, base) >= (int)sizeof(held))
+     goto failed;
+   memcpy(addr.sun_path, held, strlen(held) + 1);
+   if (bind(speech_fd, (struct sockaddr *)&addr, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(held) + 1)) < 0)
+     goto failed;
+   if (fstatat(speech_directory, base, &node, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISSOCK(node.st_mode) ||
+       node.st_uid != geteuid() || node.st_nlink != 1)
+     goto failed;
+   speech_dev = node.st_dev; speech_ino = node.st_ino;
+   memcpy(speech_basename, base, strlen(base) + 1);
+   /* Retain this own newly-created inode before checking inherited metadata,
+    * so later failure can retire it without touching a substituted endpoint. */
+   if (node.st_gid != directory.st_gid)
+     goto failed;
+   if (fchmodat(speech_directory, base, 0660, 0) < 0 ||
+       fstatat(speech_directory, base, &node, AT_SYMLINK_NOFOLLOW) < 0 ||
+       node.st_dev != speech_dev || node.st_ino != speech_ino ||
+       node.st_uid != geteuid() || node.st_gid != directory.st_gid || (node.st_mode & 07777) != 0660)
+     goto failed;
+   speech_peer = (uid_t)peer_uid;
+   speech.gain = 1.0;
+   return 0;
+ failed:
+   shiri_speech_deinit();
+   return -1;
+ #else
+   (void)peer_uid; (void)room; (void)launch; (void)framed;
+   return -1; /* Never silently enable an unauthenticated portable fallback. */
+ #endif
+ }
+ 
+ void
+ shiri_speech_poll(void)
+ {
+ #ifdef __linux__
+   uint8_t packet[SPEECH_HEADER + 2 * SPEECH_FRAMES];
+   union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(16 * sizeof(int))]; } control;
+   struct iovec iov;
+   struct msghdr message;
+   struct cmsghdr *cmsg;
+   struct ucred credentials;
+   unsigned i, found;
+   ssize_t bytes;
+   uint64_t now;
+   if (speech_fd < 0) return;
+   now = speech_now(); speech_expire(&speech, now);
+   for (i = 0; i < SPEECH_BURST; ++i) {
+     memset(&message, 0, sizeof(message)); memset(&control, 0, sizeof(control));
+     iov.iov_base = packet; iov.iov_len = sizeof(packet);
+     message.msg_iov = &iov; message.msg_iovlen = 1;
+     message.msg_control = control.bytes; message.msg_controllen = sizeof(control.bytes);
+     bytes = recvmsg(speech_fd, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+     if (bytes < 0) { if (errno == EINTR) continue; break; }
+     found = 0;
+     memset(&credentials, 0, sizeof(credentials));
+     for (cmsg = CMSG_FIRSTHDR(&message); cmsg; cmsg = CMSG_NXTHDR(&message, cmsg)) {
+       if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_CREDENTIALS &&
+           cmsg->cmsg_len == CMSG_LEN(sizeof(credentials))) {
+         memcpy(&credentials, CMSG_DATA(cmsg), sizeof(credentials)); ++found;
+       } else {
+         /* A malicious producer may attach descriptors even to a malformed or
+          * wrong-UID packet. Reap every delivered FD; truncated excess rights
+          * are closed by recvmsg itself. No ancillary authority is accepted. */
+         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+             cmsg->cmsg_len >= CMSG_LEN(0)) {
+           size_t n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int), j;
+           for (j = 0; j < n; ++j) {
+             int fd;
+             memcpy(&fd, (uint8_t *)CMSG_DATA(cmsg) + j * sizeof(int), sizeof(fd));
+             if (fd >= 0) close(fd);
+           }
+         }
+         found += 2;
+       }
+     }
+     if ((message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || found != 1 ||
+         credentials.uid != speech_peer || credentials.pid <= 0) {
+       speech_counter(&speech.refused); continue;
+     }
+     now = speech_now();
+     speech_receive(&speech, packet, (size_t)bytes, now);
+   }
+ #endif
+ }
+ 
+ void
+ shiri_speech_mix(void *pcm, size_t bytes, int frames, unsigned rate, unsigned bits, unsigned channels)
+ {
+   if (speech_fd >= 0)
+     speech_mix(&speech, pcm, bytes, frames, rate, bits, channels, speech_now());
+ }
+ 
+ int
+ shiri_speech_ids_match(const uint8_t room[16], const uint8_t launch[16])
+ {
+   return speech_fd >= 0 && room && launch && !memcmp(room, speech.room, 16) && !memcmp(launch, speech.launch, 16);
+ }
+ 
++/* These operations execute only in the authenticated player command. */
++int
++shiri_speech_begin(const uint8_t owner[16])
++{
++  return speech_fd < 0 ? -1 : speech_begin(&speech, owner, speech_now());
++}
++
++int
++shiri_speech_finish(const uint8_t owner[16])
++{
++  return speech_fd < 0 ? -1 : speech_finish(&speech, owner);
++}
++
++int
++shiri_speech_cancel(const uint8_t owner[16])
++{
++  return speech_fd < 0 ? -1 : speech_cancel(&speech, owner);
++}
++
+ void
+ shiri_speech_deinit(void)
+ {
+   struct stat node;
+   if (speech_fd >= 0) close(speech_fd);
+   speech_fd = -1;
+   if (speech_directory >= 0) {
+     if (*speech_basename && fstatat(speech_directory, speech_basename, &node, AT_SYMLINK_NOFOLLOW) == 0 &&
+         S_ISSOCK(node.st_mode) && node.st_uid == geteuid() && node.st_nlink == 1 &&
+         node.st_dev == speech_dev && node.st_ino == speech_ino)
+       unlinkat(speech_directory, speech_basename, 0);
+     close(speech_directory);
+   }
+   speech_directory = -1; *speech_basename = 0; speech_dev = 0; speech_ino = 0;
+   memset(&speech, 0, sizeof(speech));
+ }
+diff --git a/src/shiri_speech.h b/src/shiri_speech.h
+--- a/src/shiri_speech.h
++++ b/src/shiri_speech.h
+@@ -1,29 +1,32 @@
+ /* Room-local speech overlay. The existing player/output clocks remain owned
+  * by OwnTone; this module never opens an output or changes a source. */
+ #ifndef SHIRI_SPEECH_H
+ #define SHIRI_SPEECH_H
+ 
+ #include <stddef.h>
+ #include <stdint.h>
+ 
+ /* Immutable copy of bounded launch-lifetime diagnostics; never PCM/secrets. */
+ struct shiri_speech_status {
+   uint8_t room[16], launch[16];
+   uint64_t observed_monotonic_ns, sequence, queue_frames;
+   uint64_t refused, expired, admitted, pcm_packets, admitted_frames, mixed_frames;
+   uint64_t priming_events, priming_frames, empty_frames, underflow_events, underflow_frames;
+   uint64_t priming_until, first_admission_ns, last_admission_ns, last_emitted_ns, last_mix_ns;
+   uint64_t last_underflow_ns, last_resume_ns, max_admission_age_ns, max_interarrival_ns;
+   int configured, active, running, priming;
+ };
+ void shiri_speech_status(struct shiri_speech_status *out);
+ 
+ int shiri_speech_init(const char *path, long peer_uid, const char *room,
+                       const char *launch, int framed);
+ void shiri_speech_poll(void);
+ void shiri_speech_mix(void *pcm, size_t bytes, int frames, unsigned rate,
+                      unsigned bits, unsigned channels);
+ int shiri_speech_ids_match(const uint8_t room[16], const uint8_t launch[16]);
++int shiri_speech_begin(const uint8_t owner[16]);
++int shiri_speech_finish(const uint8_t owner[16]);
++int shiri_speech_cancel(const uint8_t owner[16]);
+ void shiri_speech_deinit(void);
+ 
+ #endif
+diff --git a/src/shiri_speech_ready.h b/src/shiri_speech_ready.h
+--- a/src/shiri_speech_ready.h
++++ b/src/shiri_speech_ready.h
+@@ -1,20 +1,20 @@
+ /* Private proposal: idle-only readiness; the existing player owns all clocks. */
+ #ifndef SHIRI_SPEECH_READY_H
+ #define SHIRI_SPEECH_READY_H
+ #include "shiri_source.h"
+ #define SHIRI_SPEECH_OUTPUTS 128
+ #define SHIRI_SPEECH_SETUP_NS UINT64_C(5000000000)
+ #define SHIRI_SPEECH_MIX_AGE_NS UINT64_C(100000000)
+-enum shiri_speech_action { SHIRI_SPEECH_PREPARE, SHIRI_SPEECH_READY, SHIRI_SPEECH_RELEASE, SHIRI_SPEECH_OBSERVE };
++enum shiri_speech_action { SHIRI_SPEECH_PREPARE, SHIRI_SPEECH_READY, SHIRI_SPEECH_RELEASE, SHIRI_SPEECH_OBSERVE, SHIRI_SPEECH_BEGIN, SHIRI_SPEECH_FINISH, SHIRI_SPEECH_CANCEL };
+ struct shiri_speech_request {
+   struct shiri_source_request source;
+   uint8_t room[16], launch[16], speech[16];
+   enum shiri_speech_action action;
+ };
+ struct shiri_speech_reply {
+   bool connected, ready;
+   uint64_t prepared_ns, mixed_ns;
+   unsigned outputs;
+ };
+ int player_shiri_speech_ready(const struct shiri_speech_request *request, struct shiri_speech_reply *reply);
+ #endif
+diff --git a/src/shiri_speech_ready_json.h b/src/shiri_speech_ready_json.h
+--- a/src/shiri_speech_ready_json.h
++++ b/src/shiri_speech_ready_json.h
+@@ -1,39 +1,43 @@
+ #ifndef SHIRI_SPEECH_READY_JSON_H
+ #define SHIRI_SPEECH_READY_JSON_H
+ #include "shiri_speech_ready.h"
+ #include "shiri_source_json.h"
+ #include "outputs/cast_json.h"
+ static inline int
+ shiri_speech_ready_parse(json_object *body, struct shiri_speech_request *request)
+ {
+   static const char *keys[] = { "incarnation", "session_id", "epoch", "generation", "operation_generation" };
+   json_object *source, *value, *room, *launch, *speech, *action;
+   const char *text;
+   unsigned index;
+   int ret;
+   if (!body || !json_object_is_type(body, json_type_object) || json_object_object_length(body) != 9 ||
+       !json_object_object_get_ex(body, "room_id", &room) || !json_object_object_get_ex(body, "launch_generation", &launch) ||
+       !json_object_object_get_ex(body, "speech_id", &speech) || !json_object_object_get_ex(body, "action", &action)) return -1;
+   memset(request, 0, sizeof(*request));
+   if (shiri_source_hex(room, request->room) < 0 || shiri_zero(request->room, 16) ||
+       shiri_source_hex(launch, request->launch) < 0 || shiri_zero(request->launch, 16) ||
+       shiri_source_hex(speech, request->speech) < 0 || shiri_zero(request->speech, 16) ||
+       !json_object_is_type(action, json_type_string)) return -1;
+   text = json_object_get_string(action);
+   if ((size_t)json_object_get_string_len(action) != strlen(text)) return -1;
+   if (!strcmp(text, "prepare")) request->action = SHIRI_SPEECH_PREPARE;
+   else if (!strcmp(text, "ready")) request->action = SHIRI_SPEECH_READY;
+   else if (!strcmp(text, "release")) request->action = SHIRI_SPEECH_RELEASE;
+   else if (!strcmp(text, "observe")) request->action = SHIRI_SPEECH_OBSERVE;
++  else if (!strcmp(text, "begin")) request->action = SHIRI_SPEECH_BEGIN;
++  else if (!strcmp(text, "finish")) request->action = SHIRI_SPEECH_FINISH;
++  else if (!strcmp(text, "cancel")) request->action = SHIRI_SPEECH_CANCEL;
+   else return -1;
+   source = json_object_new_object();
+   if (!source) return -1;
+   for (index = 0; index < 5; ++index) {
+     if (!json_object_object_get_ex(body, keys[index], &value)) { json_object_put(source); return -1; }
+     json_object_object_add(source, keys[index], json_object_get(value));
+   }
+   ret = shiri_source_parse(source, &request->source);
+   json_object_put(source);
+-  return ret < 0 || (shiri_zero(request->source.owner.session, 16) == (request->action == SHIRI_SPEECH_OBSERVE)) ? -1 : 0;
++  return ret < 0 || (request->action <= SHIRI_SPEECH_OBSERVE &&
++    (shiri_zero(request->source.owner.session, 16) == (request->action == SHIRI_SPEECH_OBSERVE))) ? -1 : 0;
+ }
+ #endif
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -2939,217 +2939,271 @@
+   }
+   shiri_speech_setup_event_clear();
+   if (!shiri_speech_start.connected) shiri_speech_start.prepared_ns = now;
+   shiri_speech_start.connected = true;
+   /* A lost caller cannot reserve idle transports permanently. Starting the
+    * actual bed cancels this existing finite delayed-stop mechanism. */
+   if (player_state != PLAY_PLAYING) shiri_speech_schedule_idle_stop();
+   param->reply.connected = true;
+   param->reply.prepared_ns = shiri_speech_start.prepared_ns;
+   *retval = 0; return COMMAND_END;
+ }
+ 
+ static int
+ shiri_speech_last_outputs(bool capture)
+ {
+   struct output_device *device;
+   unsigned count = 0, visited = 0, index;
+   for (device = outputs_list(); device; device = device->next) {
+     if (++visited > 1024) return -1;
+     if (!device->selected) continue;
+     if (count == SHIRI_SPEECH_OUTPUTS || device->busy || device->prevent_playback || !device->session ||
+         (device->state != OUTPUT_STATE_CONNECTED && device->state != OUTPUT_STATE_STREAMING)) return -1;
+     if (capture) {
+       shiri_last_mix.outputs[count].id = device->id;
+       shiri_last_mix.outputs[count].type = device->type;
+       shiri_last_mix.outputs[count].offset_ms = device->offset_ms;
+       shiri_last_mix.outputs[count].session = device->session;
+     } else {
+       for (index = 0; index < shiri_last_mix.count; ++index)
+         if (shiri_last_mix.outputs[index].id == device->id) break;
+       if (index == shiri_last_mix.count || shiri_last_mix.outputs[index].type != (int)device->type ||
+           shiri_last_mix.outputs[index].offset_ms != device->offset_ms ||
+           shiri_last_mix.outputs[index].session != device->session) return -1;
+     }
+     ++count;
+   }
+   if (!count || (!capture && count != shiri_last_mix.count)) return -1;
+   if (capture) shiri_last_mix.count = count;
+   return 0;
+ }
+ 
+ static void
+ shiri_speech_mix_ready(void)
+ {
+   uint64_t now;
+   if (!pb_timer_native || !pb_timer_native_anchored || player_state != PLAY_PLAYING ||
+       pb_session.quality.sample_rate != 48000 || pb_session.quality.bits_per_sample != 16 ||
+       pb_session.quality.channels != 2 || !shiri_source_state.initialized || shiri_source_state.faulted ||
+       !(now = shiri_speech_ready_now()) || shiri_speech_last_outputs(true) < 0) return;
+   shiri_last_mix.source = shiri_source_state.last;
+   shiri_last_mix.mixed_ns = now;
+   if (shiri_speech_start.connected && !shiri_speech_start.failed &&
+       shiri_speech_source_matches(&shiri_speech_start.request) && shiri_speech_outputs_snapshot(false, true) == 0)
+     shiri_speech_start.mixed_ns = now;
+ }
+ 
+ static enum command_state
+ shiri_speech_ready_check(void *arg, int *retval)
+ {
+   struct shiri_speech_param *param = arg;
+   uint64_t now = shiri_speech_ready_now();
+   if (param->request.action == SHIRI_SPEECH_OBSERVE) {
+     if (shiri_zero(param->request.source.owner.session, 16) || !shiri_speech_source_matches(&param->request)) {
+       *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
+     }
+     /* Pure observation: no output setup or program control on music. */
+     param->reply.connected = shiri_speech_last_outputs(false) == 0;
+     param->reply.outputs = param->reply.connected ? shiri_last_mix.count : 0;
+     param->reply.mixed_ns = shiri_last_mix.mixed_ns;
+     param->reply.ready = now && param->reply.connected && pb_timer_native && pb_timer_native_anchored &&
+       player_state == PLAY_PLAYING && shiri_last_mix.source.operation_generation == param->request.source.operation_generation &&
+       shiri_source_owner_equal(&shiri_last_mix.source.owner, &param->request.source.owner) &&
+       shiri_last_mix.mixed_ns && shiri_last_mix.mixed_ns <= now && now-shiri_last_mix.mixed_ns < SHIRI_SPEECH_MIX_AGE_NS;
+     *retval = 0; return COMMAND_END;
+   }
+   if (!shiri_speech_request_matches(&param->request) || !shiri_speech_source_matches(&param->request)) {
+     *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
+   }
+   if (param->request.action == SHIRI_SPEECH_RELEASE) {
+     shiri_speech_schedule_idle_stop();
+     shiri_speech_setup_event_clear();
+     if (shiri_speech_start.pending) shiri_speech_start.failed = true;
+     else memset(&shiri_speech_start, 0, sizeof(shiri_speech_start));
+     *retval = 0; return COMMAND_END;
+   }
+   if (!now || shiri_speech_start.failed || !shiri_speech_start.connected ||
+       now < shiri_speech_start.began_ns || now - shiri_speech_start.began_ns >= SHIRI_SPEECH_SETUP_NS ||
+       shiri_speech_outputs_snapshot(false, true) < 0) {
+     *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
+   }
+   param->reply.connected = true;
+   param->reply.prepared_ns = shiri_speech_start.prepared_ns;
+   param->reply.mixed_ns = shiri_speech_start.mixed_ns;
+   param->reply.outputs = shiri_speech_start.count;
+   param->reply.ready = pb_timer_native && pb_timer_native_anchored && player_state == PLAY_PLAYING &&
+     param->reply.mixed_ns >= param->reply.prepared_ns && param->reply.mixed_ns <= now &&
+     now - param->reply.mixed_ns < SHIRI_SPEECH_MIX_AGE_NS;
+   *retval = 0; return COMMAND_END;
+ }
+ 
++/* Admission/retirement is independent of the source/output machinery. The
++ * complete acknowledged request fences cleanup even after music changes its
++ * source; only BEGIN requires that source to remain current and mix-ready. */
++static struct shiri_speech_request shiri_voice_request;
++static bool shiri_voice_initialized;
++
++static bool
++shiri_speech_voice_matches(const struct shiri_speech_request *request)
++{
++  return shiri_voice_initialized && request &&
++    !memcmp(request->speech, shiri_voice_request.speech, 16) &&
++    !memcmp(request->room, shiri_voice_request.room, 16) &&
++    !memcmp(request->launch, shiri_voice_request.launch, 16) &&
++    request->source.operation_generation == shiri_voice_request.source.operation_generation &&
++    shiri_source_owner_equal(&request->source.owner, &shiri_voice_request.source.owner);
++}
++
++static enum command_state
++shiri_speech_voice_command(void *arg, int *retval)
++{
++  struct shiri_speech_param *param = arg;
++  enum shiri_speech_action action = param->request.action;
++  int ret;
++  if (!shiri_speech_ids_match(param->request.room, param->request.launch)) {
++    *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++  }
++  if (action == SHIRI_SPEECH_BEGIN) {
++    if (shiri_voice_initialized && !memcmp(param->request.speech, shiri_voice_request.speech, 16) &&
++        !shiri_speech_voice_matches(&param->request)) {
++      *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++    }
++    /* A terminal same-ID BEGIN can never resurrect PCM, even with a fresh
++     * observation and unchanged music source. */
++    param->request.action = shiri_zero(param->request.source.owner.session, 16) ? SHIRI_SPEECH_READY : SHIRI_SPEECH_OBSERVE;
++    shiri_speech_ready_check(param, retval);
++    param->request.action = action;
++    if (*retval || !param->reply.ready) return COMMAND_END;
++    ret = shiri_speech_begin(param->request.speech);
++    if (ret == 1) { param->reply.ready = false; *retval = 0; return COMMAND_END; }
++    if (ret) { *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END; }
++    shiri_voice_request = param->request; shiri_voice_initialized = true;
++  } else {
++    if (shiri_voice_initialized && !shiri_speech_voice_matches(&param->request)) {
++      *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
++    }
++    ret = action == SHIRI_SPEECH_CANCEL ? shiri_speech_cancel(param->request.speech) : shiri_speech_finish(param->request.speech);
++    if (ret) { *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END; }
++    shiri_voice_request = param->request; shiri_voice_initialized = true;
++  }
++  *retval = 0; return COMMAND_END;
++}
++
+ int
+ player_shiri_speech_ready(const struct shiri_speech_request *request, struct shiri_speech_reply *reply)
+ {
+   struct shiri_speech_param param;
+   int ret;
+-  if (!request || !reply || request->action < SHIRI_SPEECH_PREPARE || request->action > SHIRI_SPEECH_OBSERVE)
++  if (!request || !reply || request->action < SHIRI_SPEECH_PREPARE || request->action > SHIRI_SPEECH_CANCEL)
+     return SHIRI_SOURCE_INVALID;
+   memset(&param, 0, sizeof(param)); param.request = *request;
+   if (request->action == SHIRI_SPEECH_PREPARE) {
+     ret = commands_exec_sync(cmdbase, shiri_speech_prepare, NULL, &param);
+     /* Run the finish check even on a partial output-start failure, preserving
+      * its failure while scheduling only this same idle owner's delayed stop. */
+     if (ret <= 0) {
+       int finished = commands_exec_sync(cmdbase, shiri_speech_prepare_bh, NULL, &param);
+       if (!ret) ret = finished;
+     }
+-  } else ret = commands_exec_sync(cmdbase, shiri_speech_ready_check, NULL, &param);
++  } else if (request->action >= SHIRI_SPEECH_BEGIN)
++    ret = commands_exec_sync(cmdbase, shiri_speech_voice_command, NULL, &param);
++  else ret = commands_exec_sync(cmdbase, shiri_speech_ready_check, NULL, &param);
+   if (!ret) *reply = param.reply;
+   return ret;
+ }
+ 
+ /* Diagnostic reads execute on the same player thread as ingress/mix/source
+  * fencing. Copy the current source binding without mutating any media state. */
+ static enum command_state
+ shiri_speech_status_get(void *arg, int *retval)
+ {
+   struct player_shiri_speech_status *out = arg;
+   shiri_speech_status(&out->media);
+   out->source = shiri_source_state.last;
+   out->source_initialized = shiri_source_state.initialized;
+   out->source_faulted = shiri_source_state.faulted;
+   *retval = out->media.observed_monotonic_ns ? 0 : SHIRI_SOURCE_FAILURE;
+   return COMMAND_END;
+ }
+ 
+ int
+ player_shiri_speech_status(struct player_shiri_speech_status *status)
+ {
+   if (!status) return SHIRI_SOURCE_INVALID;
+   memset(status, 0, sizeof(*status));
+   return commands_exec_sync(cmdbase, shiri_speech_status_get, NULL, status);
+ }
+ 
+ static enum command_state
+ shiri_source_seal_flush(void *arg, int *retval)
+ {
+   struct shiri_source_param *param = arg;
+   int result, pending;
+ 
+   result = shiri_source_check(&shiri_source_state, &param->request);
+   if (result <= 0)
+     {
+       param->replay = (result == SHIRI_SOURCE_REPLAY);
+       *retval = result;
+       return COMMAND_END;
+     }
+ 
+   shiri_source_begin(&shiri_source_state, &param->request);
+   *retval = input_pipe_shiri_seal(param->request.operation_generation);
+   if (*retval < 0)
+     return COMMAND_END;
+   input_flush(NULL);
+   outputs_resampling_reset();
+   pb_session.read_deficit = 0;
+   shiri_source_flush_failed = 0;
+   param->restart_outputs = (player_state == PLAY_PLAYING);
+   pending = outputs_shiri_flush(device_shiri_flush_cb, &shiri_source_flush_failed);
+   outputs_metadata_purge();
+   *retval = pending > 0 ? pending : (shiri_source_flush_failed ? SHIRI_SOURCE_FAILURE : 0);
+   return pending > 0 ? COMMAND_PENDING : COMMAND_END;
+ }
+ 
+ static enum command_state
+ shiri_source_restart(void *arg, int *retval)
+ {
+   int pending;
+   (void)arg;
+   shiri_source_start_failed = 0;
+   outputs_stop_delayed_cancel();
+   pending = outputs_shiri_start(device_shiri_start_cb, &shiri_source_start_failed);
+   *retval = pending > 0 ? pending : (shiri_source_start_failed ? SHIRI_SOURCE_FAILURE : 0);
+   return pending > 0 ? COMMAND_PENDING : COMMAND_END;
+ }
+ 
+ static enum command_state
+ shiri_source_arm(void *arg, int *retval)
+ {
+   struct shiri_source_param *param = arg;
+   if (!shiri_source_state.initialized || !shiri_source_state.faulted
+       || shiri_source_flush_failed || shiri_source_start_failed
+       || shiri_source_state.last.operation_generation != param->request.operation_generation
+       || !shiri_source_owner_equal(&shiri_source_state.last.owner, &param->request.owner))
+     {
+       *retval = SHIRI_SOURCE_FAILURE;
+       return COMMAND_END;
+     }
+   *retval = input_pipe_shiri_arm(&param->request.owner, param->request.operation_generation);
+   if (*retval == 0)
+     shiri_source_state.faulted = false;
+   return COMMAND_END;
+ }
+ 
+ static enum command_state
+ playback_seek(void *arg, int *retval)
+ {
+   // Only check if the current playing track is seekable, other checks will be done in playback_pause()
+   if (pb_session.playing_now && !pb_session.playing_now->is_seekable)
+     {
+       DPRINTF(E_WARN, L_PLAYER, "Failed to seek, track is not seekable\n");
+ 
+       *retval = -1;
+       return COMMAND_END;
+     }
+ 
+   return playback_pause(arg, retval);
+ }
+ 
+@@ -4611,154 +4665,156 @@
+ {
+   uint64_t interval;
+   int ret;
+ 
+   speaker_autoselect = cfg_getbool(cfg_getsec(cfg, "general"), "speaker_autoselect");
+   clear_queue_on_stop_disabled = cfg_getbool(cfg_getsec(cfg, "library"), "clear_queue_on_stop_disable");
+ 
+   /* Handle deprecated config options, note that this is also in library.c */
+   if (0 < cfg_opt_size(cfg_getopt(cfg_getsec(cfg, "mpd"), "clear_queue_on_stop_disable")))
+     {
+       clear_queue_on_stop_disabled = cfg_getbool(cfg_getsec(cfg, "mpd"), "clear_queue_on_stop_disable");
+     }
+ 
+   ret = SETTINGS_GETINT("player", PLAYER_SETTINGS_MODE_REPEAT);
+   repeat = (ret > 0) ? ret : REPEAT_OFF;
+   shuffle = SETTINGS_GETBOOL("player", PLAYER_SETTINGS_MODE_SHUFFLE);
+   consume = SETTINGS_GETBOOL("player", PLAYER_SETTINGS_MODE_CONSUME);
+ 
+   player_state = PLAY_STOPPED;
+ 
+   CHECK_NULL(L_PLAYER, history = calloc(1, sizeof(struct player_history)));
+ 
+   // Determine if the resolution of the system timer is > or < the size
+   // of an audio packet. NOTE: this assumes the system clock resolution
+   // is less than one second.
+   if (clock_getres(CLOCK_MONOTONIC, &player_timer_res) < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not get the system timer resolution.\n");
+       goto error_history_free;
+     }
+ 
+   if (!cfg_getbool(cfg_getsec(cfg, "general"), "high_resolution_clock"))
+     {
+       DPRINTF(E_INFO, L_PLAYER, "High resolution clock not enabled on this system (res is %ld)\n", player_timer_res.tv_nsec);
+       player_timer_res.tv_nsec = 10 * PLAYER_TICK_INTERVAL * 1000000;
+     }
+ 
+   // Set the tick interval for the playback timer
+   interval = MAX(player_timer_res.tv_nsec, PLAYER_TICK_INTERVAL * 1000000);
+   player_tick_interval.tv_nsec = interval;
+ 
+   pb_write_deficit_max = (PLAYER_WRITE_BEHIND_MAX * 1000000 / interval);
+ 
+   // Create the playback timer
+ #ifdef HAVE_TIMERFD
+   pb_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+   ret = pb_timer_fd;
+ #else
+   ret = timer_create(CLOCK_MONOTONIC, NULL, &pb_timer);
+ #endif
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not create playback timer: %s\n", strerror(errno));
+       goto error_history_free;
+     }
+ 
+   CHECK_NULL(L_PLAYER, evbase_player = event_base_new());
+ #ifdef HAVE_TIMERFD
+   CHECK_NULL(L_PLAYER, pb_timer_ev = event_new(evbase_player, pb_timer_fd, EV_READ | EV_PERSIST, playback_cb, NULL));
+ #else
+   CHECK_NULL(L_PLAYER, pb_timer_ev = event_new(evbase_player, SIGALRM, EV_SIGNAL | EV_PERSIST, playback_cb, NULL));
+ #endif
+   CHECK_NULL(L_PLAYER, cmdbase = commands_base_new(evbase_player, NULL));
+ 
+   ret = outputs_init();
+   if (ret < 0)
+     {
+       DPRINTF(E_FATAL, L_PLAYER, "Output initiation failed\n");
+       goto error_evbase_free;
+     }
+ 
+   ret = input_init();
+   if (ret < 0)
+     {
+       DPRINTF(E_FATAL, L_PLAYER, "Input initiation failed\n");
+       goto error_outputs_deinit;
+     }
+ 
+   ret = shiri_speech_init(cfg_getstr(cfg_getsec(cfg, "general"), "shiri_speech_socket"),
+                           cfg_getint(cfg_getsec(cfg, "general"), "shiri_speech_peer_uid"),
+                           cfg_getstr(cfg_getsec(cfg, "general"), "shiri_speech_room_id"),
+                           cfg_getstr(cfg_getsec(cfg, "general"), "shiri_speech_launch_generation"),
+                           cfg_getbool(cfg_getsec(cfg, "library"), "pipe_framed"));
+   if (ret < 0)
+     {
+       DPRINTF(E_FATAL, L_PLAYER, "Private speech overlay admission failed\n");
+       goto error_input_deinit;
+     }
+ 
+   ret = pthread_create(&tid_player, NULL, player, NULL);
+   if (ret < 0)
+     {
+       DPRINTF(E_FATAL, L_PLAYER, "Could not spawn player thread: %s\n", strerror(errno));
+       goto error_input_deinit;
+     }
+ 
+   return 0;
+ 
+  error_input_deinit:
+   shiri_speech_deinit();
++  memset(&shiri_voice_request, 0, sizeof(shiri_voice_request)); shiri_voice_initialized = false;
+   input_deinit();
+  error_outputs_deinit:
+   outputs_deinit();
+  error_evbase_free:
+   commands_base_free(cmdbase);
+   shiri_speech_setup_event_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+ #ifdef HAVE_TIMERFD
+   close(pb_timer_fd);
+ #else
+   timer_delete(pb_timer);
+ #endif
+  error_history_free:
+   free(history);
+ 
+   return -1;
+ }
+ 
+ void
+ player_deinit(void)
+ {
+   int ret;
+ 
+   player_playback_abort();
+ 
+ #ifdef HAVE_TIMERFD
+   close(pb_timer_fd);
+ #else
+   timer_delete(pb_timer);
+ #endif
+ 
+   input_deinit();
+ 
+   outputs_deinit();
+ 
+   player_exit = 1;
+   commands_base_destroy(cmdbase);
+ 
+   ret = pthread_join(tid_player, NULL);
+   if (ret != 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not join player thread: %s\n", strerror(errno));
+ 
+       return;
+     }
+ 
+   shiri_speech_deinit();
++  memset(&shiri_voice_request, 0, sizeof(shiri_voice_request)); shiri_voice_initialized = false;
+   free(history);
+ 
+   shiri_speech_setup_event_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+ }

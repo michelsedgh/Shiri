@@ -1,0 +1,121 @@
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -3153,11 +3153,11 @@
+ 
+ static enum command_state
+ shiri_source_seal_flush(void *arg, int *retval)
+ {
+   struct shiri_source_param *param = arg;
+-  int result, pending;
++  int result, pending, stopped = 0;
+ 
+   result = shiri_source_check(&shiri_source_state, &param->request);
+   if (result <= 0)
+     {
+       param->replay = (result == SHIRI_SOURCE_REPLAY);
+@@ -3168,23 +3168,26 @@
+   param->restart_timer = (player_state == PLAY_PLAYING && pb_timer_native);
+   shiri_source_begin(&shiri_source_state, &param->request);
+   /* Output FLUSH may await a network reply. Quiesce this same player timer
+    * before sealing the input, so its tick cannot abort and replace the
+    * pending output callback while the exact source barrier is in flight. */
+-  if (param->restart_timer && pb_timer_stop() < 0)
++  if (param->restart_timer)
++    stopped = pb_timer_stop();
++  *retval = input_pipe_shiri_seal(param->request.operation_generation);
++  if (*retval < 0 || stopped < 0)
+     {
+       *retval = SHIRI_SOURCE_FAILURE;
+       return COMMAND_END;
+     }
+-  *retval = input_pipe_shiri_seal(param->request.operation_generation);
+-  if (*retval < 0)
+-    return COMMAND_END;
+   input_flush(NULL);
+   outputs_resampling_reset();
+   pb_session.read_deficit = 0;
+   shiri_source_flush_failed = 0;
+-  param->restart_outputs = (player_state == PLAY_PLAYING);
++  /* A first music grant must follow full selected-output START, so network
++   * setup cannot consume the first PCM's presentation lead after admission. */
++  param->restart_outputs = (player_state == PLAY_PLAYING
++                           || !shiri_zero(param->request.owner.session, 16));
+   pending = outputs_shiri_flush(device_shiri_flush_cb, &shiri_source_flush_failed);
+   outputs_metadata_purge();
+   *retval = pending > 0 ? pending : (shiri_source_flush_failed ? SHIRI_SOURCE_FAILURE : 0);
+   return pending > 0 ? COMMAND_PENDING : COMMAND_END;
+ }
+@@ -3216,11 +3219,22 @@
+   *retval = input_pipe_shiri_arm(&param->request.owner, param->request.operation_generation);
+   /* A successful current barrier gets a fresh first-anchor wait for its own
+    * PCM. Reuse the original timer and presentation stamp; do not retime it.
+    * A user stop/pause during the asynchronous output phase stays stopped. */
+   if (*retval == 0 && param->restart_timer && player_state == PLAY_PLAYING)
+-    *retval = pb_timer_start();
++    {
++      if (shiri_zero(param->request.owner.session, 16))
++        pb_session_stop(); /* END leaves no running music timer waiting for PCM. */
++      else if (pb_timer_start() < 0)
++        {
++          /* event_add precedes timer arming. Remove its watch even when arming
++           * failed, and seal only this exact already-armed input binding. */
++          pb_timer_stop();
++          input_pipe_shiri_disarm(&param->request.owner, param->request.operation_generation);
++          *retval = SHIRI_SOURCE_FAILURE;
++        }
++    }
+   if (*retval == 0)
+     shiri_source_state.faulted = false;
+   return COMMAND_END;
+ }
+ 
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -166,10 +166,11 @@
+  * after every output acknowledges that flush. Process-global, so initial idle
+  * admission is valid before a pipe input source exists. */
+ struct shiri_pcm_owner;
+ int input_pipe_shiri_seal(uint64_t operation_generation);
+ int input_pipe_shiri_arm(const struct shiri_pcm_owner *owner, uint64_t operation_generation);
++int input_pipe_shiri_disarm(const struct shiri_pcm_owner *owner, uint64_t operation_generation);
+ 
+ int input_pipe_shiri_state(uint64_t *operation_generation);
+ /* Copy, never consume, the first unread native SYNC anchor. 1 found, 0 waiting,
+  * -1 invalid/unanchored bytes. Thread-safe with the input producer. */
+ int input_peek_sync(struct timespec *timestamp);
+diff --git a/src/inputs/pipe.c b/src/inputs/pipe.c
+--- a/src/inputs/pipe.c
++++ b/src/inputs/pipe.c
+@@ -213,10 +213,30 @@
+     }
+   pthread_mutex_unlock(&shiri_gate_lock);
+   return ret;
+ }
+ 
++/* Failed timer arming may retire only its exact current input binding. */
++int
++input_pipe_shiri_disarm(const struct shiri_pcm_owner *owner, uint64_t operation_generation)
++{
++  int ret = -1;
++  if (!owner)
++    return -1;
++  pthread_mutex_lock(&shiri_gate_lock);
++  if (operation_generation == shiri_operation
++      && owner->epoch == shiri_owner.epoch && owner->generation == shiri_owner.generation
++      && !memcmp(owner->incarnation, shiri_owner.incarnation, 16)
++      && !memcmp(owner->session, shiri_owner.session, 16))
++    {
++      shiri_armed = false;
++      ret = 0;
++    }
++  pthread_mutex_unlock(&shiri_gate_lock);
++  return ret;
++}
++
+ /* Snapshot the process-global admission operation. The player uses it to fence
+  * the native timer; source transitions execute on that same player thread. */
+ int
+ input_pipe_shiri_state(uint64_t *operation_generation)
+ {

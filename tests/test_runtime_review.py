@@ -1,11 +1,12 @@
 """Independent failure regressions. No real process or network is mutated."""
 
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import httpx
@@ -96,15 +97,35 @@ def test_unconfigured_local_output_remains_disabled(tmp_path):
     ("plughw:CARD=USB,DEV=255,SUBDEV=255", "plughw:CARD=USB,DEV=255,SUBDEV=255"),
 ])
 async def test_startup_preserves_named_pcm_conversion_and_device_indexes(
-    tmp_path, device, expected_pcm,
+    tmp_path, device, expected_pcm, monkeypatch,
 ):
     service = broker(tmp_path)
     room = RuntimeRoom(definition(local_audio_device=device), tmp_path / "room")
     service.network = SimpleNamespace(
+        manifest={"processes": {}},
         interfaces=AsyncMock(return_value=[{"name": "eth0", "eligible": True}]),
         create_receiver=AsyncMock(return_value={"interface": "receiver0"}),
     )
     service._ensure_sender = AsyncMock(return_value={"api_host_ip": "10.190.1.1", "api_ip": "10.190.1.2"})
+    service._account = lambda owner, role, slot=None: {"name": f"shiri-{role}-{slot}", "uid": 200, "gid": 200}
+    match = re.fullmatch(r"(?:plug)?hw:CARD=USB,DEV=(\d+),SUBDEV=(\d+)", expected_pcm)
+    pin = SimpleNamespace(pcm=expected_pcm, playback_node=f"/dev/snd/pcmC5D{match[1]}p",
+                          manifest={"card_index": 5, "device": int(match[1]), "subdevice": int(match[2])},
+                          fingerprint={"version": 1, "kind": "pci", "binding": "path",
+                                       "device_path": "/devices/pci0000:00/0000:00:01.0",
+                                       "driver": "/bus/pci/drivers/snd_test", "device": int(match[1]), "subdevice": int(match[2])},
+                          validate=Mock(), close=Mock())
+    # This test exercises admitted-pin -> generated config conversion. Separate
+    # admission regressions reject raw physical CARD names before resources.
+    service._resolve_local_pin = Mock(return_value=pin)
+    def prepared(path, *args, **kwargs):
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    monkeypatch.setattr("shiri.runtime.broker.private_directory", prepared)
+    monkeypatch.setattr("shiri.runtime.broker.prepare_room_view", lambda *_: None)
+    monkeypatch.setattr("shiri.runtime.broker.file_owner", lambda *_: None)
+    fake_server = SimpleNamespace(close=Mock(), wait_closed=AsyncMock())
+    monkeypatch.setattr("shiri.runtime.broker.serve_rpc", AsyncMock(return_value=fake_server))
     # Observe the real startup configuration before any process or device opens.
     service._start_namespace_services = AsyncMock(side_effect=RuntimeFailure("Configuration captured"))
     try:
@@ -112,11 +133,21 @@ async def test_startup_preserves_named_pcm_conversion_and_device_indexes(
             await service._start_room(room)
         assert room.active_local_device == expected_pcm
         content = (room.directory / "config" / "owntone.conf").read_text()
-        assert f'card = "{expected_pcm}"' in content
+        assert 'card = "shiri"' in content
+        assert 'pcm_identity_file = "/run/shiri-worker/credentials/pcm-identity.json"' in content
         assert "software_volume = true" in content
+        private_alsa = (room.directory / "config" / "alsa.conf").read_text()
+        assert "card 5\n" in private_alsa and f"device {match[1]}\n" in private_alsa
+        assert f"subdevice {match[2]}\n" in private_alsa
+        assert ("type plug" in private_alsa) is expected_pcm.startswith("plughw:")
+        assert json.loads((room.directory / "credentials" / "pcm-identity.json").read_text()) == pin.manifest
     finally:
+        if room.signal_server:
+            room.signal_server.close()
+            await room.signal_server.wait_closed()
         if service.slot_locks[room.desired.slot].locked():
             service.slot_locks[room.desired.slot].release()
+        await service._release_local_pin(room)
 
 
 @pytest.mark.asyncio
@@ -189,26 +220,30 @@ async def test_converted_playback_endpoint_keeps_the_same_exclusive_live_lease(t
 @pytest.fixture
 def preflight_environment(tmp_path, monkeypatch):
     service = broker(tmp_path)
-    environment = {"version": "OwnTone 29.3-shiri-swvol1", "slots": 8, "hook": True, "plugins": True}
+    environment = {"version": "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1", "shairport": "Shairport Sync 5.5.2-shiri-timed3-startup1 AirPlay2 smi10", "identities": True, "cgroup": True, "hook": True, "plugins": True}
     monkeypatch.setattr("shiri.runtime.broker.sys.platform", "linux")
     monkeypatch.setattr("shiri.runtime.broker.os.geteuid", lambda: 0)
     monkeypatch.setattr("shiri.runtime.broker.shutil.which", lambda name: name)
     monkeypatch.setattr("shiri.runtime.broker.os.access", lambda *_: True)
     monkeypatch.setattr("shiri.runtime.broker.DHCP_HOOK", SimpleNamespace(is_file=lambda: environment["hook"]))
     monkeypatch.setattr(service, "binary", lambda name: name)
-    read_text = Path.read_text
-
-    def read_info(path, *args, **kwargs):
-        if str(path) == "/proc/asound/Loopback/pcm0p/info":
-            return f"subdevices_count: {environment['slots']}\n"
-        return read_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", read_info)
+    monkeypatch.setattr("shiri.runtime.broker.trusted_file", lambda path, **_: path)
+    is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: environment["cgroup"]
+                        if str(path) == "/sys/fs/cgroup/cgroup.controllers" else is_file(path))
+    monkeypatch.setattr("shiri.runtime.broker.os.pidfd_open", Mock(), raising=False)
+    monkeypatch.setattr("shiri.runtime.broker.signal.pidfd_send_signal", Mock(), raising=False)
+    def identities():
+        if not environment["identities"]:
+            raise RuntimeFailure("Daemon identities are unavailable")
+        return SimpleNamespace()
+    monkeypatch.setattr("shiri.runtime.broker.DaemonIdentities.load", lambda _: identities())
 
     async def command(args, **_):
         versions = {
             "nqptp": "NQPTP smi10",
-            "shairport-sync": "Shairport Sync 5.5.2 AirPlay2 ALSA smi10",
+            "shairport-sync": environment["shairport"],
+            "avahi-daemon": "avahi-daemon 0.8-shiri-user1",
             "owntone": environment["version"],
         }
         if args[0] in versions:
@@ -222,7 +257,50 @@ def preflight_environment(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", ["OwnTone 29.3", "OwnTone 29.3-shiri-swvol10", "OwnTone 29.3-shiri-swvol1-other"])
+@pytest.mark.parametrize("suffix", ["", "-shiri-timed1", "-shiri-timed2", "-shiri-timed20", "-shiri-timed2-other", "-shiri-timed2-soxr-other", "-shiri-timed30", "-shiri-timed3-other", "-shiri-timed3-startup1-soxr-other"])
+async def test_receiver_requires_bounded_clock_sampling_and_recovery_before_launch(preflight_environment, suffix):
+    service, environment = preflight_environment
+    environment["shairport"] = f"Shairport Sync 5.5.2{suffix} AirPlay2 smi10"
+    with pytest.raises(RuntimeFailure, match="bounded clock sampling.*rebuild pinned backends"):
+        await service.preflight()
+    assert service.versions["shairport-sync"] == environment["shairport"]
+    assert "owntone" not in service.versions
+    assert not any(call.args[0][1] == "-c" for call in service.runner.run.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("features", ["", "-soxr-metadata", "-soxr-convolution-metadata-mqtt-dbus-mpris"])
+async def test_pinned_receiver_feature_string_passes_full_preflight(preflight_environment, features):
+    service, environment = preflight_environment
+    environment["shairport"] = f"5.5.2-AirPlay2-smi10-OpenSSL-Avahi-ALSA-shiri-timed3-startup1{features}-sysconfdir:/opt/shiri/etc"
+    await service.preflight()
+    assert service.runner.run.call_args_list[-1].args[0][1] == "-c"
+
+
+@pytest.mark.asyncio
+async def test_receiver_configuration_path_cannot_supply_missing_backend_marker(preflight_environment):
+    service, environment = preflight_environment
+    environment["shairport"] = "5.5.2-AirPlay2-smi10-ALSA-sysconfdir:/opt/-shiri-timed3"
+    with pytest.raises(RuntimeFailure, match="bounded clock sampling"):
+        await service.preflight()
+
+
+@pytest.mark.asyncio
+async def test_pinned_git_receiver_with_recovery_version_passes_full_preflight(preflight_environment, tmp_path):
+    service, environment = preflight_environment
+    # Preserve the captured pinned Git feature layout with the required recovery marker.
+    environment["shairport"] = "7bad231-dirty-AirPlay2-smi10-OpenSSL-Avahi-ALSA-shiri-timed3-startup1-soxr-metadata-sysconfdir:/opt/shiri-v2-next9-deps/etc"
+    service.config = replace(service.config, binary_dir=tmp_path / "pinned")
+    manifest = service.config.binary_dir / "share" / "shiri" / "backends.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"shairport": "7bad231c18368dbd26f298577f6210e36e4b0797"}))
+    await service.preflight()
+    assert service.versions["shairport-sync"] == environment["shairport"]
+    assert service.runner.run.call_args_list[-1].args[0][1] == "-c"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["OwnTone 29.3", "OwnTone 29.3-shiri-swvol1", "OwnTone 29.3-shiri-swvol1-timed1", "OwnTone 29.3-shiri-swvol1-timed1-source1", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset10", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-other", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer10", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-other", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-framed10", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-framed1", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample10", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-other", "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed10"])
 async def test_unpatched_owntone_is_rejected_with_rebuild_instruction(preflight_environment, version):
     service, environment = preflight_environment
     environment["version"] = version
@@ -233,8 +311,21 @@ async def test_unpatched_owntone_is_rejected_with_rebuild_instruction(preflight_
 
 
 @pytest.mark.asyncio
-async def test_patched_owntone_passes_full_preflight(preflight_environment):
-    service, _ = preflight_environment
+@pytest.mark.parametrize("suffix", ["", "-framed1", "-framed1-alsa10", "-framed1-alsa1", "-framed1-alsa1-other", "-framed1-alsa1-speech10", "-framed1-alsa1-speech1", "-framed1-alsa1-speech1-other", "-framed1-alsa1-speech1-ready10", "-framed1-alsa1-speech1-ready1-other", "-framed1-alsa1-speech1-ready1", "-framed1-alsa1-speech1-ready1-anchor10", "-framed1-alsa1-speech1-ready1-anchor1-other", "-framed1-alsa1-speech1-ready1-anchor1", "-framed1-alsa1-speech1-ready1-anchor1-jitter10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-other"])
+async def test_owntone_requires_exact_partial_write_guard_before_launch(preflight_environment, suffix):
+    service, environment = preflight_environment
+    environment["version"] = "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1" + suffix
+    with pytest.raises(RuntimeFailure, match="partial-write preservation.*rebuild pinned backends"):
+        await service.preflight()
+    assert service.versions["owntone"] == environment["version"]
+    assert not any(call.args[0][1] == "-c" for call in service.runner.run.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["", " (built for Shiri)"])
+async def test_patched_owntone_passes_full_preflight(preflight_environment, suffix):
+    service, environment = preflight_environment
+    environment["version"] += suffix
     await service.preflight()
     probe = service.runner.run.call_args_list[-1].args[0]
     assert probe[1] == "-c"
@@ -245,7 +336,8 @@ async def test_patched_owntone_passes_full_preflight(preflight_environment):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field,value,error", [
     ("hook", False, "private namespace DHCP hook"),
-    ("slots", 7, "does not provide the configured number"),
+    ("identities", False, "Daemon identities are unavailable"),
+    ("cgroup", False, "requires unified cgroup v2"),
     ("plugins", False, "GStreamer plugin is unavailable"),
 ])
 async def test_patched_marker_does_not_bypass_later_runtime_requirements(
@@ -338,6 +430,9 @@ class SelectionBackend:
         self.block_release = False
         self.release_entered = asyncio.Event()
         self.release_allowed = asyncio.Event()
+        self.master_volume = 23
+        self.volume_error = None
+        self.stable_master = False
 
     async def outputs(self, exclusions):
         return [{
@@ -352,13 +447,61 @@ class SelectionBackend:
             await self.release_allowed.wait()
         self.selected = ids
         self.selection_history.append(ids)
+        if not self.stable_master:
+            self.master_volume = 23  # Unmanaged OwnTone restores persisted device volume.
         return {"ok": True}
+
+    async def volume(self, value):
+        if self.volume_error:
+            raise self.volume_error
+        self.master_volume = value
+        return {"ok": True}
+
+    async def volume_settings(self, value, speakers):
+        result = await self.volume(value)
+        self.stable_master = True
+        return result
 
     async def request(self, method, path, *, json=None):
         assert method == "PUT" and path == "/api/outputs/set"
         self.selected = json["outputs"]
         self.selection_history.append(self.selected)
         return {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_zone_volume_survives_persisted_device_volume_on_start_restore_and_selection(tmp_path):
+    service = broker(tmp_path)
+    speaker = SpeakerRef(id="123", name="Physical speaker", protocol="airplay2")
+    desired = definition(speakers=[speaker], volume=77)
+    state = RuntimeRoom(desired, tmp_path/desired.id, current_volume=77,
+                        timing=(500, 600), active_timing=(500, 600))
+    state.client = SelectionBackend(speaker)
+    service.rooms[desired.id] = state
+    await service._restore_outputs(state)
+    assert state.client.selected == ['123'] and state.client.master_volume == 77
+    state.current_volume = 61
+    await service.set_outputs(state, [speaker])
+    assert state.client.master_volume == 61 and state.current_volume == 61
+    await service._restore_outputs(state)
+    assert state.client.master_volume == 61
+
+
+@pytest.mark.asyncio
+async def test_failed_gain_staging_before_selection_retains_output_lease_until_reconciliation(tmp_path):
+    service = broker(tmp_path)
+    speaker = SpeakerRef(id="123", name="Physical speaker", protocol="airplay2")
+    desired = definition()
+    state = RuntimeRoom(desired, tmp_path/desired.id, status='running', current_volume=77,
+                        timing=(500, 600), active_timing=(500, 600))
+    state.client = SelectionBackend(speaker)
+    state.client.volume_error = RuntimeFailure('Volume not acknowledged')
+    service.rooms[desired.id] = state
+    with pytest.raises(RuntimeFailure, match='Volume not acknowledged'):
+        await service.set_outputs(state, [speaker])
+    assert state.status == 'degraded' and state.wake.is_set()
+    assert state.client.selected == [] and state.desired.speakers == []
+    assert service.speaker_leases[('owntone', '123')] == desired.id
 
 
 @pytest.mark.asyncio
@@ -415,7 +558,7 @@ async def test_disabled_room_retries_failed_cleanup_and_releases_its_slot(tmp_pa
         attempts += 1
         if attempts <= 2:
             raise RuntimeFailure("temporary namespace cleanup failure")
-    service.network = SimpleNamespace(remove=remove)
+    service.network = SimpleNamespace(remove=remove, manifest={"processes": {}})
     service._stop_sender = AsyncMock()
     state.wake.set()
     state.task = asyncio.create_task(service._room_loop(state))

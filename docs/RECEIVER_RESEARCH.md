@@ -1,9 +1,11 @@
 # Native receiver evaluation
 
-Research recorded 2026-09-30. The goal is one AirPlay 2 and one Chromecast
-input receiver per Shiri zone, accepting existing phone controls without a
-Shiri sender app. This is required functionality. An output adapter, mDNS
-advertisement or successful custom-client demonstration does not satisfy it.
+Research recorded 2026-09-30, with scope updated 2026-10-01. AirPlay 2 input
+per zone remains required. The user explicitly deferred Chromecast input after
+the open-source receiver review; [current feasibility](CAST_INPUT_FEASIBILITY.md)
+records that conclusion and future options. A future Cast receiver must accept
+existing phone controls without a Shiri sender app. An output adapter, mDNS
+advertisement or successful custom-client demonstration does not satisfy that.
 See [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md).
 
 ## AirPlay

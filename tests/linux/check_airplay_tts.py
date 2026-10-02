@@ -16,6 +16,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from fractions import Fraction
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -48,6 +49,12 @@ ROOM_ID = "b6786543-7eb2-443d-83b1-65b984123a76"
 NAME = "Shiri validation"
 SLOT, RATE, SOURCE_PORT = 7, 48000, 4169
 SOURCE_KEY = "validation:airplay-source"
+_lab_spec = importlib.util.spec_from_file_location('native_lab_admission', Path(__file__).with_name('native_lab.py'))
+_lab_module = importlib.util.module_from_spec(_lab_spec)
+_lab_spec.loader.exec_module(_lab_module)
+NATIVE_LAB = _lab_module.from_environment()
+if NATIVE_LAB is not None:
+    STATE, RUN, BINARIES = NATIVE_LAB.state, NATIVE_LAB.run, NATIVE_LAB.binaries
 
 
 def require(condition, message):
@@ -522,6 +529,7 @@ async def exercise_speech(broker, state, source, client, target, queue_id, audio
 
 
 async def check():
+    require(NATIVE_LAB is None, 'Standalone AirPlay fixture has no admitted clean-VM network supervisor')
     report = {
         "started_at": datetime.now(timezone.utc).isoformat(), "passed": False,
         "scope": "Synthetic OwnTone AirPlay2 -> Shairport -> ALSA Loopback7 -> mixer FIFO plus real Opus WebRTC speech via direct worker RPC",

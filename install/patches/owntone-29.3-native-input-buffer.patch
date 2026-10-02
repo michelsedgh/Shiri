@@ -1,0 +1,309 @@
+diff --git a/configure.ac b/configure.ac
+index 0e27b70c..55e24de6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/input.c b/src/input.c
+index e11c0a1e..ea04da59 100644
+--- a/src/input.c
++++ b/src/input.c
+@@ -1,52 +1,57 @@
+ /*
+  * Copyright (C) 2017 Espen Jürgensen <espenjurgensen@gmail.com>
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+ # include <config.h>
+ #endif
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <string.h>
+ #include <errno.h>
+ #include <stdint.h>
+ #include <inttypes.h>
+ 
+ #include <event2/event.h>
+ #include <event2/buffer.h>
+ #include <pthread.h>
+ 
+ #include "misc.h"
+ #include "logger.h"
+ #include "conffile.h"
+ #include "commands.h"
+ #include "input.h"
+ 
+ // Disallow further writes to the buffer when its size exceeds this threshold.
+ // The below gives us room to buffer 2 seconds of 48000/16/2 audio.
+ #define INPUT_BUFFER_THRESHOLD STOB(96000, 16, 2)
++/* Native framed PCM can arrive two seconds before its original presentation;
++ * the common four-second relay then schedules source reads up to 5.5 seconds
++ * ahead with the minimum supported 500 ms output buffer. This remains a fixed
++ * six-second 48 kHz/S16/stereo bound, not an unbounded presentation queue. */
++#define INPUT_BUFFER_NATIVE_THRESHOLD STOB(288000, 16, 2)
+ // How long (in nsec) to wait when the input buffer is full before looping
+ #define INPUT_LOOP_TIMEOUT_NSEC 10000000
+ // How long (in sec) to keep an input open without the player reading from it
+ #define INPUT_OPEN_TIMEOUT 600
+ 
+ //#define DEBUG_INPUT 1
+ // For testing http stream underruns
+ //#define DEBUG_UNDERRUN 1
+@@ -156,6 +161,17 @@ int debug_underrun_trigger;
+ 
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+ 
++static size_t
++input_buffer_threshold(void)
++{
++  /* Config is immutable after initialization. Do not take the pipe source
++   * gate while holding input_buffer.mutex: source seals acquire them in the
++   * opposite order. All nonframed/raw/file inputs retain the original bound. */
++  return input_now_reading.data_kind == DATA_KIND_PIPE
++    && cfg_getbool(cfg_getsec(cfg, "library"), "pipe_framed")
++    ? INPUT_BUFFER_NATIVE_THRESHOLD : INPUT_BUFFER_THRESHOLD;
++}
++
+ static int
+ map_data_kind(int data_kind)
+ {
+@@ -603,66 +619,66 @@ int
+ input_write(struct evbuffer *evbuf, struct media_quality *quality, short flags)
+ {
+   bool read_end;
+   size_t len;
+   int ret;
+ 
+   pthread_mutex_lock(&input_buffer.mutex);
+ 
+   read_end = (flags & (INPUT_FLAG_EOF | INPUT_FLAG_ERROR));
+   if (read_end)
+     {
+       buffer_full_cb();
+       input_now_reading.open = false;
+     }
+ 
+-  if ((evbuffer_get_length(input_buffer.evbuf) > INPUT_BUFFER_THRESHOLD) && evbuf)
++  if ((evbuffer_get_length(input_buffer.evbuf) > input_buffer_threshold()) && evbuf)
+     {
+       buffer_full_cb();
+ 
+       // In case of EOF or error the input is always allowed to write, even if the
+       // buffer is full. There is no point in holding back the input in that case.
+       if (!read_end)
+ 	{
+ 	  pthread_mutex_unlock(&input_buffer.mutex);
+ 	  return EAGAIN;
+ 	}
+     }
+ 
+   if (quality && !quality_is_equal(quality, &input_buffer.cur_write_quality))
+     {
+       input_buffer.cur_write_quality = *quality;
+       flags |= INPUT_FLAG_QUALITY;
+     }
+ 
+   ret = 0;
+   len = 0;
+   if (evbuf)
+     {
+       len = evbuffer_get_length(evbuf);
+ #ifdef DEBUG_UNDERRUN
+       // Starves the player so it underruns after a few minutes
+       debug_underrun_trigger++;
+       if (debug_underrun_trigger % 10 == 0)
+ 	{
+ 	  DPRINTF(E_DBG, L_PLAYER, "Underrun debug mode: Dropping audio buffer length %zu\n", len);
+ 	  evbuffer_drain(evbuf, len);
+ 	  len = 0;
+ 	}
+ #endif
+       input_buffer.bytes_written += len;
+       ret = evbuffer_add_buffer(input_buffer.evbuf, evbuf);
+       if (ret < 0)
+ 	{
+ 	  DPRINTF(E_LOG, L_PLAYER, "Error adding stream data to input buffer, stopping\n");
+ 	  input_stop();
+ 	  flags |= INPUT_FLAG_ERROR;
+ 	}
+     }
+ 
+   if (flags)
+     markers_set(flags, len);
+ 
+   pthread_mutex_unlock(&input_buffer.mutex);
+ 
+   return ret;
+ }
+@@ -717,24 +733,24 @@ static int
+ wait_buffer_ready(void)
+ {
+   struct timespec ts;
+ 
+   pthread_mutex_lock(&input_buffer.mutex);
+ 
+   // Is the buffer full? Then wait for a read or for loop_timeout to elapse
+-  if (evbuffer_get_length(input_buffer.evbuf) > INPUT_BUFFER_THRESHOLD)
++  if (evbuffer_get_length(input_buffer.evbuf) > input_buffer_threshold())
+     {
+       buffer_full_cb();
+ 
+       ts = timespec_reltoabs(input_loop_timeout);
+       pthread_cond_timedwait(&input_buffer.cond, &input_buffer.mutex, &ts);
+ 
+-      if (evbuffer_get_length(input_buffer.evbuf) > INPUT_BUFFER_THRESHOLD)
++      if (evbuffer_get_length(input_buffer.evbuf) > input_buffer_threshold())
+ 	{
+ 	  pthread_mutex_unlock(&input_buffer.mutex);
+ 	  return -1;
+ 	}
+     }
+ 
+   pthread_mutex_unlock(&input_buffer.mutex);
+   return 0;
+ }
+@@ -808,82 +824,82 @@ int
+ input_read(void *data, size_t size, short *flag, void **flagdata)
+ {
+   struct marker *marker;
+   int len;
+ 
+   *flag = 0;
+ 
+   pthread_mutex_lock(&input_buffer.mutex);
+ 
+   // First we check if there is a marker in the requested samples. If there is,
+   // we only return data up until that marker. That way we don't have to deal
+   // with multiple markers, and we don't return data that contains mixed sample
+   // rates, bits per sample or an EOF in the middle.
+   marker = input_buffer.marker_tail;
+   if (marker && marker->flag == INPUT_FLAG_SYNC && marker->pos == input_buffer.bytes_read)
+     {
+       /* This anchor belongs to the following sample, not the bytes preceding
+        * it. Return it with those samples; stop before the next marker. */
+       *flag = marker->flag;
+       *flagdata = marker->data;
+       input_buffer.marker_tail = marker->prev;
+       free(marker);
+       marker = input_buffer.marker_tail;
+       if (marker && marker->pos <= input_buffer.bytes_read + size)
+         size = marker->pos - input_buffer.bytes_read;
+     }
+   else if (marker && marker->pos <= input_buffer.bytes_read + size)
+     {
+       size = marker->pos - input_buffer.bytes_read;
+       if (marker->flag != INPUT_FLAG_SYNC)
+         {
+           *flag = marker->flag;
+           *flagdata = marker->data;
+           input_buffer.marker_tail = marker->prev;
+           free(marker);
+         }
+       /* A future sync marker remains queued until its first sample is read. */
+     }
+ 
+   len = evbuffer_remove(input_buffer.evbuf, data, size);
+   if (len < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Error reading stream data from input buffer\n");
+       *flag = INPUT_FLAG_ERROR;
+       goto out_unlock;
+     }
+ 
+   input_buffer.bytes_read += len;
+ 
+ #ifdef DEBUG_INPUT
+   // Logs if flags present or each 10 seconds
+ 
+   if (*flag & INPUT_FLAG_QUALITY)
+     input_buffer.cur_read_quality = *((struct media_quality *)(*flagdata));
+ 
+   size_t one_sec_size = STOB(input_buffer.cur_read_quality.sample_rate, input_buffer.cur_read_quality.bits_per_sample, input_buffer.cur_read_quality.channels);
+   debug_elapsed += len;
+   if (*flag || (debug_elapsed > 10 * one_sec_size))
+     {
+       debug_elapsed = 0;
+-      DPRINTF(E_DBG, L_PLAYER, "READ %zu bytes (%d/%d/%d), WROTE %zu bytes (%d/%d/%d), DIFF %zu, SIZE %zu/%d, FLAGS %04x\n",
++      DPRINTF(E_DBG, L_PLAYER, "READ %zu bytes (%d/%d/%d), WROTE %zu bytes (%d/%d/%d), DIFF %zu, SIZE %zu/%zu, FLAGS %04x\n",
+         input_buffer.bytes_read,
+         input_buffer.cur_read_quality.sample_rate,
+         input_buffer.cur_read_quality.bits_per_sample,
+         input_buffer.cur_read_quality.channels,
+         input_buffer.bytes_written,
+         input_buffer.cur_write_quality.sample_rate,
+         input_buffer.cur_write_quality.bits_per_sample,
+         input_buffer.cur_write_quality.channels,
+         input_buffer.bytes_written - input_buffer.bytes_read,
+         evbuffer_get_length(input_buffer.evbuf),
+-        INPUT_BUFFER_THRESHOLD,
++        input_buffer_threshold(),
+         *flag);
+     }
+ #endif
+ 
+  out_unlock:
+   pthread_cond_signal(&input_buffer.cond);
+   pthread_mutex_unlock(&input_buffer.mutex);
+ 
+   return len;
+ }
+@@ -1025,35 +1041,34 @@ void
+ input_deinit(void)
+ {
+   int i;
+   int ret;
+ 
+   input_stop_sync();
+ 
+   for (i = 0; inputs[i]; i++)
+     {
+       if (inputs[i]->disabled)
+ 	continue;
+ 
+       if (inputs[i]->deinit)
+         inputs[i]->deinit();
+     }
+ 
+   input_initialized = false;
+   commands_base_destroy(cmdbase);
+ 
+   ret = pthread_join(tid_input, NULL);
+   if (ret != 0)
+     {
+       DPRINTF(E_FATAL, L_MAIN, "Could not join input thread: %s\n", strerror(errno));
+       return;
+     }
+ 
+   pthread_cond_destroy(&input_buffer.cond);
+   pthread_mutex_destroy(&input_buffer.mutex);
+ 
+   event_free(input_open_timeout_ev);
+   event_free(input_ev);
+   evbuffer_free(input_buffer.evbuf);
+   event_base_free(evbase_input);
+ }
+-

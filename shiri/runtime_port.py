@@ -31,6 +31,10 @@ class SimulatedRuntime:
                  "message": "Simulation; no hardware audio"} for room in self.rooms.values()]}
         if operation == "interfaces":
             return {"interfaces": ["sim0"]}
+        if operation == "local_devices":
+            return {"devices": [], "simulation": True}
+        if operation == "bind_local_device":
+            raise RpcError("unsupported", "Simulation cannot verify or bind physical audio hardware")
         room_id = payload.get("room_id")
         room = self.rooms.get(room_id)
         if not room:
@@ -38,7 +42,9 @@ class SimulatedRuntime:
         if operation == "outputs":
             return {"outputs": [{"id": sid, "name": name, "protocol": protocol,
                                  "selected": sid in self.selected.get(room_id, []), "available": True,
-                                 "volume": room["volume"], "sync_quality": quality,
+                                 "volume": room["volume"] * next((s.get("balance_percent", 100) for s in room["speakers"] if s["id"] == sid), 100) // 100,
+                                 "balance_percent": next((s.get("balance_percent", 100) for s in room["speakers"] if s["id"] == sid), 100),
+                                 "sync_quality": quality,
                                  "offset_ms": next((s["offset_ms"] for s in room["speakers"] if s["id"] == sid), 0),
                                  "assignable": sid != "0" or room.get("local_audio_device") is not None}
                                 for sid, name, protocol, quality in [

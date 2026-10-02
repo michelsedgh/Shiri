@@ -1,0 +1,286 @@
+diff --git a/avahi-daemon/main.c b/avahi-daemon/main.c
+index 346338f..ae339bb 100644
+--- a/avahi-daemon/main.c
++++ b/avahi-daemon/main.c
+@@ -1336,166 +1336,171 @@ finish:
+     return r;
+ }
+ 
+ #define set_env(key, value) putenv(avahi_strdup_printf("%s=%s", (key), (value)))
+ 
+ static int drop_root(void) {
+     struct passwd *pw;
+     struct group * gr;
+     int r;
+ 
+     if (!(pw = getpwnam(AVAHI_USER))) {
+         avahi_log_error( "Failed to find user '"AVAHI_USER"'.");
+         return -1;
+     }
+ 
+     if (!(gr = getgrnam(AVAHI_GROUP))) {
+         avahi_log_error( "Failed to find group '"AVAHI_GROUP"'.");
+         return -1;
+     }
+ 
+     avahi_log_info("Found user '"AVAHI_USER"' (UID %lu) and group '"AVAHI_GROUP"' (GID %lu).", (unsigned long) pw->pw_uid, (unsigned long) gr->gr_gid);
+ 
+     if (initgroups(AVAHI_USER, gr->gr_gid) != 0) {
+         avahi_log_error("Failed to change group list: %s", strerror(errno));
+         return -1;
+     }
+ 
+ #if defined(HAVE_SETRESGID)
+     r = setresgid(gr->gr_gid, gr->gr_gid, gr->gr_gid);
+ #elif defined(HAVE_SETEGID)
+     if ((r = setgid(gr->gr_gid)) >= 0)
+         r = setegid(gr->gr_gid);
+ #elif defined(HAVE_SETREGID)
+     r = setregid(gr->gr_gid, gr->gr_gid);
+ #else
+ #error "No API to drop privileges"
+ #endif
+ 
+     if (r < 0) {
+         avahi_log_error("Failed to change GID: %s", strerror(errno));
+         return -1;
+     }
+ 
+ #if defined(HAVE_SETRESUID)
+     r = setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid);
+ #elif defined(HAVE_SETEUID)
+     if ((r = setuid(pw->pw_uid)) >= 0)
+         r = seteuid(pw->pw_uid);
+ #elif defined(HAVE_SETREUID)
+     r = setreuid(pw->pw_uid, pw->pw_uid);
+ #else
+ #error "No API to drop privileges"
+ #endif
+ 
+     if (r < 0) {
+         avahi_log_error("Failed to change UID: %s", strerror(errno));
+         return -1;
+     }
+ 
+     set_env("USER", pw->pw_name);
+     set_env("LOGNAME", pw->pw_name);
+     set_env("HOME", pw->pw_dir);
+ 
+     avahi_log_info("Successfully dropped root privileges.");
+ 
+     return 0;
+ }
+ 
+ static const char* pid_file_proc(void) {
+     return AVAHI_DAEMON_RUNTIME_DIR"/pid";
+ }
+ 
+ static int make_runtime_dir(void) {
+     int r = -1;
+     mode_t u;
+     int reset_umask = 0;
+     struct passwd *pw;
+     struct group * gr;
+     struct stat st;
+ 
+-    if (!(pw = getpwnam(AVAHI_USER))) {
++    /* Explicit unprivileged foreground execution uses its already-selected
++     * credentials for a private runtime directory. The default root/drop-root
++     * path keeps the configured Avahi account and privilege-drop behavior. */
++    if (!(pw = !config.drop_root && getuid() != 0 && geteuid() == getuid()
++            ? getpwuid(getuid()) : getpwnam(AVAHI_USER))) {
+         avahi_log_error( "Failed to find user '"AVAHI_USER"'.");
+         goto fail;
+     }
+ 
+-    if (!(gr = getgrnam(AVAHI_GROUP))) {
++    if (!(gr = !config.drop_root && getuid() != 0 && geteuid() == getuid()
++            ? getgrgid(getgid()) : getgrnam(AVAHI_GROUP))) {
+         avahi_log_error( "Failed to find group '"AVAHI_GROUP"'.");
+         goto fail;
+     }
+ 
+     u = umask(0000);
+     reset_umask = 1;
+ 
+     if (mkdir(AVAHI_DAEMON_RUNTIME_DIR, 0755) < 0 && errno != EEXIST) {
+         avahi_log_error("mkdir(\""AVAHI_DAEMON_RUNTIME_DIR"\"): %s", strerror(errno));
+         goto fail;
+     }
+ 
+     chown(AVAHI_DAEMON_RUNTIME_DIR, pw->pw_uid, gr->gr_gid);
+ 
+     if (stat(AVAHI_DAEMON_RUNTIME_DIR, &st) < 0) {
+         avahi_log_error("stat(): %s\n", strerror(errno));
+         goto fail;
+     }
+ 
+     if (!S_ISDIR(st.st_mode) || st.st_uid != pw->pw_uid || st.st_gid != gr->gr_gid) {
+         avahi_log_error("Failed to create runtime directory "AVAHI_DAEMON_RUNTIME_DIR".");
+         goto fail;
+     }
+ 
+     r = 0;
+ 
+ fail:
+     if (reset_umask)
+         umask(u);
+     return r;
+ }
+ 
+ static void set_one_rlimit(int resource, rlim_t limit, const char *name) {
+     struct rlimit rl;
+     rl.rlim_cur = rl.rlim_max = limit;
+ 
+     if (setrlimit(resource, &rl) < 0)
+         avahi_log_warn("setrlimit(%s, {%u, %u}) failed: %s", name, (unsigned) limit, (unsigned) limit, strerror(errno));
+ }
+ 
+ static void enforce_rlimits(void) {
+ #ifdef RLIMIT_AS
+     if (config.rlimit_as_set)
+         set_one_rlimit(RLIMIT_AS, config.rlimit_as, "RLIMIT_AS");
+ #endif
+     if (config.rlimit_core_set)
+         set_one_rlimit(RLIMIT_CORE, config.rlimit_core, "RLIMIT_CORE");
+     if (config.rlimit_data_set)
+         set_one_rlimit(RLIMIT_DATA, config.rlimit_data, "RLIMIT_DATA");
+     if (config.rlimit_fsize_set)
+         set_one_rlimit(RLIMIT_FSIZE, config.rlimit_fsize, "RLIMIT_FSIZE");
+     if (config.rlimit_nofile_set)
+         set_one_rlimit(RLIMIT_NOFILE, config.rlimit_nofile, "RLIMIT_NOFILE");
+     if (config.rlimit_stack_set)
+         set_one_rlimit(RLIMIT_STACK, config.rlimit_stack, "RLIMIT_STACK");
+ #ifdef RLIMIT_NPROC
+     if (config.rlimit_nproc_set)
+         set_one_rlimit(RLIMIT_NPROC, config.rlimit_nproc, "RLIMIT_NPROC");
+ #endif
+ 
+     /* the sysctl() call from iface-pfroute.c needs locked memory on FreeBSD */
+ #if defined(RLIMIT_MEMLOCK) && !defined(__FreeBSD__) && !defined(__FreeBSD_kernel__)
+     /* We don't need locked memory */
+     set_one_rlimit(RLIMIT_MEMLOCK, 0, "RLIMIT_MEMLOCK");
+ #endif
+ }
+ 
+ #define RANDOM_DEVICE "/dev/urandom"
+ 
+ static void init_rand_seed(void) {
+     int fd;
+     unsigned seed = 0;
+ 
+     /* Try to initialize seed from /dev/urandom, to make it a little
+      * less predictable, and to make sure that multiple machines
+      * booted at the same time choose different random seeds.  */
+     if ((fd = open(RANDOM_DEVICE, O_RDONLY)) >= 0) {
+         read(fd, &seed, sizeof(seed));
+         close(fd);
+     }
+diff --git a/configure.ac b/configure.ac
+index 58db8c7..e82dcd6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,102 +1,102 @@
+ # -*- Autoconf -*-
+ # Process this file with autoconf to produce a configure script.
+ 
+ # This file is part of avahi.
+ #
+ # avahi is free software; you can redistribute it and/or modify it
+ # under the terms of the GNU Lesser General Public License as
+ # published by the Free Software Foundation; either version 2 of the
+ # License, or (at your option) any later version.
+ #
+ # avahi is distributed in the hope that it will be useful, but WITHOUT
+ # ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ # or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public
+ # License for more details.
+ #
+ # You should have received a copy of the GNU Lesser General Public
+ # License along with avahi; if not, write to the Free Software
+ # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
+ # USA.
+ 
+ AC_PREREQ(2.63)
+-AC_INIT([avahi],[0.8],[avahi (at) lists (dot) freedesktop (dot) org])
++AC_INIT([avahi],[0.8-shiri-user1],[avahi (at) lists (dot) freedesktop (dot) org])
+ AC_CONFIG_SRCDIR([avahi-core/server.c])
+ AC_CONFIG_MACRO_DIR([common])
+ AC_CONFIG_HEADERS([config.h])
+ AM_INIT_AUTOMAKE([foreign 1.11 -Wall -Wno-portability silent-rules tar-pax])
+ 
+ AC_SUBST(PACKAGE_URL, [http://avahi.org/])
+ 
+ AC_SUBST(LIBAVAHI_COMMON_VERSION_INFO, [8:4:5])
+ AC_SUBST(LIBAVAHI_CORE_VERSION_INFO, [8:0:1])
+ AC_SUBST(LIBAVAHI_CLIENT_VERSION_INFO, [5:9:2])
+ AC_SUBST(LIBAVAHI_GLIB_VERSION_INFO, [1:2:0])
+ AC_SUBST(LIBAVAHI_LIBEVENT_VERSION_INFO, [1:0:0])
+ AC_SUBST(LIBAVAHI_GOBJECT_VERSION_INFO, [0:5:0])
+ AC_SUBST(LIBAVAHI_QT3_VERSION_INFO, [1:2:0])
+ AC_SUBST(LIBAVAHI_QT4_VERSION_INFO, [1:2:0])
+ AC_SUBST(LIBAVAHI_QT5_VERSION_INFO, [1:2:0])
+ AC_SUBST(LIBAVAHI_UI_VERSION_INFO, [1:4:1])
+ 
+ # Do not touch these, since they we took this version-info from upstream HOWL/Bonjour
+ AC_SUBST(LIBAVAHI_COMPAT_LIBDNS_SD_VERSION_INFO, [1:0:0])
+ AC_SUBST(LIBAVAHI_COMPAT_HOWL_VERSION_INFO, [0:0:0])
+ AC_SUBST(HOWL_COMPAT_VERSION, [0.9.8])
+ 
+ AC_CANONICAL_HOST
+ 
+ AM_SILENT_RULES([yes])
+ 
+ AC_CHECK_PROG([STOW], [stow], [yes], [no])
+ 
+ AS_IF([test "x$STOW" = "xyes" && test -d /usr/local/stow], [
+         AC_MSG_NOTICE([*** Found /usr/local/stow: default install prefix set to /usr/local/stow/${PACKAGE_NAME}-${PACKAGE_VERSION} ***])
+         ac_default_prefix="/usr/local/stow/${PACKAGE_NAME}-${PACKAGE_VERSION}"
+ ])
+ 
+ # Checks for programs.
+ AC_PROG_CC
+ AC_PROG_CC_C99
+ AC_PROG_CXX
+ AM_PROG_CC_C_O
+ AC_USE_SYSTEM_EXTENSIONS
+ AC_PROG_CPP
+ AC_PROG_MKDIR_P
+ AC_PROG_INSTALL
+ AC_PROG_LN_S
+ AC_PROG_MAKE_SET
+ AC_PROG_GCC_TRADITIONAL
+ 
+ # -fstack-protector
+ AC_ARG_ENABLE([stack-protector],
+     [AS_HELP_STRING([--disable-stack-protector],
+         [Disable GCC's/libc's stack-smashing protection])],
+     [case "${enableval}" in
+          yes) enable_ssp=yes ;;
+           no) enable_ssp=no ;;
+            *) AC_MSG_ERROR([invalid value ${enableval} for --disable-stack-protector]) ;;
+      esac],
+     [enable_ssp=yes])
+ 
+ if test x"$enable_ssp" = x"yes" && test x"$GCC" != x"yes"; then
+     AC_MSG_NOTICE([Disabling stack-smashing protection because compiler is not GCC])
+     enable_ssp=no
+ fi
+ 
+ if test x"$enable_ssp" = x"yes"; then
+     # Check for broken ssp in libc: http://www.avahi.org/ticket/105
+     # libc's brokenness will get in the way regardless of whether -lssp is
+     # provided, but provide it anyway (otherwise non-libc ssp would wrongly
+     # break here)
+ 
+     # Get -lssp if it exists
+     GCC_STACK_PROTECT_LIB
+ 
+     AC_MSG_CHECKING([whether stack-smashing protection is available])
+     ssp_old_cflags="$CFLAGS"
+     ssp_old_ldflags="$LDFLAGS"
+     CFLAGS="$CFLAGS -Werror -fstack-protector-all -fPIC"
+     LDFLAGS="$LDFLAGS -Wl,-z,defs"
+     cat confdefs.h > conftest.c
+     cat >>conftest.c <<_ACEOF
+ void test_broken_ssp(c)

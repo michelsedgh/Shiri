@@ -3,6 +3,19 @@
 Confirmed by the user on 2026-09-30. This document defines the product to
 deliver. An implementation limitation does not remove a requirement.
 
+On 2026-10-01 the user confirmed minimal buffering for music as well as speech,
+and clarified that Bluetooth outputs include a speaker-managed group such as
+IKEA's newer Bluetooth speakers. Keep that group compatible without requiring
+a particular model. The user subsequently excluded Bluetooth phone input;
+Bluetooth support here means speaker outputs, including externally linked groups.
+
+The user then explicitly deferred Chromecast **input** for the current release
+if no usable open-source receiver could be found. Current research found no
+supported stock-phone receiver/provisioning path for this Ubuntu VM. AirPlay 2
+input remains required; Chromecast speaker outputs remain supported. Future
+Cast input must meet the receiver checks before being enabled. This scope
+change supersedes the earlier requirement for both inputs in every zone.
+
 The user's latest instruction separates software completion from later real
 world acceptance: finish the implementation, automated review and tests,
 including isolated Linux VM and synthetic audio tests, before stopping this
@@ -14,10 +27,19 @@ as verified.
 ## A zone is a virtual casting destination
 
 An administrator creates a zone, names it, and assigns speakers to it. Every
-enabled zone exposes two native phone destinations: an AirPlay 2 receiver and
-a Google Cast / Chromecast receiver. Both represent the same zone and its
-assigned speakers. A zone can contain a mix of AirPlay, Chromecast, Bluetooth
+enabled zone exposes an AirPlay 2 receiver representing that zone and its
+assigned speakers. Chromecast input is deferred. A zone can contain a mix of AirPlay, Chromecast, Bluetooth
 and wired outputs supported by the installed adapters.
+
+A Bluetooth speaker-managed group is assigned through its main paired speaker.
+Shiri treats that exact Bluetooth endpoint as one output. Music, volume and TTS
+sent there reach the externally linked group; its members do not become
+independently addressable Shiri rooms. Administrators must assign the group to
+one zone with the intended announcement audience. Group setup, internal member
+synchronization and compatible combinations belong to the speakers. Measure
+the complete group path when calibrating it; a membership or mode change can
+change its delay and requires a fresh measurement. See
+[Bluetooth output and group compatibility](BLUETOOTH_OUTPUT.md).
 
 The listener uses the phone's existing casting controls. No Shiri phone app,
 custom sender page, replacement media player, or special development client
@@ -27,9 +49,7 @@ is not required to start ordinary phone playback.
 ```mermaid
 flowchart LR
     iPhone[iPhone native AirPlay controls] --> AP[Zone AirPlay receiver]
-    Cast[Phone existing Cast controls] --> CR[Zone Chromecast receiver]
     AP --> Input[Zone source ownership]
-    CR --> Input
     Input --> Mix[Zone music and speech mix]
     Nobly[Future Nobly TTS targeting this zone] --> Mix
     Mix --> Output[Zone output engine]
@@ -38,7 +58,7 @@ flowchart LR
 
 An input protocol and an output protocol are separate capabilities. Sending
 from OwnTone to a Chromecast speaker does not create a Chromecast receiver
-for a phone. Shiri must implement and validate both directions.
+for a phone. A future inbound Cast adapter needs its own validation.
 
 The current API calls its persisted zone records `rooms`; they are the same
 configured routing unit. A future Nobly room binding addresses that unit by
@@ -49,16 +69,15 @@ receives TTS.
 
 1. **Native phone playback.** Each enabled zone appears under its configured
    name in the appropriate phone picker. Selecting it sends the supported
-   phone audio to that zone's assigned speakers. Cast media playback and Cast
-   audio/screen streaming are different interoperability cases; both must be
-   investigated against the user's request to play audio from existing apps.
+   phone audio to that zone's assigned speakers through native AirPlay controls.
    Publish specific device/app restrictions established by testing.
 2. **Zone speaker assignment.** Select outputs once in the administration
    interface. Retain their stable identities, volume settings and calibration
    across restarts and discovery outages. Never route a program to a different
    speaker because the intended output disappeared.
-3. **Competing phones and protocols.** AirPlay and Cast feeding the same zone
-   share one explicit music owner. Define a predictable takeover policy and
+3. **Competing phones.** AirPlay inputs feeding the same zone
+   share one explicit music owner. Future protocols must use that same boundary.
+   Define a predictable takeover policy and
    enforce it in Shiri; the phones cannot coordinate ownership themselves.
    A stale disconnect or volume callback from the previous source must not
    stop or change its successor. TTS is a separate overlay, not another music
@@ -76,6 +95,12 @@ receives TTS.
    the final speaker outputs, including startup, regrouping and long playback.
    Synchronized receiver audio is insufficient if a later relay stage loses
    that timing. Independent OwnTone instances do not establish group sync.
+   For example, an iPhone grouping a Bluetooth-backed zone and a Wi-Fi-backed
+   zone supplies one shared presentation timeline. Preserve that timeline
+   through both relays, use the same declared relay delay in both zones, and
+   correct known output delay through their backends. Automated tests must
+   exercise independently arriving zone inputs from that common timeline;
+   separate successful single-zone tests do not satisfy this requirement.
 6. **Mixed output timing.** Keep established backend timing where supported.
    Measure constant delay, jitter and drift for actual output combinations;
    apply per-speaker corrections through the responsible backend. Prefer a
@@ -92,13 +117,13 @@ receives TTS.
 
 ## Production acceptance
 
-These are required gates, not features silently postponed to another product:
+These are the current release gates. Physical acceptance follows the software
+work at the user's request; Chromecast input is explicitly deferred.
 
 | Gate | Required evidence |
 | --- | --- |
 | AirPlay input | Stock iPhone discovers each enabled zone and plays through its assigned outputs, without a Shiri phone app |
-| Chromecast input | Stock phone Cast clients discover each enabled zone, authenticate, start and control the required audio paths; a custom Python sender alone does not pass |
-| Source arbitration | Repeated AirPlay-to-Cast and Cast-to-AirPlay contention has deterministic ownership; stale callbacks cannot alter the winner |
+| Source arbitration | Repeated competing AirPlay sessions have deterministic ownership; stale callbacks cannot alter the winner |
 | Native grouping | iPhone selects multiple zone receivers; final outputs remain within an explicitly measured supported tolerance across regrouping/restarts |
 | Mixed zone | Available physical AirPlay, Cast, Bluetooth and wired outputs are exercised together, with measured correction/jitter/drift and truthful compatibility |
 | TTS routing | Music advances continuously during ducking/overlay; gain restores after completion or failure; idle playback, conflicts and cancellation in at least two zones produce no wrong-zone speech |
@@ -107,9 +132,10 @@ These are required gates, not features silently postponed to another product:
 
 The candidate already contains AirPlay receiver routing, zone storage and
 speaker assignments, an OwnTone output adapter, a TTS mixer, and recovery
-work. Chromecast input, cross-protocol source arbitration and verified native
-multi-zone grouping are missing required capabilities. Until these and the
-remaining physical checks pass, this candidate is not the completed product.
+work. Complete native multi-zone qualification and the remaining software
+matrices are still open. Production replacement also requires the later
+physical checks. Chromecast input does not block this release under the revised
+scope; any future implementation must pass the stock-phone receiver gates.
 
 See [REBUILD.md](REBUILD.md) for the review loop and actual evidence, and
 [RECEIVER_RESEARCH.md](RECEIVER_RESEARCH.md) for inbound receiver evaluation.
