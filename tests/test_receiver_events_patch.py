@@ -34,8 +34,9 @@ def test_builder_pins_both_historical_and_new_layers():
     assert 'manifest["shairport_bounded_events_patch"] = sys.argv[30]' in builder
     assert 'manifest["shairport_receiver_volume_patch"] = sys.argv[28]' in builder
     assert builder.index('apply "$SHAIRPORT_VOLUME_PATCH"') < builder.index('apply "$SHAIRPORT_EVENTS_PATCH"')
-    assert builder.index("check_receiver_volume.py") < builder.index('apply "$SHAIRPORT_EVENTS_PATCH"')
-    assert builder.index("check_receiver_events.py") < builder.index("check_shairport_startup.py")
+    assert builder.index("--stage volume") < builder.index('apply "$SHAIRPORT_EVENTS_PATCH"')
+    assert builder.index('apply "$SHAIRPORT_EVENTS_PATCH"') < builder.index("--stage events")
+    assert builder.index("--stage events") < builder.index("check_shairport_startup.py")
     subprocess.run(["bash", "-n", ROOT / "install/build_backends.sh"], check=True)
 
 
@@ -76,8 +77,22 @@ def test_every_retained_lifecycle_case_executes_in_current_record_fixture():
 
 def test_builder_keeps_historical_source_guard_and_runs_current_full_checker():
     builder = (ROOT / "install/build_backends.sh").read_text()
-    assert "module.verify_source(Path(sys.argv[2]))" in builder
     assert (
-        '/usr/bin/python3 -I "$SOURCE/tests/native/check_receiver_events.py" --source "$BUILD/shairport" --compiler /usr/bin/cc --sanitize'
+        '/usr/bin/python3 -I "$SOURCE/tests/native/check_shairport_pcm_deadline.py" --source "$BUILD/shairport" --stage volume'
         in builder
     )
+    assert (
+        '/usr/bin/python3 -I "$SOURCE/tests/native/check_shairport_pcm_deadline.py" --source "$BUILD/shairport" --stage events --compiler /usr/bin/cc --sanitize'
+        in builder
+    )
+    spec = importlib.util.spec_from_file_location(
+        "receiver_deadline_pin", ROOT / "tests/native/check_shairport_pcm_deadline.py"
+    )
+    deadline = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(deadline)
+    clock = deadline.module("check_shairport_clock_recovery")
+    candidate = clock.patched_audio(clock.timing_tools())
+    historical = deadline.inverse_audio(candidate, composed=False)
+    assert hashlib.sha256(historical.encode()).hexdigest() == deadline.PURE_PREIMAGE
+    with pytest.raises(ValueError, match="exact reviewed deadline postimage"):
+        deadline.inverse_audio(candidate.replace("MSG_DONTWAIT", "0", 1), composed=False)
