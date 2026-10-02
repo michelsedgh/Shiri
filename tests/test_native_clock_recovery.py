@@ -184,6 +184,17 @@ def restore_original_producer(changed, filename):
     preimage = PRODUCER_PREIMAGES[filename]
     new = deepcopy(next(node for node in changed.body
                         if isinstance(node, ast.AsyncFunctionDef) and node.name == 'producer'))
+    if filename == 'check_native_grouping.py':
+        end = [node for node in ast.walk(new) if isinstance(node, ast.If)
+               and ast.unparse(node.test) == "action['action'] == 'end'"]
+        assert len(end) == 1
+        hold = end[0].body[-2]
+        assert ast.unparse(hold) == 'await hold_bluetooth_receiver_after_end(config, connection, path, state, stop)'
+        assert isinstance(end[0].body[-1], ast.Break)
+        assert ast.unparse(end[0].body[-3]) == "state['commands'].append({'generation': seen, 'action': 'end'})"
+        assert sum(isinstance(node, ast.Name) and node.id == 'hold_bluetooth_receiver_after_end'
+                   for node in ast.walk(new)) == 1
+        end[0].body.pop(-2)
     class UndoOwnedSeams(ast.NodeTransformer):
         def __init__(self, expected):
             self.expected, self.observations, self.progress = expected, set(), 0

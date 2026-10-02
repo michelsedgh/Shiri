@@ -601,7 +601,12 @@ async def exercise(api, api_process, broker, daemon, states, capture, producers,
         group.publish_command(producers[A]['command'], {'generation': 4, 'action': 'end'}, producers[A]['account'])
         async def idle():
             health = await call_rpc(broker._worker_socket(states[A]), 'health', {}, timeout=2)
-            return health if health['source']['owner'] is None and health['source']['ready'] else None
+            receiver = group.producer_status(producers[A])
+            ended = receiver.get('native_end_idle', {})
+            return health if (health['source']['owner'] is None and health['source']['ready']
+                and receiver.get('stage') == 'ended_idle' and receiver.get('finished') is False
+                and ended.get('generation') == 4 and ended.get('source_retired') is True
+                and ended.get('descriptor_closed') is True and ended.get('receiver_unit_held') is True) else None
         await wait(idle, 'actual A END releases native source', 5)
         first_end_packet, last_end_packet_at = len(daemon.capture.records), time.monotonic()
         async def retired():
@@ -628,6 +633,7 @@ async def exercise(api, api_process, broker, daemon, states, capture, producers,
         await healthy()
         require(report['bridge_last_observed']['flushes'] > before_end, 'Actual END did not complete selected PCM DropSync')
         report['end'] = {'passed': True, 'a_owner_idle': True, 'retirement': end_spectrum,
+                         'receiver_idle': deepcopy(group.producer_status(producers[A])['native_end_idle']),
                          'scope': 'Selected pipe/codec and observed future transport retire; no remote-radio/speaker queue claim'}
         a_guard.retire(baseline['amplitude_440']*.01, first_block=end_spectrum['first_block'])
         report['original_progress'] = deepcopy(anchors)
@@ -782,7 +788,8 @@ async def run_check(binary, digest, parent_namespace, original_netns_fd):
                 root = state.directory/'native-bluetooth-validation'
                 root_directory(root)
                 producers[identifier] = await group.launch_producer(broker, state, root, 0,
-                                                                    duration_seconds=route.PRODUCER_SECONDS)
+                                                                    duration_seconds=route.PRODUCER_SECONDS,
+                                                                    bluetooth_receiver_idle=identifier == A)
         finally:
             broker._monitor = asyncio.create_task(broker._health_monitor(), name='private-bt-production-health')
         async def granted():

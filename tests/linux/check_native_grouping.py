@@ -493,6 +493,42 @@ def bracketed_packet(grant, group, frame, sequence, common_start_ns, wide=False,
                   clock_sample_ns=raw, monotonic_before_ns=before, monotonic_after_ns=after)
 
 
+async def hold_bluetooth_receiver_after_end(config, connection, path, state, stop):
+    """Hold only the declared BT fixture receiver after acknowledged source END."""
+    profile = config.get('bluetooth_receiver_idle')
+    if profile is None:
+        return
+    require(isinstance(profile, dict) and set(profile) == {
+        'version', 'room_id', 'started_monotonic_ns', 'deadline_monotonic_ns'
+    } and type(profile['version']) is int and profile['version'] == 1
+            and profile['room_id'] == A
+            and type(config.get('duration_seconds')) is int and config['duration_seconds'] == 180
+            and config.get('leader') is True
+            and not any(key in config for key in ('music_startup', 'music_minimum', 'music_soak', 'candidate_timing')),
+            'Idle receiver lifetime is restricted to the declared Bluetooth A fixture')
+    started, deadline = profile['started_monotonic_ns'], profile['deadline_monotonic_ns']
+    now = time.monotonic_ns()
+    require(type(started) is int and type(deadline) is int
+            and 0 < started <= now < deadline and deadline-started == 180_000_000_000,
+            'Bluetooth fixture receiver exceeded or altered its original180s lifetime')
+    require(not state.get('error') and state.get('commands')
+            and state['commands'][-1] == {'generation': 4, 'action': 'end'}
+            and state.get('stage') == 'streaming' and state.get('finished') is False
+            and type(state.get('frames')) is int and state['frames'] > 0,
+            'Idle receiver hold requires the exact successful final native END')
+    connection.close()
+    state.update(stage='ended_idle', native_end_idle={
+        'generation': 4, 'source_retired': True, 'descriptor_closed': True,
+        'receiver_unit_held': True, 'observed_monotonic_ns': now,
+        'deadline_monotonic_ns': deadline,
+    })
+    atomic_json(path, state)
+    try:
+        await asyncio.wait_for(stop.wait(), (deadline-time.monotonic_ns())/1e9)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeFailure('Bluetooth fixture idle receiver reached its declared lifetime') from exc
+
+
 async def producer(config_path):
     """Receiver credentials are set by the owned unit, never by a root socket."""
     config = json.loads(Path(config_path).read_text())
@@ -575,6 +611,7 @@ async def producer(config_path):
                     require(await asyncio.wait_for(loop.sock_recv(connection, 4096), 3) == b'',
                             'Native END did not close its exact retired ingress')
                     state['commands'].append({'generation': seen, 'action': 'end'})
+                    await hold_bluetooth_receiver_after_end(config, connection, path, state, stop)
                     break
                 else:
                     require(action['action'] in {'run', 'wait'}, 'Unsupported producer command')
@@ -1311,7 +1348,8 @@ async def verify_original_receiver(broker, state, original, expected, pid, birth
 
 
 async def launch_producer(broker, state, root, common_start_ns, *, duration_seconds=MAX_DURATION,
-                          arrival_lead_ns=None, frozen_timing=None, music_startup=False, music_minimum=False, music_soak=False):
+                          arrival_lead_ns=None, frozen_timing=None, music_startup=False, music_minimum=False, music_soak=False,
+                          bluetooth_receiver_idle=False):
     # Preparation only: the original receiver must be idle and its exact unit
     # must stop before its canonical reservation can be replaced. An arbitrary
     # validation role would be rejected by production manifest recovery.
@@ -1321,6 +1359,12 @@ async def launch_producer(broker, state, root, common_start_ns, *, duration_seco
             'Refuse an undeclared native producer duration before replacement')
     require(all(type(mode) is bool for mode in (music_startup, music_minimum, music_soak))
             and sum((music_startup, music_minimum, music_soak)) <= 1, 'Music experiment admission must be exclusive boolean')
+    require(type(bluetooth_receiver_idle) is bool and (not bluetooth_receiver_idle or (
+        duration_seconds == 180 and state.desired.id == A and state.bluetooth_admission is not None
+        and isinstance(state.desired.local_audio_device, str) and state.desired.local_audio_device.startswith('bluealsa:DEV=')
+        and not any((music_startup, music_minimum, music_soak)) and frozen_timing is None
+        and type(common_start_ns) is int and common_start_ns == 0 and arrival_lead_ns is None
+    )), 'Idle receiver hold requires only the exact descriptor-backed Bluetooth A fixture')
     if music_soak:
         load_soak_module().admit_launch(state.desired, duration_seconds, common_start_ns, arrival_lead_ns,
                                        frozen_timing, FrozenWorkerTiming, lab=NATIVE_LAB)
@@ -1398,6 +1442,10 @@ async def launch_producer(broker, state, root, common_start_ns, *, duration_seco
         producer_config['candidate_timing'] = {'horizon_ms': 1000, 'buffer_ms': 500}
     if duration_seconds != MAX_DURATION:
         producer_config['duration_seconds'] = duration_seconds
+    if bluetooth_receiver_idle:
+        started = time.monotonic_ns()
+        producer_config['bluetooth_receiver_idle'] = {'version': 1, 'room_id': A,
+            'started_monotonic_ns': started, 'deadline_monotonic_ns': started+180_000_000_000}
     atomic_json(config, producer_config)
     file_owner(config, account)
     owned = await broker._start_process(key, 'shairport', [sys.executable, str(HERE), '--producer',
