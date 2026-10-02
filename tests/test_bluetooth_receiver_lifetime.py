@@ -295,12 +295,26 @@ async def test_missing_exact_eof_is_refused_before_any_idle_permission(tmp_path)
 
 @pytest.mark.asyncio
 async def test_hold_has_original_absolute_wall_limit_and_refuses_timeout(tmp_path):
-    harness = Harness(tmp_path, remaining_seconds=0.06)
+    harness = Harness(tmp_path)
+    deadline = harness.config["bluetooth_receiver_idle"]["deadline_monotonic_ns"]
+    hold = harness.environment["hold_bluetooth_receiver_after_end"]
+
+    async def enter_near_original_deadline(*args):
+        # Exercise the real END/hold and asyncio timeout without requiring
+        # producer preparation and delivery to finish inside a 60ms wall race.
+        harness.environment["time"] = SimpleNamespace(monotonic_ns=lambda: deadline - 60_000_000)
+        await hold(*args)
+
+    harness.environment["hold_bluetooth_receiver_after_end"] = enter_near_original_deadline
     task = harness.launch()
-    await harness.wait_idle(task)
     with pytest.raises(RuntimeFailure, match="declared lifetime"):
         await asyncio.wait_for(task, 1)
-    assert json.loads(harness.status.read_text())["error"]
+    state = json.loads(harness.status.read_text())
+    assert state["error"]
+    assert state["native_end_idle"]["deadline_monotonic_ns"] == deadline
+    assert state["native_end_idle"]["observed_monotonic_ns"] == deadline - 60_000_000
+    assert [packet.kind for packet in harness.packets] == [Kind.BEGIN, Kind.PCM, Kind.END]
+    assert harness.connection.closed
 
 
 @pytest.mark.parametrize(

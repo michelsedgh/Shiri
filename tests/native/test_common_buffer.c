@@ -14,7 +14,9 @@ static uint64_t session_delay(int offset) {
   struct output_device record = {.offset_ms=offset,.name="private scheduling fixture"};
   struct output_device *device=&record;
   struct alsa_session session={0}, *as=&session;
+  {
 #include "alsa_delay.inc"
+  }
   return as->delay_ms;
 }
 /* Conventional timespec normalization is plumbing, not an output scheduler. */
