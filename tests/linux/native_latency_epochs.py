@@ -371,14 +371,44 @@ async def exercise(context):
                     indexes[identifier] = index
                     context.pcm_guards[identifier].begin(index)
             if identifier in indexes:
+                read_before_ns = time.monotonic_ns()
                 player = await context.states[identifier].client.request('GET', '/api/player')
-                require(player['state'] == 'play' and player.get('volume') == context.states[identifier].current_volume == 100,
+                read_after_ns = time.monotonic_ns()
+                # OwnTone conceals internal PLAY_PLAYING as API pause until its
+                # nominal B expires. A negative endpoint correction can make
+                # actual PCM audible earlier; retain only that startup window.
+                buffering = (identifier == A and context.phase.phase == 'native'
+                    and context.states[identifier].desired.speakers[0].offset_ms < 0
+                    and player.get('state') == 'pause'
+                    and player.get('volume') == context.states[identifier].current_volume == 100
+                    and type(player.get('item_id')) is int and player['item_id'] > 0
+                    and 'first_play_reply' not in context.evidence.get('native_startup_buffering', {})
+                    and start <= read_before_ns <= read_after_ns <= start+context.declared_horizon_ns+40_000_000
+                    and (identifier not in initial_players
+                         or player['item_id'] == initial_players[identifier]['item_id']))
+                require((player['state'] == 'play' or buffering)
+                        and player.get('volume') == context.states[identifier].current_volume == 100,
                         'Initial coded program stopped or changed its output volume')
                 if identifier not in initial_players:
                     initial_players[identifier] = deepcopy(player)
                 else:
                     require(player['item_id'] == initial_players[identifier]['item_id'],
                             'Initial coded program changed its original OwnTone item')
+                if (identifier == A and context.phase.phase == 'native'
+                        and context.states[identifier].desired.speakers[0].offset_ms < 0
+                        and (buffering or 'first_play_reply' not in context.evidence.get('native_startup_buffering', {}))):
+                    record = context.evidence.setdefault('native_startup_buffering', {
+                        'scope': 'Negative-output startup API buffering only; source/item/master/PCM guards remain active',
+                        'common_presentation_ns': start, 'common_horizon_ns': context.declared_horizon_ns,
+                        'latest_buffering_reply_ns': start+context.declared_horizon_ns+40_000_000,
+                        'declared_native_period_ns': 20_000_000,
+                        'saved_offset_ms': context.states[identifier].desired.speakers[0].offset_ms})
+                    key = 'first_buffering_reply' if buffering else 'first_play_reply'
+                    record.setdefault(key, {'read_monotonic_before_ns': read_before_ns,
+                        'read_monotonic_after_ns': read_after_ns, 'player': deepcopy(player),
+                        'current_volume': context.states[identifier].current_volume,
+                        'source_owner': deepcopy(healths[identifier]['source']['owner']),
+                        'native_blocks': healths[identifier]['native_blocks']})
         return len(indexes) == len(context.producers)
     await observed_wait(context, None, initial_pcm, 'Epoch did not establish all actual final native PCM', 20)
     # Every buffer remains checked from actual onset throughout the code.

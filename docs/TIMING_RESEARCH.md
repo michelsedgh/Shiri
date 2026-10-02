@@ -189,10 +189,33 @@ byte-identical original182 fixture tree and freshly admitted boot identity.
 It passed both idle/native finite utterances, the unchanged2ms configured-offset
 and drift checks, complete prefix/body/codec-tail/quiet and all cleanup, followed
 by fresh original182 admission. Its independent queue-origin spreads were below
-1ms. The original report deliberately leaves speech performance unqualified;
-the predeclared additional latency policy requires separate cases at all three
-saved corrections. A finer kernel alone does not establish synchronization;
-the unchanged
+1ms. It lacked the required prelaunch budget binding; its original report
+deliberately leaves speech performance unqualified. Separately declared202
+zero and +2000ms cold/warm idle/native cases passed, while the native −2000ms
+startup assertion failed. Diagnostic203 conclusively observed PCM at about
+P+140ms while the negatively corrected target's API reported PAUSED/master100 and
+the same positive item; API PLAYING appeared at about P+2151ms with unchanged
+source and advancing blocks. That intentional diagnosticFAIL and its original
+capture-tail errors remain retained.
+
+The one-file204 test correction permits only this bounded initial negative-target
+buffering state, preserving source/item/volume identity and the original waveform,
+2ms alignment/drift and cleanup requirements. It changes no production package,
+native backend or buffer. A fresh204 profile and pre-source declaration bind
+all six required cases: all three cold/warm idle/native offset pairs passed with
+full cleanup and post-admission. The unchanged frozen evaluator qualified all
+12 software latency rows, preserving each original report and the complete
+independent timestamp bracket. Original202 passes were not used to qualify the
+differently admitted204 profile. Default-buffer promotion and physical/phone
+acceptance remain separate.
+
+Actual205 subsequently returned to the unchanged stock generic kernel and
+passed fresh exact candidate182 admission. Encrypted199 passed playback,
+playing/paused/idle speech, volume and manager reload with complete cleanup on
+that boot. It is a functional regression, not a repeat of the204 latency matrix.
+Both exact installation rollbacks and normal VM shutdown then passed, preserving
+the protected live VM and original images.
+A finer kernel alone does not establish synchronization; the unchanged
 2ms waveform gate, complete PCM/calendar checks and fallback/rollback checks
 must pass before any minimum policy is promoted. Local package/config evidence
 is retained in `/tmp/shiri-lowlatency-kernel-config-review-result.json`.

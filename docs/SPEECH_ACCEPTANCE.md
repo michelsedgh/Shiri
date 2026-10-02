@@ -42,6 +42,19 @@ The earlier, unqualified immutable declaration is retained at
 `/tmp/shiri-speech-release-budget-v1.json`, SHA-256
 `35a489b9ad71f6d6c12a727fc5127c5fde8774dc2f005f836d6717aa0267cfb3`.
 The pinned aiortc 1.15.0 receiver was checked locally against its source;
-audio uses `JitterBuffer(capacity=16, prefetch=4)`. The declaration is currently
-**unqualified**: focused model tests and older route passes do not meet all
-the requirements above.
+audio uses `JitterBuffer(capacity=16, prefetch=4)`.
+
+On October 2, the separately declared204 matrix passed cold/warm idle/native
+cases at −2000, zero and +2000 ms correction on one admitted boot/profile.
+The unchanged frozen evaluator qualified all 12 rows, including full independent
+latency brackets, waveform completion and cleanup. The immutable declarations
+and original finite reports remain unchanged. Earlier200 and202 results were
+not substituted into this matrix. This establishes software speech performance;
+smaller default buffers, actual-phone behavior and physical output remain
+separate requirements.
+
+After returning to the stock generic kernel, fresh candidate182 admission205
+and encrypted playback/speech/volume/reload regression199 passed with complete
+cleanup. Both exact installation rollbacks and normal VM shutdown also passed.
+The204 latency matrix remains bound to its original boot/profile; live rollout,
+actual iPhone volume and final handoff are still pending.
