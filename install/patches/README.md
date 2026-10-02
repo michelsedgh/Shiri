@@ -381,3 +381,16 @@ layer preserves original250ms packet expiry,20ms reserve, natural EOF tail,
 source/output transport files and music presentation/buffering policy. See
 [the voice owner contract](../../docs/SPEECH_JITTER.md). Portable sanitizer proofs
 do not establish a built Linux backend or physical output acceptance.
+
+
+`owntone-29.3-event-ack.patch` follows the exact paused-speech layer and adds
+`-event1`. It repairs the dictionary-valued initial `updateInfo` exchange,
+strictly frames retained/coalesced RTSP and complete authenticated cipher
+records, and echoes the receiver's full uint64 revision without playback
+mutation. It changes only `configure.ac` and `outputs/airplay_events.c`.
+The builder pins it independently at manifest argument31 after the original
+bed checks. Its strict checker reverses only this exact layer privately and
+invokes the unchanged historical bed/transition/owner guards, then compiles
+the actual event source with libplist/libevent and the unchanged pairing
+library with libgcrypt/libsodium under sanitizers. This event ACK does not
+add OwnTone device-volume application or qualify iPhone UI/acoustics.

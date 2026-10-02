@@ -95,8 +95,8 @@ directory. Another installation cannot adopt these accounts.
 
 An existing version-1 map needs a stopped, quiescent upgrade. Stop its actual
 broker and all of its owned units first, and recover any retained resources
-with the version that admitted them. The installer holds the exact owning
-`broker.lock`, verifies an empty ownership manifest, and scans live processes
+with a version that verifies their saved admission policy. The installer holds
+the exact owning `broker.lock`, verifies an empty ownership manifest, and scans live processes
 for every managed real/effective/saved/filesystem UID before atomically
 publishing version 2. It preserves all 42 published UID/GID assignments and
 never deletes or reassigns existing accounts. A failed publication may leave
@@ -117,6 +117,26 @@ interpreter with those exact owning directories:
 Do not point migration at a new empty lock directory. If the map, account,
 lock inode or owned manifest changes, installation stops and preserves the
 publication for inspection. The new broker refuses a version-1 map.
+
+Systemd reload recovery also needs the qualified current unit manager. New
+daemon launches seal an owned namespace-policy companion after verified
+transient creation; device/permission arrays remain exact while their order
+can change on reload. The real Ubuntu `policy137` check passed two reloads and
+exact cleanup on non-media services; it does not qualify phone playback.
+See [service policy persistence](../docs/DAEMON_PRIVILEGES.md#preserve-service-policy-across-manager-reloads).
+
+For historical owned units whose manager namespace mask already drifted, keep
+the original map, accounts, state, policy observations and ownership ledger.
+Review the exact invocation, cgroup and original artifacts before restoring
+only the intended unit policy. Then use the qualified new manager's full
+original ownership checks to retire those units and recreate the coherent
+runtime. The older manager can also reject reordered `DeviceAllow` pairs;
+rewriting its saved device policy or ignoring a namespace failure is not a
+recovery procedure. One-time repair files have separate receipts and cleanup.
+Restoring manager text alone neither changes an existing process's kernel
+filter nor repairs an already closed room control launch. Require actual
+native/phone acceptance after recreation before reporting the live controls
+fixed.
 
 The source replacement Bluetooth profile uses a separate bridge UID, only
 AF_UNIX, and no host D-Bus connection, audio group or ALSA node. The root broker

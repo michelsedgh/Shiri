@@ -315,6 +315,78 @@ changed namespace fail. Exact cleanup and host/legacy restoration also passed.
 This observer proof uses a synthetic listener, not the complete real receiver
 and native group playback path.
 
+## Preserve service policy across manager reloads
+
+A systemd manager reload must preserve the launched worker's namespace and
+device restrictions. On the observed systemd 249 installation, transient
+`RestrictNamespaces=yes` was written as an empty `RestrictNamespaces=` line.
+Reloading that fragment changed the manager's typed mask from 0 to all allowed
+namespaces. Shiri correctly refused the changed policy, retained ownership and
+blocked control/recovery. This can leave physical workers running while phone
+volume callbacks queue without reaching the saved room master.
+[systemd transient serialization](https://github.com/systemd/systemd/blob/v249/src/core/dbus-execute.c#L1458),
+[empty namespace-mask conversion](https://github.com/systemd/systemd/blob/v249/src/shared/nsflags.c#L50),
+[fragment parsing](https://github.com/systemd/systemd/blob/v249/src/core/load-fragment.c#L3219).
+
+New launches persist the exact intended companion path before starting the
+service. After successful transient creation and strict original policy
+verification, the broker durably records the invocation and held cgroup inode,
+then seals this root-owned file before ordinary monitoring or daemon release:
+
+```text
+/run/systemd/system/<exact-unit>.d/90-shiri-namespace-policy.conf
+```
+
+```ini
+[Service]
+RestrictNamespaces=yes
+```
+
+The ownership receipt records boot, protected parent, directory/file inodes,
+exact bytes and metadata through planned, directory, file and sealed phases.
+Creating a drop-in before `StartTransientUnit` would prevent systemd's pristine
+unit admission, so publication follows verified creation. Every subsequent
+service check still requires the actual integer namespace mask 0 and the exact
+receipt. Daemon cleanup precedes artifact cleanup. Interrupted creation can be
+recovered from its durable unique-unit plan only when the original daemon is
+proved stopped or absent and the protected path, bytes, modes and known inodes
+match. Changed, foreign or linked artifacts refuse recovery; an old boot cannot
+retarget a successor's artifact. See `shiri/runtime/namespace_policy.py`.
+
+The same reload also reverses the manager's `DeviceAllow` array: transient
+admission prepends device entries, serialization keeps that order, and fragment
+parsing prepends them again. Shiri compares the exact device/permission pairs
+independent of array order, preserving their repetitions and checking both the
+original observation and requested policy. Added nodes, wider permissions and
+every other immutable property remain refused; historical receipts are never
+rewritten. [Transient device setter](https://github.com/systemd/systemd/blob/v249/src/core/dbus-cgroup.c#L1473),
+[device fragment parser](https://github.com/systemd/systemd/blob/v249/src/core/load-fragment.c#L3604),
+[device-list insertion](https://github.com/systemd/systemd/blob/v249/src/core/cgroup.c#L566).
+
+The real isolated Ubuntu `policy137` check passed two manager reloads with the
+same service PID, invocation and held cgroup inode, actual namespace mask 0 and
+unchanged device/permission pairs. Its unpatched comparison service reproduced
+the all-allowed namespace mask and strict refusal. Both non-media sleep services
+expired normally; exact cleanup passed and the installed map/ledger stayed
+unchanged. The report is `/tmp/shiri-rvm-guest-co6loon8/policy137-poll.json`.
+`policy135` remains failed on device-array ordering, with cleanup passed;
+`policy136` remains failed because the system interpreter lacked `dbus_next`,
+with its later exact cleanup separately retained. Those failed reports are not
+relabelled. This establishes actual policy persistence and cleanup, not native
+audio, phone controls or physical synchronization. Native protocol and actual
+phone acceptance remain separate gates.
+
+Existing units without a companion receipt still require their original full
+ownership/policy checks. If their namespace mask has already changed, use a
+reviewed exact-unit policy restoration followed by the qualified new manager's
+ordinary owned retirement and coherent recreation. The new manager handles
+historical device-array order without changing any saved device entitlement.
+Do not rewrite the ownership ledger, relax mask checks, signal by prefix or
+adopt a foreign drop-in. One-time operator repair artifacts need separate exact
+receipts and cleanup. Restoring manager text does not apply a new seccomp filter
+to an existing process or revive an already retired room control launch. See
+[installation recovery](../install/README.md#fixed-worker-identities-and-upgrades).
+
 ## ALSA isolation is an additional gate
 
 Distinct room UIDs and device cgroups cannot isolate substreams 0..7 of the same

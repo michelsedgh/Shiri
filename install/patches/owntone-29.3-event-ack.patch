@@ -1,0 +1,589 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,11 +1,11 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+ AC_CONFIG_AUX_DIR([build-aux])
+ AC_CONFIG_HEADERS([config.h])
+ AM_INIT_AUTOMAKE([foreign subdir-objects 1.11])
+ AM_SILENT_RULES([yes])
+--- a/src/outputs/airplay_events.c
++++ b/src/outputs/airplay_events.c
+@@ -22,29 +22,40 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <inttypes.h>
+ #include <errno.h>
++#include <limits.h>
++#include <strings.h>
+ #include <sys/socket.h>
+ 
+ #include <pthread.h>
+ #include <event2/event.h>
+ #include <event2/buffer.h>
+ #include <plist/plist.h>
+ 
+ #include "airplay_events.h"
+ #include "commands.h"
+ #include "misc.h"
+ #include "logger.h"
+ #include "player.h"
+ #include "pair_ap/pair.h"
+ 
++#ifndef MSG_NOSIGNAL
++# define MSG_NOSIGNAL 0
++#endif
++
+ #define RTSP_VERSION "RTSP/1.0"
++#define RTSP_EVENT_HEADERS_MAX 8192U
++#define RTSP_EVENT_BODY_MAX 65536U
++#define RTSP_EVENT_PENDING_MAX (RTSP_EVENT_HEADERS_MAX + RTSP_EVENT_BODY_MAX + RTSP_EVENT_HEADERS_MAX)
++#define PAIR_EVENT_BLOCK_MAX 1024U
++#define PAIR_EVENT_OVERHEAD 18U
+ 
+ enum airplay_events
+ {
+   AIRPLAY_EVENT_UNKNOWN,
+   AIRPLAY_EVENT_PLAY,
+   AIRPLAY_EVENT_PAUSE,
+   AIRPLAY_EVENT_NEXT,
+@@ -62,23 +73,17 @@
+   struct evbuffer *pending;
+ 
+   struct airplay_events_client *next;
+ };
+ 
+ struct rtsp_message
+ {
+-  int content_length;
+-  char *content_type;
+-  char *first_line;
+-  int cseq;
+-
++  uint64_t cseq;
+   const uint8_t *body;
+   size_t bodylen;
+-
+-  const uint8_t *data;
+   size_t datalen;
+ };
+ 
+ 
+ static pthread_t thread_id;
+ static struct event_base *evbase;
+ static struct commands_base *cmdbase;
+@@ -169,30 +174,57 @@
+ 
+ /* -------------------------------- Ciphering ------------------------------- */
+ 
+ static int
+ buffer_decrypt(struct evbuffer *output, struct evbuffer *input, struct pair_cipher_context *cipher_ctx)
+ {
+   uint8_t *in;
+-  size_t in_len;
++  size_t available, in_len = 0, block_len;
+   ssize_t bytes_decrypted;
+-  uint8_t *plain;
+-  size_t plain_len;
+-
++  uint8_t *plain = NULL;
++  size_t plain_len = 0;
++  int ret;
++
++  available = evbuffer_get_length(input);
++  if (available > RTSP_EVENT_PENDING_MAX)
++    return -1;
+   in = evbuffer_pullup(input, -1);
+-  in_len = evbuffer_get_length(input);
+-
+-  // Note that bytes_decrypted is not necessarily equal to plain_len
++  if (!in && available)
++    return -1;
++
++  /* pair_decrypt expects complete two-byte little-endian record headers.
++   * Preserve a split header/tag instead of passing a trailing single byte to
++   * its pinned decoder. Authentication and counters remain in pair_decrypt. */
++  while (available - in_len >= 2)
++    {
++      block_len = in[in_len] | ((size_t)in[in_len + 1] << 8);
++      if (!block_len || block_len > PAIR_EVENT_BLOCK_MAX)
++        return -1;
++      if (available - in_len < block_len + PAIR_EVENT_OVERHEAD)
++        break;
++      in_len += block_len + PAIR_EVENT_OVERHEAD;
++    }
++  if (!in_len)
++    return 0;
++
+   bytes_decrypted = pair_decrypt(&plain, &plain_len, in, in_len, cipher_ctx);
+   if (bytes_decrypted < 0)
+     return -1;
+-
+-  evbuffer_add(output, plain, plain_len);
+-  evbuffer_drain(input, bytes_decrypted);
++  if ((size_t)bytes_decrypted != in_len || plain_len > in_len
++      || evbuffer_get_length(output) > RTSP_EVENT_PENDING_MAX - plain_len)
++    {
++      free(plain);
++      return -1;
++    }
++
++  ret = evbuffer_add(output, plain, plain_len);
+   free(plain);
++  if (ret < 0)
++    return -1;
++  evbuffer_drain(input, in_len);
+   return 0;
+ }
+ 
+ static int
+ buffer_encrypt(struct evbuffer *output, uint8_t *in, size_t in_len, struct pair_cipher_context *cipher_ctx)
+ {
+   uint8_t *out;
+@@ -208,125 +240,212 @@
+   return 0;
+ }
+ 
+ 
+ /* --------------------- Message construction/parsing ----------------------- */
+ 
+ static void
+-response_headers_add(struct evbuffer *response, int cseq, size_t content_length, const char *content_type)
++response_headers_add(struct evbuffer *response, uint64_t cseq, size_t content_length, const char *content_type)
+ {
+   evbuffer_add_printf(response, "%s 200 OK\r\n", RTSP_VERSION);
+   evbuffer_add_printf(response, "Server: %s/1.0\r\n", PACKAGE_NAME);
+   if (content_length)
+     evbuffer_add_printf(response, "Content-Length: %zu\r\n", content_length);
+   if (content_type)
+     evbuffer_add_printf(response, "Content-Type: %s\r\n", content_type);
+   if (cseq)
+-    evbuffer_add_printf(response, "CSeq: %d\r\n", cseq);
++    evbuffer_add_printf(response, "CSeq: %" PRIu64 "\r\n", cseq);
+   evbuffer_add_printf(response, "\r\n");
+ }
+ 
+ static void
+-response_create_from_raw(struct evbuffer *response, uint8_t *body, size_t body_len, int cseq, const char *content_type)
++response_create_from_raw(struct evbuffer *response, uint8_t *body, size_t body_len, uint64_t cseq, const char *content_type)
+ {
+   response_headers_add(response, cseq, body_len, content_type);
+ 
+   if (body)
+     evbuffer_add(response, body, body_len);
+ }
+ 
+ static int
+-body_find(uint8_t **body, size_t *body_len, uint8_t *in, size_t in_len)
+-{
+-  const char *plist_header = "bplist";
+-  size_t plist_header_len = strlen(plist_header);
+-
+-  *body_len = in_len;
+-  for (*body = in; *body_len > plist_header_len; (*body)++, (*body_len)--)
+-    {
+-      if (memcmp(*body, plist_header, plist_header_len) == 0)
+-	return 0;
+-    }
+-
+-  return -1;
+-}
+-
++rtsp_uint(uint64_t *result, const uint8_t *value, size_t length, uint64_t maximum)
++{
++  uint64_t number = 0;
++  size_t i;
++
++  if (!length)
++    return -1;
++  for (i = 0; i < length; i++)
++    {
++      if (value[i] < '0' || value[i] > '9'
++          || number > (maximum - (value[i] - '0')) / 10)
++        return -1;
++      number = number * 10 + value[i] - '0';
++    }
++  *result = number;
++  return 0;
++}
++
++/* 0: one complete frame, 1: retained fragment, -1: malformed/bounded failure.
++ * Never search for a plist in headers or consume bytes from the next frame. */
+ static int
+-rtsp_parse(enum airplay_events *event, uint8_t *in, size_t in_len)
+-{
+-  uint8_t *body;
+-  size_t body_len;
++rtsp_frame_parse(struct rtsp_message *message, const uint8_t *in, size_t in_len)
++{
++  const char *first_line = "POST /command " RTSP_VERSION;
++  const char *content_type = "application/x-apple-binary-plist";
++  size_t header_len = 0, position, end, colon, begin, value_end, body_len = 0;
++  uint64_t value;
++  bool length_seen = false, type_seen = false, cseq_seen = false;
++
++  memset(message, 0, sizeof(*message));
++  for (position = 0; position + 3 < in_len && position + 4 <= RTSP_EVENT_HEADERS_MAX; position++)
++    {
++      if (memcmp(in + position, "\r\n\r\n", 4) == 0)
++        {
++          header_len = position + 4;
++          break;
++        }
++    }
++  if (!header_len)
++    return in_len >= RTSP_EVENT_HEADERS_MAX ? -1 : 1;
++  for (position = 0; position < header_len; position++)
++    {
++      if ((in[position] < 32 && in[position] != '\r' && in[position] != '\n' && in[position] != '\t')
++          || in[position] > 126)
++        return -1;
++    }
++  end = 0;
++  while (end + 1 < header_len && !(in[end] == '\r' && in[end + 1] == '\n'))
++    end++;
++  if (end != strlen(first_line) || memcmp(in, first_line, end) != 0)
++    return -1;
++  position = end + 2;
++  while (position < header_len - 2)
++    {
++      end = position;
++      while (end + 1 < header_len && !(in[end] == '\r' && in[end + 1] == '\n'))
++        end++;
++      colon = position;
++      while (colon < end && in[colon] != ':')
++        {
++          uint8_t c = in[colon];
++          if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++                || (c >= '0' && c <= '9') || strchr("!#$%&'*+-.^_`|~", c)))
++            return -1;
++          colon++;
++        }
++      if (colon == position || colon == end)
++        return -1;
++      begin = colon + 1;
++      value_end = end;
++      while (begin < value_end && (in[begin] == ' ' || in[begin] == '\t'))
++        begin++;
++      while (value_end > begin && (in[value_end - 1] == ' ' || in[value_end - 1] == '\t'))
++        value_end--;
++      for (value = begin; value < value_end; value++)
++        if (in[value] < 32 && in[value] != '\t')
++          return -1;
++      if (colon - position == 14 && strncasecmp((const char *)in + position, "Content-Length", 14) == 0)
++        {
++          if (length_seen || rtsp_uint(&value, in + begin, value_end - begin, RTSP_EVENT_BODY_MAX) < 0
++              || !value)
++            return -1;
++          body_len = (size_t)value;
++          length_seen = true;
++        }
++      else if (colon - position == 12 && strncasecmp((const char *)in + position, "Content-Type", 12) == 0)
++        {
++          if (type_seen || value_end - begin != strlen(content_type)
++              || strncasecmp((const char *)in + begin, content_type, value_end - begin) != 0)
++            return -1;
++          type_seen = true;
++        }
++      else if (colon - position == 4 && strncasecmp((const char *)in + position, "CSeq", 4) == 0)
++        {
++          if (cseq_seen || rtsp_uint(&value, in + begin, value_end - begin, UINT64_MAX) < 0 || !value)
++            return -1;
++          message->cseq = value;
++          cseq_seen = true;
++        }
++      position = end + 2;
++    }
++  if (!length_seen || !type_seen)
++    return -1;
++  if (in_len - header_len < body_len)
++    return 1;
++  message->body = in + header_len;
++  message->bodylen = body_len;
++  message->datalen = header_len + body_len;
++  return 0;
++}
++
++static int
++rtsp_parse(enum airplay_events *event, struct rtsp_message *message, const uint8_t *in, size_t in_len)
++{
+   plist_t request = NULL;
+   plist_t item;
+-  char *type = NULL;
+-  char *value = NULL;
+-  int ret;
+-
+-  DHEXDUMP(E_DBG, L_AIRPLAY, in, in_len, "Incoming event\n");
+-
+-  ret = body_find(&body, &body_len, in, in_len);
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_WARN, L_AIRPLAY, "Could not parse incoming event, no plist body found\n");
+-      return -1;
+-    }
+-
+-  plist_from_bin((char *)body, (uint32_t)body_len, &request);
+-  if (!request)
+-    {
+-      DPRINTF(E_WARN, L_AIRPLAY, "Could not parse incoming event plist\n");
+-      return -1;
+-    }
+-
++  const char *type = NULL;
++  const char *value = NULL;
++  uint64_t string_length;
++  int ret;
++
++  *event = AIRPLAY_EVENT_UNKNOWN;
++  ret = rtsp_frame_parse(message, in, in_len);
++  if (ret != 0)
++    return ret;
++  if (message->bodylen < 8 || memcmp(message->body, "bplist00", 8) != 0)
++    return -1;
++
++  plist_from_bin((const char *)message->body, (uint32_t)message->bodylen, &request);
++  if (!request || plist_get_node_type(request) != PLIST_DICT)
++    goto error;
+   item = plist_dict_get_item(request, "type");
+-  if (item)
+-    {
+-      plist_get_string_val(item, &type);
+-    }
+-
++  if (!item || plist_get_node_type(item) != PLIST_STRING)
++    goto error;
++  type = plist_get_string_ptr(item, &string_length);
++  if (!type || string_length != strlen(type))
++    goto error;
+   item = plist_dict_get_item(request, "value");
+-  if (item)
+-    {
+-      plist_get_string_val(item, &value);
+-    }
+-
+-  if (!type || !value)
+-    {
+-      DPRINTF(E_DBG, L_AIRPLAY, "AirPlay event has no type/value: type=%s, value=%s\n", type, value);
+-      goto error;
+-    }
+-  else if (strcmp(type, "sendMediaRemoteCommand") != 0)
+-    {
+-      DPRINTF(E_DBG, L_AIRPLAY, "Incoming event not of type sendMediaRemoteCommand\n");
+-      goto error;
+-    }
++  if (!item)
++    goto error;
++
++  /* A metadata dictionary is a valid event-channel exchange. Acknowledge it
++   * without dispatching playback or claiming device-volume support. */
++  if (strcmp(type, "updateInfo") == 0)
++    {
++      if (plist_get_node_type(item) != PLIST_DICT)
++        goto error;
++      DPRINTF(E_DBG, L_AIRPLAY, "Received updateInfo event (metadata only)\n");
++      ret = 0;
++      goto out;
++    }
++  if (strcmp(type, "sendMediaRemoteCommand") != 0 || plist_get_node_type(item) != PLIST_STRING)
++    goto error;
++  value = plist_get_string_ptr(item, &string_length);
++  if (!value || string_length != strlen(value))
++    goto error;
+ 
+   DPRINTF(E_INFO, L_AIRPLAY, "Received event type '%s', value '%s'\n", type, value);
+-
+   if (strcmp(value, "paus") == 0)
+     *event = AIRPLAY_EVENT_PAUSE;
+   else if (strcmp(value, "play") == 0)
+     *event = AIRPLAY_EVENT_PLAY;
+   else if (strcmp(value, "nitm") == 0)
+     *event = AIRPLAY_EVENT_NEXT;
+   else if (strcmp(value, "pitm") == 0)
+     *event = AIRPLAY_EVENT_PREV;
+-  else
+-    *event = AIRPLAY_EVENT_UNKNOWN;
+-
+-  free(type);
+-  free(value);
++  ret = 0;
++  goto out;
++
++ error:
++  DPRINTF(E_WARN, L_AIRPLAY, "Could not parse framed AirPlay event plist/schema\n");
++  ret = -1;
++ out:
+   plist_free(request);
+-  return 0;
+-
+- error:
+-  free(type);
+-  free(value);
+-  plist_free(request);
+-  return -1;
++  return ret;
+ }
+ 
+ 
+ /* --------------------------- Message handling ----------------------------- */
+ 
+ static void
+ handle_event(enum airplay_events event)
+@@ -352,42 +471,48 @@
+ 	break;
+       default:
+ 	return;
+     }
+ }
+ 
+ static int
+-respond(struct airplay_events_client *client)
++respond(struct airplay_events_client *client, uint64_t cseq)
+ {
+   struct evbuffer *response;
+   struct evbuffer *encrypted;
+   uint8_t *plain;
+   size_t plain_len;
+   int ret;
+ 
+   CHECK_NULL(L_AIRPLAY, response = evbuffer_new());
+-  response_create_from_raw(response, NULL, 0, 0, NULL);
++  response_create_from_raw(response, NULL, 0, cseq, NULL);
+ 
+   plain = evbuffer_pullup(response, -1);
+   plain_len = evbuffer_get_length(response);
+ 
+   CHECK_NULL(L_AIRPLAY, encrypted = evbuffer_new());
+ 
+   ret = buffer_encrypt(encrypted, plain, plain_len, client->cipher_ctx);
+   if (ret < 0)
+     {
+       DPRINTF(E_WARN, L_AIRPLAY, "Could not encrypt AirPlay event data response: %s\n", pair_cipher_errmsg(client->cipher_ctx));
+-      return -1;
+-    }
+-
++      goto error;
++    }
++
++  /* Replies are small, but the event thread must not block on a peer which
++   * stops reading. A failed nonblocking write retires this event channel. */
+   do
+     {
+-      ret = evbuffer_write(encrypted, client->fd);
++      plain = evbuffer_pullup(encrypted, -1);
++      ret = send(client->fd, plain, evbuffer_get_length(encrypted), MSG_DONTWAIT | MSG_NOSIGNAL);
++      if (ret < 0 && errno == EINTR)
++        continue;
+       if (ret <= 0)
+         goto error;
++      evbuffer_drain(encrypted, ret);
+     } while (evbuffer_get_length(encrypted) > 0);
+ 
+   evbuffer_free(encrypted);
+   evbuffer_free(response);
+   return 0;
+ 
+  error:
+@@ -397,21 +522,22 @@
+ }
+ 
+ static void
+ incoming_cb(int fd, short what, void *arg)
+ {
+   struct airplay_events_client *client = arg;
+   enum airplay_events event;
++  struct rtsp_message message;
+   uint8_t *plain;
+   size_t plain_len;
+   int ret;
+ 
+   DPRINTF(E_DBG, L_AIRPLAY, "AirPlay event from '%s'\n", client->name);
+ 
+-  ret = evbuffer_read(client->incoming, fd, -1);
++  ret = evbuffer_read(client->incoming, fd, RTSP_EVENT_HEADERS_MAX);
+   if (ret == 0)
+     {
+       DPRINTF(E_DBG, L_AIRPLAY, "'%s' disconnected from the event channel\n", client->name);
+       goto disconnect;
+     }
+   else if (ret < 0)
+     {
+@@ -422,43 +548,44 @@
+   ret = buffer_decrypt(client->pending, client->incoming, client->cipher_ctx);
+   if (ret < 0)
+     {
+       DPRINTF(E_WARN, L_AIRPLAY, "Could not decrypt incoming AirPlay event data: %s\n", pair_cipher_errmsg(client->cipher_ctx));
+       goto disconnect;
+     }
+ 
+-  plain = evbuffer_pullup(client->pending, -1);
+-  plain_len = evbuffer_get_length(client->pending);
+-
+-  ret = rtsp_parse(&event, plain, plain_len);
+-  if (ret < 0) // A message type we don't know about, so ignore
+-    {
+-      evbuffer_drain(client->pending, -1);
+-      return;
+-    }
+-  else if (ret == 1)
+-    {
+-      DPRINTF(E_SPAM, L_AIRPLAY, "Incomplete RTSP event message, waiting for more data\n");
+-      return;
+-    }
+-
+-  evbuffer_drain(client->pending, -1);
+-
+-  handle_event(event);
+-
+-  ret = respond(client);
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_WARN, L_AIRPLAY, "Could not send AirPlay event response\n");
+-      goto disconnect;
+-    }
+-
++  while ((plain_len = evbuffer_get_length(client->pending)) > 0)
++    {
++      plain = evbuffer_pullup(client->pending, -1);
++      if (!plain)
++        goto disconnect;
++      ret = rtsp_parse(&event, &message, plain, plain_len);
++      if (ret < 0)
++        {
++          DPRINTF(E_WARN, L_AIRPLAY, "Malformed AirPlay event frame from '%s'\n", client->name);
++          goto disconnect;
++        }
++      if (ret == 1)
++        {
++          DPRINTF(E_SPAM, L_AIRPLAY, "Incomplete RTSP event message, waiting for more data\n");
++          return;
++        }
++      evbuffer_drain(client->pending, message.datalen);
++      if (event != AIRPLAY_EVENT_UNKNOWN)
++        handle_event(event);
++      ret = respond(client, message.cseq);
++      if (ret < 0)
++        {
++          DPRINTF(E_WARN, L_AIRPLAY, "Could not send AirPlay event response\n");
++          goto disconnect;
++        }
++    }
+   return;
+ 
+  disconnect:
++  shutdown(fd, SHUT_RDWR);
+   client_remove(client);
+   return;
+ }
+ 
+ /* -------------------- Event loop (thread: airplay events ) ---------------- */
+ 
+ static void *

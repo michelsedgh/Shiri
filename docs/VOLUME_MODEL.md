@@ -35,11 +35,12 @@ The OwnTone `balance1` patch enables an independent master and stages gains befo
 selection. It retains the assigned group's trims across output rediscovery and
 AirPlay protocol replacement. Native phone volume continues through the exact
 source-fenced `shiri-volume` endpoint, which uses the same master and saved trims.
-The current runtime requires the matching `owner1-balance1-transition1-bed1` backend version; deploying
-the Python changes alone against the old OwnTone build is unsupported.
+The current runtime requires the matching
+`owner1-balance1-transition1-bed1-event1` backend version; deploying the Python
+changes alone against the old OwnTone build is unsupported.
 
 The composed Shairport candidate includes the separate AP2 event-channel
-backport and requires `startup1-volume1`. Its bounded receiver control path uses
+backport and requires `startup1-volume2`. Its bounded receiver control path uses
 exact launch/session fences and phone echo suppression; see
 [receiver volume feedback](RECEIVER-VOLUME.md) for its limits and pending phone
 acceptance. A successful OwnTone volume readback proves backend intent,
@@ -54,3 +55,19 @@ all-trimmed/single-trimmed outputs, mute/unmute, rediscovery, lost acknowledgmen
 replay, and invalid identities; the original master-recalculation algorithm fails
 the same fixture. Actual phone, speaker gain and playback continuity tests remain
 necessary after a coherent backend deployment.
+
+Volume delivery also depends on healthy room service ownership. The old live
+diagnostic installation received phone volume callbacks but could not commit
+them after a systemd reload changed its namespace policy. The strict service
+guard retained resources and retired the control launch, leaving events queued
+with a bridge error. Moving the web slider does not repair that ownership state.
+
+New service launches persist the namespace restriction through a protected
+companion file. Their device-policy verification accepts only a different order
+of the same exact device/permission pairs after reload. The isolated Ubuntu
+`policy137` run verified both fixes across two actual reloads and exact cleanup;
+it used non-media sleep services. See [service policy persistence](DAEMON_PRIVILEGES.md#preserve-service-policy-across-manager-reloads).
+The old live units require reviewed restoration, qualified owned retirement
+and coherent recreation before phone controls can be tested again. Actual
+phone volume application and reverse iPhone slider feedback are still unverified
+on that installation; policy137 does not establish either behavior.

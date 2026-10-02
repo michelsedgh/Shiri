@@ -345,6 +345,71 @@ class NativeSourceGenerationGuard:
         observed['accepted'] = True
 
 
+class EndedTransportSilence:
+    """Measure idle final PCM/RTP without requiring the selected socket to close."""
+    def __init__(self, before_flush, receiver):
+        require(type(before_flush) is int and 0 <= before_flush < 2**63 and isinstance(receiver, dict),
+                'END idle proof lacks its original flush/receiver observation')
+        self.before_flush = before_flush
+        self.receiver = deepcopy(receiver)
+        self.previous = self.stable = None
+        self.since = None
+        self.last_observed_at = None
+
+    def observe(self, bridge, health, receiver, packets, chunks, now):
+        source, ended = health.get('source'), receiver.get('native_end_idle')
+        require(health.get('ready') is True and not health.get('error')
+                and isinstance(source, dict) and source.get('ready') is True and source.get('owner') is None
+                and receiver.get('stage') == 'ended_idle' and receiver.get('finished') is False
+                and not receiver.get('error') and isinstance(ended, dict)
+                and type(ended.get('generation')) is int and ended['generation'] == 4
+                and all(ended.get(key) is True for key in ('source_retired', 'descriptor_closed', 'receiver_unit_held'))
+                and ended == self.receiver.get('native_end_idle')
+                and all(type(receiver.get(key)) is type(self.receiver.get(key))
+                        and receiver.get(key) == self.receiver.get(key)
+                        for key in ('session_id', 'epoch', 'incarnation', 'generation')),
+                'END idle proof lost its exact retired source or held receiver')
+        require(bridge.get('ready') is True and not bridge.get('error')
+                and bridge.get('peer_authorized') is True and type(bridge.get('active')) is bool
+                and bridge.get('uses_system_bus') is False and bridge.get('uses_alsa_devices') is False,
+                'END idle proof lost its exact descriptor-only worker')
+        counter_keys = ('flushes', 'frames_forwarded', 'frames_discarded', 'queue_bytes')
+        require(all(type(bridge.get(key)) is int and 0 <= bridge[key] < 2**63 for key in counter_keys)
+                and type(packets) is int and 0 < packets < route.MAX_PACKETS
+                and type(chunks) is int and 0 < chunks < route.MAX_PACKETS,
+                'END idle proof counters are malformed')
+        output = bridge.get('last_output_at')
+        require(type(now) in {int, float} and 0 < now < 2**63
+                and type(output) in {int, float} and 0 < output <= now,
+                'END idle proof output clock is malformed or in the future')
+        require(self.last_observed_at is None or now >= self.last_observed_at,
+                'END idle proof observation clock moved backwards')
+        self.last_observed_at = now
+        observed = (bridge['flushes'], bridge['frames_forwarded'], bridge['frames_discarded'], output, packets, chunks)
+        if self.previous is not None:
+            require(all(current >= previous for current, previous in zip(observed, self.previous, strict=True)),
+                    'END idle proof counters or output clock moved backwards')
+        self.previous = observed
+        if bridge['flushes'] <= self.before_flush or bridge['queue_bytes'] != 0:
+            self.stable = self.since = None
+            return None
+        if self.stable != observed:
+            self.stable, self.since = observed, now
+            return None
+        require(now >= self.since, 'END idle proof observation clock moved backwards')
+        elapsed = now-self.since
+        if elapsed < .5:
+            return None
+        return {'kind': 'actual_framed_session_idle_after_completed_drop' if bridge['active']
+                        else 'actual_framed_session_ended_after_completed_drop',
+                'last_packet': packets-1, 'first_block': chunks,
+                'no_new_transport_seconds': elapsed, 'unchanged_frames_forwarded': bridge['frames_forwarded'],
+                'unchanged_frames_discarded': bridge['frames_discarded'], 'completed_flushes': bridge['flushes'],
+                'queue_bytes': 0, 'unchanged_last_output_at': output, 'socket_retained': bridge['active'],
+                'receiver_end': deepcopy(ended), 'source_owner_idle': True,
+                'scope': 'Unchanged final PCM counters and decoded/RTP callback counts over a measured interval'}
+
+
 async def exercise(api, api_process, broker, daemon, states, capture, producers, report, *, frozen_timing):
     """Own one uninterrupted B observer through music, speech and A retirement."""
     done = asyncio.Event()
@@ -608,15 +673,16 @@ async def exercise(api, api_process, broker, daemon, states, capture, producers,
                 and ended.get('generation') == 4 and ended.get('source_retired') is True
                 and ended.get('descriptor_closed') is True and ended.get('receiver_unit_held') is True) else None
         await wait(idle, 'actual A END releases native source', 5)
-        first_end_packet, last_end_packet_at = len(daemon.capture.records), time.monotonic()
+        end_idle = EndedTransportSilence(before_end, group.producer_status(producers[A]))
         async def retired():
-            nonlocal first_end_packet, last_end_packet_at
+            health = await call_rpc(broker._worker_socket(states[A]), 'health', {}, timeout=2)
+            receiver = group.producer_status(producers[A])
             bridge = await broker._worker_rpc(states[A], 'bluetooth-output', 'health', {}, timeout=2)
             require(bridge['ready'] and not bridge['error'], 'END faulted the descriptor worker')
+            silent = end_idle.observe(bridge, health, receiver, len(daemon.capture.records),
+                                      len(daemon.capture.chunks), time.monotonic())
             if bridge['flushes'] <= before_end:
                 return None
-            if len(daemon.capture.records) != first_end_packet:
-                first_end_packet, last_end_packet_at = len(daemon.capture.records), time.monotonic()
             measured = route.fit_tones(b''.join(daemon.capture.chunks[-20:]))
             quiet_first = len(daemon.capture.chunks)-20
             quiet = [route.fit_tones(data) for data in daemon.capture.chunks[quiet_first:]]
@@ -624,11 +690,7 @@ async def exercise(api, api_process, broker, daemon, states, capture, producers,
                    and max(item[f'amplitude_{frequency}'] for frequency in (440, 660, 880, 1320))
                    <= route.CODEC_TONE_FLOOR for item in quiet):
                 return {'kind': 'decoded_carrier_retired', 'spectrum': measured, 'first_block': quiet_first}
-            if not bridge['active'] and time.monotonic()-last_end_packet_at >= .5:
-                return {'kind': 'actual_framed_session_ended_after_completed_drop', 'last_packet': first_end_packet-1,
-                        'first_block': len(daemon.capture.chunks),
-                        'no_new_transport_seconds': time.monotonic()-last_end_packet_at}
-            return None
+            return silent
         end_spectrum = await wait(retired, 'actual decoded endpoint retires old A program', 8)
         await healthy()
         require(report['bridge_last_observed']['flushes'] > before_end, 'Actual END did not complete selected PCM DropSync')

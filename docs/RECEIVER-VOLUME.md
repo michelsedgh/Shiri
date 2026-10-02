@@ -80,23 +80,44 @@ root and in `params`. The maintainer describes AP2 event-channel control work
 in [discussion 2262](https://github.com/mikebrady/shairport-sync/discussions/2262).
 This backport intentionally implements a bounded exchange rather than calling
 the pinned blocking event helper or the upstream wrapper that re-enters player
-volume callbacks. The pinned original initial updateInfo event helper remains
-outside the new lane; contention with it is bounded by the new try-lock gate.
+volume callbacks. All Shiri receiver event exchanges, including the initial `updateInfo` metadata,
+use the same 750 ms bounded encrypted lane. Initial metadata is fenced to its
+exact principal connection before native BEGIN; volume commands retain the
+stronger worker/session/generation/revision fences. The bounded exchange
+releases buffers and both locks before honoring a pending thread cancellation.
+A peer that never acknowledges initial metadata retires this optional lane
+instead of blocking later controls or connection teardown.
 
 ## Build and tests
 
 Pinned receiver Git HEAD remains 7bad231c18368dbd26f298577f6210e36e4b0797.
 Keep its real Git metadata through staged builds: the receiver reports its
-truthful dirty Git origin and feature `-shiri-timed3-startup1-volume1`.
-The builder pins the additive receiver patch by SHA256, applies it after the
-clock and startup layers, sanitizes its exact C files and reserves manifest
-argument 28. OwnTone transition27 and paused-speech29 remain independent.
+truthful dirty Git origin and feature `-shiri-timed3-startup1-volume2`.
+The builder retains the original SHA-pinned volume layer at manifest argument
+28, then adds the separately pinned bounded-metadata layer at argument 30.
+OwnTone transition27 and paused-speech29 remain independent. Historical
+volume1 receipts and the original volume checker remain unchanged.
 
-`tests/native/check_receiver_volume.py --source <composed backend> --sanitize`
+`tests/native/check_receiver_events.py --source <composed backend> --sanitize`
 compiles the exact added transport and receiver lane with controlled pairing
 and plist seams. Real Unix sockets exercise fragmented acknowledgements,
 bounded timeout, EOF, current-source/revision fencing, optional lane retirement,
-allocation cleanup and joined shutdown. The full Ubuntu receiver build links
+allocation cleanup and joined shutdown. The metadata cases additionally cover
+initial ACK followed by volume on the same socket, no ACK, malformed replies,
+and cancellation while teardown holds the principal write lock. The new
+record fixture uses the pinned little-endian length and 16-byte tag layout;
+only complete records of at most 1024 bytes reach upstream decryption. Split
+initial headers and a complete record followed by one byte of the next header
+remain buffered. Authentication failure follows the pinned library's freed-output
+contract before shared cleanup. The checker
+backs out only its exact additive layer before invoking the immutable original
+volume source guard. The builder checks that historical source guard before
+applying layer 30, then compiles and executes all retained lifecycle case
+bodies against the current native source and pinned-format record seam. It
+does not claim to rerun the old fake-framing C seam on Linux. Current code
+keeps `-Wall -Wextra -Werror`; only Darwin receives the `MSG_NOSIGNAL=0`
+fallback because that macro would collide with Linux's socket enum. The six
+independent plist cleanup conditions retain their behavior on separate lines. The full Ubuntu receiver build links
 against the real pinned protocol libraries. These seams do not certify crypto
 or iPhone UI behavior. The existing startup14 and clock50 tests remain strict:
 only the SHA-pinned exact receiver overlay can be backed out to the unchanged
@@ -116,3 +137,39 @@ more than 40 seconds and resume; rapidly alternate phone/web moves; switch
 sender sessions with an outstanding web edit; disconnect/reconnect after a
 failed feedback exchange. Event acknowledgement alone does not prove that an
 application rendered its slider correctly.
+
+
+OwnTone's additional `-event1` layer accepts only complete, bounded
+`POST /command RTSP/1.0` frames with the declared binary-plist body and a valid
+`updateInfo` string plus metadata dictionary. It sends the authenticated
+acknowledgement without invoking playback or changing volume. A partial
+header, encrypted record or plist remains pending; coalesced requests are
+drained and answered individually. The response echoes the full unsigned
+64-bit CSeq used by the receiver revision. Malformed frames and failed
+nonblocking replies retire that event connection.
+
+This repairs the reproduced network128 stall: the old OwnTone asked for a
+string from `updateInfo.value`, which is a dictionary, then discarded the
+message without replying. The receiver waited for that initial response
+while holding the event mutex, preventing later reverse-volume exchanges.
+Network128 remains a failed historical receipt. The additional OwnTone
+patch is recorded at build-manifest argument31; the original receiver28,
+bounded receiver30 and prior OwnTone patches retain their own pins.
+
+`tests/native/check_airplay_events.py --source <composed owntone> --sanitize`
+checks the whole event callback with real libplist/libevent and Unix sockets,
+including retained metadata, each encrypted split, coalescing, complete-frame
+bounds, malformed schemas, CSeq overflow, EOF and a peer refusing its reply.
+The primary crypto case additionally compiles the exact pinned pairing
+implementation against libgcrypt/libsodium, validates genuine encrypted
+metadata replies and checks corrupted authentication tags, rollback and the
+library's error-path allocation ownership. Service and player actors are
+inert. The checker privately reverses only the exact event layer before
+running the unchanged bed, transition and owner validators.
+
+The pinned OwnTone sender still treats `dvlc` as an unsupported media command:
+a 200 response proves event delivery, not that its player master changed.
+No synthetic sender volume implementation is added to obtain a passing test.
+The fresh encrypted pipeline, full native builds and physical iPhone slider
+acceptance remain separate requirements. The complete player/gain/timing
+source, music presentation timestamps and configured buffers are unchanged.

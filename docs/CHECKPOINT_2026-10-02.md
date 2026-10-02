@@ -1,90 +1,48 @@
 # Rebuild checkpoint — October 2, 2026
 
-This is a work-in-progress recovery checkpoint, not a production release. Continue the active rebuild goal after creating it. Do not infer current production readiness from the large historical unit-test counts.
+This is a recovery checkpoint while release qualification continues. It is not a production release. The current speaker-test VM has not received the final combined build.
 
 ## Product contract
 
-Each zone exposes one native AirPlay 2 receiver. The user selects or groups zones through the phone's normal AirPlay controls and assigns physical speakers to each zone through Shiri. OwnTone schedules the outputs; Shiri retains the source presentation timeline, route timing and exact source/session ownership. Use one room master volume with persistent setup attenuation per physical speaker. Target speech to an exact zone and duck advancing music without pausing or flushing it.
+Each zone exposes one native AirPlay 2 receiver. Users select or group zones through the phone’s normal AirPlay controls and assign physical speakers through Shiri. OwnTone schedules outputs; Shiri preserves presentation timing and exact source/session ownership. One room master is shared by phone and web controls, with persistent setup attenuation for each physical speaker. Speech targets an exact zone and ducks continuously advancing music without pausing or flushing it.
 
-Bluetooth speaker groups are one paired primary device; synchronization of that device's followers belongs to the speaker vendor. Bluetooth input is excluded. Chromecast input is deferred at the user's request; Cast outputs remain approximate and require physical measurement. Nobly integration is a room-addressed API contract until that application exists.
+A Bluetooth speaker group is one paired primary device; the vendor manages its followers. Bluetooth input is excluded. Chromecast input is deferred at the user’s request. Cast output and mixed transports require physical measurement; a stable offset correction cannot remove changing transport jitter. Nobly currently has a zone-addressed speech API contract because that application does not yet exist.
 
-## Saved work
+## Current qualified artifacts
 
-The checkpoint includes the runtime, process/network ownership and recovery work; room and speaker storage; native timing and speech patches; Bluetooth speaker-output adapter; UI, calibration and measurement tools; installation and daemon isolation; and meaningful native/Python/browser regression tests. It also includes the reviewed room master/speaker balance changes and the receiver startup/clock repairs.
+The final combined build is installed in an isolated Ubuntu rehearsal clone. Its frozen source contains 445 files; its wheel contains 52 package files. The receiver reports `timed3-startup1-volume2`; OwnTone reports the combined `balance1-transition1-bed1-event1` contract. The original pinned Git origins remain intact. The 50-account daemon identity map, dependencies and helper binaries are preserved.
 
-The actual live iPhone → Sonos test now starts and resumes normally according to the user's test after fresh connection and a requested 40-second pause. See [the live review](LIVE_PLAYBACK_REVIEW.md) for the failures, fixes and measured scope. The independent Linux native-reader tests exercised an actual 31-second admitted pause and exact socket retirement. A timer-wait race in the test was corrected without changing production code.
+Actual native checks passed the retained startup, clock, event, real pairing-crypto, bounded receiver callback and paused-speech cases, including sanitizer checks. Both native builds compiled on Ubuntu. The final Python 3.10 suite passed 3,918 tests with 14 platform or explicit opt-in skips. The earlier run in Linux’s world-writable `/tmp` failed 53 mock policy-file tests because the production guard correctly refused that ancestor. The successful run used a protected root-owned `--basetemp`; no runtime policy was weakened. All original failed outcomes remain preserved.
 
-The live diagnostic backend binaries and the default build recipe are not yet the final combined release. The original checkpoint retained the additive live OwnTone source-transition repairs separately; the subsequent source now integrates the bounded atomic transition. Do not deploy this checkpoint over a working house installation as a qualified release.
+The installed package, native binaries, manifest and original rollback chain passed strict idle preflight and independent read-only admission. These checks establish the artifact and installation contract; functional, reboot and rollback checks remain separate requirements.
 
-## Checkpoint validation follow-up
+## Actual encrypted playback and volume
 
-The full host checkpoint run completed with 3,558 passes, 81 explicit platform skips and one failing cancellation regression. That fixture still expected volume to be applied after selection; the saved-balance implementation deliberately stages exact gains under the speaker lease before selection can start sound. The fixture now verifies that order and still requires cancellation to preserve saved intent and prevent any later operation. The focused cancellation/balance follow-up passed all 22 cases; production code was unchanged. Ruff and the 31 frontend tests passed. Linux and browser results retain their separately stated scopes.
+The current combined build passed cold decoded playback, advancing music under speech, ducking/restoration, incoming AirPlay volume and encrypted reverse-event acknowledgement in the isolated network run. Every zone, terminal, source and shared-sender actor retained its invocation/cgroup identity through a real systemd manager reload, with namespace masks still denying all namespace creation. No physical audio device was granted.
 
-## Remaining work
+The OwnTone test sender acknowledges reverse device-volume events but does not apply them to its own displayed master. That run proves delivery and acknowledgement, not the iPhone slider. An actual iPhone check remains required.
 
-The combined candidate is now installed in a separate Ubuntu rehearsal clone.
-Its exact wheel, native binaries, dependencies, installation identity and saved
-account map passed strict preflight. The working live phone/Sonos test remains
-on its separately verified diagnostic build until the combined gates pass.
+The first current run stopped before playback because its test Unix socket path was too long; cleanup passed. Its successor reached long pause, where the test incorrectly required the OwnTone sender’s owner to remain present for 31 seconds. The pinned sender deliberately sends TEARDOWN after its ten-second paused-output timeout. Shiri retired that owner correctly. The corrected test requires actual sender TEARDOWN, no music PCM during pause, unchanged zone services, exact owner retirement, and a fresh music owner on resume. The failed run remains failed until a new actual run passes. This source fixture is AirPlay 2 type96/PTP; it cannot establish the iPhone’s type103 pause behavior.
 
-The actual Python 3.10 suite completed with 3,711 passes, 14 explicit skips and
-one GCC fixture warning failure. The retained C startup fixture now compiles
-with cancellation unwind tables; all 14 sanitized GCC startup/cancellation
-cases and the 32 focused Linux checks passed without changing native bodies or
-disabling warnings. These follow-ups do not relabel the original failed run.
-The current two-zone minimum-policy gate also passed music, targeted speech
-and exact producer/output/network cleanup. Repeated speech and the remaining
-release gates are still open.
+## Live phone-volume failure
 
-Encrypted-network rehearsal exposed two configuration errors in its new
-terminal/sender fixtures: a missing metadata FIFO caused upstream Shairport's
-NULL-path crash, and OwnTone could not reopen a systemd journal descriptor as
-`/dev/stdout`. The fixtures now use an explicit isolated metadata FIFO and an
-existing writable state log. Failed receipts and successful cleanup proofs
-remain preserved; these fixture repairs do not qualify encrypted playback.
+The user previously confirmed normal fresh playback and resume after a requested 40-second iPhone pause on the diagnostic build. A subsequent unapplied phone-volume report exposed a separate real ownership failure: systemd249 serialized the transient namespace restriction as an empty value and restored it as an all-allowed mask after manager reload. The old strict guard refused those changed actors, leaving reserved resources and a closed worker routing lane. Reordered DeviceAllow observations also caused an exact-order comparison failure.
 
-Follow-up source integration now includes the bounded atomic native transition, separate receiver volume feedback and paused-source speech. The combined OwnTone backend compiled on Ubuntu with the exact `balance1-transition1-bed1` marker. The receiver compiled with the exact `startup1-volume1` marker, retaining its real pinned Git origin. These private builds have not replaced the working live diagnostic receiver.
+The current build persists an invocation-bound restrictive companion policy and verifies its exact bytes/inodes as well as the actual typed namespace mask. It compares DeviceAllow as the exact path/rights multiset, retaining duplicates and every other ownership check. The actual current encrypted run verified reload survival and incoming volume with all transport actors live. The live diagnostic VM still needs exact legacy-actor retirement and coherent rollout; policy restoration alone cannot reopen its closed worker.
 
-The combined OwnTone source passed strict composed-layer guards, 44,364 actual-C paused-speech assertions, 28 real JSON parser cases and 20 real FFmpeg converter cases under sanitizers on Ubuntu. Two test-fixture portability repairs were needed for GCC's warning checks; production code was unchanged. These are native function/converter checks with controlled hardware seams, not complete encrypted network playback or acoustic acceptance. A focused actual Python 3.10 run passed 83 cases, including the real credential/packet listener path. The complete network gate remains a separate requirement.
+## Earlier functional evidence
 
-Further review repaired asynchronous volume/assignment intent races, notification loss across quick administrative edits, and a receiver startup race. Saved gains and the complete speaker assignment are now acknowledged before receiver advertisement. Failed startup uses the existing cleanup/backoff; released leases wake waiting sibling rooms without causing the failed room to bypass its own backoff. Enabled empty zones retain discovery, while the native output readiness guard refuses music until an output is assigned. Focused broker/feedback tests passed 161 cases with one macOS platform skip.
+On the preceding combined installation, the actual two-zone minimum-buffer gate, 20 speech sessions per zone, worker crash isolation, 50 enable/disable cycles and both broker SIGKILL recovery phases passed with exact process/output/network cleanup. The corrected finite-speech gate subsequently passed idle and native-music prefix, body, tail and quiet completion; the earlier failed subtraction oracle is preserved.
 
-The subsequent full host suite reached 3,612 passes, 82 platform skips and one obsolete test expecting the earlier backend marker. Its assertion now requires the exact combined marker; all nine focused native-layer tests passed. The new network observer passed 26 regressions, including accepted-descriptor and sibling-reader cleanup. These results remain separate from the pending actual encrypted protocol run.
+The Bluetooth run passed audio, speech, volume and takeover but its final oracle incorrectly equated an intentionally retained socket with continuing music after END. Actual source retirement, DropSync, stopped frame counters and over eight seconds without RTP were retained. The corrected END oracle requires exact retirement and stable counters independently of socket lifetime. Current-build reruns remain required; historical passes do not qualify the newer namespace/native changes.
 
-- Verify bounded atomic speaker preparation/FLUSH/arming, delayed output release after END and failed-setup recovery through the complete network path.
-- Verify the phone's displayed slider and rapid alternating edits with the bounded receiver-to-phone feedback implementation.
-- Verify saved speaker balance through actual output readback and gain changes without transport changes.
-- Verify speech on a retained paused phone source through the complete network path, preserving the input timeline.
-- Exercise the complete encrypted native receiver → network output chain, repeated starts, pause/resume, teardown and failures. Preserve the distinction between OwnTone's real-time AirPlay sender and an iPhone's buffered stream.
-- Finish current-source speech, Bluetooth, recovery, network lifecycle, install/reboot and rollback checks. Earlier local synthetic soaks retain their original scope and cannot qualify new code.
-- Complete the durable handoff and release documentation. Acoustic alignment, real mixed speakers and household acceptance require later physical measurements.
+## Remaining before software acceptance
 
-The active goal remains open. Stop the goal only after the agreed software work and its required validation are complete.
+- Complete current encrypted healthy and delayed-GRANT failure/recovery checks with exact cleanup.
+- Rerun grouping, repeated and finite speech, Bluetooth END, worker faults and lifecycle/recovery against the current installed build.
+- Verify normal guest reboot, fresh boot admission and encrypted bootstrap, then exact two-stage rollback to the preceding installation and original preimage.
+- Retire the exact live legacy actors under restored full ownership authority, deploy the complete qualified package/native pair, and preserve room names, assignments, speaker trims and master volume.
+- Confirm first playback, long pause/resume, phone-to-room master and web-to-phone slider behavior on the actual iPhone.
+- Finish the durable handoff, release notes and final Git checkpoint. Mark the goal complete and stop only after these software requirements pass.
 
-## Current validation follow-up
-
-The installed combined candidate passed the two-zone minimum-policy grouping,
-20 speech sessions per zone, and zone-worker crash isolation checks, including
-exact process, output and network cleanup. The actual lifecycle run passed
-all 50 enable/disable cycles and both broker SIGKILL recovery phases, retaining
-the installation identity and unrelated state.
-
-The finite speech run remains failed. Independent replay found its complete
-opening, body and tail in the retained recording; its stationary music
-subtraction distorted the native downward duck ramp. The corrected oracle
-uses the frozen pre-offer carrier and one onset measured only before speech.
-Its original acceptance limits remain intact, and deliberate speech and
-calendar corruption are rejected. A fresh native run is still required.
-
-The encrypted AirPlay run now passes cold decoded music, speech ducking and
-source-to-room volume. It fails reverse volume feedback: the receiver's
-initial metadata exchange waits for an acknowledgement that the OwnTone
-source never sends, occupying the optional event channel. That native
-interoperability repair and complete encrypted rerun remain release blockers.
-Cleanup passed; the failed report is preserved.
-
-The user also reported an unapplied phone-volume change on the live diagnostic
-build. Its current state and logs were retained separately. The combined
-receiver/volume implementation has not been deployed there yet, and both
-directions require verification. Do not describe the current live build as
-having the final volume repair.
+The private validation artifacts are retained under `/Users/homr/Documents/Shiri-Validation/release-2026-10-02`. Acoustic alignment, real mixed speakers and household acceptance remain the later physical measurements agreed with the user.

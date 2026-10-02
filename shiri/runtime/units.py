@@ -25,6 +25,7 @@ from shiri.deadline import bounded
 from .bind_policy import BindPolicy, proof as bind_proof, trusted_file, validate_proof
 from .system import RuntimeFailure, atomic_json, boot_id, process_birth, root_directory
 from .socket_publication import discard as discard_socket, validate as validate_socket
+from . import namespace_policy
 
 DESTINATION = "org.freedesktop.systemd1"
 MANAGER_PATH = "/org/freedesktop/systemd1"
@@ -45,6 +46,14 @@ ROLE_USERS = {"dbus": "discovery", "avahi": "discovery", "shairport": "receiver"
 CGROUP2_SUPER_MAGIC = 0x63677270
 SYSCALL_POLICY_V1 = "~@mount @reboot @swap @module @raw-io @debug"
 SYSCALL_POLICY_V2 = SYSCALL_POLICY_V1 + " process_vm_readv process_vm_writev"
+
+
+def device_allow_observation(value):
+    """Compare exact device/permission pairs independent of manager list order."""
+    if (type(value) is not list or any(type(item) is not list or len(item) != 2
+            or any(type(part) is not str or not part for part in item) for item in value)):
+        raise RuntimeFailure("Malformed daemon device policy observation; resources stay reserved")
+    return sorted(value)
 
 
 def is_cgroup2(descriptor):
@@ -534,6 +543,8 @@ class UnitManager:
             raise RuntimeFailure("Malformed daemon launch policy; resources stay reserved") from exc
         if "policy_fence" in entry and not isinstance(entry["policy_fence"], dict):
             raise RuntimeFailure("Invalid daemon policy observation")
+        if "namespace_policy" in entry:
+            namespace_policy.validate(entry["namespace_policy"], entry["unit"], entry["boot_id"])
         invocation = entry.get("invocation_id")
         if invocation is not None and (not isinstance(invocation, str) or not re.fullmatch(r"[0-9a-f]{32}", invocation)):
             raise RuntimeFailure("Invalid daemon invocation identity")
@@ -555,6 +566,8 @@ class UnitManager:
         self.validate_saved(entry)
         if entry["boot_id"] != boot_id():
             raise RuntimeFailure("Daemon unit belongs to another boot; refusing authority")
+        if "namespace_policy" in entry:
+            namespace_policy.verify(entry["namespace_policy"])
         commands = actual.get("ExecStart")
         expected = [entry["argv"][0], entry["argv"], False]
         if (actual.get("Id") != entry["unit"] or actual.get("Transient") is not True
@@ -587,6 +600,8 @@ class UnitManager:
             "LimitRTPRIO": int(properties["LimitRTPRIO"]),
         }
         for key, expected_value in expected_policy.items():
+            if key == 'RestrictNamespaces' and type(actual.get(key)) is not int:
+                raise RuntimeFailure('Daemon service policy RestrictNamespaces is untyped; resources stay reserved')
             if actual.get(key) != expected_value:
                 raise RuntimeFailure(f"Daemon service policy {key} changed; resources stay reserved")
         for key in ["BindPaths", "BindReadOnlyPaths"]:
@@ -596,7 +611,7 @@ class UnitManager:
                 raise RuntimeFailure("Daemon mount boundary changed; resources stay reserved")
         device_words = properties["DeviceAllow"].split()
         expected_devices = sorted([device_words[index:index + 2] for index in range(0, len(device_words), 2)])
-        if sorted(actual.get("DeviceAllow", [])) != expected_devices:
+        if device_allow_observation(actual.get("DeviceAllow")) != expected_devices:
             raise RuntimeFailure("Daemon device boundary changed; resources stay reserved")
         if entry.get("listen_port") is not None and entry.get("policy_version", 1) < 3:
             expected = sorted([[2, 6, 1, entry["listen_port"]], [2, 17, 0, 0]])
@@ -620,7 +635,15 @@ class UnitManager:
             raise RuntimeFailure("Daemon syscall boundary is incomplete; resources stay reserved")
         if entry.get("policy_fence"):
             for key, expected_value in entry["policy_fence"].items():
-                if actual.get(key) != expected_value:
+                observed_value = actual.get(key)
+                if key == "DeviceAllow":
+                    # systemd prepends DeviceAllow entries both on transient
+                    # admission and when parsing its serialized unit on reload.
+                    # Only list order can differ; paths, rights and multiplicity
+                    # must match the original observed and requested boundary.
+                    observed_value = device_allow_observation(observed_value)
+                    expected_value = device_allow_observation(expected_value)
+                if observed_value != expected_value:
                     raise RuntimeFailure(f"Daemon immutable property {key} changed; resources stay reserved")
         invocation = actual.get("InvocationID")
         if isinstance(invocation, list):
@@ -654,6 +677,7 @@ class UnitManager:
         try:
             entry = spec.intent()
             entry["log_path"] = str(log_path)
+            entry["namespace_policy"] = namespace_policy.plan(spec.name, entry["boot_id"])
             self.validate_saved(entry)
             self.manifest.reserve_unit(key, entry)
         except BaseException:
@@ -680,6 +704,24 @@ class UnitManager:
         unit = OwnedUnit(spec.role, self, entry, log_path)
         try:
             await self.runner.run(args, timeout=12)
+            # Existing drop-ins make StartTransientUnit reject a non-pristine
+            # unit. Pin its original strict launch first, then publish the
+            # reload-safe text before admission or any gate release.
+            initial = await self.inspect(spec.name)
+            if initial is None:
+                raise RuntimeFailure('Owned daemon disappeared before policy persistence')
+            invocation, group = self.verify(entry, initial)
+            entry.update(invocation_id=invocation, control_group=group)
+            original_group = self.open_cgroup(entry)
+            try:
+                entry['cgroup_inode'] = os.fstat(original_group).st_ino
+            finally:
+                os.close(original_group)
+            self.manifest.remember_unit(key, unit.identity())
+            def persist_policy(record):
+                entry['namespace_policy'] = record
+                self.manifest.remember_unit(key, unit.identity())
+            persist_policy(namespace_policy.create(entry['namespace_policy'], persist=persist_policy))
             for _ in range(40):
                 await self.refresh(unit)
                 if unit.alive:
@@ -929,6 +971,8 @@ class UnitManager:
 
     async def stop_saved(self, entry: dict):
         await self._stop_saved(entry)
+        if entry.get("namespace_policy"):
+            namespace_policy.discard(entry["namespace_policy"], current_boot=boot_id())
         if entry.get("socket_publication"):
             discard_socket(entry["socket_publication"])
         if entry.get("gate"):

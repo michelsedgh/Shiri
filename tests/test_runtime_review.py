@@ -220,7 +220,7 @@ async def test_converted_playback_endpoint_keeps_the_same_exclusive_live_lease(t
 @pytest.fixture
 def preflight_environment(tmp_path, monkeypatch):
     service = broker(tmp_path)
-    environment = {"version": "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1", "shairport": "Shairport Sync 5.5.2-shiri-timed3-startup1-volume1 AirPlay2 smi10", "identities": True, "cgroup": True, "hook": True, "plugins": True}
+    environment = {"version": "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1", "shairport": "Shairport Sync 5.5.2-shiri-timed3-startup1-volume2 AirPlay2 smi10", "identities": True, "cgroup": True, "hook": True, "plugins": True}
     monkeypatch.setattr("shiri.runtime.broker.sys.platform", "linux")
     monkeypatch.setattr("shiri.runtime.broker.os.geteuid", lambda: 0)
     monkeypatch.setattr("shiri.runtime.broker.shutil.which", lambda name: name)
@@ -257,7 +257,7 @@ def preflight_environment(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("suffix", ["", "-shiri-timed3-startup1", "-shiri-timed3-startup1-volume10", "-shiri-timed1", "-shiri-timed2", "-shiri-timed20", "-shiri-timed2-other", "-shiri-timed2-soxr-other", "-shiri-timed30", "-shiri-timed3-other", "-shiri-timed3-startup1-soxr-other"])
+@pytest.mark.parametrize("suffix", ["", "-shiri-timed3-startup1", "-shiri-timed3-startup1-volume1", "-shiri-timed3-startup1-volume20", "-shiri-timed1", "-shiri-timed2", "-shiri-timed20", "-shiri-timed2-other", "-shiri-timed2-soxr-other", "-shiri-timed30", "-shiri-timed3-other", "-shiri-timed3-startup1-soxr-other"])
 async def test_receiver_requires_bounded_clock_sampling_and_recovery_before_launch(preflight_environment, suffix):
     service, environment = preflight_environment
     environment["shairport"] = f"Shairport Sync 5.5.2{suffix} AirPlay2 smi10"
@@ -272,7 +272,7 @@ async def test_receiver_requires_bounded_clock_sampling_and_recovery_before_laun
 @pytest.mark.parametrize("features", ["", "-soxr-metadata", "-soxr-convolution-metadata-mqtt-dbus-mpris"])
 async def test_pinned_receiver_feature_string_passes_full_preflight(preflight_environment, features):
     service, environment = preflight_environment
-    environment["shairport"] = f"5.5.2-AirPlay2-smi10-OpenSSL-Avahi-ALSA-shiri-timed3-startup1-volume1{features}-sysconfdir:/opt/shiri/etc"
+    environment["shairport"] = f"5.5.2-AirPlay2-smi10-OpenSSL-Avahi-ALSA-shiri-timed3-startup1-volume2{features}-sysconfdir:/opt/shiri/etc"
     await service.preflight()
     assert service.runner.run.call_args_list[-1].args[0][1] == "-c"
 
@@ -289,7 +289,7 @@ async def test_receiver_configuration_path_cannot_supply_missing_backend_marker(
 async def test_pinned_git_receiver_with_recovery_version_passes_full_preflight(preflight_environment, tmp_path):
     service, environment = preflight_environment
     # Preserve the captured pinned Git feature layout with the required recovery marker.
-    environment["shairport"] = "7bad231-dirty-AirPlay2-smi10-OpenSSL-Avahi-ALSA-shiri-timed3-startup1-volume1-soxr-metadata-sysconfdir:/opt/shiri-v2-next9-deps/etc"
+    environment["shairport"] = "7bad231-dirty-AirPlay2-smi10-OpenSSL-Avahi-ALSA-shiri-timed3-startup1-volume2-soxr-metadata-sysconfdir:/opt/shiri-v2-next9-deps/etc"
     service.config = replace(service.config, binary_dir=tmp_path / "pinned")
     manifest = service.config.binary_dir / "share" / "shiri" / "backends.json"
     manifest.parent.mkdir(parents=True)
@@ -311,7 +311,7 @@ async def test_unpatched_owntone_is_rejected_with_rebuild_instruction(preflight_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("suffix", ["", "-framed1", "-framed1-alsa10", "-framed1-alsa1", "-framed1-alsa1-other", "-framed1-alsa1-speech10", "-framed1-alsa1-speech1", "-framed1-alsa1-speech1-other", "-framed1-alsa1-speech1-ready10", "-framed1-alsa1-speech1-ready1-other", "-framed1-alsa1-speech1-ready1", "-framed1-alsa1-speech1-ready1-anchor10", "-framed1-alsa1-speech1-ready1-anchor1-other", "-framed1-alsa1-speech1-ready1-anchor1", "-framed1-alsa1-speech1-ready1-anchor1-jitter10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-other"])
+@pytest.mark.parametrize("suffix", ["", "-framed1", "-framed1-alsa10", "-framed1-alsa1", "-framed1-alsa1-other", "-framed1-alsa1-speech10", "-framed1-alsa1-speech1", "-framed1-alsa1-speech1-other", "-framed1-alsa1-speech1-ready10", "-framed1-alsa1-speech1-ready1-other", "-framed1-alsa1-speech1-ready1", "-framed1-alsa1-speech1-ready1-anchor10", "-framed1-alsa1-speech1-ready1-anchor1-other", "-framed1-alsa1-speech1-ready1-anchor1", "-framed1-alsa1-speech1-ready1-anchor1-jitter10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-other", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event10", "-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-other"])
 async def test_owntone_requires_exact_partial_write_guard_before_launch(preflight_environment, suffix):
     service, environment = preflight_environment
     environment["version"] = "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1" + suffix

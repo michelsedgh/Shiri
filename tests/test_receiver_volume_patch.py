@@ -18,5 +18,5 @@ def test_reverse_volume_builder_and_contract_are_exact():
     assert 'manifest["shairport_receiver_volume_patch"] = sys.argv[28]' in builder
     assert builder.index('apply "$SHAIRPORT_STARTUP_PATCH"') < builder.index('apply "$SHAIRPORT_VOLUME_PATCH"')
     assert builder.index('check_receiver_volume.py') < builder.index('check_shairport_startup.py')
-    assert 'r"-shiri-timed3-startup1-volume1(?=' in (ROOT / "shiri/runtime/broker.py").read_text()
+    assert 'r"-shiri-timed3-startup1-volume2(?=' in (ROOT / "shiri/runtime/broker.py").read_text()
     subprocess.run(["bash", "-n", ROOT / "install/build_backends.sh"], check=True)

@@ -1,0 +1,7 @@
+{
+  "log_sha256": "129c1620fd26b4de7e62c63121e695bfb1dd5f136f49641fe548c1a3671b2c30",
+  "rtsp_sha256": "02a899938d974cb1804d6b85f266470ba15e8327a37089e308b953b577718108",
+  "body_bytes": 1282,
+  "schema": "DICT type=STRING updateInfo; value=DICT",
+  "historical_network128": "FAIL preserved"
+}

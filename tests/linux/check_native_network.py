@@ -565,6 +565,35 @@ async def exercise(rig, report, *, fault_case):
             "Actual terminal music gain did not recover after voice")
     report["music_restored"] = restored
 
+    # Reload the actual host manager while the encrypted source and output
+    # are live. A phone volume receipt must still traverse the same actors.
+    before_reload = {"zone": rig.identity(rig.room.processes),
+                     "terminal": rig.identity(rig.terminal_processes),
+                     "source": rig.identity(rig.source_processes),
+                     "sender": rig.identity(rig.broker.sender_processes)}
+    owner_before_reload = (await rig.health())["source"]["owner"]
+    await rig.broker.runner.run(["/usr/bin/systemctl", "daemon-reload"], timeout=15)
+    reloaded = []
+    for actors in (rig.room.processes, rig.terminal_processes, rig.source_processes,
+                   rig.broker.sender_processes):
+        for actor in actors.values():
+            await actor.coherent_identity()
+            require(type(actor.current.get("RestrictNamespaces")) is int
+                    and actor.current["RestrictNamespaces"] == 0,
+                    "Live transport namespace restrictions changed on manager reload")
+            reloaded.append({"unit": actor.name, "pid": actor.process.pid,
+                             "invocation_id": actor.entry["invocation_id"],
+                             "namespace_mask": actor.current["RestrictNamespaces"]})
+    require({"zone": rig.identity(rig.room.processes),
+             "terminal": rig.identity(rig.terminal_processes),
+             "source": rig.identity(rig.source_processes),
+             "sender": rig.identity(rig.broker.sender_processes)} == before_reload,
+            "Manager reload changed a live transport ownership receipt")
+    require((await rig.healthy())["source"]["owner"] == owner_before_reload,
+            "Manager reload changed native music ownership")
+    report["manager_reload"] = {"same_actor_identities": True, "same_music_owner": True,
+                                 "typed_namespace_masks": reloaded}
+
     # OwnTone source volume goes through actual AirPlay SET_PARAMETER, native
     # receipt and production room master; no direct worker volume injection.
     await rig.source_client.volume(30)
@@ -602,26 +631,57 @@ async def exercise(rig, report, *, fault_case):
         return rig.room.current_volume == 50
     await eventually(volume_restored, "actual room volume restored", timeout=15)
 
+    teardown_marker = f"device_stop: Sending TEARDOWN to '{rig.room_name}'"
+    source_log_path = rig.root/"source/state/owntone.log"
+    teardowns_before_pause = source_log_path.read_text().count(teardown_marker)
     await rig.source_client.request("PUT", "/api/player/pause")
     await asyncio.sleep(2)
     paused = await rig.healthy()
     owner = paused["source"]["owner"]
+    require(owner is not None, "Paused source lost ownership before its delayed stop")
     blocks = paused.get("native_blocks")
     pause_started = time.monotonic_ns()
+    source_retired = False
+    pause_samples = []
     for _ in range(31):
         await asyncio.sleep(1)
         health = await rig.healthy()
         player = await rig.source_client.request("GET", "/api/player")
+        pause_samples.append({"elapsed_ms": (time.monotonic_ns()-pause_started)/1e6,
+                              "source": health["source"], "native_blocks": health.get("native_blocks")})
+        report["long_pause_observations"] = pause_samples
         require(player.get("state") == "pause", "Source did not remain paused for31s")
-        require(health["source"]["owner"] == owner and health.get("native_blocks") == blocks,
-                "Paused native source changed ownership or generated music PCM")
+        require(health.get("native_blocks") == blocks,
+                "Paused native source generated music PCM")
+        current_owner = health["source"]["owner"]
+        if current_owner is None:
+            # This fixture is an OwnTone sender, whose pinned outputs.c
+            # deliberately closes paused outputs after OUTPUTS_STOP_TIMEOUT=10.
+            # An observed sender TEARDOWN must retire its exact native owner;
+            # retaining that token would be a production ownership bug. This
+            # does not establish iPhone type103 pause behavior.
+            source_log = source_log_path.read_text()
+            require(source_log.count(teardown_marker) == teardowns_before_pause + 1
+                    and health["source"]["ready"] is True
+                    and health["source"]["pending_revocations"] == 0,
+                    "Paused source retired without the actual sender's timed TEARDOWN")
+            source_retired = True
+        else:
+            require(not source_retired and current_owner == owner,
+                    "Paused native source acquired an unexpected music owner")
+    require(source_retired, "Pinned OwnTone source did not retire its expired paused output")
     report["long_pause"] = {"duration_ms": (time.monotonic_ns()-pause_started)/1e6,
-                            "nonzero_music_owner_preserved": owner is not None, "native_blocks": blocks,
-                            "same_zone_units": True}
+                            "initial_music_owner": owner, "native_blocks": blocks,
+                            "sender_timed_teardown_observed": True, "source_owner_retired": True,
+                            "same_zone_units": True, "iphone_pause_acceptance": "manual_pending"}
     report["paused_speech"] = await rig.speech(label="speech after31s pause", paused=True)
     resumed = time.monotonic_ns()
     await rig.source_client.request("PUT", "/api/player/play")
     report["resume"] = await rig.actual_music("actual pause resume without volume change", since_ns=resumed)
+    resumed_owner = (await rig.healthy())["source"]["owner"]
+    require(resumed_owner is not None and resumed_owner != owner,
+            "Resumed sender reused its retired music ownership token")
+    report["resume"]["fresh_music_owner_after_sender_teardown"] = True
     before_flushes = rig.observer.registry.flushes
     seeked = time.monotonic_ns()
     await rig.source_client.request("PUT", "/api/player/seek", params={"seek_ms": "1000"})
@@ -736,7 +796,7 @@ async def inner(profile_path, *, parent_namespace, original_netns_fd, run_direct
         broker = IsolatedBroker(settings, parent_namespace)
         await broker.start(serve=False)
         require(broker.ready, broker.error or "Actual production Broker did not become ready")
-        require(REQUIRED_OWNTONE_VERSION.endswith("-balance1-transition1-bed1"),
+        require(REQUIRED_OWNTONE_VERSION.endswith("-balance1-transition1-bed1-event1"),
                 "Gate cannot run an earlier production version contract")
         report["versions"] = broker.versions
         rig = Rig(broker, root/"rig", lan.interface)

@@ -95,7 +95,9 @@ def gate_manager(tmp_path, monkeypatch):
     manifest = SimpleNamespace(state_dir=tmp_path)
     manifest.reserve_unit = Mock(side_effect=lambda key, entry: saved.update({key: dict(entry)}))
     def remember(key, entry):
-        events.append("durable-policy" if "bind_policy" in entry else "durable-invocation")
+        events.append("durable-policy" if "bind_policy" in entry else
+                      "durable-namespace-policy" if entry.get('namespace_policy', {}).get('phase') != 'sealed'
+                      else "durable-invocation")
         saved[key] = dict(entry)
     manifest.remember_unit = Mock(side_effect=remember)
     manifest.forget_unit = Mock(side_effect=lambda key: saved.pop(key, None))
@@ -142,7 +144,8 @@ async def test_payload_is_gated_until_kernel_proof_is_durable(gate_manager, tmp_
     fixture = gate_manager
     unit = await fixture.manager.start("sender:owntone", output_spec(), tmp_path / "log")
     try:
-        assert fixture.events[:6] == ["wrapper-started", "durable-invocation", "attach", "verify",
+        assert fixture.events[:10] == ["wrapper-started", "durable-namespace-policy", "durable-namespace-policy", "durable-namespace-policy",
+                                      "durable-invocation", "durable-invocation", "attach", "verify",
                                       "durable-policy", "released"]
         entry = fixture.saved["sender:owntone"]
         assert entry["policy_version"] == 3

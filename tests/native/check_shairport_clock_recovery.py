@@ -77,7 +77,8 @@ def run_tests(*, shairport_source=None, compiler=None, sanitize=True):
               if shairport_source else expected)
     actual_sha = hashlib.sha256(actual.encode()).hexdigest()
     if actual != expected and shairport_source is not None:
-        path = REPOSITORY / "tests/native/check_receiver_volume.py"
+        path = REPOSITORY / ("tests/native/check_receiver_events.py" if (shairport_source / "shiri_event_control.h").exists()
+                             else "tests/native/check_receiver_volume.py")
         spec = importlib.util.spec_from_file_location("receiver_volume_exact_overlay", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

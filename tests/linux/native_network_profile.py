@@ -24,7 +24,9 @@ PATCHES = {
     "owntone_speaker_balance_patch": "e61e28af5bdaefaa49d355681469ebb8cf23247b8a18e5c3a4261186d2d963a0",
     "owntone_native_transition_patch": "912922fb7853d25fb031d0258effeb33f3332a971b84f01e01c79014a194e8a7",
     "shairport_receiver_volume_patch": "26003aa1b8df99c5de6eecc21074bf259158e64baefd41a35c704145d5957bbd",
+    "shairport_bounded_events_patch": "a7ffecbe2fe0da846b12ec34b2303a6279d5ad4f7ba4c2312234db0c634d7ecd",
     "owntone_paused_speech_patch": "eb2f9ceb0e58f3c92d82c682cd177b98d3b0a48d4848aa5b430f3761703da928",
+    "owntone_event_ack_patch": "08ead94d976619985445e8177756ee08be82d50a6b03432faadcdd281fbc3f73",
 }
 REQUIRED_SOURCE = {"tests/linux/check_native_network.py", "tests/linux/native_network_profile.py",
                    "tests/linux/native_network_observer.py", "tests/linux/isolated_group_lan.py"}
@@ -101,7 +103,7 @@ def template(*, project, binaries, identity_file, work):
     require(build.get("owntone") == "d6fb3edf5831de38134ebd92fcf09a730ddd37aa"
             and build.get("shairport") == "7bad231c18368dbd26f298577f6210e36e4b0797"
             and all(build.get(key) == value for key, value in PATCHES.items()),
-            "Network gate requires the reviewed balance, transition, reverse-volume and paused-speech build")
+            "Network gate requires the reviewed balance, transition, bounded event exchange and paused-speech build")
     # The ordinary Broker still validates truthful executable versions. This
     # profile adds an independent exact-byte installation contract, not a
     # version fallback or a change to production preflight.

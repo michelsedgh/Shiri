@@ -1,0 +1,210 @@
+diff --git a/Makefile.am b/Makefile.am
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -109,7 +109,7 @@
+ endif
+ 
+ if USE_SHIRI
+-shairport_sync_SOURCES += audio_shiri.c shiri_pcm.h shiri_timing.h shiri_volume_control.h shiri_volume_io.h shiri_volume_lane.inc shiri_ap2_volume.c
++shairport_sync_SOURCES += audio_shiri.c shiri_pcm.h shiri_timing.h shiri_volume_control.h shiri_volume_io.h shiri_volume_lane.inc shiri_ap2_volume.c shiri_event_control.h
+ endif
+ 
+ if USE_DUMMY
+diff --git a/ap2_event_message_handler.c b/ap2_event_message_handler.c
+--- a/ap2_event_message_handler.c
++++ b/ap2_event_message_handler.c
+@@ -29,6 +29,9 @@
+ #include "rtsp.h"
+ #include "utilities/generate_random_uuid.h"
+ #include "utilities/structured_buffer.h"
++#ifdef CONFIG_SHIRI
++#include "shiri_event_control.h"
++#endif
+ 
+ void decodeAndLogPlist(plist_t plist_to_log) {
+   if (plist_to_log != NULL) {
+@@ -43,6 +46,11 @@
+ // will return -1 if there is an error or port is not open, 0 if the port was closed and a positive
+ // number if okay
+ ssize_t ap2_event_port_send_message(rtsp_conn_info *conn, char *data, size_t data_length) {
++#ifdef CONFIG_SHIRI
++  // Metadata uses the same bounded optional cipher lane as reverse volume.
++  // A sender which does not ACK updateInfo cannot retain this mutex forever.
++  return shiri_ap2_event_exchange(conn, data, data_length);
++#else
+   ssize_t result = -1; // assume a problem
+   pthread_mutex_lock(&conn->event_sender_mutex);
+   pthread_cleanup_push(mutex_unlock, &conn->event_sender_mutex);
+@@ -75,6 +83,7 @@
+   }
+   pthread_cleanup_pop(1); // unlock the mutex
+   return result;
++#endif
+ }
+ 
+ ssize_t ap2_event_port_post_command(rtsp_conn_info *conn, plist_t command) {
+diff --git a/common.c b/common.c
+--- a/common.c
++++ b/common.c
+@@ -1951,7 +1951,7 @@
+ #ifdef CONFIG_SHIRI
+     strcat(version_string, "-shiri-timed3");
+     strcat(version_string, "-startup1");
+-    strcat(version_string, "-volume1");
++    strcat(version_string, "-volume2");
+ #endif
+ #ifdef CONFIG_SOXR
+     strcat(version_string, "-soxr");
+diff --git a/shiri_ap2_volume.c b/shiri_ap2_volume.c
+--- a/shiri_ap2_volume.c
++++ b/shiri_ap2_volume.c
+@@ -1,8 +1,9 @@
+ /* Compatible AP2 volume notification from upstream commit 9a168bf774bb.
+  * The event exchange here is separately bounded and never calls the pinned
+- * blocking ap2_event_port_send_message()/player_volume() wrappers. */
++ * blocking player_volume() wrapper. Metadata shares this bounded lane. */
+ #include "config.h"
+ #include "common.h"
++#include "shiri_event_control.h"
+ #include "shiri_volume_control.h"
+ #ifdef CONFIG_AIRPLAY_2
+ #include "player.h"
+@@ -41,6 +42,20 @@
+ static void volume_drain(sized_buffer *buffer,size_t length) {
+   if (length>=buffer->length) { free(buffer->data); memset(buffer,0,sizeof(*buffer)); }
+   else { memmove(buffer->data,buffer->data+length,buffer->length-length); buffer->length-=length; }
++}
++/* Admit only whole pinned HomeKit records. The upstream decoder rejects a
++ * one-byte initial header and otherwise reads two bytes past a trailing single
++ * byte. Authentication and cipher counters remain in pair_decrypt itself. */
++static int volume_complete_records(const uint8_t *data,size_t length,size_t *complete) {
++  size_t at=0;
++  while (length-at>=2) {
++    size_t block=(size_t)data[at]|((size_t)data[at+1]<<8);
++    if (!block || block>1024) return -1;
++    if (length-at<block+18) break;
++    at+=block+18;
++  }
++  *complete=at;
++  return 0;
+ }
+ static int volume_exchange(rtsp_conn_info *conn,const char *request,size_t request_length,
+                            uint64_t revision,uint64_t deadline,shiri_volume_fence fence,void *context) {
+@@ -62,6 +77,7 @@
+   if (ret) goto done;
+   for (;;) {
+     ssize_t n,used;
++    size_t decrypt_length;
+     int complete;
+     ret=shiri_volume_wait(conn->event_channel_fd,POLLIN,deadline,fence,context);
+     if (ret) goto done;
+@@ -71,10 +87,18 @@
+     if (volume_append(&bundle->encrypted_read_buffer,incoming,(size_t)n)) { ret=SHIRI_VOLUME_PROTOCOL; goto done; }
+     plain_length=0;
+     free(plain); plain=NULL;
++    if (volume_complete_records(bundle->encrypted_read_buffer.data,
++                                bundle->encrypted_read_buffer.length,&decrypt_length)) {
++      ret=SHIRI_VOLUME_PROTOCOL; goto done;
++    }
++    if (!decrypt_length) continue;
+     used=pair_decrypt(&plain,&plain_length,bundle->encrypted_read_buffer.data,
+-                       bundle->encrypted_read_buffer.length,bundle->cipher_ctx);
+-    if (used<0 || (size_t)used>bundle->encrypted_read_buffer.length ||
+-        plain_length>sizeof(response)-response_length || (plain_length && !plain)) {
++                       decrypt_length,bundle->cipher_ctx);
++    // Pinned pair_ap frees its output on authentication failure and leaves the
++    // pointer nonNULL. Clear it before shared cleanup instead of freeing twice.
++    if (used<0) { plain=NULL; ret=SHIRI_VOLUME_PROTOCOL; goto done; }
++    if ((size_t)used!=decrypt_length || plain_length>sizeof(response)-response_length ||
++        (plain_length && !plain)) {
+       ret=SHIRI_VOLUME_PROTOCOL; goto done;
+     }
+     volume_drain(&bundle->encrypted_read_buffer,(size_t)used);
+@@ -101,6 +125,39 @@
+    * this optional feedback lane for the connection, never its music route. */
+   if (ret && consumed_cipher && !complete_exchange) conn->shiri_event_volume_faulted=1;
+   return ret;
++}
++static int metadata_fence(void *context) {
++  // The principal read lock owns this pointer for the complete exchange.
++  // Metadata precedes native BEGIN, so it has no worker/source generation.
++  return principal_conn == (rtsp_conn_info *)context;
++}
++ssize_t shiri_ap2_event_exchange(rtsp_conn_info *conn,const char *data,size_t data_length) {
++  uint64_t now=shiri_volume_now(),deadline=now+UINT64_C(750000000);
++  int ret=SHIRI_VOLUME_UNAVAILABLE, principal_locked=0,event_locked=0,cancel_state;
++  if (!conn || !data || !data_length || data_length>65536 || !now) return -1;
++  // Cancellation is delayed only for this <=750ms transaction. Every heap
++  // allocation and lock retires before restoring it; an outer AP2 receiver
++  // cleanup may then run without leaked buffers or half-owned cipher state.
++  if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE,&cancel_state)) return -1;
++  for (;;) {
++    int result=pthread_rwlock_tryrdlock(&principal_conn_lock);
++    if (!result) { principal_locked=1; break; }
++    if (result!=EBUSY && result!=EAGAIN) goto done;
++    if (!shiri_volume_now() || shiri_volume_now()>=deadline) goto done;
++    poll(NULL,0,5);
++  }
++  if (!metadata_fence(conn) || conn->airplay_type!=ap_2) goto done;
++  ret=volume_mutex(&conn->event_sender_mutex,deadline,metadata_fence,conn);
++  if (ret) goto done;
++  event_locked=1;
++  // The pinned metadata request carries no CSeq. Its single in-flight reply
++  // may omit or include one; identified volume commands remain exact below.
++  ret=volume_exchange(conn,data,data_length,0,deadline,metadata_fence,conn);
++done:
++  if (event_locked) pthread_mutex_unlock(&conn->event_sender_mutex);
++  if (principal_locked) pthread_rwlock_unlock(&principal_conn_lock);
++  pthread_setcancelstate(cancel_state,NULL);
++  return ret==SHIRI_VOLUME_OK ? (ssize_t)data_length : -1;
+ }
+ int shiri_ap2_volume(int number,unsigned int percent,uint64_t revision,shiri_volume_fence fence,void *context) {
+   uint64_t now=shiri_volume_now(),deadline=now+UINT64_C(750000000);
+@@ -151,13 +208,20 @@
+   ret=volume_exchange(conn,request,request_length,revision,deadline,fence,context);
+ done:
+   free(body); free(request);
+-  if (root) plist_free(root); if (params) plist_free(params); if (type) plist_free(type);
+-  if (value) plist_free(value); if (top_volume) plist_free(top_volume); if (param_volume) plist_free(param_volume);
++  if (root) plist_free(root);
++  if (params) plist_free(params);
++  if (type) plist_free(type);
++  if (value) plist_free(value);
++  if (top_volume) plist_free(top_volume);
++  if (param_volume) plist_free(param_volume);
+   if (locked) pthread_mutex_unlock(&conn->event_sender_mutex);
+   pthread_rwlock_unlock(&principal_conn_lock);
+   return ret;
+ }
+ #else
++ssize_t shiri_ap2_event_exchange(rtsp_conn_info *conn,const char *data,size_t data_length) {
++  (void)conn; (void)data; (void)data_length; return -1;
++}
+ int shiri_ap2_volume(int number,unsigned int percent,uint64_t revision,shiri_volume_fence fence,void *context) {
+   (void)number; (void)percent; (void)revision; (void)fence; (void)context;
+   return SHIRI_VOLUME_UNSUPPORTED;
+diff --git a/shiri_volume_io.h b/shiri_volume_io.h
+--- a/shiri_volume_io.h
++++ b/shiri_volume_io.h
+@@ -82,7 +82,7 @@
+         number=number*10+(uint64_t)(data[start]-'0');
+       }
+       if (recognized==1) { if (have_length++ || number>4096-header) return -1; body=(size_t)number; }
+-      else { if (have_sequence++ || number!=revision) return -1; }
++      else { if (have_sequence++ || (revision && number!=revision)) return -1; }
+     }
+     pos=end+2;
+   }
+diff --git a/shiri_event_control.h b/shiri_event_control.h
+new file mode 100644
+--- /dev/null
++++ b/shiri_event_control.h
+@@ -0,0 +1,8 @@
++/* Metadata and reverse volume share one bounded optional AP2 cipher lane. */
++#ifndef SHIRI_EVENT_CONTROL_H
++#define SHIRI_EVENT_CONTROL_H
++#include "player.h"
++#include <stddef.h>
++#include <sys/types.h>
++ssize_t shiri_ap2_event_exchange(rtsp_conn_info *conn, const char *data, size_t data_length);
++#endif
