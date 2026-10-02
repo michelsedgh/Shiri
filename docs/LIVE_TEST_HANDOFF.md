@@ -36,6 +36,7 @@ attempts remain preserved privately.
 | Timing | Declared 12-case calibrated digital speech matrix; grouped digital audio and offset checks |
 | Recovery | Owned actor/network cleanup, manager reload, fault recovery and post-reboot encrypted regression |
 | Installation safety | Exact package/native preflight, two-stage rollback and normal rehearsal VM shutdown |
+| Final regression | [CI37055838875](https://github.com/michelsedgh/Shiri/actions/runs/37055838875): 3,988 Python tests passed, 19 explicit/platform skips; native and browser/frontend checks passed on code checkpoint3797e23 |
 
 Normal output-buffer/relay-horizon defaults are **40/140 ms** for local or framed
 Bluetooth, **250/350 ms** for Cast or Pulse, and **500/600 ms** for AirPlay.
@@ -63,3 +64,10 @@ The [checkpoint](CHECKPOINT_2026-10-02.md) records build identities, original
 failures and retained evidence. Private validation files live outside Git in
 `/Users/homr/Documents/Shiri-Validation/release-2026-10-02`; credentials and full
 runtime backups remain protected in the guest.
+
+The final evidence bundle is `batch-0012/INDEX.json` (126 files, 53,256,914 bytes;
+SHA-256 `58a44696a1b24d0275bea77cf7227d82a45aea6c1051b8a8c27b897433c7b2a4`).
+It includes the original live rollout, rollback/shutdown, user phone report,
+post-phone observation and successful CI records. Earlier failures and indices
+remain unchanged. The final Git record is a documentation-only checkpoint after
+the passing code checkpoint3797e23.

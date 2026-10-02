@@ -14,8 +14,10 @@ See [the live test handoff](LIVE_TEST_HANDOFF.md) for the current installation
 and next tests, and [the checkpoint](CHECKPOINT_2026-10-02.md) for exact evidence.
 Physical acoustic alignment, native grouped-zone phone playback, mixed
 transport speakers and per-speaker balance checks remain later measurements.
-The latest CI rerun is pending after a focused test-clock repair; that repair
-does not change the qualified production package or native binaries.
+[Final CI37055838875](https://github.com/michelsedgh/Shiri/actions/runs/37055838875)
+passed on code checkpoint3797e23: 3,988 Python tests, 19 explicit/platform skips,
+and successful native and browser/frontend checks. The focused test-clock repair
+changed no qualified production package or native binaries.
 
 Current minimum route defaults are B40/H140 for local or framed Bluetooth,
 B250/H350 for Cast or Pulse, and B500/H600 for AirPlay. A grouped program uses
