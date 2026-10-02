@@ -562,12 +562,23 @@ class UnitManager:
             validate_proof(policy, boot=entry["boot_id"], port=entry["listen_port"],
                            device=policy["cgroup_dev"], inode=inode)
 
-    def verify(self, entry: dict, actual: dict):
+    def verify(self, entry: dict, actual: dict, *, retired_namespace_policy=False):
         self.validate_saved(entry)
         if entry["boot_id"] != boot_id():
             raise RuntimeFailure("Daemon unit belongs to another boot; refusing authority")
         if "namespace_policy" in entry:
-            namespace_policy.verify(entry["namespace_policy"])
+            if retired_namespace_policy and (
+                actual.get("ActiveState") not in {"inactive", "failed"}
+                or type(actual.get("MainPID")) is not int or actual["MainPID"] != 0
+                or type(actual.get("ControlPID")) is not int or actual["ControlPID"] != 0
+                or not entry.get("invocation_id") or not entry.get("control_group")
+                or not entry.get("cgroup_inode") or not self.cgroup_empty(entry)
+            ):
+                raise RuntimeFailure("Namespace artifact absence requires exact terminated daemon ownership")
+            if retired_namespace_policy:
+                namespace_policy.verify(entry["namespace_policy"], allow_retired_absence=True)
+            else:
+                namespace_policy.verify(entry["namespace_policy"])
         commands = actual.get("ExecStart")
         expected = [entry["argv"][0], entry["argv"], False]
         if (actual.get("Id") != entry["unit"] or actual.get("Transient") is not True
@@ -997,7 +1008,22 @@ class UnitManager:
             if not self.cgroup_empty(entry):
                 raise RuntimeFailure("Daemon unit vanished with a populated control group")
             return
-        invocation, group = self.verify(entry, actual)
+        # Repeated retirement (or recovery after discard before reservation
+        # forget) may observe the old inactive unit after its companion was
+        # removed. Permit only artifact absence, after proving its original
+        # cgroup empty/absent; all typed launch/policy/invocation guards remain.
+        retired_namespace_policy = (
+            "namespace_policy" in entry and entry["boot_id"] == boot_id()
+            and bool(entry.get("invocation_id") and entry.get("control_group") and entry.get("cgroup_inode"))
+            and actual.get("ActiveState") in {"inactive", "failed"}
+            and type(actual.get("MainPID")) is int and actual["MainPID"] == 0
+            and type(actual.get("ControlPID")) is int and actual["ControlPID"] == 0
+            and self.cgroup_empty(entry)
+        )
+        if retired_namespace_policy:
+            invocation, group = self.verify(entry, actual, retired_namespace_policy=True)
+        else:
+            invocation, group = self.verify(entry, actual)
         entry.update(invocation_id=invocation, control_group=group or entry.get("control_group"))
         try:
             descriptor = self.open_cgroup(entry)
@@ -1012,6 +1038,10 @@ class UnitManager:
             entry["cgroup_inode"] = inode
             if "populated 0" in self.cgroup_events(descriptor):
                 return
+            if retired_namespace_policy:
+                # Population changed after the retirement-only proof. Missing
+                # artifacts never grant freeze/signal authority over live tasks.
+                raise RuntimeFailure("Retired daemon cgroup became populated; resources stay reserved")
             # Holding the directory FD binds every operation to this kernel
             # cgroup even if its name is deleted/reused concurrently. Freeze
             # the non-delegated group before capturing exact process handles.

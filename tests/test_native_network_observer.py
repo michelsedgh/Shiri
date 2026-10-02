@@ -147,6 +147,80 @@ def test_decoded_frequency_oracle_and_bounded_ring():
     assert registry.spectrum(since_ns=103_000_000_000) is None
 
 
+def test_late_silent_and_audible_packets_are_both_retained_without_timestamp_rewrite():
+    registry = observer.CaptureRegistry()
+    grant = registry.begin(begin(), 1)
+    now = 100_000_000_000
+    first = replace(pcm(grant, now_ns=now), presentation_ns=now-1_000_000)
+    before = first.encode()
+    registry.message(first, 1, now_ns=now)
+    now += 20_000_000
+    audible = np.full((960, 2), -32768, dtype='<i2').tobytes()
+    second = replace(pcm(grant, sequence=2, frame_index=960, now_ns=now, data=audible),
+                     presentation_ns=now-2_000_000)
+    registry.message(second, 1, now_ns=now)
+    snapshot = registry.snapshot()
+    assert first.encode() == before
+    assert registry.ring[0][3] == first.presentation_ns
+    assert snapshot['late_blocks'] == 2 and snapshot['late_frames'] == 1920
+    assert snapshot['minimum_presentation_lead_ns'] == -2_000_000
+    assert [sample['pcm_peak'] for sample in snapshot['late_packets']] == [0, 32768]
+    assert all('pcm' not in sample for sample in snapshot['late_packets'])
+    window = registry.deadline_observation(since_ns=now)
+    assert window['blocks'] == window['late_blocks'] == 1
+    assert window['frames'] == window['late_frames'] == 960
+    assert window['late_packets'] == snapshot['late_packets'][-1:]
+    assert registry.spectrum(since_ns=100_000_000_000, minimum_frames=1920)['minimum_presentation_lead_ns'] < 0
+
+
+def test_late_metadata_bound_survives_pcm_ring_eviction_and_includes_zero_lead():
+    registry = observer.CaptureRegistry(ring_seconds=1)
+    grant = registry.begin(begin(), 1)
+    for index in range(100):
+        now = 100_000_000_000+index*20_000_000
+        packet = replace(pcm(grant, sequence=index+1, frame_index=index*960, now_ns=now),
+                         presentation_ns=now)
+        registry.message(packet, 1, now_ns=now)
+    snapshot = registry.snapshot()
+    assert snapshot['late_blocks'] == 100 and snapshot['late_frames'] == 96000
+    assert snapshot['minimum_presentation_lead_ns'] == 0
+    assert len(snapshot['late_packets']) == 64
+    assert [sample['sequence'] for sample in snapshot['late_packets']] == list(range(37, 101))
+    assert registry.ring_bytes <= RATE*4
+    window = registry.deadline_observation(since_ns=101_500_000_000)
+    assert window['blocks'] == window['late_blocks'] == 25
+    assert window['sample_limit'] == 64
+    assert len(window['late_packets']) == 25
+
+
+def test_delayed_observer_read_retains_sample_age_and_same_generation_read_gap():
+    registry = observer.CaptureRegistry()
+    grant = registry.begin(begin(), 1)
+    sample = 100_000_000_000
+    registry.message(pcm(grant, now_ns=sample-20_000_000), 1, now_ns=sample-20_000_000)
+    packet = pcm(grant, sequence=2, frame_index=960, now_ns=sample)
+    registry.message(packet, 1, now_ns=sample+200_000_000)
+    late = registry.snapshot()['late_packets'][0]
+    assert late['lead_ns'] == -50_000_000
+    assert late['clock_sample_age_ns'] == 200_000_000
+    assert late['receive_gap_ns'] == 220_000_000
+    assert late['mapping_uncertainty_ns'] > 0
+    assert late['epoch'] == grant.epoch and late['generation'] == grant.generation
+
+
+def test_new_epoch_does_not_infer_stall_from_previous_session_silence():
+    registry = observer.CaptureRegistry()
+    old = registry.begin(begin(), 1)
+    now = 100_000_000_000
+    registry.message(pcm(old, now_ns=now), 1, now_ns=now)
+    registry.disconnected(1)
+    new = registry.begin(begin(), 2)
+    now += 31_000_000_000
+    registry.message(replace(pcm(new, now_ns=now), presentation_ns=now-1), 2, now_ns=now)
+    late = registry.snapshot()['late_packets'][0]
+    assert late['epoch'] == 2 and late['receive_gap_ns'] is None
+
+
 @pytest.mark.parametrize("lane", ["pcm", "control"])
 @pytest.mark.asyncio
 async def test_cancel_before_handler_first_instruction_retires_accepted_descriptor(tmp_path, lane):

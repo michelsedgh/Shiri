@@ -353,6 +353,19 @@ proved stopped or absent and the protected path, bytes, modes and known inodes
 match. Changed, foreign or linked artifacts refuse recovery; an old boot cannot
 retarget a successor's artifact. See `shiri/runtime/namespace_policy.py`.
 
+Retirement retries may accept an absent companion only for the same current-boot
+inactive or failed invocation, typed zero main/control PIDs and its exact cgroup
+proved empty or absent; present artifacts and every immutable policy check
+remain mandatory. The isolated Ubuntu `unit-retire152` check passed two serial
+non-media services with referenced inactive-unit repeated stops, recovery from
+the unchanged durable reservation before forget, and an interrupted original
+file unlink before directory removal. Its synchronous active-unit verifier
+refused a missing companion, which was restored immediately to the same inode;
+this was not an asynchronous stop-path test. All cleanup passed, with the
+installed package and ledger unchanged. The original `unit-retire151` refusal
+and `group149` cleanup failure remain preserved; installation of the complete
+candidate and the grouped audio rerun remain separate pending gates.
+
 The same reload also reverses the manager's `DeviceAllow` array: transient
 admission prepends device entries, serialization keeps that order, and fragment
 parsing prepends them again. Shiri compares the exact device/permission pairs

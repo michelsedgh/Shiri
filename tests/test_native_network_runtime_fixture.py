@@ -174,6 +174,37 @@ async def test_full_fixture_speech_offer_and_close_dispatch_actual_worker(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('pcm_peak', [0, 1000])
+async def test_deadline_failure_records_exact_window_before_original_assert_and_closes_peer(tmp_path, monkeypatch, pcm_peak):
+    rig, broker, worker, server, producer = prepare_rig(tmp_path, monkeypatch, 'pause')
+    spectrum = {'speech_880_amplitude': 100, 'music_440_amplitude': 0,
+                'minimum_presentation_lead_ns': -7_000_000}
+    window_calls = []
+    def deadline_observation(*, since_ns):
+        window_calls.append(since_ns)
+        return {'since_ns': since_ns, 'late_blocks': 1, 'late_frames': 384,
+                'minimum_presentation_lead_ns': -7_000_000,
+                'late_packets': [{'pcm_peak': pcm_peak}], 'sample_limit': 64}
+    rig.observer.registry.spectrum = lambda **_: dict(spectrum)
+    rig.observer.registry.deadline_observation = deadline_observation
+    report = {}
+    try:
+        with pytest.raises(RuntimeFailure, match='Actual terminal speech PCM missed its original presentation deadline'):
+            await rig.speech(label='failed paused deadline', paused=True, report=report)
+        observation, = report['speech_observations']
+        assert observation['label'] == 'failed paused deadline' and observation['paused'] is True
+        assert observation['first_voice_spectrum'] == observation['steady_spectrum'] == spectrum
+        assert observation['window_start_ns'] == window_calls[0]
+        assert observation['deadline_window']['late_packets'][0]['pcm_peak'] == pcm_peak
+        assert observation['deadline_window']['minimum_presentation_lead_ns'] == -7_000_000
+        assert server.close_calls == producer.close_calls == 1
+        assert [request['action'] for request in broker.requests] == ['offer', 'close']
+        assert worker.session is None and not worker._disposals and not rig.peers
+    finally:
+        await worker.close()
+
+
+@pytest.mark.asyncio
 async def test_phase_failure_preserved_when_exact_close_also_fails(tmp_path, monkeypatch):
     rig, broker, worker, _server, producer = prepare_rig(tmp_path, monkeypatch)
     original = ValueError("original negotiation phase failure")

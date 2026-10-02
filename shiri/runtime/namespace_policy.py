@@ -216,9 +216,9 @@ def _directory(record, *, allow_absent=False):
             os.close(directory)
 
 
-def _file(record, directory):
+def _file(record, directory, *, allow_retired_absence=False):
     names = set(os.listdir(directory))
-    if not names and record["phase"] != "sealed":
+    if not names and (record["phase"] != "sealed" or allow_retired_absence):
         return False
     if names != {NAME}:
         raise RuntimeFailure("Unexpected namespace policy files; resources stay reserved")
@@ -241,10 +241,13 @@ def _file(record, directory):
 
 
 @_filesystem
-def verify(record):
-    with _directory(record, allow_absent=record["phase"] == "planned") as (_, directory):
+def verify(record, *, allow_retired_absence=False):
+    with _directory(record, allow_absent=record["phase"] == "planned" or allow_retired_absence) as (
+        _,
+        directory,
+    ):
         if directory is not None:
-            _file(record, directory)
+            _file(record, directory, allow_retired_absence=allow_retired_absence)
 
 
 @_filesystem
@@ -266,7 +269,10 @@ def discard(record, *, current_boot):
     with _directory(record, allow_absent=True) as (root, directory):
         if directory is None:
             return
-        has_file = _file(record, directory)
+        # Recovery may repeat after our unlink and before our rmdir. The exact
+        # original directory inode must still match; foreign/replaced bytes
+        # remain refused. This path is called only after proven termination.
+        has_file = _file(record, directory, allow_retired_absence=True)
         _check(
             os.stat(record["unit"] + ".d", dir_fd=root, follow_symlinks=False),
             directory=True,

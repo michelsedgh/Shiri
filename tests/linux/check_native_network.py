@@ -434,7 +434,7 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
             raise RuntimeFailure(failure)
         self.peers.pop(session, None)
 
-    async def speech(self, *, label, paused=False, baseline=None):
+    async def speech(self, *, label, paused=False, baseline=None, report=None):
         peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         tone, session = SpeechTone(), "network-"+uuid4().hex
         transceiver = peer.addTransceiver(tone, direction="sendonly")
@@ -455,10 +455,21 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
                 spectrum = self.observer.registry.spectrum(since_ns=start)
                 return spectrum if spectrum and spectrum["speech_880_amplitude"] > 20 else None
             spectrum = await eventually(voice, "actual decoded "+label, timeout=15)
+            first_voice = dict(spectrum)
             # Get at least one full second after startup to measure steady
             # ducking rather than a single initial packet or play flag.
             await asyncio.sleep(1.5)
-            spectrum = self.observer.registry.spectrum(since_ns=time.monotonic_ns()-1_000_000_000)
+            window_start = time.monotonic_ns()-1_000_000_000
+            spectrum = self.observer.registry.spectrum(since_ns=window_start)
+            if report is not None:
+                report.setdefault("speech_observations", []).append({
+                    "label": label, "paused": paused, "first_voice_spectrum": first_voice,
+                    "steady_spectrum": spectrum, "window_start_ns": window_start,
+                    "observed_ns": time.monotonic_ns(),
+                    "deadline_window": self.observer.registry.deadline_observation(since_ns=window_start),
+                    "source_owner_before": before["source"]["owner"],
+                    "native_blocks_before": before.get("native_blocks"),
+                })
             require(spectrum is not None and spectrum["speech_880_amplitude"] > 20,
                     "Terminal network did not retain actual voice audio")
             require(spectrum["minimum_presentation_lead_ns"] > 0,
@@ -558,7 +569,7 @@ async def exercise(rig, report, *, fault_case):
     baseline = rig.observer.registry.spectrum(since_ns=time.monotonic_ns()-1_000_000_000)
     require(baseline and baseline["music_440_amplitude"] > 20, "No steady actual music baseline")
     report["baseline"] = baseline
-    report["playing_speech"] = await rig.speech(label="music plus speech", baseline=baseline["music_440_amplitude"])
+    report["playing_speech"] = await rig.speech(label="music plus speech", baseline=baseline["music_440_amplitude"], report=report)
     await asyncio.sleep(2)
     restored = await rig.actual_music("music gain recovery after speech")
     require(0.7 < restored["spectrum"]["music_440_amplitude"]/baseline["music_440_amplitude"] < 1.4,
@@ -674,7 +685,7 @@ async def exercise(rig, report, *, fault_case):
                             "initial_music_owner": owner, "native_blocks": blocks,
                             "sender_timed_teardown_observed": True, "source_owner_retired": True,
                             "same_zone_units": True, "iphone_pause_acceptance": "manual_pending"}
-    report["paused_speech"] = await rig.speech(label="speech after31s pause", paused=True)
+    report["paused_speech"] = await rig.speech(label="speech after31s pause", paused=True, report=report)
     resumed = time.monotonic_ns()
     await rig.source_client.request("PUT", "/api/player/play")
     report["resume"] = await rig.actual_music("actual pause resume without volume change", since_ns=resumed)
@@ -696,7 +707,7 @@ async def exercise(rig, report, *, fault_case):
     await rig.healthy()
     report["normal_zone_units"] = rig.stable_units
     await rig.release()
-    report["cold_idle_speech"] = await rig.speech(label="cold idle speech without a phone", paused=True)
+    report["cold_idle_speech"] = await rig.speech(label="cold idle speech without a phone", paused=True, report=report)
 
     if fault_case:
         await rig.release()

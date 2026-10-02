@@ -43,6 +43,10 @@ class CaptureRegistry:
         self.volumes = deque(maxlen=128)
         self.events = deque(maxlen=512)
         self.mapping_uncertainty_max_ns = 0
+        self.minimum_presentation_lead_ns = None
+        self.late_blocks = self.late_frames = 0
+        self.late_packets = deque(maxlen=64)
+        self.last_pcm_received = None
 
     def begin(self, packet, connection_id):
         if (packet.kind is not Kind.BEGIN or packet.session == ZERO_UUID
@@ -55,6 +59,7 @@ class CaptureRegistry:
         self.seen.add(packet.session)
         self.current = (connection_id, packet.session, self.epoch)
         self.fence = StreamFence(packet.session)
+        self.last_pcm_received = None
         self.events.append({"kind": "begin", "epoch": self.epoch, "generation": 1,
                             "at_ns": time.monotonic_ns()})
         return self.grant(packet)
@@ -95,6 +100,27 @@ class CaptureRegistry:
                                                   mapped.uncertainty_ns)
             self.blocks += 1
             self.frames += packet.frames
+            lead = mapped.monotonic_ns - now_ns
+            self.minimum_presentation_lead_ns = (
+                lead if self.minimum_presentation_lead_ns is None
+                else min(self.minimum_presentation_lead_ns, lead))
+            previous = self.last_pcm_received
+            receive_gap = (now_ns - previous[2] if previous is not None
+                           and previous[:2] == (packet.epoch, packet.generation) else None)
+            self.last_pcm_received = (packet.epoch, packet.generation, now_ns)
+            if lead <= 0:
+                self.late_blocks += 1
+                self.late_frames += packet.frames
+                self.late_packets.append({
+                    "epoch": packet.epoch, "generation": packet.generation,
+                    "sequence": packet.sequence, "frame_index": packet.frame_index,
+                    "frames": packet.frames, "flags": packet.flags,
+                    "presentation_ns": mapped.monotonic_ns, "received_ns": now_ns,
+                    "lead_ns": lead, "mapping_uncertainty_ns": mapped.uncertainty_ns,
+                    "clock_sample_age_ns": now_ns - packet.monotonic_after_ns,
+                    "receive_gap_ns": receive_gap,
+                    "pcm_peak": max(abs(sample[0]) for sample in struct.iter_unpack("<h", packet.pcm)),
+                })
             self.ring.append((now_ns, packet.epoch, packet.generation, mapped.monotonic_ns,
                               packet.flags, packet.pcm))
             self.ring_bytes += len(packet.pcm)
@@ -115,7 +141,33 @@ class CaptureRegistry:
                 "blocks": self.blocks, "frames": self.frames, "flushes": self.flushes,
                 "ends": self.ends, "buffered_bytes": self.ring_bytes,
                 "mapping_uncertainty_max_ns": self.mapping_uncertainty_max_ns,
+                "minimum_presentation_lead_ns": self.minimum_presentation_lead_ns,
+                "late_blocks": self.late_blocks, "late_frames": self.late_frames,
+                "late_packets": list(self.late_packets),
                 "events": list(self.events), "volumes": list(self.volumes)}
+
+    def deadline_observation(self, *, since_ns):
+        """Bounded metadata for the exact spectrum window; never changes PCM."""
+        blocks = frames = late_blocks = late_frames = 0
+        leads = []
+        for received, _epoch, _generation, presentation, _flags, data in self.ring:
+            if received < since_ns:
+                continue
+            blocks += 1
+            count = len(data) // 4
+            frames += count
+            lead = presentation - received
+            leads.append(lead)
+            if lead <= 0:
+                late_blocks += 1
+                late_frames += count
+        return {"since_ns": since_ns, "blocks": blocks, "frames": frames,
+                "late_blocks": late_blocks, "late_frames": late_frames,
+                "minimum_presentation_lead_ns": min(leads) if leads else None,
+                "maximum_presentation_lead_ns": max(leads) if leads else None,
+                "late_packets": [dict(sample) for sample in self.late_packets
+                                 if sample["received_ns"] >= since_ns],
+                "sample_limit": self.late_packets.maxlen}
 
     def spectrum(self, *, since_ns, minimum_frames=RATE // 4):
         """Fit both independent tones on actual decoded stereo blocks."""
