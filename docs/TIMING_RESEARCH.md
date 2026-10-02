@@ -162,18 +162,37 @@ module's initial parameter alone does not describe a later proc selection.
 The external PCM-timer branch also requires matching playback and capture
 periods and checks the timer resolution against those periods. Current
 playback uses512 frames and capture uses960; a small-period dummy PCM timer
-is therefore not a drop-in replacement. No timer-source write or dummy-device
-provisioning was performed. This proposed experiment remains inadmissible
-until the period contract is resolved.
+is therefore not a drop-in replacement. Later isolated experiments195–197
+selected a dummy48-frame clock after explicitly admitting that test variant;
+they did not change production audio. Experiment195 exposed close-time proc
+write application,196 exposed an invalid timestamp-freshness assumption, and
+197 measured18.13ms of independent Loopback baseline dispersion despite a
+stable dummy clock. The external timer path can lose elapsed progress when
+callbacks batch; the retained observations do not distinguish its two callback
+stages. Every failed result remains retained, and the original blank timer and
+module state were restored before the next experiment.
 [Linux5.15 timer-source selection](https://github.com/torvalds/linux/blob/v5.15/sound/drivers/aloop.c)
 
 An alternative isolated experiment uses the official Ubuntu ARM64 lowlatency
 kernel at the same5.15.0-194 revision. The two downloaded kernel packages match
 the previously verified signed archive index; their extracted configuration
 declares `CONFIG_HZ_1000=y`, `CONFIG_HZ=1000` and high-resolution timers. This
-could test the coarse-clock hypothesis while preserving the512/960 geometry.
-Only a private provisioning proposal exists: the VM still uses the generic
-250Hz kernel. A finer kernel does not establish synchronization; the unchanged
+tests the coarse-clock hypothesis while preserving the512/960 geometry.
+Actual198 booted that already-installed official kernel for one boot, using
+stock Loopback's default timer. Fresh observation confirms the1000Hz config,
+same VM and exact application/native/settings/rollback postimages; the generic
+kernel remains the unchanged GRUB default. No kernel backport was installed.
+Finite198 passed its independent baselines but stopped when the48-frame test
+variant contradicted the finite fixture's original960-frame contract. Its full
+failure and successful cleanup are retained. Finite200 now uses the complete
+byte-identical original182 fixture tree and freshly admitted boot identity.
+It passed both idle/native finite utterances, the unchanged2ms configured-offset
+and drift checks, complete prefix/body/codec-tail/quiet and all cleanup, followed
+by fresh original182 admission. Its independent queue-origin spreads were below
+1ms. The original report deliberately leaves speech performance unqualified;
+the predeclared additional latency policy requires separate cases at all three
+saved corrections. A finer kernel alone does not establish synchronization;
+the unchanged
 2ms waveform gate, complete PCM/calendar checks and fallback/rollback checks
 must pass before any minimum policy is promoted. Local package/config evidence
 is retained in `/tmp/shiri-lowlatency-kernel-config-review-result.json`.
