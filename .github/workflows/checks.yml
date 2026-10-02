@@ -18,7 +18,7 @@ jobs:
         run: |
           /usr/bin/python3 -m venv --system-site-packages .venv
           .venv/bin/pip install --require-hashes --only-binary=:all: -r install/build_requirements.lock
-          .venv/bin/pip install --no-build-isolation -e '.[audio,test]'
+          .venv/bin/pip install --no-build-isolation '.[audio,test]'
           .venv/bin/python -m playwright install --with-deps chromium
       - name: Python validation and real PCM mixer
         env:
