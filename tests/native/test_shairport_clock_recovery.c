@@ -33,6 +33,8 @@ static int sends,deny_send,peer=61000,closed,peer_gone;
 static uint64_t clock_values[128], raw_values[64];
 static size_t clock_count, clock_index, raw_count, raw_index;
 static uint64_t default_clock = UINT64_C(9000000000);
+/* One explicit publisher RAW read after the original sampler completed. */
+static unsigned publisher_final_raw, publisher_final_reads;
 static int mock_clock_gettime(clockid_t clock,struct timespec *value){
   uint64_t ns;
   if(clock==CLOCK_MONOTONIC_RAW)ns=get_absolute_time_in_ns();
@@ -94,7 +96,12 @@ struct test_config config={.cfg=(void*)1};
 int config_lookup_non_empty_string(void*c,const char*k,const char**v){(void)c;(void)k;*v="/private/music.sock";return 1;}
 int config_lookup_int(void*c,const char*k,int*v){(void)c;(void)k;*v=61000;return 1;}
 uint64_t get_absolute_time_in_ns(void){
-  if(raw_count){assert(raw_index<raw_count);return raw_values[raw_index++];}
+  if(raw_count){
+    if(raw_index<raw_count)return raw_values[raw_index++];
+    assert(publisher_final_raw==1 && clock_index+1==clock_count);
+    publisher_final_raw=0;publisher_final_reads++;
+    return raw_values[raw_count-1];
+  }
   return UINT64_C(10000000000);
 }
 void warn(const char*p,...){(void)p;}
@@ -155,9 +162,11 @@ static void callback_result(const uint64_t *mono,size_t count,const uint64_t *ra
   assert(fd==99);state.sequence=17;state.frame_index=32;gap=1;
   struct shiri_pcm_packet saved=state;int before=sends;
   clocks(mono,count,raw,raws);
+  publisher_final_raw=1;publisher_final_reads=0;
   assert(audio_shiri.play_native(number,pcm,16,play_samples_are_timed,UINT32_MAX-4,
                                 UINT64_C(10150000000))==expected);
   assert(clock_index==count&&raw_index==raws&&!memcmp(pcm,original,sizeof(pcm)));
+  assert(publisher_final_reads<=1 && (expected || publisher_final_reads==1));
   assert(clock_recovery.batches==batches&&clock_recovery.refused==refused);
   assert(!clock_order.active);
   assert(refused_batches==refused);
@@ -175,6 +184,7 @@ static void callback_result(const uint64_t *mono,size_t count,const uint64_t *ra
     assert(!memcmp(captured+SHIRI_PCM_HEADER,original,sizeof(original)));
     assert(clock_recovery.elapsed_ns<SHIRI_CLOCK_RECOVERY_NS&&recovered_packets==(refused?1u:0u));
   }
+  publisher_final_raw=publisher_final_reads=0;
   clock_count=raw_count=0;number++;checks++;
 }
 struct script{uint64_t mono[128],raw[64],now,raw_now;size_t count,raws;};

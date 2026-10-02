@@ -32,7 +32,7 @@ OWNTONE_PATCH_SHA=f9250ebec36873ea39fff78ca3bbc5c424b023ead267868331f985ad0da1fe
 SHAIRPORT_TIMED_PATCH="$SOURCE/install/patches/shairport-5.5.2-timed-pcm.patch"
 SHAIRPORT_TIMED_SHA=6f04b42c31b1e6612586349955b135356d7d844de1b1cf36701c3fd8eae74d36
 SHAIRPORT_CLOCK_RECOVERY_PATCH="$SOURCE/install/patches/shairport-5.5.2-clock-recovery.patch"
-SHAIRPORT_CLOCK_RECOVERY_SHA=c7905cca35140fd1b9e6b1de4c1a534e9f8fa47aea0a08199c96af1a3a951a56
+SHAIRPORT_CLOCK_RECOVERY_SHA=9c242e9fccc77e8fb7251198f2b918c6df2ed3c15d8b2bb4242a5b1710d69dad
 SHAIRPORT_STARTUP_PATCH="$SOURCE/install/patches/shairport-5.5.2-native-startup.patch"
 SHAIRPORT_STARTUP_SHA=bab272cab5764fc3ebb0f8169b6a94b8318b78f63e09fd7e368058901b9a71d8
 SHAIRPORT_VOLUME_PATCH="$SOURCE/install/patches/shairport-5.5.2-receiver-volume.patch"
@@ -129,21 +129,12 @@ git -C "$BUILD/shairport" apply --check "$SHAIRPORT_STARTUP_PATCH"
 git -C "$BUILD/shairport" apply "$SHAIRPORT_STARTUP_PATCH"
 git -C "$BUILD/shairport" apply --check "$SHAIRPORT_VOLUME_PATCH"
 git -C "$BUILD/shairport" apply "$SHAIRPORT_VOLUME_PATCH"
-# Keep the immutable layer28 source guard. Its historical fake-framing C
-# seam is retained as evidence; full current C verification executes every
-# retained lifecycle body with actual record framing after additive layer30.
-/usr/bin/python3 -I - "$SOURCE/tests/native/check_receiver_volume.py" "$BUILD/shairport" <<'PYVOLUME28'
-import importlib.util
-from pathlib import Path
-import sys
-spec = importlib.util.spec_from_file_location("receiver_volume_immutable28", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-module.verify_source(Path(sys.argv[2]))
-PYVOLUME28
+# Strictly inverse only the reviewed expired-prefix publisher, retaining the
+# immutable layer28 source guard on its exact original source bytes.
+/usr/bin/python3 -I "$SOURCE/tests/native/check_shairport_pcm_deadline.py" --source "$BUILD/shairport" --stage volume
 git -C "$BUILD/shairport" apply --check "$SHAIRPORT_EVENTS_PATCH"
 git -C "$BUILD/shairport" apply "$SHAIRPORT_EVENTS_PATCH"
-/usr/bin/python3 -I "$SOURCE/tests/native/check_receiver_events.py" --source "$BUILD/shairport" --compiler /usr/bin/cc --sanitize
+/usr/bin/python3 -I "$SOURCE/tests/native/check_shairport_pcm_deadline.py" --source "$BUILD/shairport" --stage events --compiler /usr/bin/cc --sanitize
 /usr/bin/python3 -I "$SOURCE/tests/native/check_shairport_startup.py" --source "$BUILD/shairport" --compiler /usr/bin/cc
 (cd "$BUILD/shairport" && autoreconf -fi && \
   ./configure --prefix="$PREFIX" --sysconfdir="$PREFIX/etc" --with-avahi --with-ssl=openssl \

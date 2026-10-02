@@ -152,6 +152,8 @@ class Rig:
         self.stable_units = None
         self.fixture_sender_reserved = False
         self.speech_cleanup_errors = []
+        self.release_observations = []
+        self.source_rediscovery_observations = []
 
     def identity(self, processes):
         # Unit invocation+cgroup ownership is authoritative; PID is diagnostic.
@@ -175,6 +177,7 @@ class Rig:
         extra["source"]["owntone_file"] = log_tail(self.root/"source/state/owntone.log")
         record["fixture_logs"] = extra
         record["fixture_speech_cleanup_errors"] = self.speech_cleanup_errors[-8:]
+        record["fixture_release_observations"] = self.release_observations[-8:]
         return record
 
     async def healthy(self, *, stable=True):
@@ -379,6 +382,38 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
                                                    protocol="airplay2")],
                                         await self.source_client.outputs(set()))
 
+    async def select_rediscovered_source(self):
+        # Paired recovery readiness describes the rebuilt zone. The independent
+        # sender's mDNS catalog may still have removed that exact receiver.
+        # Only absence may retry inside the existing recovery deadline.
+        try:
+            outputs = await self.source_client.outputs(set())
+            expected_id = self.source_target["id"]
+            related = [v for v in outputs if v["id"] == expected_id or v["name"] == self.room_name]
+            self.source_rediscovery_observations.append({"at_ns": time.monotonic_ns(),
+                "catalog_count": len(outputs), "related": [{key: v[key] for key in
+                    ("id", "name", "protocol", "assignable", "requires_auth")} for v in related[:8]]})
+            self.source_rediscovery_observations[:] = self.source_rediscovery_observations[-8:]
+            require(expected_id == str(int(self.room.receiver["mac"].replace(":", ""), 16))
+                    and self.source_target["name"] == self.room_name
+                    and self.source_target["protocol"] == "airplay2",
+                    "Rebuilt zone changed the original source receiver identity")
+            if not related:
+                return None
+            require(len(related) == 1 and related[0]["id"] == expected_id
+                    and related[0]["name"] == self.room_name
+                    and related[0]["protocol"] == "airplay2"
+                    and related[0]["assignable"] is True and related[0]["requires_auth"] is False,
+                    "Rediscovered source receiver changed its exact identity or admission contract")
+            await self.source_client.select([SpeakerRef(id=expected_id, name=self.room_name,
+                                                       protocol="airplay2")], outputs)
+            return True
+        except RuntimeFailure as exc:
+            # eventually() retries RuntimeFailure for ordinary health probes.
+            # Malformed catalogs, changed identity, and failed selection are
+            # terminal fixture failures, never missing-discovery retries.
+            raise ValueError("Exact source receiver rediscovery failed: " + str(exc)) from exc
+
     async def queue(self):
         result = await self.source_client.request("POST", "/api/queue/items/add", params={
             "expression": "media_kind is music", "limit": "1", "playback": "start", "clear": "true"})
@@ -506,6 +541,10 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
                 raise
 
     async def release(self):
+        attempt = {"started_ns": time.monotonic_ns(), "quiescence_confirmed": False,
+                   "selection_restored": False, "observations": []}
+        self.release_observations.append(attempt)
+        self.release_observations[:] = self.release_observations[-8:]
         await self.source_client.request("PUT", "/api/player/stop")
         await self.source_client.select([], await self.source_client.outputs(set()))
         # Selection is deliberately retired for the cold fixture. Restoring it
@@ -513,10 +552,41 @@ airplay {quote(self.terminal_name)} {{ exclude = true }}
         await self.room.client.select([], await self.room.client.outputs({self.room_name}))
         async def released():
             health = await self.health()
-            return health if health["source"]["owner"] is None and self.observer.registry.current is None else None
-        await eventually(released, "actual input END and terminal transport release", timeout=20)
+            # An acknowledged voice close can retain the bounded idle FIFO
+            # tail. Selection while that pipe is still PLAYING starts a new
+            # terminal transport before the held-BEGIN fault can be armed.
+            # Observe actual retirement; never change the output lead/buffer.
+            player = await self.room.client.request("GET", "/api/player")
+            attempt["observations"].append({"at_ns": time.monotonic_ns(), "ready": health.get("ready"),
+                "source_owner_none": health["source"]["owner"] is None,
+                "pending_revocations": health["source"].get("pending_revocations"),
+                "audio_active": health.get("audio_active"), "fifo_reader": health.get("fifo_reader"),
+                "speech_session_none": health.get("speech_session_id") is None,
+                "speech_cleanup_pending": health.get("speech_cleanup_pending"),
+                "speech_cleanup_error": health.get("speech_cleanup_error"),
+                "player_state": player.get("state"), "terminal_none": self.observer.registry.current is None})
+            attempt["observations"][:] = attempt["observations"][-16:]
+            return health if (health.get("ready") is True
+                and health["source"]["owner"] is None
+                and health["source"].get("pending_revocations") == 0
+                and health.get("audio_active") is False
+                and health.get("fifo_reader") is False
+                and health.get("speech_session_id") is None
+                and health.get("speech_cleanup_pending") == 0
+                and health.get("speech_cleanup_error") is None
+                # OwnTone can suspend an exhausted idle pipe to PAUSED. Its
+                # speaker selection probes for every non-PLAYING state, so a
+                # fully retired pause is cold without rewriting its state.
+                and player.get("state") in {"pause", "stop"}
+                and self.observer.registry.current is None) else None
+        try:
+            await eventually(released, "actual input END and terminal transport release", timeout=20)
+            attempt["quiescence_confirmed"] = True
+        finally:
+            attempt["finished_ns"] = time.monotonic_ns()
         await self.broker._restore_outputs(self.room)
         await self.select_source()
+        attempt["selection_restored"] = True
 
     async def close(self):
         errors = []
@@ -716,6 +786,10 @@ async def exercise(rig, report, *, fault_case):
         original_incarnation = (await rig.health())["source"]["incarnation"]
         rig.observer.hold_next_begin_seconds = 4.5
         fault_started = time.monotonic_ns()
+        attempt = {"started_ns": fault_started, "hold_seconds": 4.5,
+                   "terminal_sessions_before": rig.observer.registry.snapshot()["sessions"],
+                   "source_catalog_observations": rig.source_rediscovery_observations}
+        report["held_setup_attempt"] = attempt
         # Observe the native3s failure while the actual source HTTP request is
         # still pending. Waiting for its separate4s client timeout first would
         # lose the evidence that the production actor fenced before GRANT.
@@ -727,10 +801,15 @@ async def exercise(rig, report, *, fault_case):
             nonlocal deadline_failure
             room = rig.broker.rooms[rig.room_id]
             rig.room = room
+            attempt["last_observation"] = {"at_ns": time.monotonic_ns(), "status": room.status,
+                "error": room.error, "units_replaced": rig.identity(room.processes) != previous}
             if room.status != "running" or rig.identity(room.processes) == previous:
                 if rig.identity(room.processes) == previous and "audio" in room.processes:
                     with suppress(Exception):
                         unhealthy = await rig.health()
+                        attempt["last_observation"].update(ready=unhealthy.get("ready"),
+                            source_error=unhealthy.get("source", {}).get("error"),
+                            source_incarnation_changed=unhealthy.get("source", {}).get("incarnation") != original_incarnation)
                         if unhealthy.get("ready") is False and unhealthy.get("source", {}).get("error"):
                             if deadline_failure is None:
                                 deadline_failure = {"at_ns": time.monotonic_ns(),
@@ -741,16 +820,31 @@ async def exercise(rig, report, *, fault_case):
                 return None
             health = await rig.health()
             if health.get("ready") and health["source"]["incarnation"] != original_incarnation:
-                return health
+                attempt["paired_recovery"] = {"at_ns": time.monotonic_ns(),
+                    "fresh_incarnation": health["source"]["incarnation"],
+                    "fresh_zone_units": rig.identity(room.processes),
+                    "unrelated_fixture_units_preserved": fixed == {
+                        "terminal": rig.identity(rig.terminal_processes), "source": rig.identity(rig.source_processes)}}
+                if await rig.select_rediscovered_source():
+                    return health
             return None
         try:
-            fresh = await eventually(recovered, "actual bounded paired recovery from held network SETUP", timeout=45)
+            fresh = await asyncio.wait_for(
+                eventually(recovered, "actual bounded paired recovery from held network SETUP", timeout=45),
+                timeout=max(0.0, (fault_started+45_000_000_000-time.monotonic_ns())/1e9))
         finally:
             if not queue_task.done():
                 queue_task.cancel()
             queued_results = await asyncio.gather(queue_task, return_exceptions=True)
             if isinstance(queued_results[0], BaseException):
                 queue_error = type(queued_results[0]).__name__
+            # Keep whether the fault really consumed a fresh native BEGIN even
+            # when recovery fails before the successful-phase receipt exists.
+            attempt.update(queue_error_type=queue_error,
+                held_begins=[dict(value) for value in rig.observer.held_begins[-4:]],
+                hold_still_armed=rig.observer.hold_next_begin_seconds,
+                terminal_sessions_after=rig.observer.registry.snapshot()["sessions"],
+                native_deadline_failure=deadline_failure, observed_failures=failures[-32:])
         require(rig.observer.held_begins and rig.observer.hold_next_begin_seconds == 0,
                 "Fault fixture did not hold an actual terminal native SETUP admission")
         hold = rig.observer.held_begins[-1]
@@ -763,7 +857,6 @@ async def exercise(rig, report, *, fault_case):
         # A new source attempt must use the fresh production worker/token and
         # must remain healthy after the old real network reply was released.
         rig.stable_units = rig.identity(rig.room.processes)
-        await rig.select_source()
         began = time.monotonic_ns()
         await rig.queue()
         retry = await rig.actual_music("fresh native owner after actual setup failure", since_ns=began, timeout=20)
@@ -840,6 +933,7 @@ async def inner(profile_path, *, parent_namespace, original_netns_fd, run_direct
         if rig:
             with suppress(Exception):
                 report["capture_final"] = rig.observer.registry.snapshot() if rig.observer else None
+                report["release_observations"] = rig.release_observations[-8:]
             try:
                 await rig.close()
                 report["cleanup"]["fixture_units_stopped"] = True
