@@ -25,7 +25,18 @@ jobs:
           SHIRI_LINUX_AUDIO_TESTS: '1'
         run: |
           .venv/bin/ruff check shiri tests
-          .venv/bin/python -m pytest -q
+          .venv/bin/python - <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          root = Path(os.environ['RUNNER_TEMP']).resolve()
+          owners = {(0, 0), (os.getuid(), os.getgid())}
+          for path in (root, *root.parents):
+              info = path.stat()
+              if not stat.S_ISDIR(info.st_mode) or (info.st_uid, info.st_gid) not in owners or info.st_mode & 0o022:
+                  raise RuntimeError(f'Pytest policy fixtures require protected ancestors: {path}')
+          PY
+          .venv/bin/python -m pytest -q --basetemp="$RUNNER_TEMP/shiri-pytest"
       - name: Native source and volume parser checks
         run: |
           .venv/bin/python tests/native/check_source_transition.py --require-json --compiler /usr/bin/cc

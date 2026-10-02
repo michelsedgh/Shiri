@@ -82,7 +82,6 @@ class Harness:
         self.stop = None
         self.status = tmp_path / "status.json"
         self.command = tmp_path / "command.json"
-        started = time.monotonic_ns() - int((180 - remaining_seconds) * 1e9)
         self.config = {
             "uid": 501,
             "gid": 20,
@@ -90,7 +89,7 @@ class Harness:
             "status": str(self.status),
             "command": str(self.command),
             "group": GROUP,
-            "common_start_ns": time.monotonic_ns() + 220_000_000,
+            "common_start_ns": 0,
             "arrival_lead_ns": 220_000_000,
             "leader": True,
             "wide_bracket": False,
@@ -100,15 +99,10 @@ class Harness:
             self.config["bluetooth_receiver_idle"] = {
                 "version": 1,
                 "room_id": A,
-                "started_monotonic_ns": started,
-                "deadline_monotonic_ns": started + 180_000_000_000,
+                "started_monotonic_ns": 0,
+                "deadline_monotonic_ns": 0,
             }
         self.config_path = tmp_path / "config.json"
-        self.publish(self.config_path, self.config)
-        self.publish(
-            self.command,
-            {"generation": 2, "action": "run", "common_start_ns": self.config["common_start_ns"]},
-        )
         fake_asyncio = SimpleNamespace(
             Event=self.event,
             get_running_loop=lambda: self,
@@ -147,6 +141,20 @@ class Harness:
         functions(GROUP_FILE, {"retire_producer", "hold_bluetooth_receiver_after_end"}, environment)
         functions(GROUP_FILE, {"producer"}, environment, restore_end=not patched)
         self.environment = environment
+        # AST extraction prepares the fixture; it must not consume the actual
+        # producer's declared delivery calendar or bounded receiver lifetime.
+        now = time.monotonic_ns()
+        self.config["common_start_ns"] = now + 220_000_000
+        if idle:
+            started = now - int((180 - remaining_seconds) * 1e9)
+            self.config["bluetooth_receiver_idle"].update(
+                started_monotonic_ns=started, deadline_monotonic_ns=started + 180_000_000_000
+            )
+        self.publish(self.config_path, self.config)
+        self.publish(
+            self.command,
+            {"generation": 2, "action": "run", "common_start_ns": self.config["common_start_ns"]},
+        )
 
     def event(self):
         self.stop = asyncio.Event()
@@ -248,6 +256,32 @@ async def test_default_profile_retains_original_end_and_exit_behavior(tmp_path):
     state = json.loads(harness.status.read_text())
     assert state["stage"] == "finished" and state["finished"] is True
     assert "native_end_idle" not in state
+
+
+@pytest.mark.asyncio
+async def test_calendar_and_idle_deadline_start_after_slow_source_preparation(tmp_path, monkeypatch):
+    prepare = functions
+    completed = []
+
+    def slow_prepare(path, names, environment, **options):
+        prepare(path, names, environment, **options)
+        if names == {"producer"}:
+            time.sleep(0.18)  # Deliberately exceeds the unchanged 150ms cadence bound.
+            completed.append(time.monotonic_ns())
+
+    monkeypatch.setitem(globals(), "functions", slow_prepare)
+    harness = Harness(tmp_path)
+    profile = harness.config["bluetooth_receiver_idle"]
+    assert profile["started_monotonic_ns"] >= completed[0]
+    assert harness.config["common_start_ns"] == profile["started_monotonic_ns"] + 220_000_000
+    assert profile["deadline_monotonic_ns"] - profile["started_monotonic_ns"] == 180_000_000_000
+    task = harness.launch()
+    try:
+        await harness.wait_idle(task)
+        assert [packet.kind for packet in harness.packets] == [Kind.BEGIN, Kind.PCM, Kind.END]
+    finally:
+        harness.stop.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -78,8 +78,11 @@ def run_tests(buffer_ms, *, own_source=None, compiler=None, sanitize=True):
         (directory/'alsa_delay.inc').write_text(delay)
         (directory/'alsa_stamp.inc').write_text(stamp)
         target = directory/'common-buffer'
-        subprocess.run([compiler, *flags, '-I', str(directory), str(Path(__file__).with_name('test_common_buffer.c')),
-                        '-pthread', '-o', str(target)], check=True, capture_output=True, text=True, timeout=30)
+        try:
+            subprocess.run([compiler, *flags, '-I', str(directory), str(Path(__file__).with_name('test_common_buffer.c')),
+                            '-pthread', '-o', str(target)], check=True, capture_output=True, text=True, timeout=30)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(exc.stderr or exc.stdout or 'Common buffer C compilation failed') from exc
         result = subprocess.run([str(target), str(buffer_ms)], env=environment,
                                 capture_output=True, text=True, timeout=30)
         if result.returncode not in (0, 1):

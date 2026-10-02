@@ -2,6 +2,8 @@
 import importlib.util
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 from uuid import uuid4
 
 import pytest
@@ -45,6 +47,16 @@ def test_actual_input_and_output_schedule_every_accepted_offset_without_changing
     preimage = check.run_tests(check.configured_buffer(rendered.replace('start_buffer_ms = 2500', 'start_buffer_ms = 500')),
                                compiler=compiler)
     assert not preimage['ok'] and preimage['ignored_offsets'] == preimage['horizon_mismatches'] == 1500
+
+
+def test_compiler_failure_retains_the_actual_stderr(tmp_path):
+    compiler = tmp_path/'failing-compiler'
+    compiler.write_text(f'#!{sys.executable}\nimport sys\nsys.stderr.write("exact compiler diagnostic\\n")\nsys.exit(2)\n')
+    compiler.chmod(0o700)
+    with pytest.raises(RuntimeError, match='exact compiler diagnostic') as failure:
+        check.run_tests(2500, compiler=str(compiler))
+    assert isinstance(failure.value.__cause__, subprocess.CalledProcessError)
+    assert failure.value.__cause__.returncode == 2
 
 
 @pytest.mark.parametrize('text', ['', 'start_buffer_ms = 0', 'start_buffer_ms = 60001',
