@@ -1,13 +1,15 @@
 # Local streaming speech
 
-**October 3 startup qualification:** initial metadata, natural-EOF drain and
-cold-music input repairs are installed. Cold idle speech still loses its opening
-words with the Sonos output's automatic PTP timing. A controlled, temporary NTP
-comparison preserved the entire phrase according to the user's listening test;
-normal PTP configuration was restored afterward. The `outputclock1` build and
-saved per-speaker timing controls are pending installation. See
+**October 3 startup qualification:** initial metadata, natural-EOF drain,
+cold-music input repairs and the `outputclock1` timing controls are installed.
+Cold idle speech lost its opening words with the Sonos output's automatic PTP
+timing. A controlled temporary NTP comparison preserved the entire phrase
+according to the user's listening test, then restored the ordinary configuration.
+This output now has a saved NTP preference through the normal room API; native
+readback confirms NTP on AirPlay 2 / ALAC. The permanent route passed its
+streaming software check; its new listening result is pending. See
 [the diagnosis and evidence boundaries](SPEECH_STARTUP_DIAGNOSIS.md) and
-[the installed-versus-staged handoff](LIVE_TEST_HANDOFF.md).
+[the installed release handoff](LIVE_TEST_HANDOFF.md).
 
 Shiri can generate speech locally from text and route it to one exact room. The
 room's music continues while the mixer fades its gain down for speech and back
@@ -52,6 +54,24 @@ does not measure acoustic onset or multi-speaker alignment. The corresponding
 cold PTP capture showed the first receiver timing probe at 2,991 ms, later than
 the sender's intended first speech presentation. Receiver clock lock remains
 unmeasured.
+
+After the permanent `outputclock1` installation and saved NTP preference, first
+room dispatch was 1,051.7 ms. By 1,222.2 ms, 179.3 ms of audio had been delivered
+while generation took 2,709.1 ms. All 4.64 seconds were delivered without
+reported speech drops; the passive capture contained six NTP anchors, no PTP
+anchors and no capture drops. Worker cleanup was confirmed. This verifies
+streaming on the installed route; its human prefix test is pending and acoustic
+onset remains unmeasured.
+
+AirPlay 2 speakers have an **AirPlay timing** preference in their room's speaker
+settings: **Automatic**, **NTP compatibility** or **PTP required**. The preference
+is saved by stable output identity. Changing it retires the old room actors and
+starts the room with a matching native configuration; requested and backend
+timing are reported separately. NTP compatibility keeps AirPlay 2 / ALAC output.
+PTP required fails clearly if the speaker or sender cannot support it. Other
+speakers retain Automatic unless explicitly changed. Timing readback describes
+the backend's protocol choice, not receiver clock lock. Recheck alignment after
+changing a speaker's timing preference.
 
 ## Models and controls
 
@@ -404,7 +424,7 @@ consumer backpressure during actual paced playback. Use quiet measurements for
 model comparisons and room metrics for delivery diagnosis. An acoustic test
 with room microphones remains necessary to establish heard latency and sync.
 
-The final live VM sequence completed 14 software cases with Kokoro and repaired
+The earlier `idle1` live VM sequence completed 14 software cases with Kokoro and repaired
 Qwen: natural replies, cancellation, immediate successors, model switching,
 quiet preview generation and replies after 16 seconds of idle following both
 EOF and cancellation. Every case confirmed worker cleanup and preserved the

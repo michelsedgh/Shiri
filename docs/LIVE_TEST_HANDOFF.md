@@ -1,12 +1,14 @@
 # Live test handoff — October 3, 2026
 
 **Current speech status:** acknowledged initial AirPlay metadata, natural-EOF
-drain, live delivery progress and the cold-music input repair are installed.
-Cold idle speech still loses opening words with this Sonos output's automatic
-PTP timing. The user heard the entire phrase during a controlled temporary NTP
-comparison; normal PTP configuration was restored afterward. The next
-`outputclock1` build adds saved timing preferences by stable output identity and
-reports the effective clock, but is **not installed yet**. See
+drain, live delivery progress, the cold-music input repair and `outputclock1`
+are installed. Cold idle speech lost opening words with this Sonos output's
+automatic PTP timing. The user heard the entire phrase during a controlled
+temporary NTP comparison, which restored the ordinary configuration afterward.
+The normal room API has now saved NTP for this stable output identity and
+confirmed matching native timing readback on AirPlay 2 / ALAC. The permanent
+route passed its streaming software check; its new listening result is pending.
+See
 [the startup diagnosis](SPEECH_STARTUP_DIAGNOSIS.md). Neither control acceptance
 nor clock exchanges establish acoustic readiness or multi-speaker sync.
 
@@ -42,14 +44,31 @@ model limits, setup, API examples and honest latency definitions.
 ## What is installed
 
 The current 60-file wheel has SHA-256
-`5573a5faf5eab4936f66b24b451bfc20062b365992e23a87616e50111365a81a`.
+`34e74f28837c76a3e64df2f6b03dd7917de1d279e7d19dc11a6b60f630906dde`.
 The coherent rollout verified all package files and matching native identity.
 Shairport retains the previous `timed3-startup1-volume2` binary, SHA-256
 `4e051902f8ea7095385367ca4260372bda4813b8e6a84bd50abe08b8eb2fb5d6`.
-OwnTone now ends `idle1-drain1-startupmeta1-coldmusic1`, SHA-256
+OwnTone now ends `idle1-drain1-startupmeta1-coldmusic1-outputclock1`, SHA-256
+`6ab30cd382aa8d1e1f7f260d929e4a2cf6e36b0251f6a663970696b97b9a5942`.
+The rollout retired old actors and owned networks before replacing the
+package/native pair. Database migration from schema 3 to 4 preserved room
+revision 83, master volume 26 and all saved room intent. Verified coherent
+rollback files remain private in
+`/var/lib/shiri-output-clock-checkpoint-20261003` in the guest; database rollback
+is allowed only when no changes beyond the migration occurred.
+
+The subsequent revision-guarded room API request saved `airplay_timing: ntp`
+for Sonos endpoint `92539824408726`, advancing the room to revision 84. The old
+room actors retired normally, and requested/native timing both report NTP.
+Volume remains 26, offset 0 ms and balance 100%; this uses no temporary service
+override or name-based configuration override.
+
+The previous `coldmusic1` checkpoint used 60-file wheel SHA-256
+`5573a5faf5eab4936f66b24b451bfc20062b365992e23a87616e50111365a81a`
+and OwnTone SHA-256
 `be6d2398f134667c319a6ff40b5e32d7b3a1db391dcc63be79d2530025d641fc`.
-This rollout preserved room revision 81 and master volume 26, and retired the
-old actors and owned networks before replacing the package/native pair.
+Its rollout preserved revision 81 and volume 26. The cold PTP failure and
+temporary NTP comparison below were observed on that checkpoint.
 
 The earlier `idle1` installation remains a historical checkpoint: its 60-file
 wheel had SHA-256
@@ -63,6 +82,10 @@ mixer instead of waiting for six seconds of silent input refill. It preserves
 music timing and buffer policy. The actual Linux build reproduced the old
 failure and passed sanitized native lifecycle and framed-resampler checks
 before installation. See [patch notes](../install/patches/README.md).
+
+The current source regression passed 4,269 portable tests (85 skips) and 59
+browser/client checks. [Source CI run 37157793956](https://github.com/michelsedgh/Shiri/actions/runs/37157793956)
+succeeded for commit `a72463df4f1d496c954841c8f41e2edbca831cd5`.
 
 The earlier `idle1` software regression passed 4,197 portable tests
 (85 explicit/platform skips), 58 browser/client checks and the actual Linux
@@ -122,7 +145,23 @@ The cold PTP baseline still clipped the phrase and did not show a receiver
 timing probe until 2,991 ms. This supports changing this tested output's timing
 preference; it does not qualify other speakers, prove clock lock or measure
 heard latency. The diagnostic restored the ordinary PTP configuration and
-services, so the temporary result is not a permanent installed NTP fix.
+services. That historical listening result is distinct from the newly saved
+NTP configuration, whose permanent listening result is still pending.
+
+The installed NTP route's software acceptance check dispatched first room PCM
+at 1,051.7 ms and had delivered 179.3 ms by 1,222.2 ms while generation took
+2,709.1 ms. All 4.64 seconds were delivered with no reported speech drops,
+and worker cleanup was confirmed. Passive capture recorded six NTP anchors,
+no PTP anchors and no capture drops. These observations verify incremental
+delivery on the installed route; they do not measure acoustic onset or qualify
+multiple outputs.
+
+In room speaker settings, **AirPlay timing** offers **Automatic**, **NTP
+compatibility** and **PTP required**. Saving a changed mode restarts that room
+normally and preserves the preference by stable speaker identity. The UI
+reports the saved preference and backend timing separately. Other outputs
+remain Automatic; a required PTP mode fails clearly if unsupported. Recheck
+physical alignment after a timing change.
 
 Mixed speaker protocols, physical volume balance, native phone grouping,
 acoustic offsets/drift, streamed speech heard latency and extended household use

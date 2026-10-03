@@ -6,13 +6,18 @@ The live VM was running the earlier `idle1` backend and paced-delivery package.
 The requested conditional Git rollback therefore did not apply. The user also
 confirmed that the missing speech opening occurred while the room was idle.
 
-The new package and complete native repair are now installed in **Shiri Speaker
-Test**, at **http://shiri-speaker-test.local:8080/**. Refresh the browser for the
-updated streaming progress display. **Physical idle-speech acceptance failed
-after this rollout:** the user still heard only `in your room`. The same user
-reports hearing the whole sentence while music plays. The speaker's idle startup
-boundary is under live investigation; software qualification does not establish
-acoustic onset. The user has now explicitly authorized audible diagnostic tests.
+The permanent `outputclock1` package and native backend are now installed in
+**Shiri Speaker Test**, at **http://shiri-speaker-test.local:8080/**. Living Room
+has a saved, stable-ID NTP timing preference, verified against the running
+AirPlay 2 output after a normal room restart. Refresh the browser for the timing
+selector and streaming progress display.
+
+The earlier `coldmusic1` rollout still truncated idle speech: the user heard
+only `in your room`, while speech over music was complete. A controlled NTP
+comparison subsequently preserved the whole phrase, confirmed by the user.
+The final installed build passed incremental-delivery and cleanup checks;
+its new listening result is pending. Acoustic onset and whole-house alignment
+have not been measured.
 
 ## Controlled clock comparison
 
@@ -35,13 +40,22 @@ The coordinator was therefore streaming during generation. Total job time
 (5,985 ms) includes paced delivery and retirement, rather than a wait before
 first sound. Actual first audible latency still needs a microphone measurement.
 
-A production timing selector is being qualified. It persists by stable speaker
+The production timing selector is installed. It persists by stable speaker
 identity, defaults to Automatic, and uses a narrowly scoped native ID override
 so renaming or duplicate names cannot redirect the setting. Explicit NTP keeps
 AirPlay 2; explicit PTP requires receiver support. Clock changes restart the
 normal room runtime and invalidate prior calibration for that configuration.
-The compatibility choice will be applied only to the physically tested output.
-No blanket NTP policy or fixed startup silence has been added.
+NTP was saved only for the physically tested output, through the normal API
+with a revision guard. The native output reports NTP, and the generated config
+contains the exact stable-ID override without a name-based setting or temporary
+service launcher. No blanket NTP policy or fixed startup silence was added.
+
+The final installed idle phrase dispatched first PCM at 1,051.7 ms. At
+1,222.2 ms it had delivered 179.3 ms of speech; generation took 2,709.1 ms for
+4.64 seconds. All generated speech was delivered, with no dropped speech
+frames and confirmed worker/room cleanup. Six NTP anchors were captured with
+zero capture drops and no PTP events. This confirms streaming during generation
+in the installed build, without measuring first audible latency.
 
 ## Reproduced music failure
 
@@ -86,8 +100,15 @@ first model PCM is not a speaker-onset measurement.
 
 ## Qualification and installed artifacts
 
-- Portable regressions: 4,215 passed, 85 explicit/platform skips; the three new
-  cold-music contract checks passed separately. Live-device opt-ins were off.
+- Final portable regressions: 4,269 passed, 85 explicit/platform skips;
+  59 browser/client checks passed. Live-device opt-ins were off.
+- Native timing selection: 202 actual configuration, discovery, feature,
+  output-JSON and SETUP assertions across 20 device cases, plus 12 actual
+  libconfuse parser cases passed. Invalid IDs, duplicate overrides and
+  unsupported PTP fail closed. The full Linux candidate compile/link passed.
+- Source checkpoint `a72463df4f1d496c954841c8f41e2edbca831cd5` passed
+  [GitHub CI run 37157793956](https://github.com/michelsedgh/Shiri/actions/runs/37157793956).
+  The earlier integration failures and corrected runs are retained in evidence.
 - Exact native input/player fixtures: both POSIX and Linux timerfd branches
   passed 676,378 ASan/UBSan checks each. The preceding source reproduced the
   six-second refill and late-anchor failure in both branches.
@@ -106,30 +127,35 @@ opened a speaker or audio device. A fixture GCC warning and an observer's
 incorrect capitalized-banner expectation are retained alongside corrected runs.
 
 Installed VM wheel SHA-256:
-`5573a5faf5eab4936f66b24b451bfc20062b365992e23a87616e50111365a81a`.
+`34e74f28837c76a3e64df2f6b03dd7917de1d279e7d19dc11a6b60f630906dde`.
 All 60 package files match the checkout byte for byte. Installed and running
 OwnTone binary SHA-256:
-`be6d2398f134667c319a6ff40b5e32d7b3a1db391dcc63be79d2530025d641fc`.
-Its complete required marker ends `idle1-drain1-startupmeta1-coldmusic1`.
+`6ab30cd382aa8d1e1f7f260d929e4a2cf6e36b0251f6a663970696b97b9a5942`.
+Its complete required marker ends `idle1-drain1-startupmeta1-coldmusic1-outputclock1`.
 
 The coordinated installation normally stopped both services, retired all
 recorded actors and released owned networks before swapping verified bytes.
 It preserved the shutdown-boundary room configuration: master volume **26**,
-revision **81**, Sonos output `92539824408726`, offset **0 ms**, balance **100%**.
-No database or ownership ledger was restored or edited manually. The database
-and any pending phone-volume journal were backed up privately at shutdown.
+revision **83**, Sonos output `92539824408726`, offset **0 ms**, balance **100%**.
+The normal timing API then saved NTP and advanced the room to revision **84**;
+all other settings were verified unchanged, and old room actors were retired.
+Database schema 3 migrated to 4 with existing room state intact. No database
+or ownership ledger was restored or edited manually. The database and any
+pending phone-volume journal were backed up privately at shutdown.
 Both services are healthy and remain enabled for VM boot. Shairport, service
 units, access settings and the Mac model worker were unchanged.
 
 The new rollback checkpoint is
-`/var/lib/shiri-speech-startup-checkpoint-20261003-coldmusic1` in the guest. It
+`/var/lib/shiri-output-clock-checkpoint-20261003` in the guest. It
 contains the actual preceding wheel/backend and coordinated recovery artifacts;
-it does not substitute an older pre-idle backend. The compatible Mac generation
-worker intentionally retains its previous package and loaded Qwen model.
+it does not substitute an older pre-idle backend. Recovery first preserves
+failed-state database files, and refuses database rollback if new user writes
+cannot be excluded. The compatible Mac generation worker intentionally retains
+its previous package and loaded Qwen model.
 
 ## Remaining physical acceptance
 
-Listen first with the room idle to `Hello. This is Shiri speaking in your room.`
+The final installed idle phrase has run; its listening confirmation is pending.
 Then test fresh iPhone playback without web-volume adjustments, phone/web
 volume agreement and a 40-second pause/resume. Speech over music, ducking,
 cancellation, standby and mixed-protocol whole-house timing still need physical
