@@ -1,5 +1,10 @@
 # Speech startup diagnosis — 3 October 2026
 
+The investigation below records the earlier uninstalled speech checkpoint.
+The later [live rollout](CHECKPOINT_COLD_PLAYBACK_2026-10-03.md) installs these
+repairs with reproduced cold-music and AirPlay gap-timing fixes. Physical
+confirmation of the idle speech opening remains pending.
+
 The reported missing opening words are a real playback failure. Silent captures
 show that generation and the room audio pipeline preserve the complete opening
 through AirPlay encoding. They also show incremental delivery before generation
@@ -194,7 +199,8 @@ failure policy is restored.
 The final revision04 Linux build and repeated ALAC capture pass. The compiled
 native candidate has SHA-256
 `b0f1f77d2b01d9a86dc1b8b931a81adc2bfdf0c30081ca0710b324c6e0f6e67e`.
-The patched candidate has **not been deployed** to the live receiver; physical
+At that checkpoint the patched candidate had **not been deployed** to the live
+receiver. See the later rollout for the installed artifacts; physical
 confirmation of complete first playback has not been performed.
 
 The web job now reports received and delivered audio progress while streaming.

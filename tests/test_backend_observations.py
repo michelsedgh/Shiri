@@ -13,7 +13,8 @@ OUTPUT = {'id': '123', 'name': 'Kitchen speaker', 'type': 'AirPlay 2',
     {'type': []}, {'selected': 'false'}, {'requires_auth': 'false'},
     {'volume': True}, {'volume': 101}, {'offset_ms': None},
     {'offset_ms': 2001}, {'name': 'Kitchen\nother'}, {'format': []},
-    {'supported_formats': ['PCM', {}]},
+    {'supported_formats': ['PCM', {}]}, {'airplay_timing': []},
+    {'airplay_timing': 'auto'}, {'airplay_timing': False},
 ])
 @pytest.mark.asyncio
 async def test_malformed_output_is_visible_failure_even_with_valid_selected_peer(change):

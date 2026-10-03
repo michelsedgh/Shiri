@@ -1,0 +1,200 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/conffile.c b/src/conffile.c
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -207,6 +207,13 @@
+     CFG_END()
+   };
+ 
++/* Stable AirPlay 2 output timing selectors, independent of advertised names. */
++static cfg_opt_t sec_shiri_airplay_timing[] =
++  {
++    CFG_STR("protocol", NULL, CFGF_NONE),
++    CFG_END()
++  };
++
+ /* Chromecast device section structure */
+ static cfg_opt_t sec_chromecast[] =
+   {
+@@ -304,6 +311,8 @@
+     CFG_SEC("alsa", sec_alsa, CFGF_MULTI | CFGF_TITLE),
+     CFG_SEC("airplay_shared", sec_airplay_shared, CFGF_NONE),
+     CFG_SEC("airplay", sec_airplay, CFGF_MULTI | CFGF_TITLE),
++    CFG_SEC("shiri_airplay_timing", sec_shiri_airplay_timing,
++            CFGF_MULTI | CFGF_TITLE | CFGF_NO_TITLE_DUPES),
+     CFG_SEC("chromecast", sec_chromecast, CFGF_MULTI | CFGF_TITLE),
+     CFG_SEC("fifo", sec_fifo, CFGF_NONE),
+     CFG_SEC("rcp", sec_rcp, CFGF_MULTI | CFGF_TITLE),
+@@ -493,7 +502,48 @@
+ 
+   free(expanded);
+ 
++  return 0;
++}
++
++/* Reject aliases and overflow before any device can consume a selector. */
++static int
++shiri_airplay_timing_validate(cfg_t *config)
++{
++  cfg_t *section;
++  const char *title, *protocol, *p;
++  uint64_t id;
++  unsigned int digit;
++  int i, j, count;
++
++  count = cfg_size(config, "shiri_airplay_timing");
++  for (i = 0; i < count; i++)
++    {
++      section = cfg_getnsec(config, "shiri_airplay_timing", i);
++      title = cfg_title(section);
++      protocol = cfg_getstr(section, "protocol");
++      if (!title || !*title || (title[0] == '0' && title[1] != '\0'))
++        goto invalid;
++      id = 0;
++      for (p = title; *p; p++)
++        {
++          if (*p < '0' || *p > '9')
++            goto invalid;
++          digit = (unsigned int)(*p - '0');
++          if (id > (UINT64_MAX - digit) / 10)
++            goto invalid;
++          id = id * 10 + digit;
++        }
++      if (!protocol || (strcmp(protocol, "ntp") != 0 && strcmp(protocol, "ptp") != 0))
++        goto invalid;
++      for (j = 0; j < i; j++)
++        if (strcmp(title, cfg_title(cfg_getnsec(config, "shiri_airplay_timing", j))) == 0)
++          goto invalid;
++    }
+   return 0;
++
++ invalid:
++  DPRINTF(E_FATAL, L_CONF, "Invalid shiri_airplay_timing: require unique canonical uint64 ID and protocol ntp or ptp\n");
++  return -1;
+ }
+ 
+ int
+@@ -523,6 +573,10 @@
+       goto out_fail;
+     }
+ 
++  ret = shiri_airplay_timing_validate(cfg);
++  if (ret < 0)
++    goto out_fail;
++
+   /* Resolve runas username */
+   runas = cfg_getstr(cfg_getsec(cfg, "general"), "uid");
+   pw = getpwnam(runas);
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -4053,6 +4053,34 @@
+   * Libratone Loop
+      ["srcvers=190.9" "seed=99" "model=LibratoneLoop1" "flags=0x4" "features=0x444C0A00" "deviceid=XX:XX:XX:XX:XX:XX"]
+  */
++/* An explicit ID selector overrides only legacy name-based timing choices.
++ * Auto retains native feature detection and daemon availability behavior. */
++static int
++airplay_shiri_timing_select(uint64_t id, cfg_t *devcfg, struct keyval *features)
++{
++  cfg_t *timing;
++  const char *protocol;
++  char selector[21];
++  bool supports_ptp;
++
++  snprintf(selector, sizeof(selector), "%" PRIu64, id);
++  timing = cfg_gettsec(cfg, "shiri_airplay_timing", selector);
++  supports_ptp = keyval_get(features, "SupportsPTP") != NULL;
++  if (!timing)
++    return supports_ptp && !(devcfg && cfg_getbool(devcfg, "ptp_disable")) && !airplay_ptp_is_disabled;
++
++  protocol = cfg_getstr(timing, "protocol");
++  if (protocol && strcmp(protocol, "ntp") == 0)
++    return 0;
++  if (protocol && strcmp(protocol, "ptp") == 0 && supports_ptp && !airplay_ptp_is_disabled)
++    return 1;
++
++  DPRINTF(E_LOG, L_AIRPLAY,
++          "AirPlay timing selector for ID %s cannot be applied: protocol=%s SupportsPTP=%d PTP service available=%d\n",
++          selector, protocol ? protocol : "missing", supports_ptp, !airplay_ptp_is_disabled);
++  return -1;
++}
++
+ static void
+ airplay_device_cb(const char *name, const char *type, const char *domain, const char *hostname, int family, const char *address, int port, struct keyval *txt)
+ {
+@@ -4191,8 +4219,13 @@
+     extra->wanted_metadata |= AIRPLAY_MD_WANTS_TEXT;
+   if (keyval_get(&features_kv, "Authentication_8"))
+     extra->supports_auth_setup = 1;
+-  if (keyval_get(&features_kv, "SupportsPTP") && !(devcfg && cfg_getbool(devcfg, "ptp_disable")) && !airplay_ptp_is_disabled)
+-    extra->use_ptp = 1;
++  ret = airplay_shiri_timing_select(id, devcfg, &features_kv);
++  if (ret < 0)
++    goto free_device;
++  extra->use_ptp = ret;
++  device->shiri_airplay_use_ptp = ret != 0;
++  DPRINTF(E_INFO, L_AIRPLAY, "AirPlay output ID %" PRIu64 " uses %s timing\n",
++          id, ret ? "PTP" : "NTP");
+ 
+   // Currently always true since no SupportsCoreUtilsPairingAndEncryption means we fall back to RAOP
+   extra->supports_encryption = 1;
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -103,6 +103,9 @@
+   // Type of output (string)
+   const char *type_name;
+ 
++  // Effective timing selected by the AirPlay 2 backend, not an input preference.
++  bool shiri_airplay_use_ptp;
++
+   // Last state that the backend returned to the handlers in outputs.c. This
+   // field must only be set in outputs.c (not in the backends/player).
+   enum output_device_state state;
+diff --git a/src/player.h b/src/player.h
+--- a/src/player.h
++++ b/src/player.h
+@@ -42,6 +42,7 @@
+   int absvol;
+   int offset_ms;
+   int balance_percent;
++  char airplay_timing[4];
+ 
+   enum media_format format;
+   uint32_t supported_formats;
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -3753,6 +3753,8 @@
+   spk->absvol = device->volume;
+   spk->offset_ms = device->offset_ms;
+   spk->balance_percent = device->shiri_balance_set ? device->shiri_balance_percent : 100;
++  if (device->type == OUTPUT_TYPE_AIRPLAY)
++    strcpy(spk->airplay_timing, device->shiri_airplay_use_ptp ? "ptp" : "ntp");
+ 
+   spk->supported_formats = device->supported_formats;
+   // Devices supporting more than one format should at least have default_format set
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1638,6 +1638,8 @@
+   json_object_object_add(output, "volume", json_object_new_int(spk->absvol));
+   json_object_object_add(output, "offset_ms", json_object_new_int(spk->offset_ms));
+   json_object_object_add(output, "balance_percent", json_object_new_int(spk->balance_percent));
++  if (spk->airplay_timing[0])
++    json_object_object_add(output, "airplay_timing", json_object_new_string(spk->airplay_timing));
+   json_object_object_add(output, "format", json_object_new_string(media_format_to_string(spk->format)));
+   json_object_object_add(output, "supported_formats", supported_formats);
+ 

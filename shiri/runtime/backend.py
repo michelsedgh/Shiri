@@ -49,6 +49,10 @@ def normalize_output(raw: dict, excluded_names: set[str]):
         return None
     if "balance_percent" in raw and (type(raw["balance_percent"]) is not int or not 0 <= raw["balance_percent"] <= 100):
         return None
+    if "airplay_timing" in raw and (protocol not in {"airplay1", "airplay2"}
+                                    or not isinstance(raw["airplay_timing"], str)
+                                    or raw["airplay_timing"] not in {"ntp", "ptp"}):
+        return None
     formats = raw.get("supported_formats", [])
     if (not isinstance(raw.get("format", ""), str) or not isinstance(formats, list) or len(formats) > 32
             or any(not isinstance(value, str) or not 1 <= len(value) <= 64 for value in formats)):
@@ -64,7 +68,7 @@ def normalize_output(raw: dict, excluded_names: set[str]):
         )
     )
     sync = "native" if family(protocol or "") == "airplay" else "approximate"
-    return {
+    result = {
         "id": output_id,
         "name": name,
         "protocol": protocol,
@@ -79,6 +83,9 @@ def normalize_output(raw: dict, excluded_names: set[str]):
         "format": raw.get("format", ""),
         "supported_formats": raw.get("supported_formats", []),
     }
+    if "airplay_timing" in raw:
+        result["airplay_timing"] = raw["airplay_timing"]
+    return result
 
 
 class OwnToneRejected(RuntimeFailure):
@@ -167,6 +174,8 @@ class OwnToneClient:
                 raise RuntimeFailure(f"Saved speaker '{speaker.name}' is unavailable or its identity changed")
             if output.get("requires_auth"):
                 raise RuntimeFailure(f"Speaker '{speaker.name}' requires OwnTone device authorization")
+            if speaker.airplay_timing != "auto" and output.get("airplay_timing") != speaker.airplay_timing:
+                raise RuntimeFailure(f"OwnTone did not apply the requested AirPlay clock for '{speaker.name}'")
         changed = [speaker for speaker in speakers if by_id[speaker.id].get("offset_ms") != speaker.offset_ms]
         resume = False
         try:
@@ -197,6 +206,10 @@ class OwnToneClient:
             selected = {output["id"] for output in observed if output["selected"]}
             if selected != {speaker.id for speaker in speakers}:
                 raise RuntimeFailure("OwnTone did not retain the requested speaker selection")
+            clocks = {output["id"]: output.get("airplay_timing") for output in observed}
+            if any(speaker.airplay_timing != "auto" and clocks.get(speaker.id) != speaker.airplay_timing
+                   for speaker in speakers):
+                raise RuntimeFailure("OwnTone did not retain the requested AirPlay clock selection")
         finally:
             if resume:
                 await self.request("PUT", "/api/player/play")

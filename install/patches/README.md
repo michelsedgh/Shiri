@@ -498,8 +498,9 @@ Its SHA256 is
 `11cd0aec9232b716d2ea3c28a9ac2d321ca24779937063178ad40982d45df525`;
 the final AirPlay source SHA256 is
 `9b598a3fe18042476af9e6a535f3201c74276eeee86da84c95c7fc51438e27b9`.
-Runtime preflight requires the complete marker ending in
-`-transition1-bed1-event1-idle1-drain1-startupmeta1`.
+This layer's source marker ends in
+`-transition1-bed1-event1-idle1-drain1-startupmeta1`; the combined runtime
+contract appears below.
 
 An idle speech bed has no queue item's metadata. Upstream OwnTone skipped its
 initial metadata request in that state, although some AirPlay receivers need
@@ -532,3 +533,128 @@ without initial DMAP metadata. The silent tests and complete isolated Linux
 candidate build pass. They establish the repaired protocol contract; the
 reported physical missing speech prefix and receiver clock readiness still
 require later speaker acceptance. No live output was used for these tests.
+
+## Framed music after an empty interval
+
+`owntone-29.3-cold-music.patch` follows startupmeta1 and adds `-coldmusic1`.
+Its SHA256 is
+`58f3346db99fadfa448a1c02c91d1ec95656b04fc0100928ef4aa790cada6c80`.
+The final player SHA256 is
+`8b845515d43a4334f90ee4779a800b4dba0c1bb9a5fb2c3891f28ba546a4b9fc`;
+the final AirPlay SHA256 is
+`405243e11ea3f24301f449346b359d81134ae20ff75c5389c491e776f1dcc046`.
+Runtime preflight requires the complete marker ending in
+`-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1`.
+
+An already admitted framed source could enter upstream file-style underrun
+recovery after 1.5 seconds of missing input. That stopped its native timer and
+waited for the six-second buffer-capacity callback. Original presentation
+markers aged inside that refill buffer; the unchanged future-anchor guard
+correctly rejected them when recovery finally restarted. The capacity bound
+had become a readiness requirement even though framed input already carried
+its own clock.
+
+A genuine empty read now clears only this file-style read debt when the exact
+framed source operation is still armed. Its admitted native timer, output
+sessions, source position and original timestamps continue. It does not turn
+an ordinary continuing packet into a new cold admission: a packet that arrives
+after its input-read time can still preserve its original future device-output
+deadline. Initial and accepted-FLUSH anchor checks remain unchanged. EOF,
+errors, flagged controls, partial reads and ordinary file/raw underruns retain
+their existing paths. No buffer size, queue capacity, PCM or clock is changed.
+
+AirPlay's sample-count-based periodic sync also stops advancing during empty
+input. A continuing receiver could receive almost one second of new payload
+before learning its resumed clock mapping. Each framed master now tracks the
+end of the original raw block, using that block's sample rate rather than the
+converted rate. A forward or backward presentation discontinuity greater than
+one source sample forces the existing sync packet before the next payload;
+smaller integer-floor and mapped-clock perturbations retain the normal cadence.
+That pending sync survives conversion warmup and resets the periodic sample
+counter when emitted. It changes neither the supplied P nor buffered samples.
+Retained partial ALAC samples remain included in the existing RTP-position
+calculation, so a fresh prefix receives its original P plus the backend buffer.
+
+```sh
+python3 tests/native/check_cold_music.py --source /path/to/coldmusic1/owntone \
+  --preimage /path/to/startupmeta1/owntone
+python3 tests/native/check_speech_packetizer.py --source /path/to/configured/coldmusic1/owntone \
+  --preimage /path/to/configured/startupmeta1/owntone --capture /tmp/shiri-bed-pcm.bin
+```
+
+The exact input-write/marker/read and player-source/timer/suspend bodies reproduce
+the old six-second refill failure. Both POSIX and Linux timerfd branches pass
+676,378 ASan/UBSan checks per candidate branch: a partial first packet, a long
+empty interval, original-timestamp resumption, 221,184 steady samples from an
+8 ms producer on a 10 ms player, valid continuation jitter, timer catch-up,
+source-owner fences and EOF/control/error/file behavior. Strict inversion of
+only coldmusic1 retains every prior metadata, speech-drain and timing validator.
+
+The codec fixture now uses the actual RTP commit and sync-cadence functions.
+With 1,024 input frames followed by a 65-second gap, the exact preceding source
+sends resumed payload without a fresh mapping. The candidate synchronizes
+before that payload while retaining 221 converted frames (about 5 ms). Real
+ALAC decoding is identical with and without the gap, including the fresh prefix
+and tail. Fractional durations and ±100 ns mapped perturbations retain ordinary
+sync cadence; actual 1 ms forward/backward gaps and a source timeline handoff
+each receive a fresh mapping. These silent software checks and the isolated
+full Linux build pass. Physical first-play and idle-speech prefix acceptance
+remain separate checks; no live speaker output was used here.
+The additive `owntone-29.3-output-clock.patch` follows the immutable
+`coldmusic1` layer and appends `outputclock1`. It adds a titled
+`shiri_airplay_timing "<canonical decimal uint64 output ID>"` section with
+`protocol = "ntp"` or `protocol = "ptp"`. Automatic mode omits that section
+and preserves OwnTone's native feature detection, name-based legacy settings
+and PTP service availability. Explicit selectors use only the parsed stable
+device ID, overriding a legacy name-based `ptp_disable` choice without changing
+the other legacy device options. Config load rejects noncanonical/overflowing
+IDs, missing or unknown protocols and duplicate titles. Explicit PTP refuses
+devices lacking the advertised capability or an available local PTP service.
+
+The selected native AirPlay 2 output timing is exposed as `airplay_timing` in
+OwnTone's output JSON; it is absent for other output types. This value records
+the backend's timing choice and does not establish receiver clock lock or
+rendered audio. Applying a different preference requires the ordinary
+configuration-controlled room restart. The source fixture executes the actual
+config validator, discovery callback, feature parsing, speaker-info copy and
+JSON serialization, and checks the existing SETUP dispatch. The Linux fixture
+also parses the actual schema with real libconfuse, including duplicate title
+rejection. Neither fixture opens a socket or audio device. Strict inversion of
+this layer retains every previous source and codec guard.
+
+### Stable output clock preferences (`outputclock1`)
+
+A controlled cold-start comparison on the test SYMFONISK speaker retained the
+whole spoken sentence with AirPlay 2 NTP timing, while its automatic PTP path
+lost the opening. The PTP capture scheduled speech before the receiver's first
+clock exchange. This does not establish a general Sonos rule, receiver clock
+lock or acoustic synchronization across speakers.
+
+`owntone-29.3-output-clock.patch` adds the private titled section
+`shiri_airplay_timing "canonical-decimal-output-id" { protocol = "ntp" }`.
+`ptp` is also supported; Automatic emits no override. Parsing rejects malformed,
+overflowing or duplicate identities and missing/invalid protocol values. The
+AirPlay 2 backend looks up the stable ID rather than the speaker's mutable or
+nonunique advertised name. Explicit PTP requires advertised support and the
+native timing service; it refuses unsupported discovery rather than silently
+selecting another mode. Separate RAOP discovery retains its existing policy.
+
+The effective `airplay_timing` field is returned only for an AirPlay 2 output
+and follows the same backend selection used by session SETUP. It reports the
+chosen clock protocol, not servo lock or audible readiness. The Shiri adapter
+requires matching readback before and after selecting an explicit mode.
+Clock edits follow normal room retirement/restart; a newer requested or applied
+snapshot cannot hide a backend still configured with the previous mode.
+
+Schema v4 retains preferences by physical speaker identity through removal and
+room reassignment. Old databases migrate with `auto` and unchanged existing
+intent. Default `auto` is omitted from old calibration fingerprints; an explicit
+clock change invalidates measurements for that configuration.
+
+The patch is additive after the frozen `coldmusic1` layer. Its checker inverts
+only this layer before applying all historical source guards. Sanitized fixtures
+execute actual configuration validation, mDNS feature/discovery selection,
+speaker-info and JSON serialization, and NTP/PTP SETUP dispatch. The Linux
+qualification also uses real libconfuse parsing and the existing actual ALAC
+encoding/independent decoding fixture. None of those checks opens a speaker or
+an audio device; physical prefix acceptance is reported separately.

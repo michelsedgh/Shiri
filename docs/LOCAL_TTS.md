@@ -1,11 +1,13 @@
 # Local streaming speech
 
-**October 3 startup qualification:** the installed house instance has a reported
-idle-speech failure that loses the opening words. Silent captures preserve the
-complete generated phrase through AirPlay encoding. The candidate repairs
-initial metadata and natural-EOF handling; physical prefix acceptance is still
-pending. See [the diagnosis and evidence boundaries](SPEECH_STARTUP_DIAGNOSIS.md)
-and [the installed-versus-staged handoff](LIVE_TEST_HANDOFF.md).
+**October 3 startup qualification:** initial metadata, natural-EOF drain and
+cold-music input repairs are installed. Cold idle speech still loses its opening
+words with the Sonos output's automatic PTP timing. A controlled, temporary NTP
+comparison preserved the entire phrase according to the user's listening test;
+normal PTP configuration was restored afterward. The `outputclock1` build and
+saved per-speaker timing controls are pending installation. See
+[the diagnosis and evidence boundaries](SPEECH_STARTUP_DIAGNOSIS.md) and
+[the installed-versus-staged handoff](LIVE_TEST_HANDOFF.md).
 
 Shiri can generate speech locally from text and route it to one exact room. The
 room's music continues while the mixer fades its gain down for speech and back
@@ -40,6 +42,16 @@ once both audio and the room backend are ready. First generated audio therefore
 does not establish when a speaker makes sound. Output protocol buffering, a
 sleeping speaker, the generated waveform's leading quiet and network conditions
 can all contribute to the time a person hears speech.
+
+The October 3 cold NTP comparison verified incremental delivery: first room PCM
+dispatch occurred at 1,036 ms, and 179 ms of speech had already been delivered
+by 1,217 ms while synthesis took 2,715 ms. The complete 4.64-second phrase was
+delivered with no reported speech drops. This establishes streaming before
+generation finishes, together with one successful human prefix observation; it
+does not measure acoustic onset or multi-speaker alignment. The corresponding
+cold PTP capture showed the first receiver timing probe at 2,991 ms, later than
+the sender's intended first speech presentation. Receiver clock lock remains
+unmeasured.
 
 ## Models and controls
 

@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import Field, field_validator
 
 from shiri.auth import Auth, COOKIE, SESSION_SECONDS
-from shiri.domain import Conflict, DomainError, NotFound, Room, RoomCreate, RoomPatch, StrictModel
+from shiri.domain import AirplayTiming, Conflict, DomainError, NotFound, Room, RoomCreate, RoomPatch, StrictModel
 from shiri.rpc import RpcError
 from shiri.runtime_port import SimulatedRuntime, SocketRuntime
 from shiri.service import RoomService
@@ -45,6 +45,11 @@ class OffsetRequest(StrictModel):
 class BalanceRequest(StrictModel):
     expected_revision: int = Field(ge=1)
     balance_percent: int = Field(ge=0, le=100)
+
+
+class AirplayTimingRequest(StrictModel):
+    expected_revision: int = Field(ge=1)
+    airplay_timing: AirplayTiming
 
 
 class LocalDeviceBinding(StrictModel):
@@ -306,8 +311,7 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
 
     @app.get("/api/v1/rooms/{room_id}/speakers")
     async def speakers(room_id: str):
-        await service._store("get_room", room_id)
-        return await runtime.call("outputs", {"room_id": room_id})
+        return {"room_id": room_id, "outputs": await service.discover(room_id)}
 
     @app.put("/api/v1/rooms/{room_id}/speakers")
     async def assign_speakers(room_id: str, body: AssignmentRequest):
@@ -320,6 +324,10 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     @app.patch("/api/v1/rooms/{room_id}/speakers/{speaker_id}/balance")
     async def speaker_balance(room_id: str, speaker_id: str, body: BalanceRequest):
         return await service.balance(room_id, speaker_id, body.balance_percent, body.expected_revision)
+
+    @app.patch("/api/v1/rooms/{room_id}/speakers/{speaker_id}/airplay-timing")
+    async def speaker_airplay_timing(room_id: str, speaker_id: str, body: AirplayTimingRequest):
+        return await service.airplay_timing(room_id, speaker_id, body.airplay_timing, body.expected_revision)
 
     @app.post("/api/v1/rooms/{room_id}/calibration", status_code=201)
     async def calibration_create(room_id: str, body: CalibrationCreate):

@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 from pydantic import ValidationError
 from shiri.domain import Conflict, RoomCreate, RoomPatch, SpeakerRef, ValidationIssue
-from shiri.store import Store, _SCHEMA_V2
+from shiri.store import SCHEMA_VERSION, Store, _SCHEMA_V2
 from shiri.calibration import fingerprint
 
 def speaker(**changes):
@@ -54,6 +54,7 @@ def test_actual_old_database_migrates_without_changing_master_revision_or_profil
         room = store.assign_speakers(room.id, [speaker(offset_ms=23)], room.revision)
         room = store.update_room(room.id, RoomPatch(volume=27), room.revision)
         events = store.list_events()
+        store._connection.execute("DROP TABLE speaker_airplay_timing")
         store._connection.execute("DROP TABLE speaker_balances")
         if version == 1:
             store._connection.execute("DROP TABLE calibration_sessions")
@@ -61,7 +62,7 @@ def test_actual_old_database_migrates_without_changing_master_revision_or_profil
     with Store(path) as store:
         assert store.get_room(room.id) == room
         assert store.list_events() == events
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         room = store.update_speaker_balance(room.id, "101", 65, room.revision)
         assert room.volume == 27 and room.speakers[0].offset_ms == 23
 
@@ -85,6 +86,7 @@ def test_default_balance_preserves_old_calibration_configuration_and_trim_change
     room = Room(id="d794c12e-9f9f-40f8-b41d-79ad9c3f3e4a", slot=0, name="Kitchen", airplay_name="Kitchen", interface="eth0", speakers=[speaker()])
     old = room.model_dump(mode="json", exclude={"revision", "enabled", "volume"})
     old["speakers"][0].pop("balance_percent")
+    old["speakers"][0].pop("airplay_timing")
     assert fingerprint(room) == old
     changed = room.model_copy(update={"speakers": [speaker(balance_percent=65)]})
     assert fingerprint(changed)["speakers"][0]["balance_percent"] == 65

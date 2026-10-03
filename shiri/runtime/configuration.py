@@ -275,6 +275,12 @@ def backend_configs(
     )
     owntone = directory / "config" / "owntone.conf"
     exclusions = "\n".join(f"airplay {quote(name)} {{ exclude = true }}" for name in all_receiver_names)
+    # A device's mDNS name can change or duplicate another device's name.
+    # Clock preferences follow the same stable OwnTone identity as assignment.
+    output_clocks = "\n".join(
+        f"shiri_airplay_timing {quote(speaker.id)} {{ protocol = {quote(speaker.airplay_timing)} }}"
+        for speaker in room.speakers if speaker.airplay_timing != "auto"
+    )
     local_device = (
         f"hw:Loopback,1,{room.slot}"
         if room.local_audio_device and room.local_audio_device.lower().startswith("bluealsa")
@@ -336,6 +342,7 @@ mpd {{
 }}
 streaming {{ sample_rate = 48000 bit_rate = 192 }}
 {exclusions}
+{output_clocks}
 """,
     )
     return shairport, owntone

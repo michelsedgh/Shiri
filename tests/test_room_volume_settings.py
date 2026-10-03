@@ -59,6 +59,7 @@ async def test_running_room_volume_or_balance_does_not_reselect_pause_or_restart
     previous = definition(volume=50)
     room = RuntimeRoom(previous, tmp_path / "room", current_volume=50)
     room.applied, room.status = previous, "running"
+    room.backend_definition, room.active_timing = previous, room.timing
     room.client = SimpleNamespace(volume_settings=AsyncMock())
     broker._sync_worker_intent = AsyncMock()
     broker._restore_outputs = AsyncMock(side_effect=AssertionError("No selection for gain mutations"))
@@ -106,6 +107,7 @@ async def test_lost_gain_ack_preserves_playing_route_and_retries_without_reselec
     previous = definition(volume=50)
     room = RuntimeRoom(previous, tmp_path / "room", current_volume=15)
     room.applied, room.status = previous, "running"
+    room.backend_definition, room.active_timing = previous, room.timing
     room.desired = previous.model_copy(update={"volume": 15, "revision": previous.revision + 1})
     client = SimpleNamespace(volume_settings=AsyncMock(side_effect=[RuntimeFailure("Lost gain ACK"), {"ok": True}]))
     room.client = client

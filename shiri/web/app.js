@@ -782,7 +782,7 @@ async function logout() {
   finally { elements.signOut.disabled = false; }
 }
 
-function draftDirty() { return !!view.roomDraft?.dirty || !!view.speakerDraft?.dirty || !!view.speakerDraft?.offsets.size || !!view.speakerDraft?.balances.size || !!view.calibrationDraft?.dirty; }
+function draftDirty() { return !!view.roomDraft?.dirty || !!view.speakerDraft?.dirty || !!view.speakerDraft?.offsets.size || !!view.speakerDraft?.balances.size || !!view.speakerDraft?.clocks.size || !!view.calibrationDraft?.dirty; }
 function confirmDiscard() { return !draftDirty() || window.confirm('Discard the unsaved room or speaker changes?'); }
 
 function closeSheet(kind, { force = false } = {}) {
@@ -795,7 +795,7 @@ function closeSheet(kind, { force = false } = {}) {
   }
   const draft = kind === 'room' ? view.roomDraft : kind === 'calibration' ? view.calibrationDraft : view.speakerDraft;
   if (!force && draft && store.busy.has(draft.id || 'create')) return false;
-  if (!force && (draft?.dirty || draft?.offsets?.size || draft?.balances?.size) && !window.confirm('Discard the unsaved changes?')) return false;
+  if (!force && (draft?.dirty || draft?.offsets?.size || draft?.balances?.size || draft?.clocks?.size) && !window.confirm('Discard the unsaved changes?')) return false;
   if (kind === 'room') { view.roomDraft = null; elements.roomDialog.close(); }
   else if (kind === 'calibration') { view.calibrationDraft = null; elements.calibrationDialog.close(); }
   else { view.speakerDraft = null; elements.speakerDialog.close(); }
@@ -1221,7 +1221,7 @@ function openSpeakers(id, { force = false } = {}) {
   const room = store.room(id);
   if (!room) return;
   closeSheet('room', { force: true });
-  view.speakerDraft = { id, revision: room.revision, selected: new Set(room.speakers.map((speaker) => speaker.id)), dirty: false, offsets: new Map(), balances: new Map() };
+  view.speakerDraft = { id, revision: room.revision, selected: new Set(room.speakers.map((speaker) => speaker.id)), dirty: false, offsets: new Map(), balances: new Map(), clocks: new Map() };
   elements.speakerDialogTitle.textContent = room.name;
   elements.reloadSpeakerDraft.hidden = true;
   notice(elements.speakerFormError, '');
@@ -1251,7 +1251,7 @@ function renderSpeakers() {
     if (!combined.some((output) => output.id === saved.id)) combined.push({ ...saved, available: false, selected: false, savedOnly: true });
   }
   // Rebuild discovery rows without replacing a number field someone is editing.
-  if (elements.speakerOptions.contains(document.activeElement) && document.activeElement?.type === 'number') return;
+  if (elements.speakerOptions.contains(document.activeElement) && (document.activeElement?.type === 'number' || document.activeElement?.tagName === 'SELECT')) return;
   if (!combined.length) {
     elements.speakerOptions.replaceChildren(node('p', 'hint', room.enabled ? 'No speakers found yet. Keep them awake and on the speaker network, then refresh discovery.' : 'No speakers saved yet.'));
   } else {
@@ -1312,6 +1312,26 @@ function renderSpeakerOption(room, draft, output, locked) {
     const reportedBalance = Number.isInteger(output.balance_percent) ? `${output.balance_percent}%` : 'Not reported';
     balancing.append(balanceLabel, balance, saveBalanceButton, node('p', 'hint', `Saved: ${saved.balance_percent ?? 100}% · Applied: ${reportedBalance}. Set this once to balance a louder speaker. 100% keeps its full level; lower values reduce music and speech. Use Room volume for normal listening.`));
     row.append(balancing);
+    if (saved.protocol === 'airplay2') {
+      const clockSettings = node('div', 'speaker-timing');
+      const clockLabel = node('label', '', 'AirPlay timing');
+      const clock = node('select');
+      clock.id = `clock-${room.id}-${output.id}`;
+      clockLabel.htmlFor = clock.id;
+      clock.setAttribute('aria-label', `AirPlay timing for ${output.name || output.id}`);
+      for (const [value, text] of [['auto', 'Automatic'], ['ntp', 'NTP compatibility'], ['ptp', 'PTP required']]) {
+        const option = node('option', '', text); option.value = value; clock.append(option);
+      }
+      clock.value = draft.clocks.get(output.id) ?? saved.airplay_timing ?? 'auto';
+      clock.disabled = locked;
+      const saveClock = button('Save timing mode', 'quiet', () => saveClockMode(room.id, output.id));
+      saveClock.disabled = locked || !draft.clocks.has(output.id);
+      clock.addEventListener('change', () => { draft.clocks.set(output.id, clock.value); saveClock.disabled = store.busy.has(room.id); });
+      clockSettings.append(clockLabel, clock, saveClock,
+        node('p', 'hint', `Saved: ${saved.airplay_timing ?? 'auto'} · Backend timing: ${['ntp', 'ptp'].includes(output.airplay_timing) ? output.airplay_timing.toUpperCase() : 'Not reported'}.`),
+        node('p', 'hint', 'Automatic uses the speaker’s supported clock. Try NTP compatibility if an idle speaker misses the opening audio. Changing this setting restarts this room. Recheck speaker alignment afterward.'));
+      row.append(clockSettings);
+    }
   }
   return row;
 }
@@ -1326,7 +1346,7 @@ async function saveSpeakers(event) {
     draft.dirty = false;
     draft.revision = result.data?.room?.revision ?? store.room(draft.id)?.revision ?? draft.revision;
     toast(result.data?.runtime_accepted === false ? 'Speaker assignments saved. Playback changes are pending; check room status.' : 'Speaker assignments saved');
-    if (!draft.offsets.size && !draft.balances.size) closeSheet('speakers', { force: true });
+    if (!draft.offsets.size && !draft.balances.size && !draft.clocks.size) closeSheet('speakers', { force: true });
     else renderSpeakers();
   } else if (!result.skipped && view.speakerDraft === draft) {
     notice(elements.speakerFormError, result.error.message);
@@ -1372,6 +1392,24 @@ async function saveBalance(roomId, speakerId) {
   }
 }
 
+async function saveClockMode(roomId, speakerId) {
+  const draft = view.speakerDraft;
+  if (!draft || draft.id !== roomId) return;
+  const mode = draft.clocks.get(speakerId);
+  if (!['auto', 'ptp', 'ntp'].includes(mode)) return;
+  const result = await store.change(roomId, () => client.request(`/rooms/${encodeURIComponent(roomId)}/speakers/${encodeURIComponent(speakerId)}/airplay-timing`, { method: 'PATCH', body: { expected_revision: draft.revision, airplay_timing: mode } }));
+  if (result.ok) {
+    draft.clocks.delete(speakerId);
+    draft.revision = result.data?.room?.revision ?? store.room(roomId)?.revision ?? draft.revision;
+    notice(elements.speakerFormError, '');
+    toast(result.data?.runtime_accepted === false ? 'AirPlay timing saved. Application is pending; check room status.' : 'AirPlay timing saved. Check room status while it applies.');
+    renderSpeakers();
+  } else if (!result.skipped && view.speakerDraft === draft) {
+    notice(elements.speakerFormError, result.error.message);
+    elements.reloadSpeakerDraft.hidden = !result.conflict;
+  }
+}
+
 function renderSheetBusy() {
   for (const [draft, form, key] of [[view.roomDraft, elements.roomForm, view.roomDraft?.id || 'create'], [view.speakerDraft, elements.speakerForm, view.speakerDraft?.id]]) {
     if (!draft) continue;
@@ -1409,6 +1447,7 @@ function calibrationConfiguration(configuration) {
     // The default balance preserves stored calibration profiles from before
     // balance settings existed. A changed balance still invalidates evidence.
     if (value.balance_percent === 100) delete value.balance_percent;
+    if (value.airplay_timing === 'auto') delete value.airplay_timing;
     return value;
   });
   return { ...configuration, speakers };

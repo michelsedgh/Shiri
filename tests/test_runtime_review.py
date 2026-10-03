@@ -220,7 +220,7 @@ async def test_converted_playback_endpoint_keeps_the_same_exclusive_live_lease(t
 @pytest.fixture
 def preflight_environment(tmp_path, monkeypatch):
     service = broker(tmp_path)
-    environment = {"version": "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1", "shairport": "Shairport Sync 5.5.2-shiri-timed3-startup1-volume2 AirPlay2 smi10", "identities": True, "cgroup": True, "hook": True, "plugins": True}
+    environment = {"version": "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1", "shairport": "Shairport Sync 5.5.2-shiri-timed3-startup1-volume2 AirPlay2 smi10", "identities": True, "cgroup": True, "hook": True, "plugins": True}
     monkeypatch.setattr("shiri.runtime.broker.sys.platform", "linux")
     monkeypatch.setattr("shiri.runtime.broker.os.geteuid", lambda: 0)
     monkeypatch.setattr("shiri.runtime.broker.shutil.which", lambda name: name)
@@ -340,6 +340,16 @@ async def test_speech_startup_requires_exact_drain_and_metadata_contract_before_
     with pytest.raises(RuntimeFailure, match="natural speech drain and acknowledged startup metadata.*rebuild pinned backends"):
         await service.preflight()
     assert service.versions["owntone"] == environment["version"]
+    assert not any(call.args[0][1] == "-c" for call in service.runner.run.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["", "-coldmusic0", "-coldmusic10", "-coldmusic1-other"])
+async def test_timed_music_backend_without_exact_empty_input_recovery_is_rejected(preflight_environment, suffix):
+    service, environment = preflight_environment
+    environment["version"] = environment["version"].removesuffix("-coldmusic1-outputclock1") + suffix
+    with pytest.raises(RuntimeFailure, match="timed music input without legacy refill.*rebuild pinned backends"):
+        await service.preflight()
     assert not any(call.args[0][1] == "-c" for call in service.runner.run.call_args_list)
 
 
@@ -734,3 +744,13 @@ async def test_continuously_trickling_backend_response_has_a_total_deadline():
         assert stream.closed, "Timed-out HTTP exchanges must release their connection/stream"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["", "-outputclock0", "-outputclock10", "-outputclock1-other"])
+async def test_missing_exact_output_clock_backend_is_rejected_before_launch(preflight_environment, suffix):
+    service, environment = preflight_environment
+    environment["version"] = environment["version"].removesuffix("-outputclock1") + suffix
+    with pytest.raises(RuntimeFailure, match="stable identity speaker clock selection.*rebuild pinned backends"):
+        await service.preflight()
+    assert not any(call.args[0][1] == "-c" for call in service.runner.run.call_args_list)

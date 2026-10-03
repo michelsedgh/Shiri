@@ -17,6 +17,7 @@ MAX_ROOMS = 8
 MAX_AIRPLAY_NAME_BYTES = 50
 MAX_OUTPUT_ID = (1 << 64) - 1
 Protocol = Literal["airplay1", "airplay2", "chromecast", "alsa", "pulseaudio"]
+AirplayTiming = Literal["auto", "ptp", "ntp"]
 
 
 class DomainError(Exception):
@@ -152,6 +153,7 @@ class SpeakerRef(StrictModel):
     protocol: Protocol
     offset_ms: int = Field(default=0, ge=-2000, le=2000)
     balance_percent: int = Field(default=100, ge=0, le=100)
+    airplay_timing: AirplayTiming = "auto"
 
     @field_validator("id")
     @classmethod
@@ -164,6 +166,12 @@ class SpeakerRef(StrictModel):
     @classmethod
     def validate_name(cls, value: str) -> str:
         return _name(value)
+
+    @model_validator(mode="after")
+    def validate_airplay_timing(self):
+        if self.airplay_timing != "auto" and self.protocol != "airplay2":
+            raise ValueError("Choose an AirPlay timing mode only for an AirPlay 2 speaker")
+        return self
 
 
 class RoomCreate(StrictModel):

@@ -1,5 +1,9 @@
 # Speech startup repair checkpoint — October 3, 2026
 
+This records the earlier **uninstalled** checkpoint at `2aa45cd`. Its live-state
+statements describe that point in time. The later installed music/speech repair
+is recorded in [the cold playback rollout](CHECKPOINT_COLD_PLAYBACK_2026-10-03.md).
+
 This candidate addresses the report that an idle Living Room announcement lost
 the beginning of `Hello. This is Shiri speaking in your room.` The investigation
 kept the running house system unchanged and used saved logs, private sockets,
@@ -107,7 +111,7 @@ side effect before their corrections.
 
 ## Running system and later acceptance
 
-The live VM remains on the previous `idle1` backend, binary SHA-256
+At this checkpoint the live VM remained on the previous `idle1` backend, binary SHA-256
 `0be833a0780a55b5a4ea53fea2aaf4ed2a9bbfa9c885ebf1708d20a12e4cef47`,
 and the previous wheel SHA-256
 `064fd36922f49f5ae735013206ea0b88856ab13a8edbcde1de2b3522bf29f3f9`.

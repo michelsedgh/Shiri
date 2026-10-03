@@ -47,7 +47,7 @@ from .unix_directory import PinnedUnixDirectory
 from .system import OwnedProcess, Runner, RuntimeFailure, atomic_json, read_json, root_directory
 
 log = logging.getLogger(__name__)
-REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1"
+REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1"
 _OWNTONE_VERSION_PATTERN = re.compile(r"(?<![\w.-])" + re.escape(REQUIRED_OWNTONE_VERSION) + r"(?![\w.-])")
 # The pinned receiver appends these feature tokens after its backend marker.
 # Its sysconfdir path is removed before matching, so path text cannot qualify.
@@ -110,7 +110,10 @@ class RuntimeRoom:
     def snapshot(self):
         offsets = {speaker.id: speaker.offset_ms for speaker in self.desired.speakers}
         balances = {speaker.id: speaker.balance_percent for speaker in self.desired.speakers}
-        outputs = [dict(output, requested_offset_ms=offsets.get(output["id"]), requested_balance_percent=balances.get(output["id"])) for output in self.outputs]
+        clocks = {speaker.id: speaker.airplay_timing for speaker in self.desired.speakers}
+        outputs = [dict(output, requested_offset_ms=offsets.get(output["id"]),
+                        requested_balance_percent=balances.get(output["id"]),
+                        requested_airplay_timing=clocks.get(output["id"])) for output in self.outputs]
         return {
             "room_id": self.desired.id,
             "status": self.status,
@@ -221,7 +224,7 @@ class Broker:
         self.versions["owntone"] = (result.stdout or result.stderr).strip()
         if not _OWNTONE_VERSION_PATTERN.search(self.versions["owntone"]):
             raise RuntimeFailure(
-                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement, saved speaker balance, bounded exact source admission, paused-source speech output and framed metadata event acknowledgement and idle speech output without input refill, natural speech drain and acknowledged startup metadata; "
+                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement, saved speaker balance, bounded exact source admission, paused-source speech output and framed metadata event acknowledgement and idle speech output without input refill, natural speech drain and acknowledged startup metadata and timed music input without legacy refill and stable identity speaker clock selection; "
                 "rebuild pinned backends using install/build_backends.sh"
             )
         if not DHCP_HOOK.is_file() or not os.access(DHCP_HOOK, os.X_OK):
@@ -670,7 +673,13 @@ class Broker:
 
     def _material(self, definition: Room):
         return (definition.interface, definition.slot, definition.airplay_name,
-                definition.local_audio_device, room_buffer_ms(definition))
+                definition.local_audio_device, room_buffer_ms(definition),
+                self._output_clocks(definition))
+
+    @staticmethod
+    def _output_clocks(definition: Room):
+        return tuple(sorted((speaker.id, speaker.airplay_timing) for speaker in definition.speakers
+                            if speaker.airplay_timing != "auto"))
 
     @staticmethod
     def _output_assignment(definition: Room):
@@ -745,9 +754,8 @@ class Broker:
                     room.status, room.error = "error", self.error
                     continue
                 applying = room.desired
-                material_changed = room.applied and self._material(room.applied) != self._material(
-                    applying
-                )
+                backend_definition = room.backend_definition or room.applied
+                material_changed = backend_definition and self._material(backend_definition) != self._material(applying)
                 if room.client and (material_changed or room.restart_required):
                     await self._stop_room(room)
                 if not room.client:
@@ -760,6 +768,7 @@ class Broker:
                         # Reconcile advances desired intent outside this lock.
                         # Every backend ACK below belongs to this exact snapshot.
                         applying, master = room.desired, room.current_volume
+                        self._check_start(room, room.backend_definition or applying)
                         gain_only = bool(room.applied is not None and (room.status == "running" or room.gain_pending)
                                          and self._output_assignment(room.applied) == self._output_assignment(applying))
                         await self._sync_worker_intent(room)
@@ -1280,6 +1289,8 @@ class Broker:
         volume = room.current_volume if volume is None else volume
         speakers = list(definition.speakers)
         backend_definition = room.backend_definition or definition
+        if self._output_clocks(definition) != self._output_clocks(backend_definition):
+            raise Superseded()
         room.outputs = await room.client.outputs(self._receiver_names())
         try:
             keys = await self._reserve_speakers(
@@ -1376,6 +1387,9 @@ class Broker:
                 raise RpcError("room_not_running", "The room changed while applying speakers")
             self._client(room)
             proposed = room.desired.model_copy(update={"speakers": speakers})
+            if self._output_clocks(proposed) != self._output_clocks(room.backend_definition or room.desired):
+                raise RpcError("configuration_requires_reconcile",
+                               "Save this speaker configuration so the room can restart with its selected clock settings")
             proposed_plan = latency_plan([proposed if other is room else other.desired
                                           for other in self.rooms.values() if not other.removing])
             if (room_buffer_ms(proposed), proposed_plan.common_horizon_ms) != room.timing:

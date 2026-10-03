@@ -249,10 +249,12 @@ def summary(recordings: list[dict], previous_offset: int, *, verification=False)
 
 def fingerprint(room):
     result = room.model_dump(mode="json", exclude={"revision", "enabled", "volume"})
-    # Default balance preserves existing calibration evidence across migration.
+    # Default settings preserve existing calibration evidence across migration.
     for speaker in result["speakers"]:
         if speaker["balance_percent"] == 100:
             speaker.pop("balance_percent")
+        if speaker["airplay_timing"] == "auto":
+            speaker.pop("airplay_timing")
     return result
 
 

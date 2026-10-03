@@ -1,0 +1,132 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -1360,6 +1360,23 @@
+           buf = pb_session.buffer;
+           len = pb_session.bufsize;
+           goto native_read;
++        }
++      if (pb_timer_native && *nbytes == 0 && flag == 0 &&
++          pb_session.reading_now && pb_session.reading_now->data_kind == DATA_KIND_PIPE &&
++          pb_session.quality.channels != 0)
++        {
++          uint64_t operation;
++          if (input_pipe_shiri_state(&operation) == 1 &&
++              operation == pb_timer_native_operation)
++            {
++              /* An empty live framed input is not a file underrun. Waiting
++               * for the capacity-based refill callback stops this clock and
++               * ages queued original timestamps until they are unusable.
++               * Keep the already-admitted source, outputs and native timer;
++               * every subsequent marker still supplies its original P.
++               * The initial/FLUSH anchor gate remains unchanged. */
++              pb_session.read_deficit = 0;
++            }
+         }
+       return 0;
+     }
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -220,6 +220,11 @@
+   struct rtp_session *rtp_session;
+ 
+   struct rtcp_timestamp cur_stamp;
++
++  // Original raw block clock, independent of resampler/packetizer rounding.
++  struct timespec shiri_input_end;
++  bool shiri_input_end_valid;
++  bool shiri_sync_pending;
+ 
+   uint8_t *rawbuf;
+   size_t rawbuf_size;
+@@ -2164,8 +2169,47 @@
+   ams->cur_stamp.pos = ams->rtp_session->pos + ams->input_buffer_samples - ams->output_buffer_samples;
+ }
+ 
++/* A sample-based sync cadence does not advance during an empty input. A
++ * framed source's new original timestamp after that gap needs a fresh mapping
++ * before its first payload, even if fewer than one second of samples arrived.
++ * Raw sample spacing avoids resampler startup and converted-count rounding. */
+ static void
+-packets_sync_send(struct airplay_master_session *ams)
++airplay_shiri_input_timestamp(struct airplay_master_session *ams, struct output_buffer *obuf)
++{
++  struct output_data *raw = &obuf->data[0];
++  struct timespec duration, tolerance;
++  uint64_t sample_ns;
++  int direction;
++  if (!cfg_getbool(cfg_getsec(cfg, "library"), "pipe_framed") ||
++      obuf->conversion_error || raw->samples <= 0 || raw->quality.sample_rate <= 0)
++    return;
++  /* Changes below one source sample cannot change the represented sample
++   * position. This also absorbs integer floors and mapped-clock noise. */
++  sample_ns = (UINT64_C(1000000000) + raw->quality.sample_rate - 1) /
++    raw->quality.sample_rate;
++  tolerance.tv_sec = sample_ns / UINT64_C(1000000000);
++  tolerance.tv_nsec = sample_ns % UINT64_C(1000000000);
++  if (ams->shiri_input_end_valid &&
++      (timespec_cmp(obuf->pts, timespec_add(ams->shiri_input_end, tolerance)) > 0 ||
++       timespec_cmp(ams->shiri_input_end, timespec_add(obuf->pts, tolerance)) > 0))
++    {
++      direction = timespec_cmp(obuf->pts, ams->shiri_input_end);
++      ams->shiri_sync_pending = true;
++      DPRINTF(E_DBG, L_AIRPLAY,
++              "Framed AirPlay timestamp discontinuity: direction=%s end=%jd.%09ld next=%jd.%09ld\n",
++              direction > 0 ? "forward" : "backward",
++              (intmax_t)ams->shiri_input_end.tv_sec, ams->shiri_input_end.tv_nsec,
++              (intmax_t)obuf->pts.tv_sec, obuf->pts.tv_nsec);
++    }
++  duration.tv_sec = raw->samples / raw->quality.sample_rate;
++  duration.tv_nsec = UINT64_C(1000000000) * (raw->samples % raw->quality.sample_rate) /
++    raw->quality.sample_rate;
++  ams->shiri_input_end = timespec_add(obuf->pts, duration);
++  ams->shiri_input_end_valid = true;
++}
++
++static void
++packets_sync_send(struct airplay_master_session *ams, bool force_sync)
+ {
+   struct rtp_packet *sync_pkt;
+   struct rtcp_timestamp cur_stamp;
+@@ -2174,7 +2218,9 @@
+   bool is_sync_time;
+ 
+   // Check if it is time send a sync packet to sessions that are already running
+-  is_sync_time = rtp_sync_is_time(ams->rtp_session);
++  if (force_sync)
++    ams->rtp_session->sync_counter = 0;
++  is_sync_time = force_sync || rtp_sync_is_time(ams->rtp_session);
+ 
+   // Just used for logging, the clock shouldn't be too far from ams->cur_stamp.ts
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+@@ -4321,6 +4367,7 @@
+ 
+   for (ams = airplay_master_sessions; ams; ams = ams->next)
+     {
++      airplay_shiri_input_timestamp(ams, obuf);
+       for (i = 0; obuf->data[i].buffer; i++)
+ 	{
+ 	  if (!quality_is_equal(&obuf->data[i].quality, &ams->rtp_session->quality))
+@@ -4331,7 +4378,8 @@
+ 	  timestamp_set(ams, obuf->pts);
+ 
+ 	  // Sends sync packets to new sessions, and if it is sync time then also to old sessions
+-	  packets_sync_send(ams);
++	  packets_sync_send(ams, ams->shiri_sync_pending);
++          ams->shiri_sync_pending = false;
+ 
+ 	  // TODO avoid this copy
+ 	  evbuffer_add(ams->input_buffer, obuf->data[i].buffer, obuf->data[i].bufsize);

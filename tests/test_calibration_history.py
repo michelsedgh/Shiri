@@ -78,11 +78,12 @@ def test_valid_v1_database_migrates_once_preserving_rooms_profiles_receipts_and_
         room, _, committed = original.apply_phone_volume(room.id, 27, room.revision, "native-volume-1")
         room = original.update_speaker_offset(room.id, "202", 17, room.revision)
         events = original.list_events()
+        original._connection.execute("DROP TABLE speaker_airplay_timing")
         original._connection.execute("DROP TABLE speaker_balances")
         original._connection.execute("DROP TABLE calibration_sessions")
         original._connection.execute("PRAGMA user_version=1")
     with Store(path) as migrated:
-        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+        assert migrated._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.get_room(room.id) == room
         assert migrated.list_events() == events
         assert migrated.list_calibrations(room.id) == []
@@ -98,6 +99,7 @@ def test_v2_calibration_history_migrates_with_exact_evidence_preserved(tmp_path)
         room = outputs(store)
         record = candidate(store, room)
         assert all("balance_percent" not in speaker for speaker in record["configuration"]["speakers"])
+        store._connection.execute("DROP TABLE speaker_airplay_timing")
         store._connection.execute("DROP TABLE speaker_balances")
         store._connection.execute("PRAGMA user_version=2")
     with Store(path) as store:
@@ -110,6 +112,7 @@ def test_invalid_v1_intent_is_preserved_before_migration(tmp_path):
     path = tmp_path / "state.sqlite3"
     with Store(path) as store:
         outputs(store)
+        store._connection.execute("DROP TABLE speaker_airplay_timing")
         store._connection.execute("DROP TABLE calibration_sessions")
         store._connection.execute("DROP TABLE speaker_balances")
         store._connection.execute("PRAGMA user_version=1")

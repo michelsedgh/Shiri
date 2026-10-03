@@ -4,7 +4,7 @@ import hashlib
 import time
 import re
 
-from shiri.domain import Conflict, NotFound, Room, RoomCreate, RoomPatch, SpeakerRef, ValidationIssue, speaker_key, validate_local_audio_device
+from shiri.domain import AirplayTiming, Conflict, NotFound, Room, RoomCreate, RoomPatch, SpeakerRef, ValidationIssue, speaker_key, validate_local_audio_device
 from shiri.rpc import RpcError
 from pydantic import ValidationError
 from shiri.calibration import CalibrationSession, CalibrationSessions, analyze_wav, available, fingerprint, probe_wav
@@ -110,6 +110,8 @@ class RoomService:
                 return {"runtime_accepted": False, "pending_reason": str(exc)}
 
     async def discover(self, room_id):
+        room = await self._store("get_room", room_id)
+        requested_timing = {speaker.id: speaker.airplay_timing for speaker in room.speakers if speaker.protocol == "airplay2"}
         result = await self.runtime.call("outputs", {"room_id": room_id})
         raw = result.get("outputs")
         if not isinstance(raw, list) or len(raw) > 1024:
@@ -119,6 +121,7 @@ class RoomService:
             if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not isinstance(entry.get("name"), str):
                 raise RpcError("invalid_response", "Runtime returned an invalid speaker identity")
             output = dict(entry)
+            output["requested_airplay_timing"] = requested_timing.get(output["id"]) if output.get("protocol") == "airplay2" else None
             output["assignable"] = bool(output.get("assignable", True) and output.get("available", True))
             if output.get("protocol") not in {"airplay1", "airplay2", "chromecast", "alsa", "pulseaudio"}:
                 output["assignable"] = False
@@ -285,6 +288,13 @@ class RoomService:
         async with self._mutation:
             await self.sync_phone_volume()
             room = await self._store("update_speaker_balance", room_id, speaker_id, balance_percent, revision)
+            self.invalidate()
+            return {"room": room.model_dump(mode="json"), **await self.reconcile()}
+
+    async def airplay_timing(self, room_id: str, speaker_id: str, airplay_timing: AirplayTiming, revision: int):
+        async with self._mutation:
+            await self.sync_phone_volume()
+            room = await self._store("update_speaker_airplay_timing", room_id, speaker_id, airplay_timing, revision)
             self.invalidate()
             return {"room": room.model_dump(mode="json"), **await self.reconcile()}
 

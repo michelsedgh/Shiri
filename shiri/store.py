@@ -23,11 +23,11 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from .domain import (
-    MAX_ROOMS, Conflict, Event, NotFound, Room, RoomCreate, RoomPatch, SpeakerRef,
+    MAX_ROOMS, AirplayTiming, Conflict, Event, NotFound, Room, RoomCreate, RoomPatch, SpeakerRef,
     ValidationIssue, local_audio_device_key, speaker_key, validate_local_audio_device,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_EVENTS = 10_000
 MAX_PHONE_RECEIPTS = 10_000
 _SCHEMA_V2 = (
@@ -90,11 +90,20 @@ _SCHEMA_V2 = (
     )""",
 )
 
-_SCHEMA = (*_SCHEMA_V2,
+_SCHEMA_V3 = (*_SCHEMA_V2,
     """CREATE TABLE speaker_balances (
         identity_family TEXT NOT NULL,
         identity_key TEXT NOT NULL,
         balance_percent INTEGER NOT NULL CHECK (balance_percent >= 0 AND balance_percent <= 100),
+        PRIMARY KEY (identity_family, identity_key)
+    )""",
+)
+
+_SCHEMA = (*_SCHEMA_V3,
+    """CREATE TABLE speaker_airplay_timing (
+        identity_family TEXT NOT NULL CHECK (identity_family = 'owntone'),
+        identity_key TEXT NOT NULL,
+        airplay_timing TEXT NOT NULL CHECK (airplay_timing IN ('auto', 'ptp', 'ntp')),
         PRIMARY KEY (identity_family, identity_key)
     )""",
 )
@@ -166,12 +175,12 @@ def _schema_signature(connection: sqlite3.Connection, table: str) -> tuple:
     return columns, frozenset(unique), foreign_keys, _checks(sql[0]) if sql else frozenset(), "autoincrement" in tokens, conflict_policies
 
 
-@lru_cache(maxsize=3)
+@lru_cache(maxsize=4)
 def _managed_signatures(version=SCHEMA_VERSION) -> dict[str, tuple]:
     # Use SQLite's interpretation of the managed schema, not brittle DDL text.
     connection = sqlite3.connect(":memory:")
     try:
-        schema = _SCHEMA if version == SCHEMA_VERSION else _SCHEMA_V2 if version == 2 else _SCHEMA_V2[:-1]
+        schema = {1: _SCHEMA_V2[:-1], 2: _SCHEMA_V2, 3: _SCHEMA_V3, 4: _SCHEMA}[version]
         for statement in schema:
             connection.execute(statement)
         return {statement.split()[2]: _schema_signature(connection, statement.split()[2]) for statement in schema}
@@ -224,7 +233,7 @@ class Store:
         try:
             connection.execute("BEGIN")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
                 raise ValidationIssue(f"Unsupported Shiri database schema version {version}; database preserved")
             if version == 0:
                 existing = connection.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view','trigger') AND name NOT GLOB 'sqlite_*'").fetchall()
@@ -239,7 +248,7 @@ class Store:
     def _initialize(self) -> None:
         with self._transaction() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
                 raise ValidationIssue(f"Unsupported Shiri database schema version {version}; database preserved")
             if version == 0:
                 existing = connection.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view','trigger') AND name NOT GLOB 'sqlite_*'").fetchall()
@@ -248,12 +257,14 @@ class Store:
                 for statement in _SCHEMA:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            elif version in {1, 2}:
+            elif version in {1, 2, 3}:
                 # Audit the previous managed schema and all saved intent before
                 # adding anything. Failed validation never repairs an old DB.
                 self._validate_database(connection, version)
                 if version == 1:
                     connection.execute(_SCHEMA_V2[-1])
+                if version < 3:
+                    connection.execute(_SCHEMA_V3[-1])
                 connection.execute(_SCHEMA[-1])
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._validate_database(connection)
@@ -347,6 +358,18 @@ class Store:
                         or connection.execute("SELECT 1 FROM speaker_profiles WHERE identity_family=? AND identity_key=?",
                                               (balance["identity_family"], balance["identity_key"])).fetchone() is None):
                     raise ValidationIssue("Stored speaker balance is invalid; database preserved")
+        if connection.execute("PRAGMA user_version").fetchone()[0] >= 4:
+            for timing in connection.execute("SELECT * FROM speaker_airplay_timing"):
+                try:
+                    if timing["identity_family"] != "owntone":
+                        raise ValueError("AirPlay timing requires a network speaker")
+                    SpeakerRef(id=timing["identity_key"], name="Stored timing profile", protocol="airplay2",
+                               airplay_timing=timing["airplay_timing"])
+                    if connection.execute("SELECT 1 FROM speaker_profiles WHERE identity_family=? AND identity_key=?",
+                                          (timing["identity_family"], timing["identity_key"])).fetchone() is None:
+                        raise ValueError("AirPlay timing has no retained speaker profile")
+                except (ValueError, ValidationError) as exc:
+                    raise ValidationIssue("Stored AirPlay timing is invalid; database preserved") from exc
         if (connection.execute("SELECT 1 FROM phone_volume_receipts LIMIT 1 OFFSET ?", (MAX_PHONE_RECEIPTS,)).fetchone()
                 or connection.execute("SELECT 1 FROM events LIMIT 1 OFFSET ?", (MAX_EVENTS,)).fetchone()):
             raise ValidationIssue("Stored event history exceeds its bounded capacity; database preserved")
@@ -414,7 +437,8 @@ class Store:
             ) from exc
         try:
             speakers = [SpeakerRef(id=output["output_id"], name=output["name"], protocol=output["protocol"], offset_ms=output["offset_ms"],
-                                   balance_percent=Store._speaker_balance(connection, (output["identity_family"], output["identity_key"])))
+                                   balance_percent=Store._speaker_balance(connection, (output["identity_family"], output["identity_key"])),
+                                   airplay_timing=Store._speaker_airplay_timing(connection, (output["identity_family"], output["identity_key"]), output["protocol"]))
                         for output in connection.execute("SELECT * FROM room_speakers WHERE room_id=? ORDER BY position", (room_id,)).fetchall()]
             return Room(
                 id=row["id"], slot=row["slot"], name=row["name"], airplay_name=row["airplay_name"],
@@ -439,6 +463,13 @@ class Store:
             return 100
         row = connection.execute("SELECT balance_percent FROM speaker_balances WHERE identity_family=? AND identity_key=?", identity).fetchone()
         return row[0] if row else 100
+
+    @staticmethod
+    def _speaker_airplay_timing(connection: sqlite3.Connection, identity: tuple[str, str], protocol: str) -> AirplayTiming:
+        if protocol != "airplay2" or connection.execute("PRAGMA user_version").fetchone()[0] < 4:
+            return "auto"
+        row = connection.execute("SELECT airplay_timing FROM speaker_airplay_timing WHERE identity_family=? AND identity_key=?", identity).fetchone()
+        return row[0] if row else "auto"
 
     def list_rooms(self) -> list[Room]:
         with self._transaction(write=False) as connection:
@@ -582,6 +613,8 @@ class Store:
                     speaker = SpeakerRef.model_validate({**speaker.model_dump(), "offset_ms": profile[0]})
                 if "balance_percent" not in explicit:
                     speaker = SpeakerRef.model_validate({**speaker.model_dump(), "balance_percent": self._speaker_balance(connection, key)})
+                if "airplay_timing" not in explicit:
+                    speaker = SpeakerRef.model_validate({**speaker.model_dump(), "airplay_timing": self._speaker_airplay_timing(connection, key, speaker.protocol)})
                 resolved.append(speaker)
             speakers = resolved
             try:
@@ -607,6 +640,31 @@ class Store:
                                (family, identity, speaker.offset_ms))
             connection.execute("INSERT INTO speaker_balances VALUES (?, ?, ?) ON CONFLICT(identity_family, identity_key) DO UPDATE SET balance_percent=excluded.balance_percent",
                                (family, identity, speaker.balance_percent))
+            if speaker.protocol == "airplay2":
+                connection.execute("INSERT INTO speaker_airplay_timing VALUES (?, ?, ?) ON CONFLICT(identity_family, identity_key) DO UPDATE SET airplay_timing=excluded.airplay_timing",
+                                   (family, identity, speaker.airplay_timing))
+
+    def update_speaker_airplay_timing(self, room_id: str, speaker_id: str, airplay_timing: AirplayTiming, expected_revision: int) -> Room:
+        if type(airplay_timing) is not str or airplay_timing not in {"auto", "ptp", "ntp"}:
+            raise ValidationIssue("AirPlay timing must be auto, ptp or ntp")
+        with self._transaction() as connection:
+            current = self._current(connection, room_id, expected_revision)
+            matches = [speaker for speaker in current.speakers if speaker.id == speaker_id]
+            if not matches:
+                raise NotFound("Speaker is not assigned to this room")
+            if len(matches) != 1:
+                raise Conflict("Speaker id is ambiguous across protocols; use a protocol-specific assignment")
+            if matches[0].protocol != "airplay2":
+                raise ValidationIssue("Choose an AirPlay timing mode only for an AirPlay 2 speaker")
+            if matches[0].airplay_timing == airplay_timing:
+                return current
+            speakers = [SpeakerRef.model_validate({**speaker.model_dump(), "airplay_timing": airplay_timing})
+                        if speaker.id == speaker_id else speaker for speaker in current.speakers]
+            room = Room.model_validate({**current.model_dump(), "speakers": speakers, "revision": current.revision + 1})
+            self._write_speakers(connection, room)
+            self._update_row(connection, room)
+            self._event(connection, "speaker.airplay_timing", f"Set {matches[0].name} AirPlay timing to {airplay_timing}", room.id)
+            return room
 
     def update_speaker_balance(self, room_id: str, speaker_id: str, balance_percent: int, expected_revision: int) -> Room:
         if type(balance_percent) is not int or not 0 <= balance_percent <= 100:

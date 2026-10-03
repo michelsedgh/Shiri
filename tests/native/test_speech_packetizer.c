@@ -40,12 +40,13 @@ enum {AIRPLAY_STATE_CONNECTED=1,AIRPLAY_STATE_STREAMING=2};
 #define AIRPLAY_RTP_PAYLOADTYPE 0x60
 #define RTP_MARKER_BIT 0x80
 struct rtcp_timestamp {uint32_t pos;struct timespec ts;};
-struct rtp_session {struct media_quality quality;uint32_t pos;};
-struct rtp_packet {uint8_t header[12];uint8_t *payload;size_t payload_len;uint32_t pos;};
+struct rtp_session {struct media_quality quality;uint32_t pos;int sync_counter,sync_each_nsamples;int pktbuf_len,pktbuf_size,pktbuf_next;uint16_t seqnum;};
+struct rtp_packet {uint8_t header[12];uint8_t *payload;size_t payload_len;uint32_t pos;unsigned samples;};
 struct airplay_master_session {
  struct evbuffer *input_buffer;uint32_t input_buffer_samples;
  struct encode_ctx *encode_ctx;struct evbuffer *encoded_buffer;
  struct rtp_session *rtp_session;struct rtcp_timestamp cur_stamp;
+ struct timespec shiri_input_end;bool shiri_input_end_valid,shiri_sync_pending;
  uint8_t *rawbuf;size_t rawbuf_size;uint32_t samples_per_packet;
  struct media_quality quality;bool use_ptp;uint32_t output_buffer_samples;
  struct airplay_master_session *next;
@@ -61,14 +62,18 @@ static AVFrame *decoded;
 static uint8_t packet_payload[8192];
 static struct rtp_packet current_packet;
 static int sync_packet_count;
-static bool rtp_sync_is_time(struct rtp_session *s){(void)s;return true;}
+static struct rtcp_timestamp last_sync_stamp;
+static uint8_t gap_decoded[16384];
+static size_t gap_decoded_bytes;
+static bool gap_capture;
+#include "actual_timing.inc"
+#include "actual_rtp.inc"
 static struct rtp_packet *rtp_packet_next(struct rtp_session *s,int bytes,unsigned frames,int type){
  assert(bytes>0 && (size_t)bytes<=sizeof(packet_payload) && frames==352 && type==AIRPLAY_RTP_PAYLOADTYPE);
- memset(&current_packet,0,sizeof(current_packet));current_packet.payload=packet_payload;current_packet.payload_len=bytes;current_packet.pos=s->pos;return &current_packet;
+ memset(&current_packet,0,sizeof(current_packet));current_packet.payload=packet_payload;current_packet.payload_len=bytes;current_packet.pos=s->pos;current_packet.samples=frames;return &current_packet;
 }
-static void rtp_packet_commit(struct rtp_session *s,struct rtp_packet *p){assert(p==&current_packet && p->pos==s->pos);s->pos+=352;}
 static struct rtp_packet *rtp_sync_packet_next(struct rtp_session *s,struct rtcp_timestamp stamp,int type){
- (void)s;(void)stamp;assert(type==0x90 || type==0x80);++sync_packet_count;return &current_packet;
+ (void)s;last_sync_stamp=stamp;assert(type==0x90 || type==0x80);++sync_packet_count;return &current_packet;
 }
 static void control_packet_send(struct airplay_session *s,struct rtp_packet *p){assert(s==airplay_sessions&&p==&current_packet);}
 static void packet_send(struct airplay_session *s,struct rtp_packet *p){
@@ -82,12 +87,17 @@ static void packet_send(struct airplay_session *s,struct rtp_packet *p){
    unsigned l=master->rawbuf[4*i] | ((unsigned)master->rawbuf[4*i+1]<<8);
    unsigned r=master->rawbuf[4*i+2] | ((unsigned)master->rawbuf[4*i+3]<<8);
    assert((uint16_t)left[i]==l && (uint16_t)right[i]==r);
+   if(gap_capture) {
+     assert(gap_decoded_bytes+4<=sizeof(gap_decoded));
+     gap_decoded[gap_decoded_bytes++]=l;gap_decoded[gap_decoded_bytes++]=l>>8;
+     gap_decoded[gap_decoded_bytes++]=r;gap_decoded[gap_decoded_bytes++]=r>>8;
+   }
  }
  packets++;decoded_samples+=352;matched_bytes+=1408;av_frame_unref(decoded);
 }
 #include "actual_airplay.inc"
 
-static cfg_opt_t library_options[]={CFG_STR_LIST("decode_audio_filters","{}",CFGF_NONE),CFG_STR_LIST("decode_video_filters","{}",CFGF_NONE),CFG_END()};
+static cfg_opt_t library_options[]={CFG_BOOL("pipe_framed",cfg_true,CFGF_NONE),CFG_STR_LIST("decode_audio_filters","{}",CFGF_NONE),CFG_STR_LIST("decode_video_filters","{}",CFGF_NONE),CFG_END()};
 static cfg_opt_t general_options[]={CFG_STR("user_agent","Silent codec fixture",CFGF_NONE),CFG_END()};
 static cfg_opt_t options[]={CFG_SEC("library",library_options,CFGF_NONE),CFG_SEC("general",general_options,CFGF_NONE),CFG_END()};
 static void begin_case(void) {
@@ -96,6 +106,7 @@ static void begin_case(void) {
  struct airplay_master_session *master=calloc(1,sizeof(*master));assert(master);
  master->rtp_session=calloc(1,sizeof(*master->rtp_session));assert(master->rtp_session);
  master->rtp_session->quality=master->quality=quality;master->rtp_session->pos=88200;
+ master->rtp_session->sync_each_nsamples=44100;master->rtp_session->pktbuf_size=1000;
  master->input_buffer=evbuffer_new();master->encoded_buffer=evbuffer_new();assert(master->input_buffer&&master->encoded_buffer);
  master->samples_per_packet=352;master->rawbuf_size=1408;master->rawbuf=malloc(1408);assert(master->rawbuf);
  master->output_buffer_samples=11025;
@@ -120,6 +131,77 @@ static void end_case(uint64_t input_frames,uint64_t case_converted,uint64_t case
  for(unsigned i=0;i<ARRAY_SIZE(output_buffer.data);i++){evbuffer_free(output_buffer.data[i].evbuf);memset(&output_buffer.data[i],0,sizeof(output_buffer.data[i]));}
  transcode_encode_cleanup(&master->encode_ctx);evbuffer_free(master->input_buffer);evbuffer_free(master->encoded_buffer);
  free(master->rawbuf);free(master->rtp_session);free(master);free(airplay_sessions);airplay_sessions=NULL;airplay_master_sessions=NULL;
+}
+static void gap_write(unsigned frames,int sample,uint64_t presentation) {
+ uint8_t pcm[1920];assert(frames<=480);
+ for(unsigned i=0;i<frames;i++) {
+   pcm[4*i]=pcm[4*i+2]=(unsigned)sample;
+   pcm[4*i+1]=pcm[4*i+3]=(unsigned)sample>>8;
+ }
+ struct media_quality quality={.sample_rate=48000,.bits_per_sample=16,.channels=2};
+ struct timespec pts={presentation/1000000000,presentation%1000000000};
+ uint64_t before=decoded_samples+airplay_master_sessions->input_buffer_samples;
+ outputs_write(pcm,frames*4,frames,&quality,&pts);
+ uint64_t after=decoded_samples+airplay_master_sessions->input_buffer_samples;
+ assert(after>=before);converted_samples+=after-before;
+}
+static void gap_cases(void) {
+ uint8_t contiguous[16384];size_t contiguous_bytes=0;
+ for(unsigned gap=0;gap<2;gap++) {
+   uint64_t start_converted=converted_samples,start_decoded=decoded_samples;
+   begin_case();gap_capture=true;gap_decoded_bytes=0;
+   const uint64_t first=UINT64_C(32000000000);
+   gap_write(480,1000,first);gap_write(480,1000,first+10000000);gap_write(64,1000,first+20000000);
+   struct airplay_master_session *master=airplay_master_sessions;
+   assert(master->input_buffer_samples>0 && master->input_buffer_samples<352);
+   unsigned old_pending=master->input_buffer_samples;
+   uint32_t first_fresh_position=master->rtp_session->pos+old_pending;
+   uint64_t resume=first+UINT64_C(1024)*1000000000/48000+(gap?UINT64_C(65000000000):0);
+   int before_sync=sync_packet_count;
+   gap_write(384,9000,resume);
+   if(gap) {
+#ifdef PREIMAGE
+     assert(sync_packet_count==before_sync);
+     assert((uint64_t)last_sync_stamp.ts.tv_sec*1000000000+last_sync_stamp.ts.tv_nsec<resume-UINT64_C(64000000000));
+     puts("exact preimage: resumed payload preceded any sync for its65s original-PTS gap");
+#else
+     assert(sync_packet_count==before_sync+1 && master->rtp_session->sync_counter<44100);
+     assert((uint64_t)last_sync_stamp.ts.tv_sec*1000000000+last_sync_stamp.ts.tv_nsec==resume);
+     assert(last_sync_stamp.pos+master->output_buffer_samples==first_fresh_position);
+     printf("65s original-PTS gap: retained=%u frames; fresh sync before resumed RTP maps first converted prefix to its original P+buffer\n",old_pending);
+#endif
+   } else assert(sync_packet_count==before_sync);
+   gap_write(480,0,resume+8000000);
+   if(gap) {
+     assert(gap_decoded_bytes==contiguous_bytes && !memcmp(gap_decoded,contiguous,contiguous_bytes));
+     puts("gapped and contiguous real ALAC decoding identical: retained partial packet/resampler state preserves fresh prefix and tail");
+   } else {contiguous_bytes=gap_decoded_bytes;memcpy(contiguous,gap_decoded,contiguous_bytes);}
+   end_case(1408,converted_samples-start_converted,decoded_samples-start_decoded);gap_capture=false;
+ }
+#ifdef PREIMAGE
+ return;
+#endif
+ /* Fractional source durations, permitted mapped-clock noise and a true small
+  * gap use the same exact original P; they never change the source clock. */
+ uint64_t start_converted=converted_samples,start_decoded=decoded_samples;
+ begin_case();uint64_t base=UINT64_C(120000000000);
+ gap_write(480,1000,base);int init_sync=sync_packet_count;
+ uint64_t next=base+10000000;
+ gap_write(64,1000,next+100);
+ gap_write(384,1000,next+100+UINT64_C(64)*1000000000/48000-200);
+ assert(sync_packet_count==init_sync);
+ uint64_t end=(uint64_t)airplay_master_sessions->shiri_input_end.tv_sec*1000000000+airplay_master_sessions->shiri_input_end.tv_nsec;
+ gap_write(384,1000,end+1000000);assert(sync_packet_count==init_sync+1);
+ end=(uint64_t)airplay_master_sessions->shiri_input_end.tv_sec*1000000000+airplay_master_sessions->shiri_input_end.tv_nsec;
+ gap_write(384,1000,end-1000000);assert(sync_packet_count==init_sync+2);
+ end=(uint64_t)airplay_master_sessions->shiri_input_end.tv_sec*1000000000+airplay_master_sessions->shiri_input_end.tv_nsec;
+ /* A source/operation handoff may reuse this master; its distinct original
+  * future timeline must get a new mapping without carrying the old clock. */
+ gap_write(384,1000,end+2000000000);assert(sync_packet_count==init_sync+3);
+ end=(uint64_t)airplay_master_sessions->shiri_input_end.tv_sec*1000000000+airplay_master_sessions->shiri_input_end.tv_nsec;
+ gap_write(480,0,end);gap_write(480,0,end+10000000);
+ end_case(2080,converted_samples-start_converted,decoded_samples-start_decoded);
+ puts("fractional/+-100ns mapped spacing keeps ordinary sync cadence;1ms forward/backward and source-handoff gaps synchronize original P once");
 }
 int main(int argc,char **argv) {
  assert(argc==2);FILE *input=fopen(argv[1],"rb");assert(input);
@@ -157,6 +239,7 @@ int main(int argc,char **argv) {
  }
  assert(feof(input) && declared && cases==4);
  end_case(declared,converted_samples-start_converted,decoded_samples-start_decoded);
+ gap_cases();
  printf("actual OwnTone AirPlay conversion/packetizer: cases=%u packets=%" PRIu64 " matched-bytes=%" PRIu64 " syncs=%d; no socket/audio device\n",cases,packets,matched_bytes,sync_packet_count);
  fclose(input);av_frame_free(&decoded);avcodec_free_context(&decoder);event_free(keep_alive_timer);event_base_free(evbase_player);cfg_free(cfg);return 0;
 }

@@ -75,6 +75,7 @@ async def path(tmp_path, monkeypatch):
                                           runtime_state_dir=tmp_path / 'root'))
     broker.ready = True
     room = broker_module.RuntimeRoom(definition, tmp_path / 'room', current_volume=definition.volume)
+    room.backend_definition, room.active_timing = definition, room.timing
     room.directory.mkdir()
     room.launch_generation = 'a1' * 16
     room.processes['audio'] = SimpleNamespace(name='audio', process=SimpleNamespace(pid=12345), alive=True)

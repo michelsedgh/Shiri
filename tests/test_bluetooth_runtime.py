@@ -171,7 +171,7 @@ async def test_failed_descriptor_release_keeps_room_and_retries_disabled_cleanup
 @pytest.mark.asyncio
 async def test_exact_buffer_and_framed_marker_reaches_pin_admission(tmp_path):
     broker, room = runtime(tmp_path)
-    broker.versions["owntone"] = "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1"
+    broker.versions["owntone"] = "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1"
     broker._resolve_local_pin = Mock(side_effect=RuntimeFailure("Pin admission reached"))
     with pytest.raises(RuntimeFailure, match="Pin admission reached"):
         await broker._start_room(room)

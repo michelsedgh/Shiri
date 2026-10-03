@@ -847,3 +847,35 @@ test('speaker balance is saved separately while the room keeps one master volume
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   assert.deepEqual(errors, []);
 }));
+
+test('AirPlay clock preference is explicit, revision guarded and reports native mode', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+  const value = roomValue({ speakers: [{ id: '101', name: 'Kitchen speaker', protocol: 'airplay2', offset_ms: 0, balance_percent: 100, airplay_timing: 'auto' }] });
+  value.outputs[0].selected = true;
+  value.outputs[0].airplay_timing = 'ptp';
+  const writes = [];
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request(), url = new URL(request.url());
+    if (request.method() === 'PATCH') {
+      writes.push({ path: url.pathname, body: request.postDataJSON() });
+      assert.equal(url.pathname, `/api/v1/rooms/${value.id}/speakers/101/airplay-timing`);
+      assert.deepEqual(request.postDataJSON(), { expected_revision: 1, airplay_timing: 'ntp' });
+      value.speakers[0].airplay_timing = 'ntp'; value.outputs[0].airplay_timing = 'ntp'; value.revision = 2;
+      await route.fulfill({ json: { room: value, runtime_accepted: true } }); return;
+    }
+    await route.fulfill({ json: url.pathname.endsWith('/events') ? { events: [] } : snapshot([value], false) });
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(base);
+  await page.getByRole('button', { name: 'Speakers', exact: true }).click();
+  const selector = page.getByLabel('AirPlay timing for Kitchen speaker');
+  assert.equal(await selector.inputValue(), 'auto');
+  assert.equal(await page.getByRole('button', { name: 'Save timing mode', exact: true }).isDisabled(), true);
+  await selector.selectOption('ntp');
+  assert.equal(writes.length, 0);
+  await page.getByRole('button', { name: 'Save timing mode', exact: true }).click();
+  await page.getByText('Saved: ntp · Backend timing: NTP.', { exact: true }).waitFor();
+  assert.equal(writes.length, 1);
+  assert.equal(value.volume, 50);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  assert.deepEqual(errors, []);
+}));
