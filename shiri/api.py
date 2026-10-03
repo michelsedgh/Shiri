@@ -158,7 +158,8 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     settings = settings or Settings.from_env()
     store = store or Store(settings.database, max_rooms=settings.max_rooms)
     runtime = runtime or (SimulatedRuntime() if settings.simulation else SocketRuntime(settings.runtime_socket))
-    auth = None if settings.simulation else Auth(token or settings.api_token_file.read_text().strip())
+    auth = (None if settings.simulation or settings.allow_unauthenticated
+            else Auth(token or settings.api_token_file.read_text().strip()))
     service = RoomService(store, runtime)
     stop = asyncio.Event()
 

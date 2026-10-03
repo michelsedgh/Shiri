@@ -396,9 +396,12 @@ limit stays at one millisecond; retries preserve the native presentation time,
 RTP position and exact PCM payload. Exhaustion closes the exact producer route
 without sending an invalid mapping or advancing its timed-frame counters. The
 mixer preserves the mapped native deadline and adds one frozen common relay
-horizon. The current low-latency candidate uses 1000 ms for ordinary zones;
-selected negative speaker corrections can raise the common horizon. Every
-enabled zone shares that horizon, including zones with different output leads.
+horizon. The current policy freezes `H = max(enabled room B) + 100 ms`:
+zero-offset local/framed Bluetooth uses B40/H140, Cast/Pulse B250/H350 and
+AirPlay B500/H600. Selected negative speaker corrections enlarge B to retain
+the route's required lead and can raise the common horizon; positive offsets
+never lower a route's floor. Every enabled zone shares that horizon, including
+zones with different output leads. See [the timing policy](TIMING_RESEARCH.md).
 The framed OwnTone input subtracts
 its existing output buffer duration before supplying `INPUT_FLAG_SYNC`; the
 existing player timer starts absolutely at that program anchor. Its output

@@ -1,21 +1,38 @@
 # Preserving native group timing through Shiri
 
-Research checkpoint: 2026-09-30. Native iPhone selection of multiple Shiri
-AirPlay 2 zones is required existing behavior. The final assigned speakers must
-retain that group's synchronization through capture, mixing and delivery. This
-is an unresolved production requirement, not an accepted deferred exclusion.
-See [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md) for the authoritative
-behavior and [CALIBRATION.md](CALIBRATION.md) for acoustic measurement methods.
+## Current route policy — October 2
 
-The initial audit below identifies the timing lost by the original raw-PCM
-relay. The candidate now implements the corresponding timestamp-preserving
-Shairport/OwnTone patches, exact source ownership and native mixer; actual C
-checks and a fresh Ubuntu backend build have passed. Whole-path multi-zone
-Linux output validation is in progress. No result here establishes physical
-speaker alignment or stock-phone compatibility. Chromecast input is deferred
-by the user for this release; Chromecast speaker outputs remain in scope.
+The production policy in [runtime/latency.py](../shiri/runtime/latency.py) uses
+these zero-offset defaults:
 
-## Candidate buffering and speaker compensation
+| Selected route | OwnTone buffer B | Single-room relay horizon H |
+| --- | ---: | ---: |
+| Local ALSA or private framed Bluetooth A2DP | 40 ms | 140 ms |
+| Cast or Pulse | 250 ms | 350 ms |
+| AirPlay 1/2 | 500 ms | 600 ms |
+
+Each room selects `B = max(40, route lead − min(0, saved offset))` across its
+assigned speakers. All enabled rooms share `H = max(B) + 100 ms`, frozen for
+the program incarnation. Positive offsets cannot lower a route's floor;
+negative offsets enlarge its buffer. A selected −2000 ms local correction
+therefore uses B2040/H2140, while AirPlay uses B2500/H2600. Disabled rooms do
+not enlarge the active plan, and speech never changes it. There is no ordinary
+H1000 or generic four-second buffer in the current policy. These are software
+route settings, not measured physical speaker latency.
+
+Timestamp-preserving group playback and the declared 12-case software speech
+matrix passed their digital timing/content/cleanup gates. Basic actual iPhone
+playback, both room-master control directions and long pause/resume also passed;
+see [the live handoff](LIVE_TEST_HANDOFF.md). Native multi-zone phone grouping,
+mixed transport acoustics and physical drift still require measurement under
+[product requirements](PRODUCT_REQUIREMENTS.md) and [calibration](CALIBRATION.md).
+Chromecast input is deferred; Chromecast speaker output remains in scope.
+
+## Historical buffering research and speaker compensation
+
+The research checkpoints below preserve earlier policies and their original
+measurements. Their B500/H1000 and opt-in language describe those historical
+stages, not the production defaults above.
 
 The current low-latency candidate computes each room's OwnTone buffer `B` as
 the maximum of 500 ms and each selected speaker's required lead minus its
@@ -82,7 +99,7 @@ acoustic alignment or measure a physical speaker's latency. Cast still adds its
 own 100 ms transport allowance and lacks proven precise final presentation;
 using the same base buffer does not remove transport jitter or drift.
 
-## Explicit minimum music buffer experiment
+## Historical explicit minimum music buffer experiment
 
 A separate opt-in plan now tests a route-specific minimum instead of charging
 local outputs the AirPlay lead. The production default above and the original

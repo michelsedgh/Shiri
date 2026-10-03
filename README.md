@@ -9,7 +9,7 @@ The rebuilt software is **qualified and installed on the live Ubuntu VM**. The u
 | Path | Implementation | Practical limit |
 | --- | --- | --- |
 | AirPlay input | Pinned Shairport Sync AirPlay 2 receiver, one advertised receiver per enabled room | Linux, bridged LAN, working multicast and PTP |
-| Room-addressed speech | Authenticated WebRTC audio API, one active producer per room | Nobly is a future external client; it is not installed |
+| Room-addressed speech | WebRTC audio API with authentication on by default, one active producer per room | Nobly is a future external client; it is not installed |
 | AirPlay output | OwnTone 29.3 | Device authorization may require setup |
 | Google Cast output | OwnTone's Cast implementation | Cross-protocol synchronization is approximate; device support varies |
 | Wired/local output | Enrolled physical ALSA device, with opened-device identity checks | Software playback is qualified; each physical device still requires admission and measurement |
@@ -58,7 +58,7 @@ sudo SHIRI_INSTALL_PREFIX=/opt/shiri bash install/install.sh --with-backends
 sudo SHIRI_INSTALL_PREFIX=/opt/shiri bash deploy/install_services.sh
 ```
 
-Backend source revisions are pinned in `install/build_backends.sh`; Python runtime dependencies and hashes are pinned in `install/requirements.lock`, generated from `uv.lock`. Installation configures the application without activating it. Inspect `/etc/shiri/shiri.env` and complete the migration and validation gates before replacing an existing deployment.
+Backend source revisions are pinned in `install/build_backends.sh`; Python runtime dependencies and hashes are pinned in `install/requirements.lock`, generated from `uv.lock`. A fresh installation configures the application without starting or boot-enabling it. Inspect `/etc/shiri/shiri.env` and complete the migration and validation gates before replacing an existing deployment. The current live VM already has both services enabled; an actual reboot verified automatic startup without a manual start.
 
 The installers validate a root-owned executable tree and its parents before privileged use and after producing files. Prefix/ancestor symlinks and writable or foreign-owned files are refused; trusted venv interpreter links remain supported. Service installation requires a stopped API and refuses active SQLite connections or retained WAL/SHM/journal files, preserving them for an operator checkpoint. See [install/README.md](install/README.md) for adoption instructions. Installation, reboot and rollback passed on the qualified Ubuntu environment; additional hosts require their own admission. The rootless API and qualified daemon privilege boundary are described in [docs/DAEMON_PRIVILEGES.md](docs/DAEMON_PRIVILEGES.md).
 
@@ -69,7 +69,13 @@ sudo systemctl enable --now shiri-runtime shiri-api
 
 `doctor` reports command/module availability. The broker additionally checks backend versions/features, matching timing interfaces and audio prerequisites before creating network resources. Neither result certifies native phone interoperability or final-speaker timing.
 
-The API defaults to localhost. Use a local tunnel or an HTTPS reverse proxy for access from another device. The proxy must preserve the original `Host`, including the external port, and forward the original scheme with `X-Forwarded-Proto`; otherwise same-origin checks will reject browser writes. Forwarded scheme/address headers are trusted only from loopback by default; configure `SHIRI_TRUSTED_PROXY_IPS` explicitly for another proxy address. Proxying HTTP control does not relay WebRTC audio: the speech client must also reach the worker's LAN ICE candidates. There is no public STUN/TURN service configured. Admin access uses the token in `/etc/shiri/api-token`; the browser receives an HttpOnly session cookie and does not save the token in local storage.
+The API defaults to localhost with authentication enabled. In that default mode, admin access uses `/etc/shiri/api-token`; the browser receives an HttpOnly session cookie and does not save the token in local storage. An operator can explicitly set `SHIRI_ALLOW_UNAUTHENTICATED=1` in `/etc/shiri/shiri.env` to permit control without a token while retaining the real backend and same-origin browser-write checks. This setting does not select simulation.
+
+The current live VM uses that explicit opt-in and a LAN listener. Open **http://shiri-speaker-test.local:8080/**, or **http://192.168.1.200:8080/** if the hostname does not resolve. Real state access without a token and service startup after reboot were verified. The temporary localhost forwards are no longer running; see [the live handoff](docs/LIVE_TEST_HANDOFF.md).
+
+The [whole-house assessment](docs/WHOLE_HOUSE_AUDIO_REPORT.md) covers measured processing load, connection and speech latency, independent room microphones, automatic calibration, speaker standby and the remaining Nobly integration work.
+
+For a default authenticated installation, use a local tunnel or an HTTPS reverse proxy for access from another device. The proxy must preserve the original `Host`, including the external port, and forward the original scheme with `X-Forwarded-Proto`; otherwise same-origin checks will reject browser writes. Forwarded scheme/address headers are trusted only from loopback by default; configure `SHIRI_TRUSTED_PROXY_IPS` explicitly for another proxy address. Proxying HTTP control does not relay WebRTC audio: the speech client must also reach the worker's LAN ICE candidates. There is no public STUN/TURN service configured.
 
 ## Migration and rollback
 
@@ -109,7 +115,7 @@ The rootless HTTP service owns validated room intent in SQLite. A separate privi
 | `GET /api/v1/rooms/{id}/diagnostics` | Runtime state and bounded daemon logs |
 | `GET /api/openapi.json` | Complete typed HTTP API schema |
 
-Automation clients send `Authorization: Bearer <installation-token>`. A successful setting write means durable intent; `runtime_accepted`, room status, and backend readback describe whether hardware has applied it. Revision conflicts return HTTP 409 without overwriting newer settings. Saved assignments can be removed during an outage. A speaker endpoint is reserved for one room, including disabled rooms, until explicitly unassigned.
+With authentication enabled, automation clients send `Authorization: Bearer <installation-token>`. A successful setting write means durable intent; `runtime_accepted`, room status, and backend readback describe whether hardware has applied it. Revision conflicts return HTTP 409 without overwriting newer settings. Saved assignments can be removed during an outage. A speaker endpoint is reserved for one room, including disabled rooms, until explicitly unassigned.
 
 Speech offers require a safe explicit `session_id`, a distinct `request_id`, `type: "offer"`, and one sending audio track. Another producer cannot take over the room. Closing the session, a failed connection, a media stall, cancellation, or 30 seconds without audible speech releases it. Silence packets do not hold music ducked. Music returns smoothly after speech; idle mixers stop writing to OwnTone rather than permanently streaming silence.
 

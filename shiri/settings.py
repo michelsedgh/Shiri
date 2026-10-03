@@ -15,6 +15,7 @@ class Settings:
     api_host: str = "127.0.0.1"
     api_port: int = 8080
     simulation: bool = False
+    allow_unauthenticated: bool = False
     api_token_file: Path = Path("/etc/shiri/api-token")
     daemon_identity_file: Path = Path("/etc/shiri/daemon-identities.json")
     bind_policy_helper: Path | None = None
@@ -23,6 +24,8 @@ class Settings:
     trusted_proxy_ips: str = "127.0.0.1,::1"
 
     def __post_init__(self):
+        if type(self.allow_unauthenticated) is not bool:
+            raise ValueError("Unauthenticated access must be explicitly enabled with a boolean")
         if type(self.api_port) is not int or not 1 <= self.api_port <= 65535:
             raise ValueError("API port must be between 1 and 65535")
         if type(self.max_rooms) is not int or not 1 <= self.max_rooms <= 8:
@@ -49,6 +52,7 @@ class Settings:
             api_host=os.environ.get("SHIRI_HOST", "127.0.0.1"),
             api_port=int(os.environ.get("SHIRI_PORT", "8080")),
             simulation=os.environ.get("SHIRI_SIMULATION", "0") == "1",
+            allow_unauthenticated=os.environ.get("SHIRI_ALLOW_UNAUTHENTICATED", "0") == "1",
             api_token_file=Path(os.environ.get("SHIRI_API_TOKEN_FILE", "/etc/shiri/api-token")),
             daemon_identity_file=Path(os.environ.get("SHIRI_DAEMON_IDENTITY_FILE", "/etc/shiri/daemon-identities.json")),
             bind_policy_helper=(Path(os.environ["SHIRI_BIND_POLICY_HELPER"])
