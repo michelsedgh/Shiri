@@ -1,0 +1,120 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -252,6 +252,8 @@
+ 
+   uint64_t statusflags;
+   uint16_t wanted_metadata;
++  bool shiri_startup_metadata_acked;
++  uint32_t shiri_startup_metadata_rtp;
+   bool req_has_auth;
+   bool supports_auth_setup;
+   bool supports_encryption;
+@@ -2459,6 +2461,43 @@
+   return 0;
+ }
+ 
++/* The Shiri framed stream has no DB queue item while idle. Some AirPlay
++ * receivers, including Sonos, require initial DMAP metadata before unmuting.
++ * Keep this request in START_PLAYBACK, ahead of the final volume request, so
++ * CONNECTED cannot acknowledge startup until the receiver accepted it. This
++ * bounded placeholder never becomes global music metadata or computes a
++ * progress clock from the not-yet-initialized cur_stamp. */
++static int
++payload_make_shiri_startup_metadata(struct evrtsp_request *req, struct airplay_session *session, void *arg)
++{
++  const char *speech_socket;
++  char rtpinfo[32];
++  size_t before;
++  int ret;
++  (void)arg;
++  speech_socket = cfg_getstr(cfg_getsec(cfg, "general"), "shiri_speech_socket");
++  if (!speech_socket || !*speech_socket ||
++      !cfg_getbool(cfg_getsec(cfg, "library"), "pipe_framed") ||
++      !(session->wanted_metadata & AIRPLAY_MD_WANTS_TEXT) || airplay_cur_metadata)
++    return 1; /* Skip to the final volume step; ordinary music is unchanged. */
++  if (!session->master_session || !session->master_session->rtp_session)
++    return -1;
++  ret = snprintf(rtpinfo, sizeof(rtpinfo), "rtptime=%" PRIu32, session->master_session->rtp_session->pos);
++  if (ret < 0 || (size_t)ret >= sizeof(rtpinfo)) return -1;
++  if (evrtsp_add_header(req->output_headers, "RTP-Info", rtpinfo) < 0) return -1;
++  before = evbuffer_get_length(req->output_buffer);
++  dmap_add_container(req->output_buffer, "mlit", 63);
++  dmap_add_char(req->output_buffer, "mikd", 2);
++  dmap_add_string(req->output_buffer, "minm", "Shiri");
++  dmap_add_string(req->output_buffer, "asar", "Shiri");
++  dmap_add_string(req->output_buffer, "asal", "Room audio");
++  dmap_add_short(req->output_buffer, "astn", 1);
++  if (evbuffer_get_length(req->output_buffer) - before != 71) return -1;
++  session->shiri_startup_metadata_rtp = session->master_session->rtp_session->pos;
++  session->shiri_startup_metadata_acked = false;
++  return 0;
++}
++
+ static int
+ payload_make_set_volume(struct evrtsp_request *req, struct airplay_session *session, void *arg)
+ {
+@@ -3115,6 +3154,19 @@
+   return AIRPLAY_SEQ_ABORT;
+ }
+ 
++/* START_PLAYBACK owns the callback incarnation; sequence_continue_cb checks
++ * it before invoking this handler. Log a durable receipt for passive diagnosis
++ * without claiming that the physical receiver has rendered any PCM. */
++static enum airplay_seq_type
++response_handler_shiri_startup_metadata(struct evrtsp_request *req, struct airplay_session *session)
++{
++  if (!req || req->response_code != RTSP_OK) return AIRPLAY_SEQ_ABORT;
++  session->shiri_startup_metadata_acked = true;
++  DPRINTF(E_LOG, L_AIRPLAY, "Shiri initial metadata acknowledged: device=%" PRIu64 ", callback=%d, rtptime=%" PRIu32 "\n",
++          session->device_id, session->callback_id, session->shiri_startup_metadata_rtp);
++  return AIRPLAY_SEQ_CONTINUE;
++}
++
+ static enum airplay_seq_type
+ response_handler_volume_start(struct evrtsp_request *req, struct airplay_session *session)
+ {
+@@ -3645,7 +3697,7 @@
+ 
+ // The size of the second array dimension MUST at least be the size of largest
+ // sequence + 1, because then we can count on a zero terminator when iterating
+-static struct airplay_seq_request airplay_seq_request[][7] =
++static struct airplay_seq_request airplay_seq_request[][8] =
+ {
+   {
+     { AIRPLAY_SEQ_START, "GET /info", EVRTSP_REQ_GET, NULL, response_handler_info_start, NULL, "/info", false },
+@@ -3660,6 +3712,7 @@
+     { AIRPLAY_SEQ_START_PLAYBACK, "RECORD", EVRTSP_REQ_RECORD, payload_make_record, response_handler_record, NULL, NULL, false },
+     { AIRPLAY_SEQ_START_PLAYBACK, "SETPEERS", EVRTSP_REQ_SETPEERS, payload_make_setpeers, NULL, "/peer-list-changed", NULL, false },
+     { AIRPLAY_SEQ_START_PLAYBACK, "SETUP (stream)", EVRTSP_REQ_SETUP, payload_make_setup_stream, response_handler_setup_stream, "application/x-apple-binary-plist", NULL, false },
++    { AIRPLAY_SEQ_START_PLAYBACK, "SET_PARAMETER (Shiri initial metadata)", EVRTSP_REQ_SET_PARAMETER, payload_make_shiri_startup_metadata, response_handler_shiri_startup_metadata, "application/x-dmap-tagged", NULL, false },
+     // Some devices (e.g. Sonos Symfonisk) don't register the volume if it isn't last
+     { AIRPLAY_SEQ_START_PLAYBACK, "SET_PARAMETER (volume)", EVRTSP_REQ_SET_PARAMETER, payload_make_set_volume, response_handler_volume_start, "text/parameters", NULL, true },
+   },
+@@ -3798,6 +3851,14 @@
+   const char *uri;
+   int ret;
+ 
++  /* Pairing/SETUP already succeeded before Shiri's optional initial DMAP
++   * step. A rejected metadata request must fail this output session without
++   * erasing a verified pairing key through start_failure(). Restore the
++   * upstream error policy for every other START_PLAYBACK step. */
++  if (cur_request->seq_type == AIRPLAY_SEQ_START_PLAYBACK)
++    seq_ctx->on_error = cur_request->payload_make == payload_make_shiri_startup_metadata
++      ? session_failure : start_failure;
++
+   req = evrtsp_request_new(sequence_continue_cb, seq_ctx);
+   if (!req)
+     goto error;

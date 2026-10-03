@@ -400,8 +400,9 @@ add OwnTone device-volume application or qualify iPhone UI/acoustics.
 `owntone-29.3-idle-speech.patch` follows the unchanged event1 layer and adds
 `-idle1`. Its SHA256 is
 `19161c472ceb6ab80d88d3e22202ea16c37a7829ed5d44db027cdcd3b73ac29c`.
-The builder records the additive layer in `share/shiri/backends.json`; runtime
-preflight requires the coherent version ending in `-transition1-bed1-event1-idle1`.
+The builder records the additive layer in `share/shiri/backends.json`. This
+layer's source marker ends in `-transition1-bed1-event1-idle1`; the combined
+runtime contract appears below.
 
 The old idle speech path generated timed silence in the program FIFO. After an
 utterance ended, OwnTone could suspend that exhausted input and wait for its
@@ -447,3 +448,87 @@ audio and preservation of the legacy mixer path.
 These results qualify the exercised software seams. Installation of the new
 binary and live speaker acceptance remain separate gates; they do not establish
 acoustic onset latency or microphone synchronization.
+
+## Natural speech EOF and finite packet completion
+
+`owntone-29.3-speech-drain.patch` follows the unchanged idle1 layer and adds
+`-drain1`. Its SHA256 is
+`2e240eecaad804b805d886b961116e142f0dff94d6c437f134b96f80b8408563`.
+The final player source SHA256 is
+`9d11e31ca558861951a6f5285aa4b933b58cecc6aeb59ea806420aa3258eef6c`.
+
+PCM datagrams and the HTTP FINISH command travel over independent transports.
+The original FINISH could close admission between player ticks while its last
+successfully submitted datagram still waited in the kernel. FINISH now polls
+the existing bounded receive burst before sealing natural EOF. A foreign
+request fails the exact voice-owner check before polling; CANCEL still closes
+pending media immediately.
+
+After admitted speech drains, the exact output-only bed can emit at most 480
+additional zero frames (10 ms at 48 kHz). This releases resampler history and the
+incomplete 352-frame AirPlay ALAC packet. A short timer catch-up interval retains
+the unused part of that finite budget for the next past interval. Source and
+selected-output-session checks remain exact; genuine queued music wins its
+original anchor and supplies subsequent audio normally. CANCEL permits no
+padding. There is no extra startup prebuffer or permanent silence stream.
+
+```sh
+python3 tests/native/check_speech_drain.py --source /path/to/drain1/owntone \
+  --preimage /path/to/idle1/owntone --capture /tmp/shiri-bed-pcm.bin
+python3 tests/native/check_speech_packetizer.py --source /path/to/configured/owntone \
+  --capture /tmp/shiri-bed-pcm.bin
+```
+
+The actual player C fixture covers the pending-datagram EOF race, every prefix
+and tail sample of distinct 4.6-second cold/warm utterances, a 1 ms terminal
+interval, replacement output sessions/sources, CANCEL and resumed music's
+original presentation anchor. Its strict inverse applies the unchanged idle,
+event, bed, transition, owner, media and authentication validators. The Linux
+packetizer check links the actual complete OwnTone output conversion and
+transcode sources, executes the actual AirPlay packetizer, and independently
+decodes real FFmpeg ALAC packets. Every decoded stereo sample matches the
+encoder input; any remaining incomplete packet contains only zero audio. It
+opens no network socket or audio device. These checks establish sample
+preservation through packetization, not acoustic output onset.
+
+## Initial AirPlay metadata readiness
+
+`owntone-29.3-startup-metadata.patch` follows drain1 and adds `-startupmeta1`.
+Its SHA256 is
+`11cd0aec9232b716d2ea3c28a9ac2d321ca24779937063178ad40982d45df525`;
+the final AirPlay source SHA256 is
+`9b598a3fe18042476af9e6a535f3201c74276eeee86da84c95c7fc51438e27b9`.
+Runtime preflight requires the complete marker ending in
+`-transition1-bed1-event1-idle1-drain1-startupmeta1`.
+
+An idle speech bed has no queue item's metadata. Upstream OwnTone skipped its
+initial metadata request in that state, although some AirPlay receivers need
+initial DMAP metadata before playing audio. Music Assistant's pinned
+[AirPlay client implementation](https://github.com/music-assistant/airplay-cli/blob/8e79242996b7ef52352ee49d390e6db434bf88a6/src/ap2_client.c)
+and [design notes](https://github.com/music-assistant/airplay-cli/blob/8e79242996b7ef52352ee49d390e6db434bf88a6/DESIGN.md)
+document this requirement for Sonos and the required `RTP-Info` header.
+
+For Shiri's framed speech-enabled input with no real metadata, START_PLAYBACK
+now sends a transient 71-byte DMAP placeholder after stream SETUP. Its
+`RTP-Info` uses the exact initialized RTP session position, including uint32
+rollover; it does not compute a timestamp from the not-yet-initialized output
+clock. A successful metadata response must precede the existing final volume
+request and CONNECTED acknowledgment. Rejection, disconnect and stale callback
+incarnations fail closed. Metadata failure preserves the already verified
+pairing key; other startup failures retain the upstream error policy. The
+placeholder never replaces global or queued
+music metadata and contains no spoken text. A durable acknowledgment log records
+the exact device, callback and sent RTP position for later passive diagnosis.
+
+```sh
+python3 tests/native/check_startup_metadata.py --source /path/to/startupmeta1/owntone \
+  --preimage /path/to/drain1/owntone
+```
+
+Actual sequence/payload/DMAP C tests capture the request body and hold RTSP
+replies to prove ACK ordering, timestamp boundaries and existing ownership
+guards under ASan/UBSan. The exact preceding source reproduces readiness
+without initial DMAP metadata. The silent tests and complete isolated Linux
+candidate build pass. They establish the repaired protocol contract; the
+reported physical missing speech prefix and receiver clock readiness still
+require later speaker acceptance. No live output was used for these tests.

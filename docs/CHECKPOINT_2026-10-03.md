@@ -1,5 +1,10 @@
 # Streaming speech checkpoint — October 3, 2026
 
+The later [speech startup investigation](CHECKPOINT_SPEECH_STARTUP_2026-10-03.md)
+records a physical playback failure reported after this checkpoint. The route
+passes below establish software delivery; they do not establish complete
+audible speech at the receiver. The new repair candidate is tracked separately.
+
 This checkpoint adds optional local text-to-speech generation to Shiri and
 repairs idle speech at the OwnTone boundary. The working system remains one
 AirPlay receiver per zone, with selected physical outputs, one phone/web room

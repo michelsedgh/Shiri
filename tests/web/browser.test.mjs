@@ -33,7 +33,7 @@ async function withPage(action) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   let browser, context;
   try {
-    browser = await playwright.chromium.launch({ headless: true, ...(process.env.SHIRI_CHROMIUM_EXECUTABLE ? { executablePath: process.env.SHIRI_CHROMIUM_EXECUTABLE } : {}) });
+    browser = await playwright.chromium.launch({ headless: true, args: ['--mute-audio'], ...(process.env.SHIRI_CHROMIUM_EXECUTABLE ? { executablePath: process.env.SHIRI_CHROMIUM_EXECUTABLE } : {}) });
     context = await browser.newContext();
     const page = await context.newPage();
     const errors = [];
@@ -121,7 +121,7 @@ test('quiet model benchmark has one explicit admission and shows generation metr
   assert.equal(reads.every((path) => path.endsWith(identifier)), true);
   const metrics = await page.locator('#tts-metrics').textContent();
   assert.match(metrics, /First non-silent generated audio220.6 ms/);
-  assert.equal(metrics.includes('Speaker backend ready'), false);
+  assert.equal(metrics.includes('Outputs connected'), false);
   assert.match(await page.locator('#tts-metrics-help').textContent(), /No room audio was sent/);
   assert.deepEqual(errors, []);
 }));
@@ -134,7 +134,7 @@ test('room speech sends text only to its explicit room and cancels the exact adm
     if (url.pathname.endsWith('/tts/models')) { await route.fulfill({ json: ttsCatalog() }); return; }
     if (url.pathname === `/api/v1/rooms/${room.id}/tts`) {
       const body = request.postDataJSON(); identifier = body.request_id; writes.push({ path: url.pathname, body });
-      await route.fulfill({ status: 202, json: { id: identifier, kind: 'speech', room_id: room.id, state: 'playing', metrics: { first_pcm_ms: 24, room_admission_ms: 4, backend_ready_ms: 18 } } }); return;
+      await route.fulfill({ status: 202, json: { id: identifier, kind: 'speech', room_id: room.id, state: 'playing', metrics: { first_worker_pcm_received_ms: 27, room_admission_ms: 28, backend_ready_ms: 18, delivered_audio_s: .02 } } }); return;
     }
     if (url.pathname.includes('/tts/jobs/')) {
       if (request.method() === 'DELETE') writes.push({ path: url.pathname, method: 'DELETE' });
@@ -149,8 +149,11 @@ test('room speech sends text only to its explicit room and cancels the exact adm
   await page.locator('#tts-text').fill('This reply belongs in the living room.');
   await page.locator('#tts-speak').click();
   await page.locator('#tts-job-status').filter({ hasText: 'Sending speech' }).waitFor();
-  assert.match(await page.locator('#tts-metrics').textContent(), /Room admission4.0 ms/);
-  assert.match(await page.locator('#tts-metrics-help').textContent(), /not subtracted or added/);
+  const progress = await page.locator('#tts-metrics').textContent();
+  assert.match(progress, /First audio received27.0 ms/);
+  assert.match(progress, /First audio sent to room28.0 ms/);
+  assert.match(progress, /Delivery and cleanup durationNot measured/);
+  assert.match(await page.locator('#tts-metrics-help').textContent(), /it is not the time to first sound/);
   await page.locator('#tts-cancel').click();
   await page.locator('#tts-job-status').filter({ hasText: 'Job stopped' }).waitFor();
   assert.equal(writes.length, 2);

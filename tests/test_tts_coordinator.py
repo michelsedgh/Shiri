@@ -393,6 +393,56 @@ async def test_backend_readiness_metric_is_confirmed_before_delayed_first_genera
     assert job.metrics["room_admission_ms"] == pytest.approx(507)
 
 
+async def test_received_progress_precedes_room_readiness_and_engine_completion(rig, monkeypatch):
+    import shiri.tts.coordinator as module
+    clock = [100.0]
+    rig.runtime.now_ns = lambda: int(clock[0] * 1e9)
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0], monotonic_ns=rig.runtime.now_ns))
+
+    async def sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    rig.runtime.prepare_gate = asyncio.Event()
+    rig.pause_after, rig.pause_gate, rig.pause_entered = 1, asyncio.Event(), asyncio.Event()
+    coordinator = rig.coordinator()
+    admitted = await coordinator.admit(request(), room_id=rig.room.id)
+    await asyncio.wait_for(rig.runtime.prepare_entered.wait(), 1)
+    job = coordinator.get(admitted["id"])
+    assert job.state == "generating" and not job.task.done()
+    assert job.metrics["first_worker_pcm_received_ms"] == pytest.approx(0)
+    assert job.metrics["received_audio_s"] == .02
+    assert job.metrics["delivered_audio_s"] == 0
+    assert "first_pcm_ms" not in job.metrics and "room_admission_ms" not in job.metrics
+
+    clock[0] += .62
+    rig.runtime.prepare_gate.set()
+    await asyncio.wait_for(rig.pause_entered.wait(), 1)
+    public = job.public()
+    assert public["state"] == "playing" and not job.task.done()
+    assert public["metrics"]["received_audio_s"] == .02
+    assert public["metrics"]["delivered_audio_s"] == .02
+    assert public["metrics"]["room_admission_ms"] == pytest.approx(620)
+    assert "first_pcm_ms" not in public["metrics"]
+
+    rig.pause_gate.set()
+    job = await complete(coordinator, admitted)
+    assert job.state == "completed"
+    assert job.metrics["first_worker_pcm_received_ms"] == pytest.approx(0)
+    assert job.metrics["received_audio_s"] == job.metrics["delivered_audio_s"] == .03
+    assert job.metrics["first_pcm_ms"] == 12  # A separate engine clock, received only at EOS.
+
+
+async def test_received_progress_does_not_claim_delivery_when_room_refuses_pcm(rig):
+    rig.runtime.refuse = "pcm"
+    coordinator = rig.coordinator()
+    job = await complete(coordinator, await coordinator.admit(request(), room_id=rig.room.id))
+    assert job.state == "failed" and job.error == "Injected room refusal"
+    assert job.metrics["received_audio_s"] == .02 and job.metrics["delivered_audio_s"] == 0
+    assert job.metrics["first_worker_pcm_received_ms"] >= 0
+    assert "room_admission_ms" not in job.metrics
+
+
 async def test_benchmark_collects_generation_metrics_without_room_resolution_or_audio(rig):
     coordinator = rig.coordinator()
     job = await complete(coordinator, await coordinator.admit(request(), benchmark=True))

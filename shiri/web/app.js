@@ -945,17 +945,22 @@ function renderTts() {
     ['First generated audio', metrics.first_pcm_ms, ' ms'],
     ['First non-silent generated audio', metrics.first_non_silent_pcm_ms, ' ms'],
     ['Leading generated silence', metrics.leading_silence_ms, ' ms'],
-    ...(job.kind === 'speech' ? [['Room admission', metrics.room_admission_ms, ' ms'], ['Speaker backend ready', metrics.backend_ready_ms, ' ms']] : []),
+    ['First audio received', metrics.first_worker_pcm_received_ms, ' ms'],
+    ...(job.kind === 'speech' ? [
+      ['First audio sent to room', metrics.room_admission_ms, ' ms'],
+      ['Outputs connected', metrics.backend_ready_ms, ' ms'],
+      ['Audio sent to room', metrics.delivered_audio_s, ' s'],
+    ] : []),
     ['Generated audio length', metrics.audio_duration_s, ' s'],
     ['Generation time / audio length', metrics.realtime_factor, '×'],
-    ['Total job time', metrics.total_ms, ' ms'],
+    [job.kind === 'speech' ? 'Delivery and cleanup duration' : 'Generation and cleanup duration', metrics.total_ms, ' ms'],
   ];
   elements.ttsMetrics.replaceChildren(...rows.flatMap(([label, value, suffix]) => [
     node('dt', '', label), node('dd', '', Number.isFinite(value) && value >= 0 ? `${value.toFixed(suffix === '×' ? 2 : 1)}${suffix}` : 'Not measured'),
   ]));
   elements.ttsMetricsHelp.textContent = job.kind === 'benchmark'
     ? 'These are model-generation measurements. No room audio was sent. Speaker and acoustic latency are not measured here.'
-    : 'Generation, room admission and backend readiness are separate software measurements. Their clocks are not subtracted or added. First audible sound needs a microphone test.';
+    : 'Audio streams as chunks arrive. Delivery duration includes sending the reply in realtime and cleanup; it is not the time to first sound. Output connection and room delivery measure software processing. Speaker onset needs a microphone test.';
 }
 
 function clearTtsPreview({ keepFailure = false } = {}) {

@@ -221,7 +221,9 @@ class TextSpeechCoordinator:
         generation_attempted = False
         terminal_state = "failed"
         frame_index, sequence = 0, 1
+        received_frames = 0
         pace_start = None
+        job.metrics.update(received_audio_s=0.0, delivered_audio_s=0.0)
         try:
             catalog = await self.catalog()
             worker = catalog["worker"]
@@ -264,6 +266,13 @@ class TextSpeechCoordinator:
                             raise ValueError("Invalid generation PCM frame")
                         if frame_index + len(pcm) // 2 > 48000 * MAX_GENERATED_SECONDS:
                             raise ValueError("Speech exceeds the audio duration limit")
+                        # This is the router's first observed PCM, before room
+                        # readiness or pacing can wait. Engine timing arrives
+                        # only with EOS and uses a separate generation clock.
+                        if "first_worker_pcm_received_ms" not in job.metrics:
+                            job.metrics["first_worker_pcm_received_ms"] = (time.monotonic() - started) * 1000
+                        received_frames += len(pcm) // 2
+                        job.metrics["received_audio_s"] = received_frames / 48000
                         if preparation is not None and prepared is None:
                             prepared = await asyncio.shield(preparation)
                             if not prepared.get("ok") or not prepared.get("stream_id"):
@@ -298,6 +307,7 @@ class TextSpeechCoordinator:
                         else:
                             job.audio.extend(pcm)
                         frame_index += len(pcm) // 2
+                        job.metrics["delivered_audio_s"] = frame_index / 48000
                         sequence += 1
                     elif kind == "end":
                         if got_end or not got_format or frame_index == 0:

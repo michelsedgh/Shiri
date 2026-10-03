@@ -4,11 +4,13 @@ import base64
 import json
 import multiprocessing
 import os
+import socket
 import threading
 import time
 
 import httpx
 import pytest
+import uvicorn
 from starlette.requests import ClientDisconnect, Request
 
 from shiri.tts.models import DEFAULT_MODEL_ID, QWEN_MODEL_ID, GenerationRequest, get_model
@@ -17,6 +19,89 @@ from shiri.tts.worker import ModelWorker, _child, create_worker_app, read_worker
 
 TOKEN = "private-generation-worker-token-12345678901234567890"
 PCM = b"\x12\x00" * 960
+
+
+def gated_http_child(connection, cancel_event, eos_gate):
+    """Use the production child loop, with EOS controlled by the HTTP observer."""
+    import shiri.tts.backend as backend_module
+
+    class Backend:
+        last_metrics = {"synthetic": True, "complete": False}
+
+        def prewarm(self):
+            return {"synthetic": True}
+
+        def generate(self, _request):
+            yield PCM * 2
+            if not eos_gate.wait(5):
+                raise TimeoutError("HTTP test never released EOS")
+            yield b"\x45\x00" * 480
+            self.last_metrics = {"synthetic": True, "complete": True}
+
+    backend_module.load_backend = lambda *args, **kwargs: Backend()
+    _child(connection, get_model(DEFAULT_MODEL_ID), None, False, cancel_event)
+
+
+async def test_real_http_delivers_incremental_child_pcm_before_eos_is_released():
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    cancellation, eos_gate = context.Event(), context.Event()
+    process = context.Process(target=gated_http_child, args=(child, cancellation, eos_gate), daemon=True)
+    process.start()
+    child.close()
+    worker = ModelWorker()
+    worker.process, worker.connection, worker.cancel_event = process, parent, cancellation
+    server_task = listener = server = None
+    try:
+        ready = await worker._receive(5)
+        assert ready["type"] == "ready"
+        worker.state, worker.model_id, worker.warmup = "ready", DEFAULT_MODEL_ID, ready["warmup"]
+        app = create_worker_app(token=TOKEN, worker=worker)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(128)
+        listener.setblocking(False)
+        url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        listening = asyncio.Event()
+
+        class ObservedServer(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets=sockets)
+                listening.set()
+
+        server = ObservedServer(uvicorn.Config(app, log_level="error", lifespan="off"))
+        server_task = asyncio.create_task(server.serve(sockets=[listener]))
+        await asyncio.wait_for(listening.wait(), 5)
+        received, kinds = bytearray(), []
+        async with httpx.AsyncClient(headers={"Authorization": "Bearer " + TOKEN}, trust_env=False,
+                                     timeout=2) as client:
+            async with client.stream("POST", url + "/v1/generate", json=payload()) as response:
+                assert response.status_code == 200
+                async for line in response.aiter_lines():
+                    event = json.loads(line)
+                    kinds.append(event["type"])
+                    if event["type"] == "pcm":
+                        block = base64.b64decode(event["pcm_base64"], validate=True)
+                        assert 0 < len(block) <= 1920
+                        received.extend(block)
+                        if len(received) <= len(PCM * 2):
+                            assert not eos_gate.is_set() and worker.state == "busy"
+                            assert bytes(received) == (PCM * 2)[:len(received)]
+                            if len(received) == len(PCM * 2):
+                                eos_gate.set()
+                    if event["type"] == "end":
+                        assert eos_gate.is_set() and event["metrics"]["complete"]
+                assert kinds == ["format", "pcm", "pcm", "pcm", "end"]
+                assert bytes(received) == PCM * 2 + b"\x45\x00" * 480
+    finally:
+        eos_gate.set()
+        if server is not None:
+            server.should_exit = True
+        if server_task is not None:
+            await asyncio.wait_for(server_task, 3)
+        if listener is not None:
+            listener.close()
+        await worker.close()
 
 
 class Connection:

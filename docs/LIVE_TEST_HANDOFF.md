@@ -1,5 +1,13 @@
 # Live test handoff — October 3, 2026
 
+**Current speech status:** the user reported missing opening words during idle
+room speech on this installed release. The complete sentence survives quiet
+generation and silent output encoding; the receiver startup boundary still
+needs physical acceptance. A separate candidate adds acknowledged initial
+AirPlay metadata, natural-EOF drain fixes and live delivery progress. It is
+staged for qualification, **not installed in the house instance**. See
+[the startup diagnosis](SPEECH_STARTUP_DIAGNOSIS.md).
+
 The text-to-speech release is installed in **Shiri Speaker Test**, with its
 native MLX worker on the Mac. Open **http://shiri-speaker-test.local:8080/** on
 the LAN, or **http://192.168.1.200:8080/** if the hostname does not resolve.
@@ -21,8 +29,10 @@ enabled Living Room Test room to send text to its assigned Sonos speaker.
 
 Kokoro is the default. Qwen3's incremental audio route is selectable; its pinned
 MLX input compatibility repair follows the official full-text CustomVoice
-layout and preserves streaming audio. Its measured short-reply first PCM is
-about 55 ms on this Mac. That measures generation, not sound heard in the room.
+layout and preserves streaming audio. Earlier controlled short replies emitted
+first PCM in about 55 ms. The reported live request measured 158 ms; later quiet
+probes of that exact text measured 445–461 ms to HTTP PCM. These are different
+measurements and conditions, not a guaranteed house-speaker startup delay.
 Soprano is another compact English option. Voice/language/speed capabilities
 come from the model catalog. See [local streaming speech](LOCAL_TTS.md) for
 model limits, setup, API examples and honest latency definitions.

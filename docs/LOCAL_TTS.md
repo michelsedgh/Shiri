@@ -1,5 +1,12 @@
 # Local streaming speech
 
+**October 3 startup qualification:** the installed house instance has a reported
+idle-speech failure that loses the opening words. Silent captures preserve the
+complete generated phrase through AirPlay encoding. The candidate repairs
+initial metadata and natural-EOF handling; physical prefix acceptance is still
+pending. See [the diagnosis and evidence boundaries](SPEECH_STARTUP_DIAGNOSIS.md)
+and [the installed-versus-staged handoff](LIVE_TEST_HANDOFF.md).
+
 Shiri can generate speech locally from text and route it to one exact room. The
 room's music continues while the mixer fades its gain down for speech and back
 up afterwards. Nobly can use the same text API through an external room binding;
@@ -353,12 +360,21 @@ The following metrics answer different questions:
 - `leading_silence_ms`: quiet samples at the beginning of the generated waveform,
   using a threshold of −60 dB relative to full scale.
 - `backend_ready_ms`: router job start to confirmation that the room speech
-  backend is ready.
+  backend is connected and its local startup contract completed. This is not
+  a receiver clock-lock or acoustic-readiness measurement.
+- `first_worker_pcm_received_ms`: router job start to its first received worker
+  PCM record, before waiting for the room. Available while generation continues.
+- `received_audio_s`: duration of validated PCM consumed from the worker so far.
+- `delivered_audio_s`: duration accepted by the room so far, or retained in the
+  sample for a quiet benchmark. A refused frame does not advance it.
 - `room_admission_ms`: router job start to acceptance of its first room PCM frame.
 - `first_pcm_dispatch_ms`: router job start to sending its first room PCM RPC.
 - `first_pcm_rpc_ms`: elapsed first-frame RPC time, including dispatch and reply.
 - `worker_cleanup_confirmed`: whether bounded worker retirement was observed
   before the job became terminal and its generation slot was released.
+- `total_ms`: the full delivery and cleanup duration. Room speech is submitted
+  at playback speed, so a 4.64-second reply takes roughly that long to send
+  after preparation. This field does not measure startup latency.
 
 In the initial inference trials, a Qwen short sample had 17.5 ms of leading quiet. A longer paragraph emitted its
 first PCM after about 51 ms but contained about 432 ms of leading quiet audio.

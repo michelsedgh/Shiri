@@ -1,0 +1,104 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -365,6 +365,7 @@
+ static void shiri_speech_bed_retire_outputs(void);
+ static struct shiri_speech_request shiri_voice_request;
+ static bool shiri_voice_initialized;
++static unsigned shiri_voice_output_tail_frames;
+ 
+ struct event_base *evbase_player;
+ 
+@@ -3265,11 +3266,24 @@
+   uint8_t buffer[480 * 4] = { 0 };
+   uint64_t operation, elapsed;
+   int ret, frames;
+-  if (!shiri_speech_bed_wanted() ||
++  bool wanted = shiri_speech_bed_wanted();
++  bool padding = !wanted && shiri_voice_output_tail_frames;
++  if ((!wanted && !padding) ||
+       (!pb_timer_speech_only && (!pb_timer_native || !pb_timer_native_waiting_for_pcm || pb_timer_native_anchored)) ||
+       player_tick_interval.tv_sec || player_tick_interval.tv_nsec != 10000000L ||
+       input_pipe_shiri_state(&operation) != 1 || operation != shiri_source_state.last.operation_generation ||
+-      shiri_speech_last_outputs(true) < 0) return false;
++      shiri_speech_last_outputs(padding ? false : true) < 0) return false;
++  /* At most480 final silence frames release resampler history and the partial
++   * ALAC packet after natural voice EOF. A short catch-up interval retains
++   * its remainder for the next past-interval write; no future horizon is
++   * reserved. Genuine music wins the peek below. A CANCEL never pads. */
++  if (padding && (!shiri_last_mix.output_bed ||
++      shiri_last_mix.source.operation_generation != shiri_source_state.last.operation_generation ||
++      !shiri_source_owner_equal(&shiri_last_mix.source.owner, &shiri_source_state.last.owner) ||
++      shiri_speech_last_outputs(false) < 0)) {
++    shiri_voice_output_tail_frames = 0;
++    return false;
++  }
+   /* Reserve no future output horizon. T is captured before the empty peek:
+    * this voice-only bed represents the preceding player interval and ends
+    * no later than T. Any music P accepted as genuinely future on its later
+@@ -3281,7 +3295,10 @@
+   if (clock_gettime(CLOCK_MONOTONIC, &tick_end) < 0) return false;
+   if (!tick_end.tv_sec && tick_end.tv_nsec < 10000000L) return true;
+   ret = input_peek_sync(&anchor);
+-  if (ret != 0) return false; /* genuine queued PCM/anchor always wins */
++  if (ret != 0) {
++    if (padding) shiri_voice_output_tail_frames = 0;
++    return false; /* genuine queued PCM/anchor always wins */
++  }
+   if (clock_gettime(CLOCK_MONOTONIC, &fresh) < 0) return false;
+   duration.tv_sec = 0; duration.tv_nsec = 10000000L;
+   if (timespec_cmp(fresh, timespec_add(tick_end, duration)) > 0)
+@@ -3305,6 +3322,8 @@
+   elapsed -= start.tv_nsec;
+   frames = elapsed >= UINT64_C(10000000) ? 480 : (int)(elapsed * 48000 / UINT64_C(1000000000));
+   if (frames <= 0) return true;
++  if (padding && (unsigned)frames > shiri_voice_output_tail_frames)
++    frames = shiri_voice_output_tail_frames;
+   shiri_speech_mix(buffer, frames * 4, frames, 48000, 16, 2);
+   outputs_write(buffer, frames * 4, frames, &quality, &start);
+   duration.tv_sec = 0; duration.tv_nsec = (long)(UINT64_C(1000000000) * frames / 48000);
+@@ -3312,7 +3331,8 @@
+   shiri_output_end_valid = true;
+   shiri_output_bed_frames += frames;
+   shiri_speech_mix_ready(true);
+-  return true;
++  if (padding) shiri_voice_output_tail_frames -= frames;
++  return wanted || shiri_voice_output_tail_frames;
+ }
+ 
+ /* Admission/retirement is independent of the source/output machinery. The
+@@ -3353,10 +3373,22 @@
+     if (ret == 1) { param->reply.ready = false; *retval = 0; return COMMAND_END; }
+     if (ret) { *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END; }
+     shiri_voice_request = param->request; shiri_voice_initialized = true;
++    shiri_voice_output_tail_frames = 0;
+   } else {
+     if (shiri_voice_initialized && !shiri_speech_voice_matches(&param->request)) {
+       *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END;
+     }
++    /* The final PCM datagram and HTTP FINISH use independent transports.
++     * Admit the already-readable bounded FIFO burst before sealing natural EOF;
++     * otherwise a FINISH between player ticks refuses valid last samples.
++     * CANCEL deliberately keeps pending media closed and does not drain it. */
++    if (action == SHIRI_SPEECH_FINISH) {
++      struct shiri_speech_status media;
++      shiri_speech_poll();
++      shiri_speech_status(&media);
++      if (!shiri_voice_initialized || shiri_voice_request.action != SHIRI_SPEECH_FINISH)
++        shiri_voice_output_tail_frames = media.running || media.queue_frames ? 480 : 0;
++    } else shiri_voice_output_tail_frames = 0;
+     ret = action == SHIRI_SPEECH_CANCEL ? shiri_speech_cancel(param->request.speech) : shiri_speech_finish(param->request.speech);
+     if (ret) { *retval = SHIRI_SOURCE_CONFLICT; return COMMAND_END; }
+     shiri_voice_request = param->request; shiri_voice_initialized = true;
