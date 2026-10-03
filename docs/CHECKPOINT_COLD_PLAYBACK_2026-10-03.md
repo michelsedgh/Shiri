@@ -163,7 +163,20 @@ checks. If the opening remains truncated, correlate receiver PTP exchanges,
 metadata ACK and first PCM with microphone onset; no render-ready ACK has been
 established that could justify a guessed startup wait.
 
-New receipts, failed proposals, build inputs, exact package and rollout proof
-are being prepared for additive `batch-0005` in
-`/Users/homr/Documents/Shiri-Validation/release-2026-10-03`. Earlier sealed
-evidence and the historical uninstalled checkpoint remain unchanged.
+Receipts, failed proposals, build inputs, exact package and rollout proof are
+sealed in additive `batch-0005` under
+`/Users/homr/Documents/Shiri-Validation/release-2026-10-03`: 161 payloads,
+15,536,666 bytes. Its `INDEX.json` SHA-256 is
+`ca725733cd5b23a97a86caa393020d6531c5970817e33fc868369a15e9ee1b4b`.
+An independent audit verified every payload, read-only permissions, all prior
+batch hashes and absence of the private worker credential in raw/decoded data.
+Its receipts are retained under `reviews/batch0005-root` beside the batches.
+
+The source archive contains all 499 exact committed files at documented
+deployment checkpoint `89bd2d000de9367d7c3a785d083f1600bddb525b`; archive
+SHA-256 is `fc05d348767fba696914dffd56c45716cebbf4ac4e2eb8fa81695d65373ad047`.
+[That checkpoint's CI](https://github.com/michelsedgh/Shiri/actions/runs/37158534208)
+also passed. The implementation remains the qualified `a72463d` code; this later
+commit only updates documentation. The evidence-index pointer update follows
+the archived checkpoint. Earlier sealed evidence and the historical uninstalled
+checkpoint remain unchanged. The installed listening response is still pending.

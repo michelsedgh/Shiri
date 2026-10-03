@@ -175,7 +175,11 @@ speaker group is represented by its paired primary. Nobly does not exist yet;
 exact externally bound room text/audio APIs are ready for its future client.
 Speaker standby policies remain deferred until real devices can be measured.
 
-The new checkpoint preserves generation trials, old failures and successful
-software checks outside Git under
-`/Users/homr/Documents/Shiri-Validation/release-2026-10-03`. The previous
-`release-2026-10-02` evidence and failed attempts remain unchanged.
+The new checkpoint preserves generation trials, old failures, clock comparisons,
+verified deployment and successful software checks outside Git under
+`/Users/homr/Documents/Shiri-Validation/release-2026-10-03`. Sealed `batch-0005`
+contains 161 payloads and the exact 499-file source archive at documented
+deployment commit `89bd2d000de9367d7c3a785d083f1600bddb525b`; its CI also passed.
+See [the installed checkpoint](CHECKPOINT_COLD_PLAYBACK_2026-10-03.md) for hashes
+and audit receipts. The previous `release-2026-10-02` evidence and failed
+attempts remain unchanged.
