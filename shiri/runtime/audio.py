@@ -24,6 +24,7 @@ import time
 
 from shiri.rpc import RpcError, call_rpc, serve_rpc
 from .latency import MINIMUM_LOCAL_OUTPUT_BUFFER_MS
+from .pcm_speech import PcmSpeech
 
 log = logging.getLogger(__name__)
 RATE = 48000
@@ -218,6 +219,7 @@ class SpeechSession:
     preparation: asyncio.Task | None = None
     disposed: bool = False
     natural_eof: bool = False
+    pcm: PcmSpeech | None = None
 
 
 class AudioWorker:
@@ -255,6 +257,9 @@ class AudioWorker:
         if operation == "health":
             return {**self.mixer.health(), "music_active": self.music_active,
                     "speech_session_id": self.session.session_id if self.session else None,
+                    "speech_transport": ("pcm" if self.session.pcm is not None else "webrtc")
+                    if self.session else None,
+                    "speech_pcm": self.session.pcm.receipt() if self.session and self.session.pcm else None,
                     "speech_ready": not self._closing and self._cleanup_error is None and len(self._disposals) < self._cleanup_limit
                     and (not self.native or not self._disposals),
                     "speech_cleanup_pending": sum(not task.done() for task in self._disposals),
@@ -287,12 +292,20 @@ class AudioWorker:
         action = payload.get("action", "offer")
         if action == "offer":
             return await self.offer(payload, gain)
+        if action == "prepare-pcm":
+            return await self.prepare_pcm(payload, gain)
+        if action in {"pcm", "finish"}:
+            return await self.direct_pcm(payload)
         if action not in {"control", "close"}:
             raise RpcError("invalid_request", "Unknown speech action")
         async with self._lock:
             current = self.session
             if current is not None and current.session_id != payload["session_id"]:
                 raise RpcError("session_conflict", "Another speech producer owns this room")
+            if current is not None and current.pcm is not None:
+                if current.request_id != payload["request_id"]:
+                    raise RpcError("session_conflict", "Direct speech requires its exact request identity")
+                current.pcm.identity(payload)
             if action == "control" and current is None:
                 raise RpcError("not_found", "This speech session does not exist")
             if action == "control" and current:
@@ -303,6 +316,91 @@ class AudioWorker:
         if action == "close" and current:
             await self._dispose(current)
         return {"ok": True}
+
+    async def prepare_pcm(self, payload, gain):
+        """Admit one paced PCM producer through the ordinary speech barrier."""
+        if not self.native or getattr(self.mixer, "speech_output", None) is None:
+            raise RpcError("audio_unavailable", "Direct speech requires an authenticated native speech output")
+        async with self._lock:
+            if self._closing or self._cleanup_error is not None:
+                raise RpcError("audio_unavailable", "The audio worker cannot admit another speech producer")
+            if self._disposals:
+                raise RpcError("audio_unavailable", "Earlier speech retirement is still being observed")
+            old = self.session
+            if old is not None:
+                if (old.session_id != payload["session_id"] or old.request_id != payload["request_id"]
+                        or old.pcm is None):
+                    raise RpcError("session_conflict", "Another speech producer owns this room")
+                if old.answer is not None:
+                    return old.answer
+                raise RpcError("conflict", "This direct speech stream is still preparing")
+            current = SpeechSession(payload["session_id"], payload["request_id"], None, gain,
+                                    negotiation=asyncio.current_task(), pcm=PcmSpeech())
+            self.session = current
+        try:
+            preparation = self.native.begin_speech(current)
+            current.preparation = asyncio.create_task(self.native.prepare_speech(current, preparation),
+                                                     name="direct-speech-startup-readiness")
+            await current.preparation
+            async with self._lock:
+                if self.session is not current or self._closing:
+                    raise RpcError("session_conflict", "Direct speech ended during preparation")
+                current.answer = current.pcm.prepared(current.session_id, current.request_id)
+                current.negotiation = None
+                return current.answer
+        except BaseException as exc:
+            await self._release(current, wait=not isinstance(exc, asyncio.CancelledError))
+            raise
+
+    async def direct_pcm(self, payload):
+        failure = None
+        async with self._lock:
+            current = self.session
+            if (current is None or current.pcm is None or current.session_id != payload["session_id"]
+                    or current.request_id != payload["request_id"]):
+                raise RpcError("session_conflict", "Direct speech requires its exact admitted session and request")
+            if current.answer is None:
+                raise RpcError("conflict", "Direct speech is not ready for audio")
+            current.pcm.identity(payload)
+            if payload["action"] == "finish":
+                current.pcm.finish(payload)
+                current.natural_eof = True
+                self.session = None
+                result = {"ok": True, "finished": True, **current.pcm.receipt()}
+            else:
+                try:
+                    data, samples, now, next_ns, audible = current.pcm.decode(payload)
+                    preparation = self.mixer.speech_preparation
+                    if (preparation is None or preparation.identity is not current or preparation.retired
+                            or preparation.phase != "ready" or not preparation.owned()):
+                        raise RpcError("audio_unavailable", "Direct speech's admitted output source changed")
+                    self.mixer.set_speech_gain(current.duck_gain)
+                    self.mixer.push_speech(data, samples)
+                except Exception as exc:
+                    if isinstance(exc, RpcError) and exc.code not in {
+                        "media_overrun", "media_underrun", "audio_unavailable",
+                    }:
+                        raise
+                    failure = exc if isinstance(exc, RpcError) else RpcError(
+                        "audio_unavailable", "Direct speech failed before its PCM admission could complete"
+                    )
+                    self.session = None
+                else:
+                    current.last_media = time.monotonic()
+                    if audible:
+                        current.last_audible = current.last_media
+                    return current.pcm.admitted(samples, now, next_ns, audible)
+        if failure is not None:
+            await self._dispose(current, wait=False)
+            raise failure
+        # Exact natural FINISH closes admission but preserves every valid tail.
+        # Wait only its original bounded queue lifetime; this is not acoustic
+        # confirmation and never flushes or pauses the shared music output.
+        await self._dispose(current)
+        tail = current.pcm.tail_seconds()
+        if tail:
+            await asyncio.sleep(tail)
+        return result
 
     async def offer(self, payload, gain):
         from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
@@ -461,7 +559,8 @@ class AudioWorker:
             try:
                 # aiortc.close itself must survive RPC cancellation: cancelling
                 # it poisons its internal closing Future and leaks ICE sockets.
-                await session.peer.close()
+                if session.peer is not None:
+                    await session.peer.close()
             finally:
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)

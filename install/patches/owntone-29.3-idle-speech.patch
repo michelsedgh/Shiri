@@ -1,0 +1,44 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -3067,7 +3067,10 @@
+   /* A lost caller cannot reserve idle transports permanently. Starting the
+    * actual bed cancels this existing finite delayed-stop mechanism. */
+   if (player_state != PLAY_PLAYING) shiri_speech_schedule_idle_stop();
+-  if (!shiri_zero(param->request.source.owner.session, 16) && shiri_speech_bed_arm() < 0) {
++  /* Idle speech also owns this output-only clock. Refilling a paused framed
++   * program FIFO waits for its capacity threshold and cannot prove a fresh mix.
++   * No program read, anchor or P/counter mutation is needed for this bed. */
++  if (shiri_speech_bed_arm() < 0) {
+     shiri_speech_start.failed = true;
+     *retval = SHIRI_SOURCE_FAILURE; return COMMAND_END;
+   }
+@@ -3207,7 +3210,15 @@
+    * that finite cleanup only for the exact still-idle source and sessions
+    * which this bed actually mixed; never stop a paused phone or successor. */
+   if (!shiri_source_state.initialized || shiri_source_state.faulted || shiri_speech_bed_wanted() ||
+-      !shiri_zero(shiri_source_state.last.owner.session, 16) || !shiri_last_mix.mixed_ns ||
++      !shiri_zero(shiri_source_state.last.owner.session, 16)) return;
++  /* Setup can expire before its first mix. The exact prepared idle source and
++   * session snapshot still owns a finite delayed release in that case. */
++  if (shiri_speech_source_matches(&shiri_speech_start.request))
++    {
++      shiri_speech_schedule_idle_stop();
++      return;
++    }
++  if (!shiri_last_mix.mixed_ns ||
+       shiri_last_mix.source.operation_generation != shiri_source_state.last.operation_generation ||
+       !shiri_source_owner_equal(&shiri_last_mix.source.owner, &shiri_source_state.last.owner) ||
+       shiri_speech_last_outputs(false) < 0) return;

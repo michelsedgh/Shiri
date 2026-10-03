@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 
 from shiri.rpc import RpcError, call_rpc
 from .latency import MINIMUM_LOCAL_OUTPUT_BUFFER_MS
+from .music_startup import MusicStartupTrace
 from .source import SourceActor
 from .speech_startup import SpeechPreparation, complete as complete_speech_startup, retire_backend
 from .timing import (
@@ -225,6 +226,13 @@ class NativeMixer:
             self.speech_output.control(speech_active, duck_gain)
         if self.error:
             raise RuntimeError(self.error)
+        if self.speech_output is not None:
+            # The authenticated backend owns an output-only speech clock even
+            # when the room has no music owner. Synthetic FIFO silence would
+            # compete with that bed and make a paused input wait for its full
+            # capacity before a fresh mix, aging the original packet anchor.
+            # Actual music still enters only through accept() at its original P.
+            return
         if self.actor is None or self.token is not None or self.route is None:
             return
         preparation = self.speech_preparation
@@ -374,6 +382,7 @@ class NativeController:
         self.listener = None
         self.connections = set()
         self.ingress_fault = None
+        self.music_startup = MusicStartupTrace()
 
     @staticmethod
     def _revision(value):
@@ -487,13 +496,20 @@ class NativeController:
 
     async def _transition(self, owner):
         self.operation_generation += 1
+        operation = self.operation_generation
         incarnation, session, epoch, generation = owner
         body = {"incarnation": incarnation.hex(), "session_id": session.hex() if session != ZERO_UUID else None,
-                "epoch": epoch, "generation": generation, "operation_generation": self.operation_generation}
-        ack = await self.client.request("POST", "/api/player/shiri-source", json=body)
-        if ack != body:
-            raise TimingError("Output source barrier did not acknowledge the exact owner and operation")
-        self.mixer.arm(owner)
+                "epoch": epoch, "generation": generation, "operation_generation": operation}
+        self.music_startup.backend_started(owner, operation, self.mixer.now_ns())
+        try:
+            ack = await self.client.request("POST", "/api/player/shiri-source", json=body)
+            if ack != body:
+                raise TimingError("Output source barrier did not acknowledge the exact owner and operation")
+            self.mixer.arm(owner)
+        except BaseException:
+            self.music_startup.backend_completed(owner, operation, self.mixer.now_ns(), acknowledged=False)
+            raise
+        self.music_startup.backend_completed(owner, operation, self.mixer.now_ns(), acknowledged=True)
 
     async def initialize(self):
         state = self.actor.snapshot()
@@ -502,6 +518,7 @@ class NativeController:
     async def barrier(self, previous, next_token):
         state = self.actor.snapshot()
         if next_token is None:
+            self.music_startup.retire(previous)
             owner = (UUID(state["incarnation"]).bytes, ZERO_UUID, previous.epoch if previous else state["epoch"], 1)
         else:
             handle = self.handles.get(next_token.session_id)
@@ -516,6 +533,8 @@ class NativeController:
                 raise TimingError("Native transport handle belongs to another source token")
             owner = (UUID(next_token.incarnation).bytes, UUID(next_token.session_id).bytes,
                      next_token.epoch, handle.generation)
+            self.music_startup.start(next_token, handle.generation,
+                                     getattr(handle, "music_requested_ns", self.mixer.now_ns()))
         await self._transition(owner)
 
     async def begin(self, packet, handle):
@@ -525,6 +544,7 @@ class NativeController:
                 or packet.session_id in self.handles or len(self.handles) >= 8):
             raise TimingError("Native admission requires a fresh exact AirPlay2 producer")
         handle.fence = StreamFence(packet.session)
+        handle.music_requested_ns = self.mixer.now_ns()
         self.handles[packet.session_id] = handle
         try:
             handle.token = await self.actor.admit_native("airplay2", packet.session_id, handle)
@@ -537,6 +557,7 @@ class NativeController:
                 handle.close_connection()
             self.handles.pop(packet.session_id, None)
             raise
+        self.music_startup.grant_ready(handle.token, handle.generation, self.mixer.now_ns())
         return self.grant(packet, handle)
 
     @staticmethod
@@ -555,6 +576,7 @@ class NativeController:
         if packet.kind is Kind.FLUSH:
             handle.fence.flush(packet)
             handle.generation = packet.generation
+            handle.music_requested_ns = self.mixer.now_ns()
             if not await self.actor.flush_native(handle.token):
                 raise TimingError("An old native source cannot flush a successor")
             if handle.last_volume is not None and handle.last_volume[2] != handle.generation:
@@ -565,12 +587,20 @@ class NativeController:
                 volume, base_revision, _old_generation = handle.last_volume
                 self.volume_event(handle.token, handle.generation, volume, base_revision)
                 handle.last_volume = (volume, base_revision, handle.generation)
+            self.music_startup.grant_ready(handle.token, handle.generation, self.mixer.now_ns())
             return self.grant(packet, handle)
         if packet.generation != handle.generation:
             raise TimingError("Native callback belongs to a previous flush generation")
         if packet.kind is Kind.PCM:
             handle.fence.accept(packet)
-            self.mixer.accept(packet, handle.token)
+            received_ns = self.mixer.now_ns()
+            written, dropped = self.mixer.writer.written_bytes, self.mixer.writer.dropped_bytes
+            if self.mixer.accept(packet, handle.token):
+                self.music_startup.pcm(handle.token, packet, self.mixer._last_mapping,
+                    received_ns=received_ns, completed_ns=self.mixer.now_ns(),
+                    relay_delay_ns=self.mixer.relay_delay_ns, output_buffer_ms=self.mixer.output_buffer_ms,
+                    written_bytes=self.mixer.writer.written_bytes-written,
+                    dropped_bytes=self.mixer.writer.dropped_bytes-dropped)
         elif packet.kind is Kind.VOLUME:
             # Capture before waiting for the ownership lock. A UI edit arriving
             # during that wait must not become the old phone event's base.
@@ -612,6 +642,7 @@ class NativeController:
                 if answer is not None:
                     stage = "reply"
                     await asyncio.wait_for(loop.sock_sendall(connection, answer.encode()), timeout=0.3)
+                    self.music_startup.grant_sent(handle.token, handle.generation, self.mixer.now_ns())
         except Exception as exc:
             if handle.token is not None and self.actor.owns(handle.token):
                 self.ingress_fault = _fault_context(exc, stage, packet, previous,
@@ -680,6 +711,7 @@ class NativeController:
         source = self.actor.snapshot()
         return {"source": source, "native_volume_events": deepcopy(self.events),
                 "native_ingress_fault": deepcopy(self.ingress_fault),
+                "music_startup": self.music_startup.snapshot(),
                 "source_operation_generation": self.operation_generation,
                 "control_revision": self.control_revision, "native_volume_bridge_error": self.volume_bridge_error,
                 "receiver_volume": deepcopy(self.receiver_volume.result),

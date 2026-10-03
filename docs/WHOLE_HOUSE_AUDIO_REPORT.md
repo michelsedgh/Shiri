@@ -1,4 +1,4 @@
-# Whole-house audio assessment — October 2, 2026
+# Whole-house audio assessment — updated October 3, 2026
 
 Shiri's current AirPlay music engine is usable on the live test VM. The user
 confirmed first play, phone-to-web and web-to-phone master volume, and playback
@@ -31,7 +31,7 @@ remain controlled by the vendor.
 | --- | --- | --- |
 | Native phone music | AirPlay 2 receiver per zone, native presentation timestamps, backend readiness before admission; real iPhone/Sonos play and pause/resume confirmed | Actual multi-zone phone grouping, mixed physical speakers and long household sessions |
 | Volume | Shared phone/web room master and saved speaker balance; both master directions confirmed | Acoustic balance and vendor-specific response tests |
-| Speech overlay | Streamed, exact-zone WebRTC audio mixed in OwnTone; music duck/restore and cancellation software-qualified | Physical first-audio latency, Nobly producer integration and common-calendar multi-zone speech |
+| Speech overlay | Exact-zone WebRTC audio or text-generated PCM mixed in OwnTone; selectable native Mac models, quiet measurements and explicit previews; music duck/restore | Physical first-audio latency, Nobly producer integration and common-calendar multi-zone speech |
 | Lifecycle | Owned service/device/network resources, bounded recovery and rollback; actual VM reboot passed | Broader power, network, standby and physical Bluetooth recovery trials |
 | Calibration | Probe generation, shared-clock recording analysis, guarded offset application, fresh verification and rollback | Distributed room capture, clock qualification, automatic campaign playback and whole-house solver |
 | Microphones/Nobly | Stable external room bindings and room-addressed speech boundary | Room agents, microphones, wake-word/ASR routing, playback reference for echo cancellation and presence registration |
@@ -80,7 +80,15 @@ does not exist yet, so no registration service or announcement has been
 implemented or sent. The working local hostname already reduces dependence on
 a manually remembered control IP.
 
-## Occasional extra connection time
+## Occasional extra first-play time
+
+The user clarified this observation on October 3: AirPlay connects quickly;
+first **Play to sound** can be slower than pause/resume. The causes below are
+possibilities, not a measured diagnosis. The new bounded
+[music-onset trace](MUSIC_ONSET_DIAGNOSTICS.md) now captures server preparation,
+GRANT, first PCM and actual FIFO delivery through room diagnostics. A later
+fresh iPhone session and microphone observation remain necessary to attribute
+the physical interval.
 
 An additional one or two seconds on a cold connection is plausible, but the
 reported delay has not been timed or attributed. There is no normal fixed
@@ -113,6 +121,12 @@ documentation](https://github.com/mikebrady/shairport-sync#latency-stuffing-timi
 ## Music and streaming speech latency
 
 Shiri accepts speech as a stream and does not wait for an entire utterance.
+It also now accepts text through selectable local models. The optional Mac
+worker prewarms quietly and streams direct PCM to the Linux router, avoiding
+the WebRTC input's codec and prefetch overhead. Model and delivery benchmarks
+are exposed separately in the UI; see [local TTS](LOCAL_TTS.md). Models that
+synthesize complete phrases are labeled accordingly. Streaming support alone
+does not qualify model pronunciation or acoustic latency.
 Speech enters the common OwnTone mix directly rather than traveling through
 the music receiver again. The current zero-correction software policy is:
 
@@ -373,9 +387,11 @@ speaker. [BlueZ device connection API](https://bluez.readthedocs.io/en/latest/de
 
 ## Nobly listening, echo control and video
 
-Room Orins/Nobly should own capture, wake-word detection, ASR, agent reasoning
-and speech generation. Shiri should own audio delivery, zone state, mixing and
-calibration. Use exact stable room bindings for response routing; a changing
+Room Orins/Nobly should own capture, wake-word detection, ASR and agent reasoning.
+Shiri owns audio delivery, zone state, mixing and calibration. Its optional
+native Mac worker can generate speech from Nobly's complete text request;
+Nobly can also stream externally generated speech through the existing audio
+API. Use exact stable room bindings for response routing; a changing
 IP or a similar room name must not redirect private speech.
 
 Microphones hearing Shiri need a playback reference for echo cancellation and

@@ -1,91 +1,109 @@
-# Live test handoff — October 2, 2026
+# Live test handoff — October 3, 2026
 
-The qualified rebuild is running in **Shiri Speaker Test**. The user confirmed
-fresh iPhone playback without a web-volume adjustment, phone volume changing
-both audible volume and the web room slider, web volume updating the phone,
-and normal resume after the requested 40-second pause.
+The text-to-speech release is installed in **Shiri Speaker Test**, with its
+native MLX worker on the Mac. Open **http://shiri-speaker-test.local:8080/** on
+the LAN, or **http://192.168.1.200:8080/** if the hostname does not resolve.
+Connect an iPhone to **Shiri Test Living Room** using its AirPlay controls.
+Keep the VM running for listening.
 
-Open **http://shiri-speaker-test.local:8080/** on the LAN, or
-**http://192.168.1.200:8080/** if the hostname does not resolve. Connect the phone
-to **Shiri Test Living Room** using its normal AirPlay controls. The temporary
-localhost forwards, including ports 8767 and 52609, stopped after reboot. Keep the
-VM running for listening.
+The previous release's physical phone test passed fresh playback without a web
+volume adjustment, phone volume changing sound and the room slider, web volume
+updating the phone, and resume after a 40-second pause. That observation remains
+historical: it is not a new physical acceptance test of today's native update.
 
-Both `shiri-runtime` and `shiri-api` are already enabled for boot. The actual
-reboot to `6f410567-1a9d-4669-8ed7-a4b2bdb70b37` verified both enabled and active
-without a manual start. Fresh installations intentionally only configure the
-services; their operator still uses `systemctl enable --now` after setup.
+## Trying the current speech release
 
-The current live configuration explicitly sets `SHIRI_ALLOW_UNAUTHENTICATED=1`:
-the UI and real state API work without a token, while same-origin browser-write
-checks remain enforced. Authentication stays enabled by default elsewhere.
-This opt-in does not enable simulation.
+Open **Speech voices**, select a model and load it. Wait for `ready`, then use
+**Quiet model measurement** to generate a reply without opening room speakers.
+Its completed result offers a browser audio preview. Use **Speak** on the
+enabled Living Room Test room to send text to its assigned Sonos speaker.
+**Stop** cancels that exact request. Models and measurements share one job slot.
+
+Kokoro is the default. Qwen3's incremental audio route is selectable; its pinned
+MLX input compatibility repair follows the official full-text CustomVoice
+layout and preserves streaming audio. Its measured short-reply first PCM is
+about 55 ms on this Mac. That measures generation, not sound heard in the room.
+Soprano is another compact English option. Voice/language/speed capabilities
+come from the model catalog. See [local streaming speech](LOCAL_TTS.md) for
+model limits, setup, API examples and honest latency definitions.
 
 ## What is installed
 
-The live installation retains the qualified candidate182 native pair:
-Shairport `timed3-startup1-volume2` and OwnTone
-`balance1-transition1-bed1-event1`. The current 52-entry wheel has SHA-256
-`486df5161544bd498e6b2e25f909a00876f4ccc9f5b40557facad3d892125020`;
-50 package files match the qualified baseline, with only API/settings changed
-for the explicit authentication opt-in. No audio or native code changed.
+The current 60-file wheel has SHA-256
+`064fd36922f49f5ae735013206ea0b88856ab13a8edbcde1de2b3522bf29f3f9`.
+The VM and native Mac worker verified the same package manifest.
+Shairport retains the previous `timed3-startup1-volume2` binary, SHA-256
+`4e051902f8ea7095385367ca4260372bda4813b8e6a84bd50abe08b8eb2fb5d6`.
+OwnTone now ends `balance1-transition1-bed1-event1-idle1`, SHA-256
+`0be833a0780a55b5a4ea53fea2aaf4ed2a9bbfa9c885ebf1708d20a12e4cef47`.
 
-Room names, speaker assignments and saved timing profiles were preserved. The
-current rebooted room retains saved master 15 and Sonos endpoint `92539824408726`.
-The earlier phone-test readback matched room/backend master 28, with no room
-error or pending volume update and the same nine restrictive daemon identities
-through that test. These historical observations and the user's latest saved
-volume remain separate; the reboot does not reset user intent.
+The additive native repair makes idle speech use the existing output-only
+mixer instead of waiting for six seconds of silent input refill. It preserves
+music timing and buffer policy. The actual Linux build reproduced the old
+failure and passed sanitized native lifecycle and framed-resampler checks
+before installation. See [patch notes](../install/patches/README.md).
 
-The rollout first retained a complete verified backup of the old installation,
-application state, runtime state, native binaries and configuration. It then
-retired only the nine recorded old actors. Normal production recovery released
-their saved reservations before the API started; no manual ownership-ledger,
-network-interface or DHCP-lease edits were used. Backups and unsuccessful
-attempts remain preserved privately.
+The final software regression passed 4,197 portable tests (85 explicit/platform
+skips), 58 browser/client checks and the actual Linux native build checks. The
+14-case live route sequence passed natural speech, cancel/successor and idle
+reuse with both Kokoro and Qwen; each confirmed generation cleanup and retained
+the same room actors/settings. This confirms software routing and cleanup,
+without a new human/acoustic observation. Initial-frame pacing now follows the
+room's verified actual PCM admission rather than starting before dispatch.
 
-## Accepted software behavior
+Installation preserved the exact room revision, assignments and saved master
+volume 15, including Sonos endpoint `92539824408726`. Normal service shutdown
+retired the recorded actors and released their owned networks before the
+package/native swap. No ownership ledger or DHCP reservation was edited
+manually. Verified backups and coherent native/package rollback remain private
+in `/var/lib/shiri-text-tts-checkpoint-2026-10-03-idle1` in the guest.
 
-| Area | Evidence |
-| --- | --- |
-| AirPlay receiver and volume | Encrypted protocol checks plus the actual iPhone/Sonos report above |
-| Zone speech | Complete cold/warm speech, advancing music, ducking/restoration and untouched other-zone checks |
-| Timing | Declared 12-case calibrated digital speech matrix; grouped digital audio and offset checks |
-| Recovery | Owned actor/network cleanup, manager reload, fault recovery and post-reboot encrypted regression |
-| Installation safety | Exact package/native preflight, two-stage rollback and normal rehearsal VM shutdown |
-| Qualified baseline regression | [CI37055838875](https://github.com/michelsedgh/Shiri/actions/runs/37055838875): 3,988 Python tests passed, 19 explicit/platform skips; native and browser/frontend checks passed on code checkpoint3797e23 |
+## Startup and access
 
-Normal output-buffer/relay-horizon defaults are **40/140 ms** for local or framed
-Bluetooth, **250/350 ms** for Cast or Pulse, and **500/600 ms** for AirPlay.
-Grouped zones use their slowest route and saved correction. These are Shiri's
-route settings, not a promise about total phone-to-speaker latency. There is no
-generic four-second buffer. The measured speech performance and its exact
-qualification boundary are recorded in [speech acceptance](SPEECH_ACCEPTANCE.md).
+`shiri-runtime` and `shiri-api` remain enabled for VM boot. The earlier real
+reboot to `6f410567-1a9d-4669-8ed7-a4b2bdb70b37` verified automatic startup.
+Today's update restarted both normally; it did not reboot the VM.
 
-## Later physical measurements
+The Mac's `org.shiri.tts` LaunchAgent starts its native worker after this user's
+login and keeps it running. Models and its private environment live at
+`/Users/homr/Library/Application Support/Shiri/TTS`. The VM reaches it through
+`Homrs-MacBook-Air.local:8091`. Wait for the selected model to become ready;
+first loading and compilation are intentionally separate from normal speech.
 
-The current live result covers one iPhone and its assigned AirPlay speaker.
-Mixed AirPlay/Cast/Bluetooth/wired speakers, native phone grouping, acoustic
-offsets/drift, physical speaker trims and extended household use still need the
-later measurements we agreed on. The [calibration UI](CALIBRATION.md) supports
-recording, reviewing, applying and verifying stable corrections; variable radio
-or transport timing requires repeated measurement.
+The live LAN UI has the requested `SHIRI_ALLOW_UNAUTHENTICATED=1` opt-in, with
+same-origin browser-write checks retained. Other installations remain
+authenticated by default. The generation worker always requires its separate
+private bearer credential. Its startup is separate from the VM's services.
 
-Chromecast input remains deferred. Bluetooth input is excluded. A Bluetooth
-speaker group is assigned through its paired primary; its vendor manages the
-followers. Nobly does not exist yet; the room-addressed speech API is ready for
-that future client. See [product requirements](PRODUCT_REQUIREMENTS.md) and
-[architecture](ARCHITECTURE.md).
+## Timing and remaining physical checks
 
-The [checkpoint](CHECKPOINT_2026-10-02.md) records build identities, original
-failures and retained evidence. Private validation files live outside Git in
-`/Users/homr/Documents/Shiri-Validation/release-2026-10-02`; credentials and full
-runtime backups remain protected in the guest.
+Normal output-buffer/relay-horizon defaults remain **40/140 ms** for local or
+framed Bluetooth, **250/350 ms** for Cast or Pulse, and **500/600 ms** for
+AirPlay. Grouped zones use their slowest route and saved correction. These
+settings do not promise total phone-to-speaker latency. There is no generic
+four-second speech buffer. The previous digital qualification is recorded in
+[speech acceptance](SPEECH_ACCEPTANCE.md); today's release adds separate native
+and live software regression evidence in [the checkpoint](CHECKPOINT_2026-10-03.md).
 
-The final evidence bundle is `batch-0012/INDEX.json` (126 files, 53,256,914 bytes;
-SHA-256 `58a44696a1b24d0275bea77cf7227d82a45aea6c1051b8a8c27b897433c7b2a4`).
-It includes the original live rollout, rollback/shutdown, user phone report,
-post-phone observation and successful CI records. Earlier failures and indices
-remain unchanged. That evidence bundle predates the authentication opt-in and
-latest live reboot described above; it does not rewrite those historical
-receipts or claim that the newer API/settings wheel is the old baseline wheel.
+The reported slower first sound after a fast iPhone connection still needs a
+fresh session trace. [Music-onset diagnostics](MUSIC_ONSET_DIAGNOSTICS.md)
+separate backend preparation, first incoming PCM, original presentation and
+FIFO delivery. They do not measure the phone's Play-button time or acoustic
+onset. Compare fresh playback and later pause/resume when the phone is available.
+
+Mixed speaker protocols, physical volume balance, native phone grouping,
+acoustic offsets/drift, streamed speech heard latency and extended household use
+remain later tests. Independently clocked room microphones on Orin/USB systems
+fit the [whole-house plan](WHOLE_HOUSE_AUDIO_REPORT.md); their clock uncertainty
+and acoustic placement must be measured. [Calibration](CALIBRATION.md) can apply
+and verify stable corrections; changing transport timing needs repeated capture.
+
+Chromecast input remains deferred, Bluetooth input is excluded, and a Bluetooth
+speaker group is represented by its paired primary. Nobly does not exist yet;
+exact externally bound room text/audio APIs are ready for its future client.
+Speaker standby policies remain deferred until real devices can be measured.
+
+The new checkpoint preserves generation trials, old failures and successful
+software checks outside Git under
+`/Users/homr/Documents/Shiri-Validation/release-2026-10-03`. The previous
+`release-2026-10-02` evidence and failed attempts remain unchanged.

@@ -47,7 +47,7 @@ from .unix_directory import PinnedUnixDirectory
 from .system import OwnedProcess, Runner, RuntimeFailure, atomic_json, read_json, root_directory
 
 log = logging.getLogger(__name__)
-REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1"
+REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1"
 _OWNTONE_VERSION_PATTERN = re.compile(r"(?<![\w.-])" + re.escape(REQUIRED_OWNTONE_VERSION) + r"(?![\w.-])")
 # The pinned receiver appends these feature tokens after its backend marker.
 # Its sysconfdir path is removed before matching, so path text cannot qualify.
@@ -221,7 +221,7 @@ class Broker:
         self.versions["owntone"] = (result.stdout or result.stderr).strip()
         if not _OWNTONE_VERSION_PATTERN.search(self.versions["owntone"]):
             raise RuntimeFailure(
-                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement, saved speaker balance, bounded exact source admission, paused-source speech output and framed metadata event acknowledgement; "
+                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement, saved speaker balance, bounded exact source admission, paused-source speech output and framed metadata event acknowledgement and idle speech output without input refill; "
                 "rebuild pinned backends using install/build_backends.sh"
             )
         if not DHCP_HOOK.is_file() or not os.access(DHCP_HOOK, os.X_OK):
@@ -1600,7 +1600,7 @@ class Broker:
         message = {key: value for key, value in payload.items() if key != "room_id"}
         message["duck_gain"] = room.desired.duck_gain
         generation = self.session_generations.get(session_id)
-        if payload.get("action") in {"offer", "close"} or generation is None:
+        if payload.get("action") in {"offer", "prepare-pcm", "close"} or generation is None:
             generation = object()
         self.session_generations[session_id] = generation
         self.sessions[session_id] = room.desired.id
@@ -1620,7 +1620,7 @@ class Broker:
                 if not operations:
                     self._session_operations.pop(session_id, None)
                     self.pending_sessions.discard(session_id)
-        if payload.get("action") == "close":
+        if payload.get("action") in {"close", "finish"}:
             self._forget_session(session_id, generation)
         return result
 
@@ -1729,6 +1729,14 @@ class Broker:
                     stream.seek(max(0, stream.tell() - 8192))
                     logs[path.stem] = stream.read(8192).decode(errors="replace")
             result["logs"] = logs
+            launch = room.launch_generation
+            if launch and room.processes.get("audio"):
+                try:
+                    health = await self._worker_rpc(room, "audio", "health", {}, timeout=2)
+                    if room.launch_generation == launch:
+                        result["music_startup"] = health.get("music_startup")
+                except (RpcError, OSError, RuntimeFailure):
+                    result["music_startup"] = {"error": "Audio diagnostics are unavailable"}
         result["capabilities"] = {
             "airplay_input": True,
             "cast_input": False,

@@ -394,3 +394,56 @@ invokes the unchanged historical bed/transition/owner guards, then compiles
 the actual event source with libplist/libevent and the unchanged pairing
 library with libgcrypt/libsodium under sanitizers. This event ACK does not
 add OwnTone device-volume application or qualify iPhone UI/acoustics.
+
+## Idle speech after a suspended input
+
+`owntone-29.3-idle-speech.patch` follows the unchanged event1 layer and adds
+`-idle1`. Its SHA256 is
+`19161c472ceb6ab80d88d3e22202ea16c37a7829ed5d44db027cdcd3b73ac29c`.
+The builder records the additive layer in `share/shiri/backends.json`; runtime
+preflight requires the coherent version ending in `-transition1-bed1-event1-idle1`.
+
+The old idle speech path generated timed silence in the program FIFO. After an
+utterance ended, OwnTone could suspend that exhausted input and wait for its
+buffer-full callback before resuming the same item. The framed input's existing
+capacity threshold is six seconds of 48 kHz S16 stereo PCM, while speech
+preparation has a five-second deadline. Reopening the FIFO did not start the
+same paused item through pipe autostart. Refilling it in real time therefore
+could not produce a fresh mix before the deadline; its earliest original
+presentation marker would also age while waiting. A gap flag permits sequence
+discontinuity but does not resume the player or replace that original marker.
+
+Idle preparation now arms OwnTone's existing output-only speech bed, also used
+for retained paused phone sources. The backend mixes the private speech queue
+on its existing player timer without reading a program FIFO or advancing the
+program's presentation and frame counters. Python suppresses synthetic idle
+FIFO writes when this authenticated speech output is configured, so those
+packets cannot compete with the output-only bed. The legacy mixer without that
+output retains its existing behavior. Genuine music still takes priority at
+its original anchor through the unchanged source and timing gates.
+
+If setup expires before its first mix, the exact prepared idle source and
+connected output-session snapshot restore the existing finite delayed-stop
+cleanup. Natural FINISH retains its admitted tail; CANCEL retires its exact
+voice. Neither a stale session nor a paused phone authorizes stopping another
+source's outputs. No permanent warm bed, new scheduler, music-buffer reduction,
+retiming or increased setup/RPC timeout is introduced.
+
+```sh
+python3 tests/native/check_idle_speech.py --source /path/to/idle1/owntone \
+  --preimage /path/to/event1/owntone
+```
+
+The exact event1 player source reproduces the missing idle output clock. The
+candidate passes 44,433 ASan/UBSan checks using actual composed C bodies and
+controlled output callbacks: paused and never-produced idle sources, cold/warm
+FINISH and CANCEL, finite expiry cleanup, selected-session and source fences,
+and unchanged original music anchors/counters. The checker privately reverses
+only idle1 and invokes the unchanged event1 validator, which in turn retains
+the exact historical bed, transition, owner, media and authentication guards.
+Seventy-two related Python tests pass, including suppression of idle program
+audio and preservation of the legacy mixer path.
+
+These results qualify the exercised software seams. Installation of the new
+binary and live speaker acceptance remain separate gates; they do not establish
+acoustic onset latency or microphone synchronization.

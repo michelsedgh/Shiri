@@ -304,10 +304,9 @@ def test_actual_c_exact_250ms_freshness_boundary_and_guard_preimage_sensitivity(
         assert stats['admitted'] == 1 and stats['expired'] == 960 and data == bytes(3840)
 
 
-async def test_actual_idle_anchor_is_B_plus_100_without_music_ownership_or_extra_backend_commands():
-    from shiri.runtime.timing import ZERO_UUID
+async def test_authenticated_idle_speech_uses_output_channel_without_program_fifo_or_music_ownership():
     now = 10_000_000_000
-    packets, requests = [], []
+    packets, requests, speech_packets, controls = [], [], [], []
     class Writer:
         reader_present, written_bytes, dropped_bytes = True, 0, 0
         def reset(self, owner):
@@ -321,8 +320,10 @@ async def test_actual_idle_anchor_is_B_plus_100_without_music_ownership_or_extra
         def set_gain(self, gain):
             self.gain = gain
         def push(self, pcm, frames):
+            speech_packets.append((pcm, frames))
             return True
         def control(self, active, gain):
+            controls.append((active, gain))
             return True
         def close(self):
             pass
@@ -335,12 +336,18 @@ async def test_actual_idle_anchor_is_B_plus_100_without_music_ownership_or_extra
     controller = NativeController(str(uuid4()), mixer, Client())
     try:
         await controller.initialize()
-        mixer.push_speech(np.full(960, 600, dtype='<i2').tobytes(), 960)
+        original_source, original_route = controller.actor.snapshot(), mixer.route
+        assert original_source['ready'] and original_source['owner'] is None
+        assert len(requests) == 1
+        voice = np.full(960, 600, dtype='<i2').tobytes()
+        mixer.push_speech(voice, 960)
         mixer.tick(music_active=False, speech_active=True, duck_gain=.2, elapsed=.02)
-        assert len(packets) == 1 and packets[0].presentation_ns == now+600_000_000
-        assert packets[0].session == ZERO_UUID and packets[0].pcm == bytes(3840)
-        assert packets[0].presentation_ns-mixer.output_buffer_ms*1_000_000-now == 100_000_000
-        assert controller.actor.snapshot()['owner'] is None and len(requests) == 1
+        assert speech_packets == [(voice, 960)] and controls == [(True, .2)]
+        # OwnTone's authenticated output clock drives idle speech. A competing
+        # silence packet here would refill its suspended music input instead.
+        assert not packets
+        assert mixer.route == original_route and controller.actor.snapshot() == original_source
+        assert len(requests) == 1
     finally:
         await controller.close()
 

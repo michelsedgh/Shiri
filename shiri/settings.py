@@ -22,6 +22,8 @@ class Settings:
     pcm_exec_helper: Path | None = None
     max_rooms: int = 8
     trusted_proxy_ips: str = "127.0.0.1,::1"
+    tts_worker_url: str | None = None
+    tts_worker_token_file: Path | None = None
 
     def __post_init__(self):
         if type(self.allow_unauthenticated) is not bool:
@@ -35,6 +37,16 @@ class Settings:
                 ipaddress.ip_network(address.strip(), strict=False)
         if not self.api_host or any(ord(char) < 32 for char in self.api_host):
             raise ValueError("API host must be a nonempty address")
+        if self.tts_worker_url:
+            from urllib.parse import urlsplit
+            if any(ord(char) <= 32 or ord(char) == 127 for char in self.tts_worker_url):
+                raise ValueError("TTS worker origin must not contain whitespace or control characters")
+            address = urlsplit(self.tts_worker_url)
+            _ = address.port  # Validate malformed and out-of-range explicit ports.
+            if address.scheme not in {"http", "https"} or not address.hostname or address.username or address.password or address.query or address.fragment or address.path not in {"", "/"}:
+                raise ValueError("TTS worker must be a trusted installation HTTP(S) origin")
+            if self.tts_worker_token_file is None:
+                raise ValueError("Configure a private TTS worker token file")
 
     @property
     def database(self) -> Path:
@@ -61,6 +73,9 @@ class Settings:
                              if os.environ.get("SHIRI_PCM_EXEC_HELPER") else None),
             max_rooms=int(os.environ.get("SHIRI_MAX_ROOMS", "8")),
             trusted_proxy_ips=os.environ.get("SHIRI_TRUSTED_PROXY_IPS", "127.0.0.1,::1"),
+            tts_worker_url=os.environ.get("SHIRI_TTS_WORKER_URL") or None,
+            tts_worker_token_file=(Path(os.environ["SHIRI_TTS_WORKER_TOKEN_FILE"])
+                                   if os.environ.get("SHIRI_TTS_WORKER_TOKEN_FILE") else None),
         )
 
 

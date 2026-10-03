@@ -117,7 +117,7 @@ async def test_late_speech_delivery_failure_cannot_duck_retime_or_command_the_mu
 
 
 @pytest.mark.asyncio
-async def test_late_idle_speech_starts_a_short_timed_silence_bed_without_the_music_relay_wait():
+async def test_late_idle_speech_uses_the_backend_clock_without_synthesizing_program_fifo_audio():
     c, writer, client = controller()
     overlay = LateSpeech(accepted=True)
     c.mixer.speech_output = overlay
@@ -125,9 +125,9 @@ async def test_late_idle_speech_starts_a_short_timed_silence_bed_without_the_mus
     await c.initialize()
     c.mixer.push_speech(array('h', [1200]*480).tobytes(), 480)
     c.mixer.tick(music_active=False, speech_active=True, duck_gain=0.2, elapsed=0.01)
-    packet = writer.packets[-1]
-    assert packet.pcm == bytes(3840) and packet.session == ZERO_UUID
-    assert packet.presentation_ns-c.mixer.now_ns() == 600_000_000
+    assert not writer.packets
+    assert overlay.frames == [(array('h', [1200]*480).tobytes(), 480)]
+    assert overlay.controls == [(True, 0.2)]
     assert len(client.requests) == 1 and c.actor.snapshot()['owner'] is None
     await c.close()
 

@@ -21,8 +21,8 @@ def test_event_patch_builder_and_required_contract_are_coherent():
     from shiri.runtime.broker import REQUIRED_OWNTONE_VERSION, _OWNTONE_VERSION_PATTERN
     value = checker()
     assert hashlib.sha256(value.PATCH.read_bytes()).hexdigest() == value.PATCH_SHA
-    assert REQUIRED_OWNTONE_VERSION == value.VERSION
-    assert _OWNTONE_VERSION_PATTERN.search("OwnTone " + value.VERSION)
+    assert REQUIRED_OWNTONE_VERSION == value.VERSION + "-idle1"
+    assert _OWNTONE_VERSION_PATTERN.search("OwnTone " + REQUIRED_OWNTONE_VERSION)
     for stale in (value.VERSION.removesuffix("-event1"), value.VERSION + "0", value.VERSION + "-other"):
         assert not _OWNTONE_VERSION_PATTERN.search("OwnTone " + stale)
     builder = (ROOT / "install/build_backends.sh").read_text()

@@ -14,7 +14,6 @@ from shiri.runtime.audio import AudioWorker
 from shiri.runtime.audio import SpeechSession
 from shiri.runtime.native import NativeController, NativeHandle, NativeMixer
 from shiri.runtime.speech_startup import PREFIX_MAX_AGE_NS, PREFIX_MAX_FRAMES, SpeechPreparation
-from shiri.runtime.timing import ZERO_UUID
 from test_audio import FakePeer, request
 from test_native_audio import Writer, begin, pcm
 
@@ -239,8 +238,7 @@ async def test_delayed_outputs_and_first_mix_gate_whole_prefix_and_original_rece
         client.connect()
         await wait_for(lambda: prep.phase == "waiting_for_mix")
         native.mixer.tick(music_active=False, speech_active=False, duck_gain=0.2, elapsed=0.01)
-        assert writer.packets[-1].session == ZERO_UUID
-        assert writer.packets[-1].presentation_ns - native.mixer._idle_next_ns == 580_000_000
+        assert not writer.packets  # Exact C readiness creates its own output-only bed.
         voice = array("h", [900] * 960).tobytes()
         native.mixer.set_speech_gain(0.1)
         native.mixer.push_speech(voice, 960)
@@ -373,7 +371,7 @@ async def test_bounded_setup_timeout_discards_prefix_without_timer_or_source_mut
 
 
 @pytest.mark.parametrize("horizon,lead", [(1_000_000_000, 500), (2_750_000_000, 2250)])
-async def test_connected_same_peer_quiet_bed_stays_open_independent_of_music_horizon_then_retires(
+async def test_connected_same_peer_quiet_speech_never_fills_program_fifo_then_retires(
     horizon, lead
 ):
     native, writer, client, overlay = await native_controller(horizon=horizon, lead=lead)
@@ -390,16 +388,12 @@ async def test_connected_same_peer_quiet_bed_stays_open_independent_of_music_hor
         native.mixer.push_speech(bytes(1920), 960)
         native.mixer.tick(music_active=False, speech_active=False, duck_gain=0.2, elapsed=0.02)
         assert not writer.closed
-    assert len(writer.packets) == 400 and native.actor.snapshot()["owner"] is None
-    assert writer.packets[0].presentation_ns - base == (lead + 100) * 1_000_000
-    assert all(
-        b.frame_index == a.frame_index + 960 and b.presentation_ns == a.presentation_ns + 20_000_000
-        for a, b in zip(writer.packets[:-1], writer.packets[1:], strict=True)
-    )
+    assert not writer.packets and native.actor.snapshot()["owner"] is None
+    assert len(overlay.sent) == 400 and sum(packet[1] for packet in overlay.sent) == 400 * 960
     native.retire_speech(identity)
     clock[0] += 10_000_000_000
     native.mixer.tick(music_active=False, speech_active=False, duck_gain=0.2, elapsed=0.02)
-    assert writer.closed and prep.retired
+    assert not writer.packets and prep.retired
     await native.close()
 
 

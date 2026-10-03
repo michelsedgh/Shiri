@@ -61,13 +61,30 @@ def main():
     actions.add_parser("runtime", help="Start the privileged Linux audio broker")
     actions.add_parser("doctor", help="Report prerequisites without changing the system")
     actions.add_parser("bootstrap", help="Initialize storage and an installation admin token")
+    tts_worker = actions.add_parser("tts-worker", help="Start the optional isolated local TTS model worker")
+    tts_worker.add_argument("--host", default="127.0.0.1")
+    tts_worker.add_argument("--port", type=int, default=8091)
+    tts_worker.add_argument("--token-file", type=Path, required=True)
+    tts_worker.add_argument("--cache-dir", type=Path)
+    tts_worker.add_argument("--registry", type=Path)
+    from shiri.tts.models import DEFAULT_MODEL_ID
+    tts_worker.add_argument("--preload", default=DEFAULT_MODEL_ID)
+    tts_worker.add_argument("--allow-download", action="store_true", help="Allow pinned model downloads during explicit loading")
     migration = actions.add_parser("migrate", help="Plan or atomically import the old JSON configuration")
     migration.add_argument("source", type=Path)
     migration.add_argument("--apply", action="store_true", help="Import as disabled rooms; source remains untouched")
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
-    if args.command == "serve":
+    if args.command == "tts-worker":
+        import uvicorn
+        from shiri.tts.worker import create_worker_app, read_worker_token
+        app = create_worker_app(token=read_worker_token(args.token_file), registry_file=args.registry,
+                                cache_dir=args.cache_dir, allow_download=args.allow_download,
+                                preload_model=args.preload or None)
+        uvicorn.run(app, host=args.host, port=args.port, workers=1, timeout_graceful_shutdown=10,
+                    proxy_headers=False)
+    elif args.command == "serve":
         from dataclasses import replace
         import uvicorn
         from shiri.api import create_app

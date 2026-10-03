@@ -2,14 +2,16 @@
 
 Shiri turns each configured zone into an **AirPlay 2 receiver**. Phones use their existing AirPlay controls, without a Shiri phone app. Shiri sends the incoming audio to that zone's assigned speakers, which can use different supported output protocols. TTS targets the same zones, lowering music volume while music keeps playing, then smoothly restoring it. The user deferred Chromecast input on October 1; Chromecast speaker outputs remain supported through OwnTone. The authoritative behavior and release requirements are in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md).
 
-The rebuilt software is **qualified and installed on the live Ubuntu VM**. The user confirmed fresh iPhone playback without a web-volume nudge, phone volume reaching the speakers and web room master, web volume updating the iPhone slider, and resume after a requested 40-second pause. The qualified software also covers targeted speech, source ownership, lifecycle/recovery, reboot and rollback. See [the live test handoff](docs/LIVE_TEST_HANDOFF.md) for the installed version and next tests. Physical acoustic synchronization, native iPhone grouping across zones, mixed speaker transports and per-speaker balance tests remain to be measured; this single phone test does not establish universal device compatibility. Chromecast input is deferred; [receiver feasibility](docs/CAST_INPUT_FEASIBILITY.md) records why. Nobly is a future client, and Bluetooth input is excluded. Historical failures and the review record are preserved in [docs/REBUILD.md](docs/REBUILD.md).
+The rebuilt software is **installed on the live Ubuntu VM**, with optional local text-to-speech generation on the Mac. The previous iPhone test confirmed first playback, phone/web volume feedback and resume after a 40-second pause. The current release adds selectable voices, generation measurements and an OwnTone repair for speech after idle input. See [the live test handoff](docs/LIVE_TEST_HANDOFF.md) for exact installed versions, validation and next tests.
+
+Physical acoustic synchronization, native iPhone grouping across zones, mixed speaker transports and per-speaker balance still need measurements. Chromecast input is deferred; [receiver feasibility](docs/CAST_INPUT_FEASIBILITY.md) records why. Nobly is a future client, and Bluetooth input is excluded. Historical failures and the review record remain in [docs/REBUILD.md](docs/REBUILD.md).
 
 ## Supported paths and test boundaries
 
 | Path | Implementation | Practical limit |
 | --- | --- | --- |
 | AirPlay input | Pinned Shairport Sync AirPlay 2 receiver, one advertised receiver per enabled room | Linux, bridged LAN, working multicast and PTP |
-| Room-addressed speech | WebRTC audio API with authentication on by default, one active producer per room | Nobly is a future external client; it is not installed |
+| Room-addressed speech | Text-to-speech with selectable local models, or streamed WebRTC audio; one producer per room | Optional MLX generation runs on Apple Silicon; one model job at a time. Nobly is a future client |
 | AirPlay output | OwnTone 29.3 | Device authorization may require setup |
 | Google Cast output | OwnTone's Cast implementation | Cross-protocol synchronization is approximate; device support varies |
 | Wired/local output | Enrolled physical ALSA device, with opened-device identity checks | Software playback is qualified; each physical device still requires admission and measurement |
@@ -75,6 +77,8 @@ The current live VM uses that explicit opt-in and a LAN listener. Open **http://
 
 The [whole-house assessment](docs/WHOLE_HOUSE_AUDIO_REPORT.md) covers measured processing load, connection and speech latency, independent room microphones, automatic calibration, speaker standby and the remaining Nobly integration work.
 
+The **Speech voices** control loads a local model and measures generation quietly. **Speak** on a room sends a generated reply to its assigned speakers. See [local streaming speech](docs/LOCAL_TTS.md) for setup, exact room/Nobly text APIs, voice controls, latency measurements and model limits. The [music-onset trace](docs/MUSIC_ONSET_DIAGNOSTICS.md) helps investigate slower first playback without changing the working music buffers.
+
 For a default authenticated installation, use a local tunnel or an HTTPS reverse proxy for access from another device. The proxy must preserve the original `Host`, including the external port, and forward the original scheme with `X-Forwarded-Proto`; otherwise same-origin checks will reject browser writes. Forwarded scheme/address headers are trusted only from loopback by default; configure `SHIRI_TRUSTED_PROXY_IPS` explicitly for another proxy address. Proxying HTTP control does not relay WebRTC audio: the speech client must also reach the worker's LAN ICE candidates. There is no public STUN/TURN service configured.
 
 ## Migration and rollback
@@ -109,6 +113,12 @@ The rootless HTTP service owns validated room intent in SQLite. A separate privi
 | `/api/v1/rooms/{id}/calibration` | Recorded timing sessions, analysis, guarded correction and rollback |
 | `POST /api/v1/rooms/{id}/speech` | Negotiate or close explicitly identified speech |
 | `POST /api/v1/nobly/rooms/{external_id}/speech` | Route by an exact configured Nobly room binding |
+| `POST /api/v1/rooms/{id}/tts` | Generate text and stream it to one room |
+| `POST /api/v1/nobly/rooms/{external_id}/tts` | Admit text by one exact external room binding |
+| `GET /api/v1/tts/models` | Read registered models and generation worker readiness |
+| `POST /api/v1/tts/models/load` | Explicitly load and silently warm a registered model |
+| `POST /api/v1/tts/benchmark` | Measure generation without playing house audio |
+| `GET /api/v1/tts/jobs/{id}` / `DELETE` | Inspect or cancel the exact text request |
 | `GET /api/v1/health/live` | HTTP process liveness |
 | `GET /api/v1/health/ready` | Cheap broker and enabled-room readiness |
 | `GET /api/v1/events` | Bounded durable configuration event history |

@@ -132,103 +132,109 @@ def assemble(source, target):
     return hasbed
 
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--source", type=Path, required=True)
-parser.add_argument("--preimage", type=Path)
-parser.add_argument("--compiler")
-args = parser.parse_args()
-compiler = args.compiler or shutil.which("clang") or shutil.which("cc")
-if not compiler:
-    raise SystemExit("A C compiler is required")
-cases = [("candidate", args.source)]
-if args.preimage:
-    cases.append(("preimage", args.preimage))
-results = []
-with tempfile.TemporaryDirectory(prefix="shiri-paused-real-c-") as temp:
-    for name, source in cases:
-        unit = Path(temp) / (name + ".c")
-        bed = assemble(source, unit)
-        binary = unit.with_suffix("")
-        flags = [
-            compiler,
-            "-std=gnu11",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-Wno-unused-parameter",
-            "-Wno-unused-variable",
-            "-Wno-unused-function",
-            "-Wno-sign-compare",
-            "-O1",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            "-I" + str(source / "src"),
-            '-DSHIRI_SPEECH_SOURCE="' + str(source / "src/shiri_speech.c") + '"',
-            str(unit),
-            "-lm",
-            "-o",
-            str(binary),
-        ]
-        completed = subprocess.run(flags, capture_output=True, text=True)
-        if completed.returncode:
-            print(completed.stderr)
-            raise SystemExit(1)
-        run = subprocess.run(
-            [str(binary)],
-            capture_output=True,
-            text=True,
-            env=dict(
-                os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1", UBSAN_OPTIONS="halt_on_error=1"
-            ),
-        )
-        if bed:
-            if run.returncode:
-                print(run.stderr, run.stdout)
-                raise SystemExit(1)
-            results.append(run.stdout.strip())
-        elif run.returncode == 0 or "paused phone preparation must succeed" not in run.stderr:
-            raise SystemExit("Old actual native regression did not reproduce: " + run.stdout + run.stderr)
-        else:
-            results.append(
-                "Exact pre-bed source preimage reproduced paused-phone setup refusal under the same lifecycle fixture"
-            )
-        json_flags = shlex.split(
-            subprocess.run(
-                ["pkg-config", "--cflags", "--libs", "json-c"], capture_output=True, text=True, check=True
-            ).stdout
-        )
-        json_binary = Path(temp) / (name + "-json")
-        compiled = subprocess.run(
-            [
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--preimage", type=Path)
+    parser.add_argument("--compiler")
+    args = parser.parse_args()
+    compiler = args.compiler or shutil.which("clang") or shutil.which("cc")
+    if not compiler:
+        raise SystemExit("A C compiler is required")
+    cases = [("candidate", args.source)]
+    if args.preimage:
+        cases.append(("preimage", args.preimage))
+    results = []
+    with tempfile.TemporaryDirectory(prefix="shiri-paused-real-c-") as temp:
+        for name, source in cases:
+            unit = Path(temp) / (name + ".c")
+            bed = assemble(source, unit)
+            binary = unit.with_suffix("")
+            flags = [
                 compiler,
                 "-std=gnu11",
                 "-Wall",
                 "-Wextra",
                 "-Werror",
+                "-Wno-unused-parameter",
+                "-Wno-unused-variable",
+                "-Wno-unused-function",
+                "-Wno-sign-compare",
                 "-O1",
                 "-fsanitize=address,undefined",
                 "-fno-sanitize-recover=all",
                 "-I" + str(source / "src"),
-                str(NATIVE / "test_paused_speech_json.c"),
-                *json_flags,
+                '-DSHIRI_SPEECH_SOURCE="' + str(source / "src/shiri_speech.c") + '"',
+                str(unit),
+                "-lm",
                 "-o",
-                str(json_binary),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if compiled.returncode:
-            print(compiled.stderr)
-            raise SystemExit(1)
-        parsed = subprocess.run([str(json_binary)], capture_output=True, text=True)
-        if bed:
-            if parsed.returncode:
-                print(parsed.stderr, parsed.stdout)
+                str(binary),
+            ]
+            completed = subprocess.run(flags, capture_output=True, text=True)
+            if completed.returncode:
+                print(completed.stderr)
                 raise SystemExit(1)
-            results.append(parsed.stdout.strip())
-        elif parsed.returncode == 0 or "paused phone JSON prepare must be accepted" not in parsed.stderr:
-            raise SystemExit("Actual old JSON refusal not reproduced")
-        else:
-            results.append("Exact pre-bed JSON parser reproduced actual paused-source preparation refusal")
+            run = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                env=dict(
+                    os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1", UBSAN_OPTIONS="halt_on_error=1"
+                ),
+            )
+            if bed:
+                if run.returncode:
+                    print(run.stderr, run.stdout)
+                    raise SystemExit(1)
+                results.append(run.stdout.strip())
+            elif run.returncode == 0 or "paused phone preparation must succeed" not in run.stderr:
+                raise SystemExit("Old actual native regression did not reproduce: " + run.stdout + run.stderr)
+            else:
+                results.append(
+                    "Exact pre-bed source preimage reproduced paused-phone setup refusal under the same lifecycle fixture"
+                )
+            json_flags = shlex.split(
+                subprocess.run(
+                    ["pkg-config", "--cflags", "--libs", "json-c"], capture_output=True, text=True, check=True
+                ).stdout
+            )
+            json_binary = Path(temp) / (name + "-json")
+            compiled = subprocess.run(
+                [
+                    compiler,
+                    "-std=gnu11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-O1",
+                    "-fsanitize=address,undefined",
+                    "-fno-sanitize-recover=all",
+                    "-I" + str(source / "src"),
+                    str(NATIVE / "test_paused_speech_json.c"),
+                    *json_flags,
+                    "-o",
+                    str(json_binary),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if compiled.returncode:
+                print(compiled.stderr)
+                raise SystemExit(1)
+            parsed = subprocess.run([str(json_binary)], capture_output=True, text=True)
+            if bed:
+                if parsed.returncode:
+                    print(parsed.stderr, parsed.stdout)
+                    raise SystemExit(1)
+                results.append(parsed.stdout.strip())
+            elif parsed.returncode == 0 or "paused phone JSON prepare must be accepted" not in parsed.stderr:
+                raise SystemExit("Actual old JSON refusal not reproduced")
+            else:
+                results.append("Exact pre-bed JSON parser reproduced actual paused-source preparation refusal")
 
-print(json.dumps({"ok": True, "sanitized": True, "results": results}, indent=2))
+    print(json.dumps({"ok": True, "sanitized": True, "results": results}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

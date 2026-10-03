@@ -300,9 +300,9 @@ class RoomService:
 
     async def speech(self, room_id: str, payload: dict):
         room: Room = await self._store("get_room", room_id)
-        if not room.enabled and payload.get("action", "offer") != "close":
+        if not room.enabled and payload.get("action", "offer") not in {"close", "finish"}:
             raise Conflict("Enable this room before sending speech")
-        if not room.speakers and payload.get("action", "offer") != "close":
+        if not room.speakers and payload.get("action", "offer") not in {"close", "finish"}:
             raise Conflict("Assign speakers to this room before sending speech")
         result = await self.runtime.call("speech", {**payload, "room_id": room_id, "duck_gain": room.duck_gain})
         return {**result, "admitted_room_id": room.id}

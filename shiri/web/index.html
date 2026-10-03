@@ -36,7 +36,7 @@
     <section id="dashboard" aria-labelledby="page-title">
       <div class="page-heading">
         <div><span class="eyebrow">A place for every sound</span><h1 id="page-title">Your rooms</h1><p id="room-summary">Loading your home…</p></div>
-        <button id="add-room" class="button primary" type="button" disabled><span aria-hidden="true">＋</span> Add room</button>
+        <div class="page-heading-actions"><button id="tts-settings" class="button quiet" type="button">Speech voices</button><button id="add-room" class="button primary" type="button" disabled><span aria-hidden="true">＋</span> Add room</button></div>
       </div>
       <div id="connection-error" class="notice error" role="alert" hidden></div>
       <div id="mode-notice" class="notice" hidden></div>
@@ -82,6 +82,35 @@
       <div class="sheet-footer"><button id="refresh-speakers" class="button quiet" type="button">Refresh discovery</button><button id="save-speakers" class="button primary" type="submit">Save speakers</button></div>
       <div class="room-connection-details"><button id="measure-timing" class="button quiet" type="button">Measure speaker timing</button><p class="hint">Two microphones on one capture device can measure relative arrival. Calibration never changes a delay automatically.</p></div>
     </form>
+  </dialog>
+
+  <dialog id="tts-dialog" class="side-sheet" aria-labelledby="tts-title">
+    <div class="sheet-heading"><div><span class="eyebrow">Spoken replies</span><h2 id="tts-title">Speech voices</h2></div><button class="close-button" data-close="tts" type="button" aria-label="Close speech voices">×</button></div>
+    <div class="sheet-body">
+      <p id="tts-intro" class="form-intro">Choose a voice and measure how quickly it generates speech.</p>
+      <p id="tts-worker-status" class="notice" role="status">Checking speech availability…</p>
+      <p id="tts-error" class="notice error" role="alert" hidden></p>
+      <form id="tts-form">
+        <label class="field" for="tts-model">Voice model</label><select id="tts-model" required disabled></select>
+        <p id="tts-model-help" class="hint"></p>
+        <p id="tts-model-warning" class="notice warning" role="status" hidden></p>
+        <div class="tts-model-actions"><button id="tts-load-model" class="button quiet" type="button" disabled>Load selected model</button><button id="tts-refresh" class="button quiet" type="button">Refresh availability</button></div>
+        <label class="field" for="tts-voice">Voice</label><select id="tts-voice" required disabled></select>
+        <label class="field" for="tts-language">Language</label><select id="tts-language" required disabled></select>
+        <div id="tts-speed-field" hidden><label class="field" for="tts-speed">Speaking speed</label><select id="tts-speed"><option value="0.75">Slower · 0.75×</option><option value="1" selected>Normal · 1×</option><option value="1.25">Faster · 1.25×</option><option value="1.5">Fast · 1.5×</option></select></div>
+        <label class="field" for="tts-text">What should Shiri say?</label><textarea id="tts-text" rows="5" maxlength="2000" placeholder="Type a spoken reply…" required></textarea>
+        <p id="tts-room-help" class="hint"></p>
+        <div class="tts-submit-actions"><button id="tts-speak" class="button primary" type="submit" hidden disabled>Speak in room</button><button id="tts-benchmark" class="button quiet" type="button" disabled>Measure model latency</button></div>
+        <p class="hint">Measuring a model generates speech quietly. It does not send audio to your room speakers.</p>
+      </form>
+      <section id="tts-job" class="tts-job" aria-labelledby="tts-job-title" hidden>
+        <div class="tts-job-heading"><h3 id="tts-job-title">Speech progress</h3><button id="tts-cancel" class="button quiet" type="button" disabled>Stop job</button></div>
+        <p id="tts-job-status" class="notice" role="status"></p>
+        <dl id="tts-metrics" class="tts-metrics"></dl>
+        <p id="tts-metrics-help" class="hint">These measurements end at software processing points. Speaker and acoustic latency need a microphone test.</p>
+        <div id="tts-preview" class="tts-preview" hidden><audio id="tts-audio" controls preload="none" aria-label="Listen to the measured voice in this browser"></audio><p class="hint">Listen here; this preview plays on this browser, not the room speakers.</p><p id="tts-preview-error" class="notice error" role="alert" hidden></p></div>
+      </section>
+    </div>
   </dialog>
 
   <dialog id="calibration-dialog" class="side-sheet" aria-labelledby="calibration-title">

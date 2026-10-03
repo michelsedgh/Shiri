@@ -31,7 +31,7 @@ def test_build_digest_marker_and_required_credential_check_are_coherent():
     assert builder.index('apply "$OWNTONE_OWNER_PATCH"') < builder.index("check_speech_owner.py")
     assert 'check_speech_owner.py" --source "$BUILD/owntone" --compiler /usr/bin/cc --require-credentials' in builder
     assert 'manifest["owntone_speech_owner_patch"] = sys.argv[23]' in builder
-    assert REQUIRED_OWNTONE_VERSION == CHECKER.VERSION + "-balance1-transition1-bed1-event1"
+    assert REQUIRED_OWNTONE_VERSION == CHECKER.VERSION + "-balance1-transition1-bed1-event1-idle1"
 
 
 def test_owner_marker_is_exact_and_patch_cannot_change_output_transport(tmp_path):

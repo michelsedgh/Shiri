@@ -254,6 +254,29 @@ the mere existence of a WebRTC connection. This establishes music/speech
 mixing. Arbitration between phones and input protocols remains required work,
 including stale-event protection and real device verification.
 
+The optional text path resolves a room UUID or exact Nobly binding once at
+admission. A bounded job retains that UUID, a client request ID and a hash of its
+immutable intent. Repeating the same retained request returns the existing job;
+reusing its ID for different text or routing conflicts. Binding edits cannot
+redirect subsequent audio or cancellation.
+
+MLX generation runs in an isolated persistent Mac process, separate from Linux
+speaker routing. Registered models are pinned; HTTP callers choose model IDs,
+voices and languages rather than arbitrary files or repositories. Prewarm audio
+is discarded. A model job streams normalized mono PCM through one stateful
+resampler; the API paces private 20 ms frames into the same room producer slot
+used by WebRTC. Sequence/frame positions and an exact stream identity fence
+replay, stale finish and stale cancellation. This path avoids Opus input and
+WebRTC prefetch, while preserving OwnTone's output timing and music calendar.
+
+One generation job is active at a time. Normal cancellation closes the generator,
+discards its resampler tail and resets its decoder before a bounded explicit
+acknowledgment permits warm reuse. A missing acknowledgment, uncertain error or
+hung model discards the process. Neither warmup nor waiting for generation ducks
+music. Received audible speech uses the existing smooth gain envelope. Model
+generation, room admission and physical acoustic onset remain distinct clocks
+and measurements. See [local TTS](LOCAL_TTS.md) for the concrete API and bounds.
+
 The speech path must preserve continuous music playback and phone ownership.
 Offer, received speech, control, close, timeout and failure handling must never
 invoke music pause/seek/restart, reconnect output sessions or replace the

@@ -20,6 +20,7 @@ from shiri.runtime_port import SimulatedRuntime, SocketRuntime
 from shiri.service import RoomService
 from shiri.settings import Settings
 from shiri.store import Store
+from shiri.tts.coordinator import TextSpeechCoordinator, TextSpeechRequest
 
 log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
@@ -161,6 +162,9 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     auth = (None if settings.simulation or settings.allow_unauthenticated
             else Auth(token or settings.api_token_file.read_text().strip()))
     service = RoomService(store, runtime)
+    tts = TextSpeechCoordinator(service, worker_url=settings.tts_worker_url,
+                               worker_token=(settings.tts_worker_token_file.read_text().strip()
+                                             if settings.tts_worker_url else None))
     stop = asyncio.Event()
 
     async def reconcile_loop():
@@ -183,12 +187,14 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
             stop.set()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            await tts.close()
             store.close()
 
     app = FastAPI(title="Shiri", version="2.0.0", lifespan=lifespan,
                   docs_url=None, openapi_url="/api/openapi.json", redoc_url=None)
     app.state.service = service
     app.state.settings = settings
+    app.state.tts = tts
     app.add_middleware(BodyLimit)
     login_attempts = defaultdict(deque)
 
@@ -381,6 +387,42 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     async def events(limit: int = Query(default=100, ge=1, le=200)):
         entries = await service._store("list_events", limit)
         return {"events": [event.model_dump(mode="json") for event in entries]}
+
+    @app.get("/api/v1/tts/models")
+    async def tts_models():
+        return await tts.catalog()
+
+    class ModelLoad(StrictModel):
+        model_id: str = Field(min_length=1, max_length=128)
+
+    @app.post("/api/v1/tts/models/load", status_code=202)
+    async def tts_load(body: ModelLoad):
+        return await tts.load(body.model_id)
+
+    @app.post("/api/v1/tts/benchmark", status_code=202)
+    async def tts_benchmark(body: TextSpeechRequest):
+        return await tts.admit(body, benchmark=True)
+
+    @app.post("/api/v1/rooms/{room_id}/tts", status_code=202)
+    async def room_tts(room_id: str, body: TextSpeechRequest):
+        return await tts.admit(body, room_id=room_id)
+
+    @app.post("/api/v1/nobly/rooms/{external_id:path}/tts", status_code=202)
+    async def nobly_tts(external_id: str, body: TextSpeechRequest):
+        return await tts.admit(body, external_id=external_id)
+
+    @app.get("/api/v1/tts/jobs/{job_id}")
+    async def tts_job(job_id: str):
+        return tts.get(job_id).public()
+
+    @app.delete("/api/v1/tts/jobs/{job_id}")
+    async def cancel_tts(job_id: str):
+        return await tts.cancel(job_id)
+
+    @app.get("/api/v1/tts/jobs/{job_id}/sample.wav")
+    async def tts_sample(job_id: str):
+        return Response(tts.sample(job_id), media_type="audio/wav",
+                        headers={"Content-Disposition": 'inline; filename="shiri-voice-preview.wav"'})
 
     @app.get("/api/v1/rooms/{room_id}/diagnostics")
     async def diagnostics(room_id: str):
