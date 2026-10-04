@@ -42,18 +42,18 @@ def test_actual_sender_and_ap2_consumer_all_offsets_reject_preimage_and_preserve
 
 @pytest.mark.parametrize("protocol,offset,refused,accepted", [
     ("airplay1", -100, 500, 600), ("airplay2", -250, 500, 750),
-    ("airplay2", -2000, 2250, 2500), ("alsa", -2000, 2249, 2250),
+    ("airplay2", -2000, 2250, 2500), ("alsa", -2000, 2039, 2040),
     ("pulseaudio", -2000, 2249, 2250), ("chromecast", -2000, 2249, 2250),
 ])
-def test_explicit_legacy_buffer_renderer_retains_selected_protocol_lead_before_writing(tmp_path, protocol, offset, refused, accepted):
+def test_explicit_buffer_renderer_retains_selected_protocol_lead_before_writing(tmp_path, protocol, offset, refused, accepted):
     definition = room(protocol, offset)
-    args = dict(broker_socket=tmp_path / "broker.sock", all_receiver_names=[], password="private-test-only")
+    args = dict(all_receiver_names=[], password="private-test-only", audio_uid=1234)
     with pytest.raises(RuntimeFailure, match="required timing lead"):
         backend_configs(definition, tmp_path / "refused", {"interface": "receiver0"},
-                        {"api_host_ip": "10.211.0.1", "api_ip": "10.211.0.2"}, output_buffer_ms=refused, **args)
+                        output_buffer_ms=refused, **args)
     assert not (tmp_path / "refused").exists()
     _, own = backend_configs(definition, tmp_path / "accepted", {"interface": "receiver0"},
-                             {"api_host_ip": "10.211.0.1", "api_ip": "10.211.0.2"}, output_buffer_ms=accepted, **args)
+                             output_buffer_ms=accepted, **args)
     assert f"start_buffer_ms = {accepted}" in own.read_text()
     assert room_buffer_ms(definition) == (2040 if protocol == "alsa" else accepted)
 

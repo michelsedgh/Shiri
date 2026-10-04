@@ -22,9 +22,8 @@ def test_unauthenticated_auxiliary_owntone_listeners_are_disabled(tmp_path, slot
     room = Room(id=str(uuid4()), slot=slot, name="Review room", airplay_name="Review input", interface="eth0")
     _receiver, config = backend_configs(
         room, tmp_path, {"interface": "srreview"},
-        {"api_host_ip": "10.190.1.1", "api_ip": "10.190.1.2"},
-        broker_socket=tmp_path / "broker.sock", all_receiver_names=[room.airplay_name],
-        password="review-private-password",
+        all_receiver_names=[room.airplay_name],
+        password="review-private-password", audio_uid=1234,
     )
     text = config.read_text()
     mpd = re.search(r"(?m)^mpd\s*\{([^}]*)\}", text)

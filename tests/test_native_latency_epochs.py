@@ -1,6 +1,5 @@
 """Actual policy, signal and epoch coroutines; external OS facts simulated."""
 
-import ast
 from collections import deque
 from copy import deepcopy
 import importlib.util
@@ -192,7 +191,6 @@ def test_marker_disqualified_pulse_cannot_bias_later_qualifying_coded_onset():
             break
     assert gate.passed and gate.first_absolute == trigger + 200_000_000 and gate.first_callback == 10.2
     assert gate.receipt()["encoder_to_final_pts_seconds"] == 0.2
-
 
 
 def test_later_qualifying_code_cannot_claim_missing_cold_utterance_prefix_is_complete():
@@ -433,7 +431,6 @@ def test_strict_aggregate_retains_all_nine_rows_actual_horizons_and_music_subcas
     assert result["physical_speakers_verified"] is False
 
 
-
 def test_ten_second_coded_runs_pass_integrity_without_disguising_speech_performance():
     actual, expected = reports()
     for report in actual:
@@ -603,30 +600,6 @@ def test_aggregate_rejects_incomplete_relabeled_faulted_or_reused_epochs(fault):
         warm["unchanged_item_id"] = 2
     with pytest.raises((RuntimeFailure, ValueError)):
         epoch.aggregate_epoch_reports(actual, expected)
-
-
-def test_new_phase_dispatch_preserves_exact_existing_legacy_audio_and_optional_hook_ast():
-    source = ast.parse((ROOT / "tests/linux/check_native_grouping.py").read_text())
-    run = next(
-        node for node in source.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_check"
-    )
-    body = next(node.body for node in run.body if isinstance(node, ast.Try))
-    wrapper = next(
-        node
-        for node in body
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "latency_epoch is not None"
-        and any(isinstance(child, ast.Attribute) and child.attr == "exercise" for child in ast.walk(node))
-    )
-    assert wrapper.orelse
-    hooks = [
-        node
-        for node in wrapper.orelse
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Name)
-        and node.test.id in {"faults", "latency"}
-    ]
-    assert {node.test.id for node in hooks} == {"faults", "latency"}
 
 
 @pytest.mark.asyncio

@@ -49,7 +49,7 @@ async def test_skipped_busy_hint_is_not_reported_as_preparing(adapter):
 
 
 async def test_active_speech_has_priority_without_worker_request(adapter):
-    adapter.coordinator.active = "owned-speech"
+    adapter.coordinator.active["test-room"] = "owned-speech"
     assert (await adapter.coordinator.warm(DEFAULT_MODEL_ID, purpose="interaction"))["state"] == "busy"
     assert not adapter.calls
 
@@ -69,13 +69,16 @@ async def test_speech_admission_does_not_wait_for_pending_model_hint_response():
         generation_entered.set()
         await asyncio.Event().wait()  # Cancellation retires this silent fake request.
 
-    async def get_room(*_arguments):
-        return SimpleNamespace(id="test-room", enabled=True, speakers=["silent-test-output"])
+    async def get_room(**_arguments):
+        return SimpleNamespace(id="test-room", enabled=True, interface="test0", slot=0,
+                               airplay_name="Test", local_audio_device=None,
+                               speakers=[SimpleNamespace(id="silent-test-output", protocol="airplay2",
+                                                         offset_ms=0, airplay_timing="auto")])
 
     async def speech(*_arguments):
         return {"ok": True, "stream_id": "owned-silent-test-stream"}
 
-    service = SimpleNamespace(_mutation=asyncio.Lock(), _store=get_room, speech=speech)
+    service = SimpleNamespace(resolve_text_speech=get_room, open_text_speech=speech)
     client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     coordinator = TextSpeechCoordinator(service, worker_url="http://worker.test", client=client)
     hint = asyncio.create_task(coordinator.warm(DEFAULT_MODEL_ID, purpose="interaction"))
@@ -84,10 +87,10 @@ async def test_speech_admission_does_not_wait_for_pending_model_hint_response():
         job = await asyncio.wait_for(coordinator.admit(
             TextSpeechRequest(request_id="b"*32, text="Actual speech takes priority."),
             room_id="test-room"), .5)
-        assert coordinator.active == job["id"] and not hint.done() and not warm_response.is_set()
+        assert job["id"] in coordinator.active.values() and not hint.done() and not warm_response.is_set()
         await asyncio.wait_for(generation_entered.wait(), 1)
         result = await asyncio.wait_for(coordinator.cancel(job["id"]), 1)
-        assert result["state"] == "cancelled" and coordinator.active is None
+        assert result["state"] == "cancelled" and not coordinator.active
         assert result["metrics"]["worker_cleanup_confirmed"] is True
     finally:
         warm_response.set()

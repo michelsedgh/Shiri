@@ -9,6 +9,8 @@ import stat
 import struct
 from collections.abc import Awaitable, Callable
 import uuid
+from dataclasses import dataclass
+from anyio import CancelScope
 
 from shiri.deadline import bounded
 
@@ -48,6 +50,22 @@ class RpcError(RuntimeError):
         super().__init__(message)
 
 
+class AdmissionRefused(RpcError):
+    """A stream attempt owns no resources; no retirement acknowledgement is due."""
+
+
+@dataclass
+class StreamReply:
+    """An authenticated RPC admission transferring its connection to a bounded stream.
+
+    The server retains cleanup even when the admission reply is lost. Ordinary
+    RPC operations still carry exactly one request per connection.
+    """
+    result: dict
+    run: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
+    close: Callable[[], Awaitable[object]]
+
+
 async def read_message(reader: asyncio.StreamReader) -> dict:
     length = struct.unpack("!I", await reader.readexactly(4))[0]
     if not 0 < length <= MAX_MESSAGE_BYTES:
@@ -68,7 +86,7 @@ async def write_message(writer: asyncio.StreamWriter, payload: dict):
     await writer.drain()
 
 
-async def call_rpc(socket_path: Path | str, operation: str, payload: dict | None = None, *, timeout=15.0):
+async def call_rpc(socket_path: Path | str, operation: str, payload: dict | None = None, *, timeout=15.0):  # noqa: ASYNC109 - owned RPC deadline.
     async def exchange():
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -134,6 +152,8 @@ async def serve_rpc(socket_path: Path | str, handler: Callable[[str, dict], Awai
         deadline = asyncio.get_running_loop().time() + 5
         response_started = False
         response_complete = False
+        stream = None
+        invoked = False
 
         async def reply(payload):
             nonlocal response_started, response_complete
@@ -162,7 +182,17 @@ async def serve_rpc(socket_path: Path | str, handler: Callable[[str, dict], Awai
                 if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 100 <= timeout_ms <= 30000:
                     raise RpcError("invalid_request", "Invalid RPC deadline")
                 deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
-                operation_task = asyncio.create_task(handler(operation, payload))
+                async def invoke():
+                    nonlocal stream, invoked
+                    invoked = True
+                    result = await handler(operation, payload)
+                    # Acquire ownership before yielding, including when the
+                    # caller disconnects as the admission finishes.
+                    if isinstance(result, StreamReply):
+                        stream = result
+                    return result
+
+                operation_task = asyncio.create_task(invoke())
                 disconnect = asyncio.create_task(reader.read(1))
                 try:
                     done, _ = await asyncio.wait({operation_task, disconnect}, timeout=timeout_ms / 1000,
@@ -179,12 +209,29 @@ async def serve_rpc(socket_path: Path | str, handler: Callable[[str, dict], Awai
                     for pending in (operation_task, disconnect):
                         if not pending.done():
                             pending.cancel()
-                    await asyncio.gather(operation_task, disconnect, return_exceptions=True)
-                await reply({"id": request_id, "ok": True, "result": result})
+                    joined = asyncio.gather(operation_task, disconnect, return_exceptions=True)
+                    with CancelScope(shield=True):
+                        while not joined.done():
+                            try:
+                                await asyncio.shield(joined)
+                            except asyncio.CancelledError:
+                                pass
+                await reply({"id": request_id, "ok": True, "result": stream.result if stream else result})
+                if stream:
+                    # Media defines stricter per-record deadlines and bounds;
+                    # this final ceiling also retires an indefinitely idle link.
+                    try:
+                        await asyncio.wait_for(stream.run(reader, writer), timeout=90)
+                    finally:
+                        # Flush a terminal error/retirement receipt too, even
+                        # after the original admission deadline has elapsed.
+                        deadline = asyncio.get_running_loop().time() + 2
         except (RpcError, ValueError, asyncio.TimeoutError) as exc:
             if not response_started:
                 with contextlib.suppress(OSError, asyncio.TimeoutError):
-                    await reply({"id": request_id, "ok": False, "code": getattr(exc, "code", "invalid_request"), "error": str(exc) or "Runtime request timed out"})
+                    await reply({"id": request_id, "ok": False, "code": getattr(exc, "code", "invalid_request"),
+                                 "error": str(exc) or "Runtime request timed out",
+                                 **({"admission_refused": True} if not invoked or isinstance(exc, AdmissionRefused) else {})})
         except (OSError, asyncio.IncompleteReadError):
             pass
         except Exception:
@@ -193,19 +240,34 @@ async def serve_rpc(socket_path: Path | str, handler: Callable[[str, dict], Awai
                     await reply({"id": request_id, "ok": False, "code": "runtime_error", "error": "Runtime operation failed; inspect its service logs"})
         finally:
             try:
-                if response_complete and not state["closed"]:
-                    # drain() can return with a tail below its low watermark.
-                    # Flush that tail for healthy readers, within the deadline.
-                    writer.close()
-                    try:
-                        remaining = max(0, deadline - asyncio.get_running_loop().time())
-                        await asyncio.wait_for(writer.wait_closed(), timeout=remaining)
-                    except (OSError, asyncio.TimeoutError, asyncio.CancelledError):
-                        writer.transport.abort()
-                else:
-                    writer.transport.abort()
+                if stream is not None:
+                    cleanup = asyncio.create_task(stream.close())
+                    with CancelScope(shield=True):
+                        while not cleanup.done():
+                            try:
+                                await asyncio.shield(cleanup)
+                            except asyncio.CancelledError:
+                                pass
+                    # A broken downstream link cannot produce a retirement
+                    # receipt; its owner still retires it on EOF. No success
+                    # is reported for that case.
+                    with contextlib.suppress(RpcError, OSError):
+                        cleanup.result()
             finally:
-                tasks.discard(current)
+                try:
+                    if response_complete and not state["closed"]:
+                        # drain() can return with a tail below its low watermark.
+                        # Flush that tail for healthy readers, within the deadline.
+                        writer.close()
+                        try:
+                            remaining = max(0, deadline - asyncio.get_running_loop().time())
+                            await asyncio.wait_for(writer.wait_closed(), timeout=remaining)
+                        except (OSError, asyncio.TimeoutError, asyncio.CancelledError):
+                            writer.transport.abort()
+                    else:
+                        writer.transport.abort()
+                finally:
+                    tasks.discard(current)
 
     server = await asyncio.start_unix_server(connection, path=str(path))
     try:

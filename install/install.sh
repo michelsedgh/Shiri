@@ -14,14 +14,19 @@ case "${1:-}" in
   "") ;;
   *) echo "Usage: $0 [--with-backends]" >&2; exit 2 ;;
 esac
-/usr/bin/python3 -I "$SOURCE/install/apt_dependencies.py" build-essential python3-venv python3-pip python3-gi python3-cairo gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
-  iproute2 isc-dhcp-client iputils-ping util-linux coreutils dbus avahi-daemon alsa-utils \
-  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad gstreamer1.0-alsa
-/usr/bin/python3 -I "$SOURCE/install/kernel_modules.py"
+/usr/bin/python3 -I "$SOURCE/install/apt_dependencies.py" build-essential python3-venv python3-pip \
+  iproute2 isc-dhcp-client iputils-ping util-linux coreutils dbus avahi-daemon alsa-utils
+# Native receiver and Bluetooth output paths do not use an ALSA loopback card.
+# Virtual-device qualification remains an explicit development option.
+if [[ "${SHIRI_INSTALL_LOOPBACK:-0}" == 1 ]]; then
+  /usr/bin/python3 -I "$SOURCE/install/kernel_modules.py"
+  modprobe snd-aloop
+  install -d -m 0755 /etc/modules-load.d
+  printf '%s\n' snd-aloop > /etc/modules-load.d/shiri.conf
+fi
 SHIRI_INSTALL_PREFIX="$PREFIX" bash "$SOURCE/install/build_helpers.sh"
 mkdir -p "$PREFIX"
-/usr/bin/python3 -I -m venv --system-site-packages "$PREFIX/venv"
+/usr/bin/python3 -I -m venv "$PREFIX/venv"
 /usr/bin/python3 -I "$SOURCE/install/validate_installation.py" "$PREFIX"
 "$PREFIX/venv/bin/python" -m pip install --require-hashes --only-binary=:all: -r "$SOURCE/install/build_requirements.lock"
 "$PREFIX/venv/bin/python" -m pip install --require-hashes --only-binary=:all: -r "$SOURCE/install/requirements.lock"
@@ -29,18 +34,9 @@ mkdir -p "$PREFIX"
 /usr/bin/python3 -I "$SOURCE/install/validate_installation.py" "$PREFIX"
 "$PREFIX/venv/bin/python" -m pip check
 "$PREFIX/venv/bin/python" - <<'PY'
-import gi
 import aiortc
 import av
 import numpy
-gi.require_version("Gst", "1.0")
-gi.require_version("GstAudio", "1.0")
-from gi.repository import Gst, GstAudio
-Gst.init(None)
-GstAudio.AudioInfo()
-for factory in ("alsasrc", "alsasink", "audiomixer", "audioconvert", "audioresample", "appsrc", "appsink"):
-    if Gst.ElementFactory.find(factory) is None:
-        raise SystemExit("Missing GStreamer factory: " + factory)
 PY
 install -d -m 0755 /etc/dhcp/shiri
 install -m 0755 "$SOURCE/shiri/runtime/dhclient_hook.py" /etc/dhcp/shiri/dhclient-script
@@ -53,7 +49,6 @@ if [[ -f /etc/apparmor.d/sbin.dhclient ]]; then
   fi
   if command -v apparmor_parser >/dev/null; then apparmor_parser -r /etc/apparmor.d/sbin.dhclient; fi
 fi
-modprobe snd-aloop
 if [[ "${SHIRI_INSTALL_BLUETOOTH:-0}" == 1 ]]; then
   # Pairing remains an operator action; never take over host sound/pairing state.
   apt-cache show bluez-alsa-utils >/dev/null 2>&1 || {
@@ -61,7 +56,5 @@ if [[ "${SHIRI_INSTALL_BLUETOOTH:-0}" == 1 ]]; then
   }
   /usr/bin/python3 -I "$SOURCE/install/apt_dependencies.py" bluez bluez-alsa-utils
 fi
-install -d -m 0755 /etc/modules-load.d
-printf '%s\n' snd-aloop > /etc/modules-load.d/shiri.conf
 printf '%s\n' "Package installed in $PREFIX/venv. Run deploy/install_services.sh to configure services."
 printf '%s\n' "Existing audio services and host DHCP hooks remain in place."

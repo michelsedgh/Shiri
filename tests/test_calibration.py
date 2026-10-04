@@ -9,9 +9,9 @@ import pytest
 np = pytest.importorskip("numpy")
 
 from shiri.api import create_app  # noqa: E402
-from shiri.calibration import (CalibrationSessions, analyze_wav, probe_pcm, probe_wav,  # noqa: E402
+from shiri.calibration import (CalibrationSession, add_result, analyze_wav, create_session, probe_pcm, probe_wav,  # noqa: E402
                                read_wav, summary)
-from shiri.domain import Conflict, NotFound, Room, SpeakerRef, ValidationIssue  # noqa: E402
+from shiri.domain import Conflict, Room, SpeakerRef, ValidationIssue  # noqa: E402
 from shiri.runtime_port import SimulatedRuntime  # noqa: E402
 from shiri.settings import Settings  # noqa: E402
 
@@ -137,27 +137,16 @@ def definition():
                           SpeakerRef(id="202", name="Target", protocol="chromecast")])
 
 
-async def test_exact_room_bound_expiring_bounded_sessions_and_duplicate_pcm():
-    sessions = CalibrationSessions(capacity=1)
-    room = definition()
-    arguments = dict(target_id="202", reference_id="101", capture_device="Shared ADC",
-                     geometry="Equal distance near-field microphones", max_lag_ms=500, geometry_correction_ms=0)
-    session = sessions.create(room, **arguments)
-    with pytest.raises(NotFound):
-        sessions.get("another-room", session.id)
-    with pytest.raises(Conflict, match="Too many"):
-        sessions.create(room, **arguments)
+async def test_duplicate_pcm_is_rejected_without_retaining_raw_audio():
+    session = create_session(definition(), target_id="202", reference_id="101", capture_device="Shared ADC",
+                             geometry="Equal distance near-field microphones", max_lag_ms=500, geometry_correction_ms=0)
     data = recording(session.seed)
-    result = analyze_wav(data, session.seed)
-    sessions.add_result(session, result)
+    add_result(session, analyze_wav(data, session.seed))
     # A container chunk alone must not turn duplicate PCM into another take.
     altered_container = data + b"JUNK\x00\x00\x00\x00"
     with pytest.raises(Conflict, match="PCM recording"):
-        sessions.add_result(session, analyze_wav(altered_container, session.seed))
-    session.deadline = 0
-    with pytest.raises(NotFound, match="expired"):
-        sessions.get(room.id, session.id)
-    assert len(sessions.sessions) == 0
+        add_result(session, analyze_wav(altered_container, session.seed))
+    assert len(session.recordings) == 1
 
 
 @pytest.fixture
@@ -181,7 +170,7 @@ async def begin(client, r):
 
 
 async def import_take(app, client, endpoint, session_id, take, *, delay_ms=23, verification=False):
-    seed = app.state.service.calibrations.sessions[session_id].seed
+    seed = (await client.get(endpoint)).json()["probe"]["seed"]
     result = await client.post(endpoint + "/recordings" + ("?verification=true" if verification else ""),
                                content=recording(seed, take=take, delay_ms=delay_ms), headers={"Content-Type": "audio/wav"})
     assert result.status_code == 200, result.text
@@ -230,7 +219,7 @@ async def test_api_exact_identity_auth_validation_candidate_apply_verify_and_rol
         if isinstance(value, list):
             return any(raw_capture(item) for item in value)
         return False
-    assert not raw_capture(vars(app.state.service.calibrations.sessions[session["id"]]))
+    assert not raw_capture(app.state.service.store.get_calibration(r["id"], session["id"]))
     assert exported["previous_offset_ms"] == 0
     assert exported["verification_backend"][0]["reported_offsets"] == {"202": -23, "101": 0}
     r = (await client.patch(f"/api/v1/rooms/{r['id']}", json={"expected_revision": r["revision"], "changes": {"enabled": False}})).json()["room"]
@@ -251,7 +240,7 @@ async def test_stale_speaker_offset_prevents_import_apply_and_rollback(api):
     r = (await client.patch(f"/api/v1/rooms/{r['id']}", json={"expected_revision": r["revision"], "changes": {"enabled": False}})).json()["room"]
     response = await client.post(endpoint + "/apply", json={"expected_revision": r["revision"], "expected_generation": (await client.get(endpoint)).json()["generation"]})
     assert response.status_code == 409 and "stale" in response.json()["error"]
-    response = await client.post(endpoint + "/recordings", content=recording(app.state.service.calibrations.sessions[session["id"]].seed, take=7), headers={"Content-Type": "audio/wav"})
+    response = await client.post(endpoint + "/recordings", content=recording(session["probe"]["seed"], take=7), headers={"Content-Type": "audio/wav"})
     assert response.status_code == 409
     assert app.state.service.store.get_room(r["id"]).speakers[1].offset_ms == 0
 
@@ -269,7 +258,7 @@ async def test_cancelled_analysis_cannot_append_late_evidence(api, monkeypatch):
         await release.wait()
         return await original(*args, **kwargs)
     monkeypatch.setattr("shiri.service.asyncio.to_thread", deferred)
-    task = asyncio.create_task(service.calibration_recording(r["id"], session["id"], recording(service.calibrations.sessions[session["id"]].seed)))
+    task = asyncio.create_task(service.calibration_recording(r["id"], session["id"], recording(session["probe"]["seed"])))
     await entered.wait()
     task.cancel()
     await asyncio.sleep(0)
@@ -279,7 +268,7 @@ async def test_cancelled_analysis_cannot_append_late_evidence(api, monkeypatch):
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert service.calibrations.sessions[session["id"]].recordings == []
+    assert service.store.get_calibration(r["id"], session["id"])["recordings"] == []
 
 
 async def prepared_correction(api):
@@ -314,7 +303,7 @@ async def test_cancelled_apply_retains_commit_and_exact_rollback_receipt(api, mo
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    retained = service.calibrations.get(room["id"], session["id"])
+    retained = CalibrationSession.from_record(service.store.get_calibration(room["id"], session["id"]))
     assert retained.previous_offset_ms == 0
     assert retained.applied_offset_ms == -23
     assert retained.applied_revision == service.store.get_room(room["id"]).revision
@@ -350,7 +339,7 @@ async def test_verification_requires_active_speakers_exact_backend_readback_and_
     endpoint, session, room = await prepared_correction(api)
     applied = (await client.post(endpoint + "/apply", json={"expected_revision": room["revision"], "expected_generation": (await client.get(endpoint)).json()["generation"]})).json()
     room = applied["room"]
-    seed = app.state.service.calibrations.sessions[session["id"]].seed
+    seed = session["probe"]["seed"]
     data = recording(seed, delay_ms=0, take=11)
     verification_endpoint = endpoint + "/recordings?verification=true"
     response = await client.post(verification_endpoint, content=data, headers={"Content-Type": "audio/wav"})
@@ -366,7 +355,7 @@ async def test_verification_requires_active_speakers_exact_backend_readback_and_
     monkeypatch.setattr(app.state.service, "discover", wrong_readback)
     response = await client.post(verification_endpoint, content=data, headers={"Content-Type": "audio/wav"})
     assert response.status_code == 409 and "offsets reported" in response.json()["error"]
-    assert app.state.service.calibrations.sessions[session["id"]].verification_recordings == []
+    assert app.state.service.store.get_calibration(room["id"], session["id"])["verification_recordings"] == []
     monkeypatch.setattr(app.state.service, "discover", original)
     old_capture = recording(seed, delay_ms=23, take=0)
     response = await client.post(verification_endpoint, content=old_capture, headers={"Content-Type": "audio/wav"})
@@ -401,7 +390,7 @@ async def test_room_deletion_releases_unreachable_evidence_and_calibration_capac
     room = (await client.patch(f"/api/v1/rooms/{room['id']}", json={"expected_revision": room["revision"], "changes": {"enabled": False}})).json()["room"]
     response = await client.delete(f"/api/v1/rooms/{room['id']}?expected_revision={room['revision']}")
     assert response.status_code == 200, response.text
-    assert session["id"] not in app.state.service.calibrations.sessions
+    assert app.state.service.store._connection.execute("SELECT count(*) FROM calibration_sessions").fetchone()[0] == 0
     assert (await client.get(endpoint)).status_code == 404
 
 
@@ -418,14 +407,14 @@ async def test_concurrent_import_is_rejected_without_starting_another_fft(api, m
         await release.wait()
         return await original(*args, **kwargs)
     monkeypatch.setattr("shiri.service.asyncio.to_thread", blocked)
-    data = recording(service.calibrations.sessions[session["id"]].seed)
+    data = recording(session["probe"]["seed"])
     first = asyncio.create_task(service.calibration_recording(room["id"], session["id"], data))
     await entered.wait()
     with pytest.raises(Conflict, match="Another recording"):
         await service.calibration_recording(room["id"], session["id"], data)
     release.set()
     await first
-    assert len(service.calibrations.sessions[session["id"]].recordings) == 1
+    assert len(service.store.get_calibration(room["id"], session["id"])["recordings"]) == 1
 
 
 async def test_stable_wrong_post_change_delay_is_explicit_verification_failure(api):
@@ -538,7 +527,7 @@ async def test_reference_profile_edit_blocks_baseline_apply_and_import(api):
     result = await client.post(endpoint + "/apply", json={"expected_revision": target["revision"], "expected_generation": session["generation"],
         "expected_reference_revision": changed["revision"]})
     assert result.status_code == 409 and "Reference" in result.json()["error"]
-    result = await client.post(endpoint + "/recordings", content=recording(app.state.service.calibrations.sessions[session["id"]].seed, take=7), headers={"Content-Type": "audio/wav"})
+    result = await client.post(endpoint + "/recordings", content=recording(session["probe"]["seed"], take=7), headers={"Content-Type": "audio/wav"})
     assert result.status_code == 409 and "Reference" in result.json()["error"]
     assert app.state.service.store.get_room(target["id"]).speakers[0].offset_ms == 0
 
@@ -558,7 +547,7 @@ async def test_cross_verification_requires_reference_enabled_selected_and_exact_
                     output["offset_ms"] = 13
         return result
     monkeypatch.setattr(app.state.service.runtime, "call", wrong_reference)
-    data = recording(app.state.service.calibrations.sessions[session["id"]].seed, take=3, delay_ms=0)
+    data = recording(session["probe"]["seed"], take=3, delay_ms=0)
     result = await client.post(endpoint + "/recordings?verification=true", content=data, headers={"Content-Type": "audio/wav"})
     assert result.status_code == 409 and "Both measured speakers" in result.json()["error"]
     monkeypatch.setattr(app.state.service.runtime, "call", original)
@@ -577,5 +566,5 @@ async def test_deleted_reference_keeps_export_but_blocks_apply_and_import(api):
     rejected = await client.post(endpoint + "/apply", json={"expected_revision": target["revision"], "expected_generation": session["generation"],
         "expected_reference_revision": reference["revision"]})
     assert rejected.status_code == 409 and "reference room was removed" in rejected.json()["error"]
-    result = await client.post(endpoint + "/recordings", content=recording(app.state.service.calibrations.sessions[session["id"]].seed, take=7), headers={"Content-Type": "audio/wav"})
+    result = await client.post(endpoint + "/recordings", content=recording(session["probe"]["seed"], take=7), headers={"Content-Type": "audio/wav"})
     assert result.status_code == 409 and "reference room was removed" in result.json()["error"]

@@ -8,7 +8,7 @@ import pytest
 
 from shiri.rpc import RpcError
 from shiri.runtime.native import NativeController, NativeHandle, NativeMixer
-from shiri.runtime.timing import Clock, FLAG_AIRPLAY2, Kind, Packet, TimingError, ZERO_UUID
+from shiri.runtime.timing import Clock, FLAG_AIRPLAY2, Kind, Packet, TimingError
 
 
 class Writer:
@@ -107,7 +107,6 @@ async def test_late_speech_delivery_failure_cannot_duck_retime_or_command_the_mu
     assert writer.packets[-1].pcm == original.pcm
     assert writer.packets[-1].presentation_ns == 16_150_000_100
     assert overlay.frames == [(voice, 480)] and overlay.controls == [(True, 0.2)]
-    assert not c.mixer.speech and c.mixer._gain == 1
     assert len(client.requests) == 2 and not handle.closed
     assert c.mixer.health()['music_gain'] is None  # Backend gain needs output evidence.
     assert c.mixer.health()['timing_relay_delay_ms'] == 1000
@@ -136,6 +135,8 @@ async def test_late_idle_speech_uses_the_backend_clock_without_synthesizing_prog
 async def test_real_adapter_callbacks_preserve_timestamps_and_overlay_only_target_zone():
     a, wa, ca = controller()
     b, wb, cb = controller()
+    overlay = LateSpeech(accepted=True)
+    a.mixer.speech_output = overlay
     await a.initialize()
     await b.initialize()
     ha, hb = NativeHandle(a), NativeHandle(b)
@@ -164,12 +165,15 @@ async def test_real_adapter_callbacks_preserve_timestamps_and_overlay_only_targe
     assert ha.closed is False
     assert len(ca.requests) == len(cb.requests) == 2 # idle + grant, no overlay flush/player command
     aa, bb = array('h',wa.packets[-1].pcm), array('h',wb.packets[-1].pcm)
-    assert aa[-1] == 1200 and bb[-1] == 1000
+    # Speech stays on its separate late-mix socket; both music programs keep
+    # their original PCM and matching presentation timeline.
+    assert aa[-1] == bb[-1] == 1000
+    assert overlay.frames == [(array('h', [1000]*1920).tobytes(), 1920)]
     assert wa.packets[-1].presentation_ns == wb.packets[-1].presentation_ns
     a.mixer.tick(music_active=True,speech_active=False,duck_gain=.2,elapsed=.01)
     for i in range(2,27):
         await a.message(pcm(pa,sequence=i,frame_index=2400+(i-2)*480),ha)
-    assert a.mixer._gain == pytest.approx(1)
+    assert overlay.controls[-1] == (False, .2)
     assert len(ca.requests) == 2
     await a.close()
     await b.close()
@@ -250,20 +254,6 @@ async def test_bad_backend_ack_fails_closed_and_no_packet_can_reopen_route():
 
 
 @pytest.mark.asyncio
-async def test_idle_short_speech_uses_zero_music_identity_and_no_extra_backend_commands():
-    c,w,client = controller()
-    await c.initialize()
-    c.mixer.push_speech(array('h',[1200]*480).tobytes(),480)
-    c.mixer.tick(music_active=False,speech_active=True,duck_gain=.2,elapsed=.01)
-    assert len(w.packets) == 1
-    assert w.packets[0].session == ZERO_UUID and w.packets[0].epoch == 0
-    assert c.actor.snapshot()['owner'] is None
-    assert len(client.requests) == 1
-    assert array('h',w.packets[0].pcm)[:960] == array('h',[1200]*960)
-    await c.close()
-
-
-@pytest.mark.asyncio
 async def test_cancelled_quiesce_closes_exact_connection_but_never_a_new_handle():
     class Connection:
         closed = False
@@ -285,22 +275,6 @@ async def test_cancelled_quiesce_closes_exact_connection_but_never_a_new_handle(
     assert connection.closed and not newer.connection.closed
     old.abort(newer.token)
     assert not newer.connection.closed
-    await c.close()
-
-
-@pytest.mark.asyncio
-async def test_native_voice_queue_bounded_and_malformed_clock_does_not_consume_speech():
-    c,w,_ = controller()
-    await c.initialize()
-    h = NativeHandle(c)
-    grant = await c.begin(begin(),h)
-    data = array('h',[500]*9600).tobytes()
-    c.mixer.push_speech(data,9600)
-    c.mixer.push_speech(data,9600)
-    assert len(c.mixer.speech) == 12000 and c.mixer.speech_dropped_frames == 7200
-    with pytest.raises(TimingError):
-        await c.message(pcm(grant,clock_sample_ns=0),h)
-    assert len(c.mixer.speech) == 12000 and not w.packets
     await c.close()
 
 

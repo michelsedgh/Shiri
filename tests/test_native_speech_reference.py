@@ -1,12 +1,12 @@
-"""Local decoded-reference prototype proofs; no hardware or manual fixture runs."""
+"""Decoded-reference instrument tests using synthetic PCM and actual Opus codecs.
+
+These test the measurement oracle, not the current native output engine.
+"""
 import asyncio
-from collections import deque
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from fractions import Fraction
-import hashlib
 import importlib.util
-import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import pytest
 
-from shiri.runtime.native import NativeMixer
+from synthetic_speech import SyntheticSpeechWaveform
 from shiri.runtime.system import RuntimeFailure
 
 np = pytest.importorskip('numpy')
@@ -36,10 +36,6 @@ def load(name, filename):
 
 reference = load('speech_reference_prototype_tests', 'native_speech_reference.py')
 stress = load('speech_reference_measure_tests', 'native_speech_stress.py')
-historical_replay = pytest.mark.skipif(
-    os.environ.get('SHIRI_HISTORICAL_REPLAY') != '1',
-    reason='Historical stress28 replay lacks original Opus payloads; same-settings encoding is platform dependent',
-)
 
 
 def encoded_reference(frequency=1320, packets=8):
@@ -129,7 +125,7 @@ def test_sample_level_cancel_has_one_endpoint_and_natural_finish_keeps_whole_pac
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     cutoff, first, count = 48*960+remainder, 36*960, 36*960
     ended, restored = reference.Alignment(decoder.session_id, 1920, cutoff), reference.GainPlan(1920, cutoff)
-    blocks = tuple(native_block(at, carrier, decoded, ended, restored) for at in range(0, first+count, 960))
+    blocks = tuple(synthetic_block(at, carrier, decoded, ended, restored) for at in range(0, first+count, 960))
     data = b''.join(blocks[first//960:])
     active, gain = reference.Alignment(decoder.session_id, 1920), reference.GainPlan(1920)
     values = terminal_observation(decoder.session_id)
@@ -147,7 +143,7 @@ def test_sample_level_cancel_has_one_endpoint_and_natural_finish_keeps_whole_pac
             (first, first+count-9600), 880, stress.spectrum, terminal=natural)
     full = 50*960+1920
     full_alignment, full_gain = reference.Alignment(decoder.session_id, 1920, full), reference.GainPlan(1920, full)
-    complete = b''.join(native_block(at, carrier, decoded, full_alignment, full_gain)
+    complete = b''.join(synthetic_block(at, carrier, decoded, full_alignment, full_gain)
                         for at in range(first, first+count, 960))
     admitted, natural_gain, _ = reference.admit_restore(complete, first, carrier, decoded, active, gain,
         (first, first+count-9600), 880, stress.spectrum, terminal=natural)
@@ -161,10 +157,10 @@ def test_sample_cancel_proposal_never_fits_away_original_whole_buffer_defects(fa
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     cutoff, first, count = 48*960+480, 36*960, 36*960
     ended, gain = reference.Alignment(decoder.session_id, 1920, cutoff), reference.GainPlan(1920, cutoff)
-    blocks = [native_block(at, carrier, decoded, ended, gain) for at in range(first, first+count, 960)]
+    blocks = [synthetic_block(at, carrier, decoded, ended, gain) for at in range(first, first+count, 960)]
     if fault == 'restore-law':
         bad = reference.GainPlan(1920, cutoff+480)
-        blocks = [native_block(at, carrier, decoded, ended, bad) for at in range(first, first+count, 960)]
+        blocks = [synthetic_block(at, carrier, decoded, ended, bad) for at in range(first, first+count, 960)]
     else:
         at = 25 if fault == 'stale-own' else 5
         pcm = np.frombuffer(blocks[at], dtype='<i2').reshape(-1, 2).copy()
@@ -190,11 +186,9 @@ def music(first, count=960, *, speech=0, frequency=1320):
     return np.repeat(mono[:, None], 2, axis=1).tobytes()
 
 
-def native_block(first, carrier, decoded, alignment, gain, count=960):
-    """Use the real native gain/mix seam, not a mirror of the verifier."""
-    mixer = NativeMixer.__new__(NativeMixer)
-    # Set only the real mixer's initial state at the start of this test block.
-    mixer._gain = float(gain.values(np.array([first-1], dtype=np.int64))[0])
+def synthetic_block(first, carrier, decoded, alignment, gain, count=960):
+    """Generate a declared waveform independently of the verifier under test."""
+    waveform = SyntheticSpeechWaveform(float(gain.values(np.array([first-1], dtype=np.int64))[0]))
     frames = np.arange(first, first+count, dtype=np.int64)
     index = frames-alignment.start_frame
     active = (index >= 0) & (index < len(decoded))
@@ -202,15 +196,15 @@ def native_block(first, carrier, decoded, alignment, gain, count=960):
         active &= frames < alignment.stop_frame
     voice = np.zeros(count, dtype='<i2')
     voice[active] = decoded[index[active]]
-    mixer.speech = deque(map(int, voice))
+    waveform.push(voice.tobytes())
     raw = np.repeat(carrier.values(frames).astype('<i2')[:, None], 2, axis=1).tobytes()
     boundaries = sorted({first, first+count, *(point for point in (gain.duck_frame, gain.restore_frame)
                         if point is not None and first < point < first+count)})
     parts = []
     for start, end in zip(boundaries, boundaries[1:], strict=False):
-        mixer._target_gain = (1. if start < gain.duck_frame
+        target_gain = (1. if start < gain.duck_frame
                               or gain.restore_frame is not None and start >= gain.restore_frame else .2)
-        parts.append(mixer._mix(raw[(start-first)*4:(end-first)*4], end-start))
+        parts.append(waveform.render(raw[(start-first)*4:(end-first)*4], end-start, target_gain=target_gain))
     return b''.join(parts)
 
 
@@ -218,42 +212,21 @@ def check(data, first, carrier, decoded, alignment, gain, foreign=880):
     return reference.verify_block(data, first, carrier, decoded, alignment, gain, foreign, stress.spectrum)
 
 
-@historical_replay
-def test_retained_actual28_music_corner_and_codec_onset_reference_replay():
-    a = (ROOT/'fixtures/stress28/a.pcm').read_bytes()
-    b = (ROOT/'fixtures/stress28/b.pcm').read_bytes()
-    assert hashlib.sha256(a).hexdigest() == '3562a897ec7acae0cb7ce5b647c35e59273a367f6da8367836eea69d4f327ccb'
-    assert hashlib.sha256(b).hexdigest() == '4ff63afbb1db8b707a49c27dfe219bc916435b9439b9eab44350beb4af678780'
-    decoder, _ = encoded_reference(packets=4)
-    decoded = decoder.snapshot()
-    carrier = reference.Carrier(a[:2400*4], next_frame=2400)
-    alignment = reference.Alignment(decoder.session_id, 2688)
-    gain = reference.GainPlan(2688)
-    # This replay uses independently encoded identical source settings: the
-    # historical run did not retain payload bytes. It diagnoses the old model;
-    # future acceptance requires the exact produced/received-payload proof.
-    assert stress.spectrum(b[2*3840:3*3840])['voice'][880] > 10
-    assert stress.spectrum(b[3*3840:])['voice'][880] > 20
-    receipts = [check(b[i*3840:(i+1)*3840], i*960, carrier, decoded, alignment, gain) for i in range(4)]
-    assert max(row['foreign_rms'] for row in receipts) < .32
-    assert max(row['residual_rms'] for row in receipts) < 4
-
-
 @pytest.mark.parametrize('duck', [0, 120, 768, 960])
-def test_real_native_piecewise_gain_and_exact_decoded_opus_are_not_foreign(duck):
+def test_declared_synthetic_gain_and_exact_decoded_opus_are_not_foreign(duck):
     decoder, _ = encoded_reference()
     decoded = decoder.snapshot()
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     alignment = reference.Alignment(decoder.session_id, duck)
     gain = reference.GainPlan(duck)
     for first in range(0, 5760, 960):
-        data = native_block(first, carrier, decoded, alignment, gain)
+        data = synthetic_block(first, carrier, decoded, alignment, gain)
         receipt = check(data, first, carrier, decoded, alignment, gain)
         assert receipt['residual_rms'] <= 1 and receipt['foreign_rms'] < 1
     restore = reference.GainPlan(duck, 5760)
     ended = reference.Alignment(decoder.session_id, duck, 5760)
     for first in range(5760, 20160, 960):
-        data = native_block(first, carrier, decoded, ended, restore)
+        data = synthetic_block(first, carrier, decoded, ended, restore)
         assert check(data, first, carrier, decoded, ended, restore)['residual_rms'] <= 1
 
 
@@ -265,7 +238,7 @@ def test_fixed_reference_cannot_absorb_any_phase_five_ms_foreign_voice(edge, pha
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     alignment, gain = reference.Alignment(decoder.session_id, 120), reference.GainPlan(120)
     first = 2880
-    data = native_block(first, carrier, decoded, alignment, gain)
+    data = synthetic_block(first, carrier, decoded, alignment, gain)
     contaminated = np.frombuffer(data, dtype='<i2').reshape(-1, 2).copy()
     marker = (600*np.sin(2*np.pi*880*np.arange(240)/48000+phase)).astype('<i2')
     contaminated[edge:edge+240] += marker[:, None]
@@ -281,7 +254,7 @@ def test_actual_foreign_decoded_payload_and_music_omission_cannot_be_normalized(
     decoded = decoder.snapshot()
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     alignment, gain = reference.Alignment(decoder.session_id, 120), reference.GainPlan(120)
-    data = native_block(2880, carrier, decoded, alignment, gain)
+    data = synthetic_block(2880, carrier, decoded, alignment, gain)
     contaminated = np.frombuffer(data, dtype='<i2').reshape(-1, 2).copy()
     contaminated[edge:edge+240] += foreign.snapshot()[1920:2160, None]
     with pytest.raises(RuntimeFailure, match='immutable|wrong-room'):
@@ -358,25 +331,6 @@ def test_snapshot_authority_cannot_be_made_writable_even_after_source_changes_or
         frozen.pcm.flags.writeable = True
 
 
-@historical_replay
-def test_onset_search_recovers_actual28_once_and_never_refits_a_later_buffer():
-    a = (ROOT/'fixtures/stress28/a.pcm').read_bytes()
-    b = (ROOT/'fixtures/stress28/b.pcm').read_bytes()
-    decoder, _ = encoded_reference(packets=4)
-    decoded = decoder.snapshot()
-    carrier = reference.Carrier(a[:9600], next_frame=2400)
-    alignment, gain, evidence = reference.admit_onset(b, 0, carrier, decoded, decoder.session_id,
-                                                     (0, 2880), (0, 2880), 880, stress.spectrum)
-    assert alignment.start_frame == gain.duck_frame == 2688
-    assert evidence['checked_frames'] == 3840 and evidence['maximum_foreign_rms'] < .32
-    assert evidence['work_seconds'] <= reference.ADMISSION_SECONDS
-    assert evidence['maximum_fft_points'] == 32768 and evidence['maximum_rounds'] == 15
-    shifted = reference.Alignment(decoder.session_id, alignment.start_frame+1)
-    with pytest.raises(RuntimeFailure, match='immutable'):
-        check(b[-3840:], 2880, carrier, decoded, shifted, gain)
-    assert alignment.start_frame == 2688 and gain.duck_frame == 2688
-
-
 @pytest.mark.parametrize('offset', [-960, 0, 960])
 def test_onset_search_selects_one_integer_mapping_with_fixed_gain_level(offset):
     decoder, _ = encoded_reference(packets=12)
@@ -384,7 +338,7 @@ def test_onset_search_selects_one_integer_mapping_with_fixed_gain_level(offset):
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     gain = reference.GainPlan(2688)
     original = reference.Alignment(decoder.session_id, 2688+offset)
-    data = b''.join(native_block(first, carrier, decoded, original, gain) for first in range(0, 9600, 960))
+    data = b''.join(synthetic_block(first, carrier, decoded, original, gain) for first in range(0, 9600, 960))
     alignment, proposed, receipt = reference.admit_onset(data, 0, carrier, decoded, decoder.session_id,
                                              (0, 3840), (0, 7680), 880, stress.spectrum)
     assert alignment.start_frame == original.start_frame and proposed.duck_frame == gain.duck_frame
@@ -401,7 +355,7 @@ def test_onset_admission_cannot_fit_away_five_ms_wrong_room_wave(phase, edge):
     decoded = decoder.snapshot()
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     gain, original = reference.GainPlan(2688), reference.Alignment(decoder.session_id, 2688)
-    data = b''.join(native_block(first, carrier, decoded, original, gain) for first in range(0, 9600, 960))
+    data = b''.join(synthetic_block(first, carrier, decoded, original, gain) for first in range(0, 9600, 960))
     samples = np.frombuffer(data, dtype='<i2').reshape(-1, 2).copy()
     start = 2880+edge
     marker = (600*np.sin(2*np.pi*880*np.arange(240)/48000+phase)).astype('<i2')
@@ -420,14 +374,14 @@ def test_closed_prefix_and_restore_are_admitted_once_then_full_tail_is_checked(r
     cutoff, first = 48*960, 42*960
     restored_gain = reference.GainPlan(0, cutoff+restore_minus_stop)
     ended = reference.Alignment(decoder.session_id, 0, cutoff)
-    data = b''.join(native_block(at, carrier, decoded, ended, restored_gain)
+    data = b''.join(synthetic_block(at, carrier, decoded, ended, restored_gain)
                     for at in range(first, first+24000, 960))
     alignment, gain, receipt = reference.admit_restore(data, first, carrier, decoded, active_alignment,
                             active_gain, (first, first+14400), 880, stress.spectrum)
     assert alignment.start_frame == 0 and alignment.stop_frame == cutoff
     assert gain.duck_frame == 0 and gain.restore_frame == restored_gain.restore_frame
     assert receipt['whole_packet_candidates'] <= 26 and receipt['maximum_residual_rms'] <= 1
-    tail = native_block(first+24000, carrier, decoded, alignment, gain)
+    tail = synthetic_block(first+24000, carrier, decoded, alignment, gain)
     assert check(tail, first+24000, carrier, decoded, alignment, gain)['residual_rms'] <= 1
     contaminated = np.frombuffer(tail, dtype='<i2').reshape(-1, 2).copy()
     contaminated[720:] += decoded[1920:2160, None]
@@ -442,13 +396,13 @@ def test_maximum_eof_lease_then_real_native_restore_and_clean_tail_fit_declared_
     cutoff = 50*960
     first = cutoff-960
     ended, gain = reference.Alignment(decoder.session_id, 0, cutoff), reference.GainPlan(0, cutoff+13920)
-    data = b''.join(native_block(at, carrier, decoded, ended, gain)
+    data = b''.join(synthetic_block(at, carrier, decoded, ended, gain)
                     for at in range(first, first+35520, 960))
     alignment, restored, receipt = reference.admit_restore(data, first, carrier, decoded,
         reference.Alignment(decoder.session_id, 0), reference.GainPlan(0), (first, first+25920), 880, stress.spectrum)
     assert alignment.stop_frame == cutoff and restored.restore_frame == cutoff+13920
     assert receipt['whole_packet_candidates'] <= 39 and receipt['maximum_residual_rms'] <= 1
-    tail = native_block(first+35520, carrier, decoded, alignment, restored)
+    tail = synthetic_block(first+35520, carrier, decoded, alignment, restored)
     assert check(tail, first+35520, carrier, decoded, alignment, restored)['residual_rms'] <= 1
     contaminated = np.frombuffer(tail, dtype='<i2').reshape(-1, 2).copy()
     contaminated[720:] += (600*np.sin(2*np.pi*880*np.arange(240)/48000+.2)).astype('<i2')[:, None]
@@ -496,7 +450,7 @@ def session_vector():
     decoded = decoder.snapshot()
     carrier = reference.Carrier(music(0, 2400), next_frame=2400)
     alignment, gain = reference.Alignment(decoder.session_id, 1920, 48000), reference.GainPlan(1920, 48000)
-    blocks = tuple(native_block(first, carrier, decoded, alignment, gain) for first in range(0, 62400, 960))
+    blocks = tuple(synthetic_block(first, carrier, decoded, alignment, gain) for first in range(0, 62400, 960))
     return decoder, decoded, carrier, alignment, gain, blocks
 
 

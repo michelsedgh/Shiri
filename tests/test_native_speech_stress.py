@@ -14,6 +14,8 @@ from uuid import uuid4
 
 import pytest
 
+from synthetic_speech import SyntheticSpeechWaveform
+
 np = pytest.importorskip('numpy', reason='Speech stress requires the audio extra')
 pytest.importorskip('aiortc', reason='Manual grouped fixture imports the audio extra')
 ROOT = Path(__file__).parent/'linux'
@@ -84,7 +86,7 @@ def test_independent_marker_projection_retains_voice_and_music_at_arbitrary_phas
 
 @pytest.mark.parametrize('frames', [480, 960])
 @pytest.mark.parametrize('direction', ['duck', 'restore'])
-def test_real_smooth_gain_ramps_do_not_invent_a_peer_voice_marker(frames, direction):
+def test_synthetic_smooth_gain_ramps_do_not_invent_a_peer_voice_marker(frames, direction):
     times = np.arange(frames)/48000
     gain = .2+.8*np.exp(-times/.06)
     if direction == 'restore':
@@ -288,9 +290,10 @@ async def test_real_media_track_retains_declared_marker_pcm_and_paced_frame_indi
 class Driver:
     """Run the real stress loop with captured PCM and exact fake control I/O.
 
-    Only HTTP/RPC/media negotiation are replaced; actual capture metadata,
-    every-buffer observers, transition gates, round counting, cancellation,
-    rejection and cleanup execute their maintained production-harness paths.
+    Synthetic PCM and fake HTTP/RPC/media negotiation drive the actual
+    capture metadata, every-buffer observers, transition gates, round counting,
+    cancellation, rejection and cleanup paths in the measurement harness.
+    Passing this driver does not qualify the production native mixer.
     """
     def __init__(self, monkeypatch, *, audible=True):
         from shiri.domain import Room
@@ -312,13 +315,7 @@ class Driver:
         self.artifact_root = Path(tempfile.mkdtemp(prefix='stress-reference-test-'))
         self.report, self.phases, self.checks = {'artifacts': {'private_directory': str(self.artifact_root)}}, [], 0
         self.transform_pcm = lambda _room, data: data
-        from shiri.runtime.native import NativeMixer
-        self.mixers = {}
-        for room in self.rooms:
-            mixer = NativeMixer.__new__(NativeMixer)
-            mixer._gain = mixer._target_gain = 1.
-            mixer.speech = deque()
-            self.mixers[room] = mixer
+        self.waveforms = {room: SyntheticSpeechWaveform() for room in self.rooms}
         monkeypatch.setattr(stress, 'time', SimpleNamespace(monotonic=lambda: self.now))
         async def yield_now(_seconds=0):
             await asyncio.sleep(0)
@@ -450,7 +447,7 @@ class Driver:
         for room, value in self.captures.items():
             speaking = room in self.current and self.current[room].connectionState == 'connected'
             active = speaking and self.audible
-            mixer = self.mixers[room]
+            waveform = self.waveforms[room]
             if active:
                 from av import AudioFrame
                 tone = self.current[room].tone
@@ -461,9 +458,8 @@ class Driver:
                 packets, at = tone.encoder.encode(frame)
                 data = tone.reference.feed(packets[0], at)
                 tone.samples += 960
-                mixer.speech.extend(np.frombuffer(data, dtype='<i2').tolist())
-            mixer._target_gain = .2 if active else 1.
-            mixed = mixer._mix(pcm(value.next_frame), 960)
+                waveform.push(data)
+            mixed = waveform.render(pcm(value.next_frame), 960, target_gain=.2 if active else 1.)
             append(value, self.transform_pcm(room, mixed), at=self.now)
         await asyncio.sleep(0)
 

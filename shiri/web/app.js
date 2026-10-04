@@ -267,25 +267,67 @@ export class TtsStore {
   constructor(client) {
     this.client = client;
     this.catalog = null;
-    this.job = null;
+    this.jobs = new Map();
+    this.target = null;
+    this.selectedJobs = new Map();
     this.error = '';
     this.busy = false;
     this.version = 0;
     this.catalogVersion = 0;
-    this.jobVersion = 0;
+    this.jobVersions = new Map();
     this.catalogRead = null;
-    this.jobRead = null;
+    this.jobReads = new Map();
     this.listeners = new Set();
   }
 
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   notify() { for (const listener of this.listeners) listener(this); }
-  activeJob() { return !!this.job && !ttsTerminalStates.has(this.job.state); }
+  get job() { return this.jobs.get(this.selectedJobs.get(this.target)) || null; }
+  selectTarget(roomId) { this.target = roomId; this.error = ''; this.notify(); }
+  selectJob(id) {
+    const job = this.jobs.get(id);
+    if (!job) return;
+    this.target = job.room_id ?? null;
+    this.selectedJobs.set(this.target, id);
+    this.error = '';
+    this.notify();
+  }
+  targetJobs(roomId = this.target) { return [...this.jobs.values()].filter((job) => (job.room_id ?? null) === roomId); }
+  activeJobs(roomId = this.target) { return this.targetJobs(roomId).filter((job) => !ttsTerminalStates.has(job.state)); }
+  activeJob(roomId = this.target) { return this.activeJobs(roomId).length > 0; }
+  hasActiveJobs() { return [...this.jobs.values()].some((job) => !ttsTerminalStates.has(job.state)); }
+  canQueue(roomId) {
+    const jobs = this.activeJobs(roomId);
+    return !jobs.some((job) => job.state === 'unconfirmed') && jobs.length < (roomId === null ? 1 : 3);
+  }
+  rememberJob(job) {
+    this.jobs.set(job.id, job);
+    // Retain bounded recent results without evicting unfinished request fences.
+    for (const saved of this.jobs.values()) {
+      if (this.jobs.size <= 32) break;
+      if (ttsTerminalStates.has(saved.state) && saved.id !== job.id && saved.id !== this.job?.id) {
+        this.jobs.delete(saved.id);
+        this.jobVersions.delete(saved.id);
+        this.jobReads.delete(saved.id);
+        if (this.selectedJobs.get(saved.room_id ?? null) === saved.id) this.selectedJobs.delete(saved.room_id ?? null);
+      }
+    }
+  }
+  async refreshJobs() {
+    await Promise.all([...this.jobs.values()].filter((job) => !ttsTerminalStates.has(job.state)).map((job) => this.refreshJob(job.id)));
+  }
+  nextJobVersion(id) {
+    this.jobVersions.set(id, (this.jobVersions.get(id) || 0) + 1);
+    this.jobReads.delete(id);
+  }
   invalidate() {
     this.version += 1;
     this.catalogVersion += 1;
-    this.jobVersion += 1;
-    this.catalog = this.job = this.catalogRead = this.jobRead = null;
+    this.jobs.clear();
+    this.selectedJobs.clear();
+    this.jobVersions.clear();
+    this.jobReads.clear();
+    this.catalog = this.catalogRead = null;
     this.error = '';
     this.busy = false;
     this.notify();
@@ -326,7 +368,7 @@ export class TtsStore {
   }
 
   async loadModel(modelId) {
-    if (this.activeJob()) throw new ApiError('Stop the current speech job before loading another model.');
+    if (this.hasActiveJobs()) throw new ApiError('Stop the active speech jobs before loading another model.');
     return this.action(async (version) => {
       this.catalogVersion += 1;
       this.catalogRead = null;
@@ -337,34 +379,44 @@ export class TtsStore {
   }
 
   async createJob(path, body) {
-    if (this.activeJob()) throw new ApiError('Stop the current speech job before starting another.');
     const room = path.match(/^\/rooms\/([^/]+)\/tts$/);
     if (path !== '/tts/benchmark' && !room) throw new ApiError('Choose a room or quiet model measurement.');
     const id = body.request_id || ttsRequestId();
     if (!/^[0-9a-f]{32}$/.test(id)) throw new ApiError('The speech request identity is invalid.');
     const kind = room ? 'speech' : 'benchmark';
     const roomId = room ? decodeURIComponent(room[1]) : null;
+    if (!this.canQueue(roomId)) throw new ApiError('Stop the current speech job or wait for this room’s queue before adding another reply.');
+    if (this.jobs.has(id)) throw new ApiError('This speech request is already being tracked.');
+    this.selectTarget(roomId);
     const matches = (value) => validTtsJob(value, id) && value.kind === kind && (kind === 'benchmark' ? !value.room_id : value.room_id === roomId);
     return this.action(async (version) => {
-      this.jobVersion += 1;
-      this.jobRead = null;
+      this.nextJobVersion(id);
+      const previousSelection = this.selectedJobs.get(roomId);
+      this.selectedJobs.set(roomId, id);
       try {
         const value = await this.client.request(path, { method: 'POST', body: { ...body, request_id: id } });
         if (version !== this.version) return null;
         if (!matches(value)) throw new ApiError('Shiri did not confirm this exact speech request.', { ambiguous: true });
-        this.job = value;
+        this.rememberJob(value);
         this.notify();
         return value;
       } catch (error) {
         if (version !== this.version) return null;
-        if (!error.ambiguous) throw error;
-        this.job = { id, kind, room_id: roomId, state: 'unconfirmed', metrics: {} };
+        if (!error.ambiguous) {
+          if (this.selectedJobs.get(roomId) === id) {
+            if (previousSelection) this.selectedJobs.set(roomId, previousSelection);
+            else this.selectedJobs.delete(roomId);
+          }
+          this.jobVersions.delete(id);
+          throw error;
+        }
+        this.rememberJob({ id, kind, room_id: roomId, state: 'unconfirmed', metrics: {} });
         this.notify();
         try {
           const recovered = await this.client.request(`/tts/jobs/${encodeURIComponent(id)}`);
           if (version !== this.version) return null;
           if (!matches(recovered)) throw new ApiError('The exact speech request could not be recovered.');
-          this.job = recovered;
+          this.rememberJob(recovered);
           this.notify();
           return recovered;
         } catch (recoveryError) {
@@ -376,38 +428,41 @@ export class TtsStore {
     });
   }
 
-  async refreshJob() {
-    if (!this.activeJob()) return this.job;
-    if (this.jobRead) return this.jobRead;
-    const id = this.job.id, version = this.version, jobVersion = this.jobVersion;
+  async refreshJob(id = this.job?.id) {
+    const job = this.jobs.get(id);
+    if (!job || ttsTerminalStates.has(job.state)) return job || null;
+    if (this.jobReads.has(id)) return this.jobReads.get(id);
+    const version = this.version, jobVersion = this.jobVersions.get(id);
+    const current = () => version === this.version && jobVersion === this.jobVersions.get(id) && this.jobs.has(id);
     const request = Promise.resolve().then(async () => {
       try {
         const value = await this.client.request(`/tts/jobs/${encodeURIComponent(id)}`);
-        if (version !== this.version || jobVersion !== this.jobVersion || this.job?.id !== id) return null;
-        if (!validTtsJob(value, id) || value.kind !== this.job.kind || (value.room_id ?? null) !== (this.job.room_id ?? null)) throw new ApiError('Shiri returned a different speech job. The current result is unconfirmed.');
-        this.job = value;
-        this.error = '';
+        if (!current()) return null;
+        if (!validTtsJob(value, id) || value.kind !== job.kind || (value.room_id ?? null) !== (job.room_id ?? null)) throw new ApiError('Shiri returned a different speech job. The current result is unconfirmed.');
+        this.rememberJob(value);
+        if (id === this.job?.id) this.error = '';
         this.notify();
         return value;
       } catch (error) {
-        if (version === this.version && jobVersion === this.jobVersion && this.job?.id === id) { this.error = error.message; this.notify(); }
+        if (current() && id === this.job?.id) { this.error = error.message; this.notify(); }
         throw error;
-      } finally { if (this.jobRead === request) this.jobRead = null; }
+      } finally { if (this.jobReads.get(id) === request) this.jobReads.delete(id); }
     });
-    this.jobRead = request;
+    this.jobReads.set(id, request);
     return request;
   }
 
-  async cancelJob() {
-    if (!this.activeJob()) return this.job;
-    const id = this.job.id;
+  async cancelJob(id = this.job?.id) {
+    const job = this.jobs.get(id);
+    if (!job || ttsTerminalStates.has(job.state)) return job || null;
     return this.action(async (version) => {
-      this.jobVersion += 1;
-      this.jobRead = null;
+      this.nextJobVersion(id);
       const value = await this.client.request(`/tts/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      if (version !== this.version || this.job?.id !== id) return null;
-      if (!validTtsJob(value, id) || value.kind !== this.job.kind || (value.room_id ?? null) !== (this.job.room_id ?? null)) throw new ApiError('Stopping the speech job was not confirmed. Refresh its status.', { ambiguous: true });
-      this.job = value;
+      if (version !== this.version || !this.jobs.has(id)) return null;
+      if (!validTtsJob(value, id) || value.kind !== job.kind || (value.room_id ?? null) !== (job.room_id ?? null)) throw new ApiError('Stopping the speech job was not confirmed. Refresh its status.', { ambiguous: true });
+      // Polls started while DELETE was in flight may still carry pre-stop state.
+      this.nextJobVersion(id);
+      this.rememberJob(value);
       this.notify();
       return value;
     });
@@ -417,7 +472,7 @@ export class TtsStore {
 const client = new ApiClient();
 const store = new RoomStore(client);
 const tts = new TtsStore(client);
-const view = { roomDraft: null, speakerDraft: null, calibrationDraft: null, calibrationSessions: new Map(), calibrationHistory: new Map(), toastTimer: null, eventsRequest: null, eventsVersion: 0, speech: new Map(), cardSignature: '', pollTimer: null, ttsDraft: null, ttsPollTimer: null, ttsPollCount: 0, ttsPreviewPath: null, ttsPreviewFailed: null, ttsPreviewSuppressedJob: null, ttsWarmLeases: new Map(), ttsWarmInFlight: null };
+const view = { roomDraft: null, speakerDraft: null, calibrationDraft: null, calibrationSessions: new Map(), calibrationHistory: new Map(), toastTimer: null, eventsRequest: null, eventsVersion: 0, speech: new Map(), pollTimer: null, ttsDraft: null, ttsPollTimer: null, ttsPollCount: 0, ttsPreviewPath: null, ttsPreviewFailed: null, ttsPreviewSuppressedJob: null, ttsWarmLeases: new Map(), ttsWarmInFlight: null };
 const elements = {};
 
 if (typeof document !== 'undefined') {
@@ -649,14 +704,21 @@ function render() {
   if (view.ttsDraft) renderTts();
 }
 
+export function roomCardSignature(room, runtime, { writeError = '', speechActive = false } = {}) {
+  // Only displayed state and the revision used by event handlers affect a card.
+  // Runtime timestamps, lease countdowns and discovery diagnostics do not.
+  return JSON.stringify([room.id, room.revision, room.name, room.airplay_name, room.nobly_room_id,
+    room.enabled, room.volume, room.runtime?.status, room.runtime?.error, room.outputs_error,
+    room.speakers.map((speaker) => [speaker.id, speaker.name]), roomHealth(room, runtime), writeError, speechActive]);
+}
+
 function renderCards() {
   if (!store.snapshot || store.authRequired) return;
   if (store.busy.size) {
-    // Keep the user's toggled/dragged control in place until its write finishes.
-    // Replacing it in the change event also breaks assistive/browser input state.
-    view.cardSignature = '';
+    // Preserve controls through their own change events and write confirmation.
     for (const card of elements.roomGrid.querySelectorAll('.room-card')) {
       const locked = store.busy.has(card.dataset.roomId);
+      if (locked) card.dataset.renderSignature = '';
       card.setAttribute('aria-busy', String(locked));
       for (const control of card.querySelectorAll('input, button')) {
         if (locked) { if (control.dataset.wasDisabled === undefined) control.dataset.wasDisabled = String(control.disabled); control.disabled = true; }
@@ -666,17 +728,32 @@ function renderCards() {
     return;
   }
   const rooms = store.snapshot.rooms;
-  const signature = JSON.stringify([rooms, [...store.busy], [...store.writeErrors], [...view.speech.keys()], store.snapshot.runtime.simulation]);
-  const active = document.activeElement;
-  if (signature === view.cardSignature || elements.roomGrid.contains(active) && active?.type === 'range') return;
-  view.cardSignature = signature;
   if (!rooms.length) {
+    if (elements.roomGrid.querySelector('.empty-state[data-rooms-empty]')) return;
     const empty = node('div', 'empty-state');
+    empty.dataset.roomsEmpty = '';
     empty.append(node('span', 'room-symbol', '⌂'), node('h2', '', 'Start with a room'), node('p', '', 'Give a room a name, turn on its audio, then choose the speakers that belong there.'), button('Add your first room', 'primary', () => openRoom()));
     elements.roomGrid.replaceChildren(empty);
     return;
   }
-  elements.roomGrid.replaceChildren(...rooms.map(renderCard));
+  const cards = new Map([...elements.roomGrid.querySelectorAll('.room-card')].map((card) => [card.dataset.roomId, card]));
+  const active = document.activeElement;
+  const retained = new Set();
+  for (const [index, room] of rooms.entries()) {
+    const signature = roomCardSignature(room, store.snapshot.runtime,
+      { writeError: store.writeErrors.get(room.id), speechActive: view.speech.has(room.id) });
+    let card = cards.get(room.id);
+    const editingRange = card?.contains(active) && active?.type === 'range';
+    if (!card || card.dataset.renderSignature !== signature && !editingRange) {
+      const previous = card;
+      card = renderCard(room);
+      card.dataset.renderSignature = signature;
+      if (previous) previous.replaceWith(card);
+    }
+    retained.add(card);
+    if (elements.roomGrid.children[index] !== card) elements.roomGrid.insertBefore(card, elements.roomGrid.children[index] || null);
+  }
+  for (const child of [...elements.roomGrid.children]) if (!retained.has(child)) child.remove();
 }
 
 function renderCard(room) {
@@ -720,7 +797,7 @@ function renderCard(room) {
     const result = await store.change(room.id, () => patchRoom(room, { volume: level }));
     if (result.ok) toast(`${room.name} volume saved`);
   });
-  slider.addEventListener('blur', () => { view.cardSignature = ''; renderCards(); });
+  slider.addEventListener('blur', renderCards);
   volume.append(volumeLabel, slider);
   const actions = node('div', 'room-actions');
   const speakersButton = button('Speakers', 'quiet', () => openSpeakers(room.id));
@@ -767,7 +844,6 @@ async function login(event) {
     await client.request('/session', { method: 'POST', body: { token } });
     store.authRequired = false;
     store.version += 1;
-    view.cardSignature = '';
     await store.refresh();
     if (!store.authRequired) toast('Browser connected');
   } catch (error) { notice(elements.pairingError, error.message); }
@@ -792,7 +868,7 @@ function closeSheet(kind, { force = false } = {}) {
     clearTtsPreview();
     view.ttsDraft = null;
     elements.ttsDialog.close();
-    if (!tts.activeJob()) clearTimeout(view.ttsPollTimer);
+    if (!tts.hasActiveJobs()) clearTimeout(view.ttsPollTimer);
     return true;
   }
   const draft = kind === 'room' ? view.roomDraft : kind === 'calibration' ? view.calibrationDraft : view.speakerDraft;
@@ -820,7 +896,9 @@ function ttsFailure(error) {
 function openTts(roomId = null) {
   const room = roomId ? store.room(roomId) : null;
   if (roomId && !room) return;
+  clearTtsPreview();
   view.ttsDraft = { roomId, modelId: elements.ttsModel.value || null, fieldsSignature: '' };
+  tts.selectTarget(roomId);
   elements.ttsTitle.textContent = room ? `Speak in ${room.name}` : 'Speech voices';
   elements.ttsIntro.textContent = room
     ? `Generate a spoken reply in ${room.name}. Its music lowers smoothly during the reply and returns afterward.`
@@ -836,14 +914,14 @@ async function refreshTts() {
   view.ttsPollCount = 0;
   try {
     await tts.refreshModels();
-    if (tts.activeJob()) await tts.refreshJob();
+    if (tts.hasActiveJobs()) await tts.refreshJobs();
   } catch (error) { ttsFailure(error); }
   scheduleTtsPoll();
 }
 
 function scheduleTtsPoll() {
   clearTimeout(view.ttsPollTimer);
-  if (store.authRequired || !view.ttsDraft && !tts.activeJob()) return;
+  if (store.authRequired || !view.ttsDraft && !tts.hasActiveJobs()) return;
   if (view.ttsPollCount >= 600) {
     if (view.ttsDraft) notice(elements.ttsError, 'Automatic speech updates have stopped. Refresh availability to check the latest state.');
     return;
@@ -852,12 +930,12 @@ function scheduleTtsPoll() {
     view.ttsPollCount += 1;
     try {
       if (!document.hidden) {
-        if (tts.activeJob()) await tts.refreshJob();
+        if (tts.hasActiveJobs()) await tts.refreshJobs();
         if (view.ttsDraft) await tts.refreshModels();
       }
     } catch (error) { ttsFailure(error); }
     finally { scheduleTtsPoll(); }
-  }, tts.activeJob() || tts.catalog?.worker.state === 'loading' ? 1000 : 4000);
+  }, tts.hasActiveJobs() || tts.catalog?.worker.state === 'loading' ? 1000 : 4000);
 }
 
 function renderTts() {
@@ -900,14 +978,14 @@ function renderTts() {
     ? 'Experimental voice model: speech quality and timing are still being qualified. Listen to a quiet measurement before using it for room replies.' : '', 'warning');
   const available = !!catalog?.enabled;
   const warming = catalog?.worker.state === 'busy' && catalog.worker.operation === 'warming';
-  const ready = available && (catalog.worker.state === 'ready' || warming) && catalog.worker.model_id === model?.id;
-  const busy = tts.busy || tts.activeJob();
+  const ready = available && ['ready', 'busy'].includes(catalog.worker.state) && catalog.worker.model_id === model?.id;
+  const busy = tts.busy;
   const workerModel = models.find((item) => item.id === catalog?.worker.model_id)?.name || 'voice model';
   const workerStatus = !catalog ? 'Checking speech availability…'
     : !available ? 'Voice generation is not configured. Connect Shiri’s optional speech worker to enable models and spoken replies.'
       : catalog.worker.state === 'loading' ? `Loading ${workerModel}…`
         : warming ? `${workerModel} is preparing quietly. A spoken reply takes priority.`
-          : catalog.worker.state === 'busy' ? `${workerModel} is generating speech.`
+          : catalog.worker.state === 'busy' ? `${workerModel} is generating speech. New replies wait for their turn.`
           : catalog.worker.state === 'unavailable' ? 'The speech worker is unreachable. Check it, then refresh availability.'
             : catalog.worker.state === 'failed' ? 'The voice model could not load. Refresh availability or load it again.'
             : ready ? `${workerModel} is ready.` : 'Load the selected model before generating speech.';
@@ -917,21 +995,33 @@ function renderTts() {
   elements.ttsVoice.disabled = elements.ttsLanguage.disabled = !available || !model || busy;
   elements.ttsSpeed.disabled = !model?.supports_speed || busy;
   elements.ttsText.disabled = !available || busy;
-  elements.ttsLoadModel.disabled = !available || !model || busy || ready || catalog.worker.state === 'loading' || catalog.worker.state === 'busy';
+  elements.ttsLoadModel.disabled = !available || !model || busy || tts.hasActiveJobs() || ready || catalog.worker.state === 'loading' || catalog.worker.state === 'busy';
   elements.ttsRefresh.disabled = tts.busy;
-  elements.ttsBenchmark.disabled = !ready || busy || !model?.voices.length || !model?.languages.length;
+  elements.ttsBenchmark.disabled = !ready || busy || !tts.canQueue(null) || !model?.voices.length || !model?.languages.length;
   const room = draft.roomId ? store.room(draft.roomId) : null;
   const roomReady = !!room && roomHealth(room, store.snapshot?.runtime).ready;
   elements.ttsSpeak.hidden = !draft.roomId;
   elements.ttsSpeak.textContent = room ? `Speak in ${room.name}` : 'Speak in room';
-  elements.ttsSpeak.disabled = elements.ttsBenchmark.disabled || !roomReady;
+  elements.ttsSpeak.disabled = !ready || busy || !tts.canQueue(draft.roomId) || !model?.voices.length || !model?.languages.length || !roomReady;
   elements.ttsPrepare.hidden = !draft.roomId;
   elements.ttsPrepare.disabled = !roomReady || !ready || busy || !!view.ttsWarmInFlight;
   elements.ttsRoomHelp.textContent = draft.roomId
-    ? roomReady ? 'The reply plays only in this room. Shiri keeps music advancing while it lowers and restores its level.'
+    ? roomReady ? 'Replies play in order in this room. Up to two can wait behind the current reply; select a reply below to stop only that one.'
       : 'This room must be on with its assigned speakers ready before a reply can play.'
     : 'Model measurements use the text below and stay quiet in the house.';
   const job = tts.job;
+  const queue = tts.targetJobs().filter((entry) => !ttsTerminalStates.has(entry.state) || entry.id === job?.id);
+  elements.ttsQueue.hidden = queue.length < 2;
+  const queueSignature = JSON.stringify([job?.id, queue.map((entry) => [entry.id, entry.state])]);
+  if (elements.ttsQueue.dataset.signature !== queueSignature) {
+    elements.ttsQueue.dataset.signature = queueSignature;
+    elements.ttsQueue.replaceChildren(...queue.map((entry, index) => {
+      const label = `${index + 1}. ${entry.state === 'playing' ? 'Speaking' : entry.state === 'generating' ? 'Generating' : entry.state === 'queued' ? 'Waiting' : entry.state}`;
+      const choice = button(label, 'button quiet', () => tts.selectJob(entry.id));
+      choice.setAttribute('aria-pressed', String(entry.id === job?.id));
+      return choice;
+    }));
+  }
   renderTtsPreview(job);
   elements.ttsJob.hidden = !job;
   if (!job) return;
@@ -945,9 +1035,11 @@ function renderTts() {
   };
   const error = typeof job.error === 'string' ? job.error : typeof job.error?.message === 'string' ? job.error.message : '';
   notice(elements.ttsJobStatus, `${labels[job.state]}${error ? ` ${error}` : ''}`, job.state === 'failed' ? 'error' : '');
-  elements.ttsCancel.disabled = !tts.activeJob() || tts.busy;
+  elements.ttsCancel.disabled = ttsTerminalStates.has(job.state) || tts.busy;
   const metrics = job.metrics || {};
   const rows = [
+    ['Waiting for earlier room replies', metrics.room_queue_wait_ms, ' ms'],
+    ['Waiting for voice generation', metrics.generation_wait_ms, ' ms'],
     ['First generated audio', metrics.first_pcm_ms, ' ms'],
     ['First non-silent generated audio', metrics.first_non_silent_pcm_ms, ' ms'],
     ['Leading generated silence', metrics.leading_silence_ms, ' ms'],
@@ -1018,8 +1110,7 @@ async function submitTts(kind) {
   const draft = view.ttsDraft;
   if (!draft || !elements.ttsForm.reportValidity()) return;
   const model = tts.catalog?.models.find((item) => item.id === draft.modelId);
-  const warming = tts.catalog?.worker.state === 'busy' && tts.catalog.worker.operation === 'warming';
-  if (!model || !tts.catalog?.enabled || (!warming && tts.catalog.worker.state !== 'ready') || tts.catalog.worker.model_id !== model.id) {
+  if (!model || !tts.catalog?.enabled || !['ready', 'busy'].includes(tts.catalog.worker.state) || tts.catalog.worker.model_id !== model.id) {
     notice(elements.ttsError, 'Load the selected voice model before generating speech.');
     return;
   }
@@ -1034,7 +1125,7 @@ async function submitTts(kind) {
   try {
     const job = await tts.createJob(path, body);
     if (job) { view.ttsPollCount = 0; scheduleTtsPoll(); }
-  } catch (error) { ttsFailure(error); if (tts.activeJob()) { view.ttsPollCount = 0; scheduleTtsPoll(); } }
+  } catch (error) { ttsFailure(error); if (tts.hasActiveJobs()) { view.ttsPollCount = 0; scheduleTtsPoll(); } }
 }
 
 async function prepareTtsRoom() {
@@ -1894,7 +1985,6 @@ function releaseSpeech(id, expected = view.speech.get(id)) {
   try { expected.oscillator.stop(); } catch {}
   expected.context.close().catch(() => {});
   if (view.speech.get(id) === expected) view.speech.delete(id);
-  view.cardSignature = '';
 }
 
 async function stopSpeech(id, expected = view.speech.get(id)) {

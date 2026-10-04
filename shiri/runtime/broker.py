@@ -30,7 +30,8 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from shiri.domain import Room, SpeakerRef, local_audio_device_key, speaker_key, validate_local_audio_device
-from shiri.rpc import RpcError, call_rpc, serve_rpc
+from shiri.rpc import AdmissionRefused, RpcError, StreamReply, call_rpc, serve_rpc
+from shiri.speech_stream import open_speech, serve_speech
 from shiri.readiness import transport_fingerprint
 from shiri.settings import RuntimeConfig
 from shiri.source import SourceToken
@@ -109,6 +110,7 @@ class RuntimeRoom:
     phone_volume_revision: int | None = None
     receiver_volume: dict | None = None
     activity: dict = field(default_factory=dict)
+    speech_streams: dict = field(default_factory=dict)
 
     def snapshot(self):
         offsets = {speaker.id: speaker.offset_ms for speaker in self.desired.speakers}
@@ -250,10 +252,6 @@ class Broker:
             [
                 sys.executable,
                 "-c",
-                'import gi; gi.require_version("Gst", "1.0"); gi.require_version("GstAudio", "1.0"); '
-                "from gi.repository import Gst, GstAudio; Gst.init(None); GstAudio.AudioInfo(); "
-                "assert all(Gst.ElementFactory.find(name) for name in "
-                '("alsasrc", "alsasink", "audiomixer", "audioconvert", "audioresample", "appsrc", "appsink")); '
                 "import aiortc; import av; import numpy",
             ]
         )
@@ -421,6 +419,8 @@ class Broker:
                 return {"ok": True}
             if operation == "speech":
                 return await self.speech(room, payload)
+            if operation == "speech-stream":
+                return await self.open_speech(room, payload)
             if operation == "warm":
                 return await self.warm(room, payload)
             raise RpcError("unknown_operation", "Unsupported runtime operation")
@@ -1113,11 +1113,9 @@ class Broker:
         own_url = f"http://{sender['api_ip']}:{3869 + starting.slot * 10}"
         shairport, owntone = backend_configs(
             starting.model_copy(update={"local_audio_device": "shiri" if pin else local_device if bluetooth else None}),
-            room.directory, room.receiver, sender,
-            broker_socket=self.config.runtime_socket,
-            all_receiver_names=sorted(self._receiver_names()), password=password,
+            room.directory, room.receiver, all_receiver_names=sorted(self._receiver_names()), password=password,
             view_directory=VIEW, output_state_directory=VIEW / "state", own_username=output["name"],
-            native_timing=True, audio_uid=audio["uid"], music_socket=VIEW / "input" / "music.sock",
+            audio_uid=audio["uid"], music_socket=VIEW / "input" / "music.sock",
             output_buffer_ms=output_buffer_ms,
             speech_output={"socket": VIEW / "overlay" / "speech.sock", "peer_uid": audio["uid"],
                            "room_id": starting.id, "launch_generation": generation},
@@ -1212,7 +1210,7 @@ class Broker:
         room.processes["audio"] = await self._start_process(
             f"{starting.id}:audio", "audio",
             [sys.executable, "-m", "shiri.runtime.audio", "--room-dir", str(VIEW),
-             "--socket", str(VIEW / "control" / "audio.sock"), "--native", "--room-id", starting.id,
+             "--socket", str(VIEW / "control" / "audio.sock"), "--room-id", starting.id,
              "--native-uid", str(receiver["uid"]), "--native-socket", str(VIEW / "input" / "music.sock"),
              "--own-url", own_url, "--own-password-file", str(VIEW / "credentials" / "owntone.json"),
              "--speech-socket", str(VIEW / "overlay" / "speech.sock"), "--speech-launch-generation", generation,
@@ -1297,6 +1295,7 @@ class Broker:
         backend_definition = room.backend_definition or definition
         if self._output_clocks(definition) != self._output_clocks(backend_definition):
             raise Superseded()
+        await self._retire_speech_streams(room)
         room.outputs = await room.client.outputs(self._receiver_names())
         try:
             keys = await self._reserve_speakers(
@@ -1334,9 +1333,13 @@ class Broker:
         if room.processes or room.receiver or room.client or room.bluetooth_admission:
             room.status = "stopping"
         room.launch_generation = None
+        # Stopping the exact processes below is the final backstop when a
+        # broken stream cannot acknowledge retirement.
+        await self._retire_speech_streams(room, stopping=True)
         for session_id, room_id in list(self.sessions.items()):
             if room_id == room.desired.id:
                 self._forget_session(session_id)
+                self.pending_sessions.discard(session_id)
         if room.signal_server:
             room.signal_server.close()
             await room.signal_server.wait_closed()
@@ -1349,6 +1352,7 @@ class Broker:
             room.processes.pop(name, None)
         if self.network:
             await self._stop_reserved_units(room.desired.id)
+        room.speech_streams.clear()
         if room.bluetooth_rpc_directory is not None:
             room.bluetooth_rpc_directory.close()
             room.bluetooth_rpc_directory = None
@@ -1401,6 +1405,8 @@ class Broker:
             if (room_buffer_ms(proposed), proposed_plan.common_horizon_ms) != room.timing:
                 raise RpcError("configuration_requires_reconcile",
                                "Save this speaker configuration so all grouped zones can update their timing together")
+            if transport_fingerprint(proposed) != transport_fingerprint(room.desired):
+                await self._retire_speech_streams(room)
             outputs = await client.outputs(self._receiver_names())
             try:
                 definition = room.backend_definition or room.desired
@@ -1599,7 +1605,93 @@ class Broker:
         self.sessions.pop(session_id, None)
         self.session_generations.pop(session_id, None)
 
+    async def _retire_speech_streams(self, room, *, stopping=False):
+        outcomes = await asyncio.gather(*(close() for close in tuple(room.speech_streams.values())),
+                                        return_exceptions=True)
+        if not stopping and any(isinstance(result, BaseException) for result in outcomes):
+            raise RuntimeFailure("Speech retirement is unconfirmed; retain the current output assignment")
+
+    async def open_speech(self, room, payload):
+        """Freeze one routing decision, then relay bounded PCM without control RPCs."""
+        session_id = payload.get("session_id")
+        if (not isinstance(session_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", session_id)):
+            raise RpcError("invalid_request", "A bounded speech session id is required")
+        async with room.control_lock:
+            if session_id in self.sessions:
+                raise RpcError("session_conflict", "Speech session already has an admitted owner")
+            if len(self.sessions) >= 32:
+                raise RpcError("session_limit", "Too many retained speech sessions")
+            client = self._client(room)
+            launch = room.launch_generation
+            fingerprint = transport_fingerprint(room.desired)
+            checked_definition = room.desired
+            selected = frozenset(room.selected_ids)
+            if (not room.desired.enabled or not launch or not selected
+                    or selected != {speaker.id for speaker in room.desired.speakers}
+                    or payload.get("transport_fingerprint") != fingerprint):
+                raise RpcError("session_conflict", "The admitted speech room routing has changed")
+            generation = object()
+            self.sessions[session_id] = room.desired.id
+            self.session_generations[session_id] = generation
+            self.pending_sessions.add(session_id)
+            downstream = None
+            admission_refused = False
+
+            def validate():
+                nonlocal checked_definition
+                # Room intent is replaced as a complete model. Hash only a new
+                # definition, never PCM frames on a stable admitted route.
+                if room.desired is not checked_definition:
+                    if transport_fingerprint(room.desired) != fingerprint:
+                        raise RpcError("session_conflict", "The admitted speech room routing has retired")
+                    checked_definition = room.desired
+                if (self._closing or self.rooms.get(room.desired.id) is not room or room.removing
+                        or not room.desired.enabled or room.client is not client
+                        or room.launch_generation != launch
+                        or frozenset(room.selected_ids) != selected
+                        or self.session_generations.get(session_id) is not generation):
+                    raise RpcError("session_conflict", "The admitted speech room or launch has retired")
+
+            async def close():
+                if downstream is None and not admission_refused:
+                    # The worker may own BEGIN even when its initial reply was
+                    # lost. Keep routing fenced until this exact launch stops;
+                    # never send cancellation to an unidentified future voice.
+                    raise RpcError("audio_unavailable", "Speech admission retirement is unconfirmed")
+                result = await downstream.close() if downstream is not None else None
+                # Keep an unconfirmed retirement registered until this launch
+                # stops. A later output edit must not erase that uncertainty.
+                if room.speech_streams.get(session_id) is close:
+                    room.speech_streams.pop(session_id)
+                if self.session_generations.get(session_id) is generation:
+                    self._forget_session(session_id, generation)
+                    self.pending_sessions.discard(session_id)
+                return result
+
+            # Admission itself can acquire a voice before its reply arrives.
+            # Register its retirement owner before that first network await.
+            room.speech_streams[session_id] = close
+            try:
+                message = {key: value for key, value in payload.items()
+                           if key not in {"room_id", "transport_fingerprint"}}
+                message["duck_gain"] = room.desired.duck_gain
+                downstream = await open_speech(self._worker_socket(room), message)
+                validate()
+                prepared = {**downstream.prepared, "launch_generation": launch,
+                            "transport_fingerprint": fingerprint, "admitted_room_id": room.desired.id}
+                return StreamReply(prepared,
+                                   lambda reader, writer: serve_speech(reader, writer, downstream,
+                                                                      validate=validate), close)
+            except BaseException as exc:
+                admission_refused = isinstance(exc, AdmissionRefused)
+                if downstream is not None or admission_refused:
+                    await close()
+                raise
+
     async def speech(self, room: RuntimeRoom, payload: dict):
+        if payload.get("action", "offer") not in {"offer", "control", "close"}:
+            raise RpcError("invalid_request", "Speech control supports offer, control, or close")
         session_id = payload.get("session_id")
         if not isinstance(session_id, str) or not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", session_id
@@ -1608,6 +1700,10 @@ class Broker:
         previous = self.sessions.get(session_id)
         if previous is not None and previous != room.desired.id:
             raise RpcError("session_conflict", "Speech session belongs to another room")
+        if session_id in room.speech_streams:
+            # A refused RTC request must not rewrite a binary stream's
+            # generation and indirectly revoke its next PCM frame.
+            raise RpcError("session_conflict", "Generated speech is owned by its admitted binary connection")
         if payload.get("action") == "close" and not room.processes.get("audio"):
             self._forget_session(session_id)
             return {"ok": True, "closed": True}
@@ -1620,7 +1716,7 @@ class Broker:
         message = {key: value for key, value in payload.items() if key != "room_id"}
         message["duck_gain"] = room.desired.duck_gain
         generation = self.session_generations.get(session_id)
-        if payload.get("action") in {"offer", "prepare-pcm", "close"} or generation is None:
+        if payload.get("action", "offer") in {"offer", "close"} or generation is None:
             generation = object()
         self.session_generations[session_id] = generation
         self.sessions[session_id] = room.desired.id
@@ -1640,7 +1736,7 @@ class Broker:
                 if not operations:
                     self._session_operations.pop(session_id, None)
                     self.pending_sessions.discard(session_id)
-        if payload.get("action") in {"close", "finish"}:
+        if payload.get("action") == "close":
             self._forget_session(session_id, generation)
         return result
 
@@ -1687,14 +1783,15 @@ class Broker:
         while not self._closing:
             await asyncio.sleep(5)
             sender_healthy = True
-            if self.sender:
+            sender = self.sender
+            if sender:
                 try:
                     sender_healthy = all(
                         process.alive for process in self.sender_processes.values()
-                    ) and await self.network.healthy(self.sender)
+                    ) and await self.network.healthy(sender)
                 except RuntimeFailure:
                     sender_healthy = False
-            if not sender_healthy:
+            if not sender_healthy and self.sender is sender:
                 for room in list(self.rooms.values()):
                     if room.desired.enabled:
                         room.restart_required = True
@@ -1702,6 +1799,18 @@ class Broker:
             await asyncio.gather(*(self._probe_room(room) for room in list(self.rooms.values())))
 
     async def _probe_room(self, room):
+        client, receiver, launch_generation = room.client, room.receiver, room.launch_generation
+
+        def current():
+            # Probes must not hold control_lock across slow I/O. Fence each
+            # result instead: stop/restart may retire this launch at any await.
+            return (
+                not self._closing and not room.removing and room.desired.enabled
+                and room.status in {"running", "degraded"}
+                and room.client is client and room.receiver is receiver
+                and room.launch_generation == launch_generation
+            )
+
         try:
             if (room.removing and room.task and room.task.done()
                     and not room.processes and not room.receiver and not room.bluetooth_admission):
@@ -1729,19 +1838,27 @@ class Broker:
                         await asyncio.wait_for(room.bluetooth_admission.check(), timeout=8)
                     except asyncio.TimeoutError as exc:
                         raise RuntimeFailure("Bluetooth endpoint validation exceeded its deadline") from exc
+                    if not current():
+                        return
                 if room.local_pin:
                     try:
                         room.local_pin.validate()
                     except PCMIdentityError as exc:
                         raise RuntimeFailure(str(exc)) from exc
-                if not all(
+                healthy = all(
                     process.alive for process in room.processes.values()
-                ) or not await self.network.healthy(room.receiver):
+                ) and await self.network.healthy(receiver)
+                if not current():
+                    return
+                if not healthy:
                     room.restart_required = True
                     room.wake.set()
                     return
                 try:
-                    room.player = await room.client.request("GET", "/api/player")
+                    player = await client.request("GET", "/api/player")
+                    if not current():
+                        return
+                    room.player = player
                     for name in ["audio", "bluetooth-output"]:
                         if name in room.processes:
                             observed_sessions = {
@@ -1750,6 +1867,8 @@ class Broker:
                                 if name == "audio" and owner == room.desired.id
                             }
                             health = await self._worker_rpc(room, name, "health", {}, timeout=2)
+                            if not current():
+                                return
                             if health.get("ready") is False or health.get("error"):
                                 raise RuntimeFailure(
                                     health.get("error") or f"Room {name} worker is not ready"
@@ -1771,11 +1890,15 @@ class Broker:
                     if room.status == "degraded" and (not room.gain_pending or asyncio.get_running_loop().time() >= room.retry_at):
                         room.wake.set()
                 except (RuntimeFailure, RpcError) as exc:
+                    if not current():
+                        return
                     room.error = str(exc)
                     room.restart_required = True
                     room.wake.set()
                 room.last_health_at = now()
         except (RuntimeFailure, OSError) as exc:
+            if not current():
+                return
             room.error = str(exc)
             room.restart_required = True
             room.wake.set()

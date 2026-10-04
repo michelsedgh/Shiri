@@ -203,7 +203,9 @@ async def test_malformed_worker_credential_returns_unauthorized_without_decoder_
 
 
 @pytest.mark.parametrize("value", [[], None, "hello", 5, {"model_id": "unknown", "text": "hi"},
-                                 payload(voice="not-a-voice"), payload(speed=3), payload(untrusted_repo="https://evil.test")])
+                                 payload(voice="not-a-voice"), payload(speed=3), payload(untrusted_repo="https://evil.test"),
+                                 payload(speed=10**400), payload(streaming_interval=10**400),
+                                 payload(model_id=QWEN_MODEL_ID, temperature=10**400)])
 async def test_bad_generation_input_is_refused_before_ipc_or_reservation(value):
     worker = ready_worker()
     app = create_worker_app(token=TOKEN, worker=worker)
@@ -591,6 +593,49 @@ async def spawn_cooperative_worker(mode):
         raise
 
 
+def reloaded_decoder(connection, _spec, _cache_dir, _allow_download, cancel_event):
+    cooperative_decoder(connection, cancel_event, "natural-end")
+
+
+@pytest.mark.parametrize("observation", ["status", "warm", "reserve", "load"])
+async def test_idle_child_exit_is_not_ready_and_same_model_can_be_reloaded(monkeypatch, observation):
+    import shiri.tts.worker as module
+    worker = await spawn_cooperative_worker("natural-end")
+    previous_process, previous_connection = worker.process, worker.connection
+    monkeypatch.setattr(module, "_child", reloaded_decoder)
+    try:
+        # Only the isolated test decoder exits; no HTTP operation is active to
+        # notice its death and update the parent's last readiness receipt.
+        previous_connection.send(None)
+        await asyncio.to_thread(previous_process.join, 2)
+        assert not previous_process.is_alive() and worker.state == "ready"
+        if observation == "status":
+            assert worker.status()["state"] == "failed"
+            assert "exited" in worker.error
+        elif observation == "warm":
+            receipt = await worker.warm(DEFAULT_MODEL_ID, "a" * 32)
+            assert not receipt["accepted"] and receipt["reason"] == "model_not_ready"
+        elif observation == "reserve":
+            with pytest.raises(ValueError, match="Load and warm"):
+                await worker.reserve(payload(text="successor"))
+            assert not worker.lock.locked()
+        # Recovery must also work without a prior status read or failed speech.
+        await worker.load(DEFAULT_MODEL_ID)
+        assert worker.state == "loading"
+        await asyncio.wait_for(worker.load_task, 5)
+        assert worker.state == "ready" and worker.error is None
+        assert worker.process is not previous_process and worker.process.is_alive()
+        assert previous_connection.closed
+        with pytest.raises(ValueError, match="closed"):
+            previous_process.is_alive()
+        prepared = await worker.reserve(payload(text="successor"))
+        records = [json.loads(line) async for line in worker.stream(prepared)]
+        assert [record["type"] for record in records] == ["format", "pcm", "end"]
+        assert base64.b64decode(records[1]["pcm_base64"]) == b"\x52\x00" * 480
+    finally:
+        await worker.close()
+
+
 @pytest.mark.parametrize("mode", ["before-first", "after-first", "natural-end"])
 async def test_real_spawn_cancellation_keeps_owned_reader_and_next_generation_clean(mode):
     worker = await spawn_cooperative_worker(mode)
@@ -731,4 +776,165 @@ async def test_level_triggered_http_disconnect_shields_cooperative_cleanup():
         assert worker.connection is connection and worker.process is process
         assert not connection.closed and not process.closed and connection.messages == []
     finally:
+        await worker.close()
+
+
+async def wait_ready(worker, model_id, *, previous=None):
+    async def observe():
+        while worker.state != "ready" or worker.model_id != model_id or worker.process is previous:  # noqa: ASYNC110 - observe the bounded external process lifecycle.
+            await asyncio.sleep(.01)
+    await asyncio.wait_for(observe(), 5)
+
+
+async def test_selected_model_persists_after_warmup_and_restores_at_next_start(tmp_path, monkeypatch):
+    import shiri.tts.worker as module
+    monkeypatch.setattr(module, "_child", reloaded_decoder)
+    state_file = tmp_path / "selected-model.json"
+    worker = ModelWorker(state_file=state_file)
+    restored = None
+    try:
+        await worker.start(DEFAULT_MODEL_ID)
+        await wait_ready(worker, DEFAULT_MODEL_ID)
+        await worker.load(QWEN_MODEL_ID)
+        await wait_ready(worker, QWEN_MODEL_ID)
+        assert json.loads(state_file.read_text()) == {"version": 1, "model_id": QWEN_MODEL_ID}
+        assert state_file.stat().st_mode & 0o777 == 0o600
+        await worker.close()
+        restored = ModelWorker(state_file=state_file)
+        await restored.start(DEFAULT_MODEL_ID)
+        await wait_ready(restored, QWEN_MODEL_ID)
+        assert restored.status()["selected_model_id"] == QWEN_MODEL_ID
+        assert restored.status()["automatic_recovery"]
+        request = await restored.reserve({"model_id": QWEN_MODEL_ID, "text": "successor"})
+        records = [json.loads(line) async for line in restored.stream(request)]
+        assert [record["type"] for record in records] == ["format", "pcm", "end"]
+    finally:
+        await worker.close()
+        if restored is not None:
+            await restored.close()
+
+
+async def test_resident_model_recovers_idle_exit_and_pending_request_without_periodic_inference(monkeypatch):
+    import shiri.tts.worker as module
+    monkeypatch.setattr(module, "_child", reloaded_decoder)
+    monkeypatch.setattr(module, "RECOVERY_POLL_SECONDS", .01)
+    worker = ModelWorker()
+    try:
+        await worker.start(DEFAULT_MODEL_ID)
+        await wait_ready(worker, DEFAULT_MODEL_ID)
+        previous = worker.process
+        worker.connection.send(None)
+        await asyncio.to_thread(previous.join, 2)
+        assert not previous.is_alive()
+        # The request waits for resident recovery; it never loads a model itself.
+        prepared = await asyncio.wait_for(worker.reserve(payload(text="successor")), 5)
+        assert worker.process is not previous and worker.recovery_attempts == 1
+        records = [json.loads(line) async for line in worker.stream(prepared)]
+        assert [record["type"] for record in records] == ["format", "pcm", "end"]
+        resident = worker.process
+        await asyncio.sleep(.05)
+        assert worker.process is resident and worker.recovery_attempts == 1 and worker.state == "ready"
+        assert not worker.lock.locked() and worker._receive_task is None
+    finally:
+        await worker.close()
+    assert worker.state == "stopped" and worker.process is None
+
+
+def selectively_unavailable_decoder(connection, spec, cache_dir, allow_download, cancel_event):
+    if spec.id == QWEN_MODEL_ID:
+        connection.send({"type": "error", "error": "Selected checkpoint is unavailable"})
+        connection.close()
+    else:
+        reloaded_decoder(connection, spec, cache_dir, allow_download, cancel_event)
+
+
+async def test_failed_model_change_preserves_last_successful_selection_and_recovers_it(tmp_path, monkeypatch):
+    import shiri.tts.worker as module
+    monkeypatch.setattr(module, "_child", selectively_unavailable_decoder)
+    monkeypatch.setattr(module, "RECOVERY_POLL_SECONDS", .01)
+    state_file = tmp_path / "selected-model.json"
+    worker = ModelWorker(state_file=state_file)
+    try:
+        await worker.load(DEFAULT_MODEL_ID)
+        await worker.load_task
+        await worker.start()
+        previous = worker.process
+        await worker.load(QWEN_MODEL_ID)
+        await worker.load_task
+        assert worker.model_id in {QWEN_MODEL_ID, DEFAULT_MODEL_ID}
+        assert json.loads(state_file.read_text())["model_id"] == DEFAULT_MODEL_ID
+        await wait_ready(worker, DEFAULT_MODEL_ID, previous=previous)
+        assert worker.selected_model == DEFAULT_MODEL_ID and worker.recovery_attempts == 1
+    finally:
+        await worker.close()
+
+
+async def test_explicit_same_model_selection_is_saved_and_survives_new_preload_default(tmp_path, monkeypatch):
+    import shiri.tts.worker as module
+    monkeypatch.setattr(module, "_child", reloaded_decoder)
+    state_file = tmp_path / "selected-model.json"
+    worker = ModelWorker(state_file=state_file)
+    restored = None
+    try:
+        await worker.start(DEFAULT_MODEL_ID)
+        await wait_ready(worker, DEFAULT_MODEL_ID)
+        resident = worker.process
+        await worker.load(DEFAULT_MODEL_ID)
+        assert worker.process is resident and json.loads(state_file.read_text())["model_id"] == DEFAULT_MODEL_ID
+        await worker.close()
+        restored = ModelWorker(state_file=state_file)
+        await restored.start(QWEN_MODEL_ID)
+        await wait_ready(restored, DEFAULT_MODEL_ID)
+    finally:
+        await worker.close()
+        if restored is not None:
+            await restored.close()
+
+
+@pytest.mark.parametrize("new_model", [False, True])
+async def test_cancelled_selection_write_cannot_escape_its_lock_and_overwrite_successor(tmp_path, monkeypatch, new_model):
+    import shiri.tts.worker as module
+    monkeypatch.setattr(module, "_child", reloaded_decoder)
+    state_file = tmp_path / "selected-model.json"
+    worker = ModelWorker(state_file=state_file)
+    entered, release = threading.Event(), threading.Event()
+    saving = None
+    try:
+        await worker.load(DEFAULT_MODEL_ID)
+        await worker.load_task
+        save = worker._save_selection
+
+        def blocked_save(model_id):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("Selection-write test did not release its gate")
+            save(model_id)
+
+        monkeypatch.setattr(worker, "_save_selection", blocked_save)
+        selected = QWEN_MODEL_ID if new_model else DEFAULT_MODEL_ID
+        successor = DEFAULT_MODEL_ID if new_model else QWEN_MODEL_ID
+        if new_model:
+            await worker.load(selected)
+            saving = worker.load_task
+        else:
+            saving = asyncio.create_task(worker.load(selected))
+        assert await asyncio.to_thread(entered.wait, 1)
+        saving.cancel()
+        await asyncio.sleep(0)
+        assert not saving.done() and worker.lock.locked()
+        with pytest.raises(ValueError, match="operation is already active"):
+            await worker.load(successor)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await saving
+        assert worker.selected_model == selected
+        assert json.loads(state_file.read_text())["model_id"] == selected
+        await worker.load(successor)
+        await worker.load_task
+        assert worker.selected_model == successor
+        assert json.loads(state_file.read_text())["model_id"] == successor
+    finally:
+        release.set()
+        if saving is not None:
+            await asyncio.gather(saving, return_exceptions=True)
         await worker.close()

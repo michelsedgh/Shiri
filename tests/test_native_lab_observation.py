@@ -1,15 +1,7 @@
-"""Offline regressions for the actual manual AirPlay/API observation harness.
-
-These checks import its real observation/control code, without starting Linux
-resources, GStreamer, a peer connection, or the manual check() entry point.
-CI installs the audio extra; a minimal control-only install explicitly skips.
-"""
-import asyncio
+"""Offline regressions for the native laboratory PCM measurement instruments."""
 from collections import deque
 import importlib.util
 from pathlib import Path
-import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +9,7 @@ np = pytest.importorskip("numpy", reason="AirPlay observation checks require the
 pytest.importorskip("aiortc", reason="Manual harness imports the optional audio extra")
 pytest.importorskip("av", reason="Manual harness imports the optional audio extra")
 
-HARNESS = Path(__file__).parent / "linux" / "check_airplay_api_tts.py"
+HARNESS = Path(__file__).parent / "linux" / "native_lab_observation.py"
 spec = importlib.util.spec_from_file_location("airplay_observation_harness", HARNESS)
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
@@ -42,6 +34,7 @@ def metadata(rate=48000, first=0, frames=960, *, discont=False):
 
 def observer():
     capture = harness.OutputCapture.__new__(harness.OutputCapture)
+    capture.device = "synthetic-observer"
     capture.error = capture.warning = None
     capture.capture_dropped = 0
     capture.needs_latency = False
@@ -190,88 +183,3 @@ def test_restoration_waits_for_actual_music_and_rejects_lingering_voice(rate):
         gate.push(clean, 22.44 + index * .02, rate)
     assert gate.complete
     assert gate.evidence(23.1)["first_matching_callback_seconds_after_trigger"] >= 2.4
-
-
-async def test_actual_exercise_cannot_skip_music_failure_during_gain_readiness_retry(monkeypatch, tmp_path):
-    """Exercise the closure wiring that previously advanced past a bad block."""
-    capture = observer()
-    started = time.monotonic()
-    clean, silence = pcm(blocks=1)[0], pcm(music=0, blocks=1)[0]
-    capture_started = False
-    baseline_readiness = False
-    injected = False
-    blocked_monitor = asyncio.Event()
-    original_poll = capture.poll
-    real_eventually = harness.base.eventually
-    readiness_calls = 0
-
-    def poll():
-        nonlocal injected
-        if capture_started:
-            data = silence if baseline_readiness and not injected else clean
-            if baseline_readiness:
-                injected = True
-            at = time.monotonic()
-            first = capture.total // 4
-            capture.pending.append((at, data, 48000, 2, "S16LE", metadata(first=first)))
-            capture.last_packet_at = at
-        return original_poll()
-
-    def start_capture():
-        nonlocal capture_started
-        capture_started = True
-
-    async def eventually(action, description, *, timeout=40):
-        nonlocal baseline_readiness, readiness_calls
-        if description != "baseline worker gain":
-            return await real_eventually(action, description, timeout=timeout)
-        baseline_readiness = True
-        async def ready():
-            nonlocal readiness_calls
-            readiness_calls += 1
-            return await action()
-        try:
-            return await real_eventually(ready, description, timeout=.3)
-        finally:
-            blocked_monitor.set()
-
-    class Player:
-        def __init__(self, *, source=False):
-            self.source = source
-            self.initial_read = True
-
-        async def request(self, method, path):
-            if not self.source and not self.initial_read:
-                await blocked_monitor.wait()
-            self.initial_read = False
-            return {"state": "play", "item_id": 1,
-                    "volume": 20 if self.source else 100,
-                    "item_progress_ms": int((time.monotonic() - started) * 1000)}
-
-        async def outputs(self, _excluded):
-            return [{"id": "111" if self.source else "0", "selected": True,
-                     "protocol": "airplay2" if self.source else "alsa"}]
-
-    async def health(path, operation, *, timeout):
-        assert path.name == "audio.sock" and operation == "health"
-        return {"ready": True, "error": None, "music_active": True, "audio_active": True,
-                "speech_session_id": None, "music_gain": 1., "dropped_bytes": 0}
-
-    async def forbidden_patch(_changes):
-        raise AssertionError("A bad music block reached later volume controls")
-
-    capture.start, capture.poll = start_capture, poll
-    monkeypatch.setattr(harness.base, "owned_identities", lambda *_args: {})
-    monkeypatch.setattr(harness.base, "eventually", eventually)
-    monkeypatch.setattr(harness, "call_rpc", health)
-    monkeypatch.setattr(harness, "output_hw_params", lambda: {"rate": 48000})
-    state = SimpleNamespace(client=Player(), selected_ids=["0"], directory=tmp_path)
-    api = SimpleNamespace(patch=forbidden_patch)
-    process = SimpleNamespace(evidence=lambda: {"uid": 999})
-    report = {"output_hw_params_before_capture": {"rate": 48000}}
-    with pytest.raises(harness.base.RuntimeFailure, match="lost the continuous440"):
-        await asyncio.wait_for(harness.exercise(
-            None, state, None, Player(source=True), {"id": "111"}, 1, api, process,
-            capture, None, None, {"session_id": "test"}, "unused", report), 3)
-    assert injected and readiness_calls >= 2
-    assert capture.sequence.evidence()["verified_frames"] >= 4800

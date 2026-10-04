@@ -38,27 +38,24 @@ def broker(directory):
     ))
 
 
-def test_receiver_pcm_settings_use_pinned_shairport_alsa_lookup_paths(tmp_path):
-    # At pinned 7bad231, audio_alsa.c calls parse_audio_options("alsa", ...).
-    # audio.c resolves rate/format/channels under that named stanza. Testing
+def test_receiver_pcm_settings_use_native_shairport_lookup_paths(tmp_path):
+    # The native receiver resolves PCM settings under its own named stanza;
     # bare text presence would accept ignored settings in general instead.
     receiver, _ = backend_configs(
         definition(), tmp_path, {"interface": "receiver0"},
-        {"api_host_ip": "10.190.1.1", "api_ip": "10.190.1.2"},
-        broker_socket=tmp_path / "broker.sock", all_receiver_names=["Kitchen input"], password="private",
+        all_receiver_names=["Kitchen input"], password="private", audio_uid=1234,
     )
     sections = dict(re.findall(r"(?m)^(\w+) = \{\n(.*?)^\};", receiver.read_text(), re.DOTALL))
     for parameter in ("output_rate = 48000;", 'output_format = "S16_LE";', "output_channels = 2;"):
-        assert parameter in sections["alsa"]
+        assert parameter in sections["shiri"]
         assert parameter not in sections["general"]
-    assert 'output_backend = "alsa";' in sections["general"]
-    assert 'output_device = "hw:Loopback,0,0";' in sections["alsa"]
+    assert 'output_backend = "shiri";' in sections["general"]
+    assert 'peer_uid = 1234;' in sections["shiri"]
 
 
 @pytest.mark.parametrize("device,expected_pcm", [
     ("hw:CARD=Loopback,DEV=1,SUBDEV=7", "hw:CARD=Loopback,DEV=1,SUBDEV=7"),
     ("plughw:CARD=Speakers,DEV=2,SUBDEV=1", "plughw:CARD=Speakers,DEV=2,SUBDEV=1"),
-    ("bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp", "hw:Loopback,1,7"),
 ])
 def test_local_outputs_use_session_volume_without_a_shared_card_mixer(tmp_path, device, expected_pcm):
     # OwnTone's unpatched hardware path treats card as a CTL fallback and cannot
@@ -66,8 +63,7 @@ def test_local_outputs_use_session_volume_without_a_shared_card_mixer(tmp_path, 
     # patched local ALSA session; never choose another room's Master/PCM control.
     _, own = backend_configs(
         definition(local_audio_device=device, slot=7), tmp_path,
-        {"interface": "receiver0"}, {"api_host_ip": "10.190.1.1", "api_ip": "10.190.1.2"},
-        broker_socket=tmp_path / "broker.sock", all_receiver_names=[], password="private",
+        {"interface": "receiver0"}, all_receiver_names=[], password="private", audio_uid=1234,
     )
     content = own.read_text()
     audio = re.search(r"(?m)^audio \{ (.*?)^\}", content, re.DOTALL).group(1)
@@ -81,8 +77,7 @@ def test_local_outputs_use_session_volume_without_a_shared_card_mixer(tmp_path, 
 def test_unconfigured_local_output_remains_disabled(tmp_path):
     _, own = backend_configs(
         definition(), tmp_path, {"interface": "receiver0"},
-        {"api_host_ip": "10.190.1.1", "api_ip": "10.190.1.2"},
-        broker_socket=tmp_path / "broker.sock", all_receiver_names=[], password="private",
+        all_receiver_names=[], password="private", audio_uid=1234,
     )
     content = own.read_text()
     assert 'audio { type = "disabled" }' in content
@@ -220,7 +215,7 @@ async def test_converted_playback_endpoint_keeps_the_same_exclusive_live_lease(t
 @pytest.fixture
 def preflight_environment(tmp_path, monkeypatch):
     service = broker(tmp_path)
-    environment = {"version": "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1-duck1-warm1", "shairport": "Shairport Sync 5.5.2-shiri-timed3-startup1-volume2 AirPlay2 smi10", "identities": True, "cgroup": True, "hook": True, "plugins": True}
+    environment = {"version": "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1-duck1-warm1", "shairport": "Shairport Sync 5.5.2-shiri-timed3-startup1-volume2 AirPlay2 smi10", "identities": True, "cgroup": True, "hook": True, "imports": True}
     monkeypatch.setattr("shiri.runtime.broker.sys.platform", "linux")
     monkeypatch.setattr("shiri.runtime.broker.os.geteuid", lambda: 0)
     monkeypatch.setattr("shiri.runtime.broker.shutil.which", lambda name: name)
@@ -248,8 +243,8 @@ def preflight_environment(tmp_path, monkeypatch):
         }
         if args[0] in versions:
             return CommandResult(args, 0, versions[args[0]])
-        if not environment["plugins"]:
-            raise RuntimeFailure("Required GStreamer plugin is unavailable")
+        if not environment["imports"]:
+            raise RuntimeFailure("Required native audio dependency is unavailable")
         return CommandResult(args, 0)
 
     service.runner.run = AsyncMock(side_effect=command)
@@ -323,7 +318,7 @@ async def test_owntone_requires_exact_partial_write_guard_before_launch(prefligh
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suffix", ["", "-idle10", "-idle1-other"])
-async def test_owntone_without_exact_idle_speech_backend_is_rejected_before_plugin_probe(preflight_environment, suffix):
+async def test_owntone_without_exact_idle_speech_backend_is_rejected_before_dependency_probe(preflight_environment, suffix):
     service, environment = preflight_environment
     environment["version"] = "OwnTone 29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1" + suffix
     with pytest.raises(RuntimeFailure, match="idle speech output without input refill.*rebuild pinned backends"):
@@ -362,8 +357,8 @@ async def test_patched_owntone_passes_full_preflight(preflight_environment, suff
     await service.preflight()
     probe = service.runner.run.call_args_list[-1].args[0]
     assert probe[1] == "-c"
-    assert all(plugin in probe[2] for plugin in ["alsasrc", "alsasink", "audiomixer", "appsink"])
-    assert "import aiortc" in probe[2]
+    assert all(f"import {module}" in probe[2] for module in ["aiortc", "av", "numpy"])
+    assert "gi" not in probe[2] and "Gst" not in probe[2]
 
 
 @pytest.mark.asyncio
@@ -371,7 +366,7 @@ async def test_patched_owntone_passes_full_preflight(preflight_environment, suff
     ("hook", False, "private namespace DHCP hook"),
     ("identities", False, "Daemon identities are unavailable"),
     ("cgroup", False, "requires unified cgroup v2"),
-    ("plugins", False, "GStreamer plugin is unavailable"),
+    ("imports", False, "native audio dependency is unavailable"),
 ])
 async def test_patched_marker_does_not_bypass_later_runtime_requirements(
     preflight_environment, field, value, error,

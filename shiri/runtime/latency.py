@@ -89,12 +89,14 @@ def speaker_lead_ms(speaker: SpeakerRef) -> int:
     if not isinstance(speaker, SpeakerRef):
         raise ValueError("Latency policy requires a validated SpeakerRef")
     speaker = SpeakerRef.model_validate(speaker)
+    if speaker.protocol == "alsa":
+        return MINIMUM_LOCAL_OUTPUT_BUFFER_MS
     return AIRPLAY_SPEAKER_LEAD_MS if speaker.protocol in {"airplay1", "airplay2"} else NEGATIVE_OFFSET_MARGIN_MS
 
 
 def _buffer_ms(room: Room) -> int:
     return max(MINIMUM_LOCAL_OUTPUT_BUFFER_MS,
-               max((minimum_speaker_lead_ms(speaker) - min(0, speaker.offset_ms)
+               max((speaker_lead_ms(speaker) - min(0, speaker.offset_ms)
                     for speaker in room.speakers), default=0))
 
 
@@ -133,32 +135,3 @@ def latency_plan(rooms: Sequence[Room]) -> LatencyPlan:
     ))
     maximum_buffer_ms = max((decision.output_buffer_ms for decision in decisions), default=MINIMUM_LOCAL_OUTPUT_BUFFER_MS)
     return LatencyPlan(maximum_buffer_ms + MINIMUM_COMMON_HORIZON_MARGIN_MS, decisions)
-
-
-def minimum_speaker_lead_ms(speaker: SpeakerRef) -> int:
-    """Software route lead; ALSA includes the private framed A2DP route.
-
-    Two native20ms periods/four OwnTone10ms ticks are the first local candidate,
-    not a Bluetooth device latency measurement. AirPlay's positive packet
-    window remains500ms; Cast and the unqualified Pulse route retain250ms.
-    """
-    lead = speaker_lead_ms(speaker)  # Reuse exact domain/protocol validation.
-    return MINIMUM_LOCAL_OUTPUT_BUFFER_MS if speaker.protocol == "alsa" else lead
-
-
-def minimum_room_buffer_ms(room: Room) -> int:
-    """Qualification entry point for the same production route policy."""
-    return room_buffer_ms(room)
-
-
-def minimum_latency_plan(rooms: Sequence[Room]) -> LatencyPlan:
-    """Qualification entry point: local B40/H140, Cast B250/H350, AirPlay B500/H600.
-
-    Saved negative offsets retain each selected endpoint's lead; every enabled
-    zone shares H=max(B)+100ms. With native callback availability E150ms before
-    the original P, the largest-buffer room has a250ms cold admission budget.
-    A late first anchor still fails in OwnTone; this plan neither rebases P nor
-    claims cold hardware startup fits that budget. The runtime freezes this
-    same plan before opening each program incarnation and TTS cannot retime it.
-    """
-    return latency_plan(rooms)

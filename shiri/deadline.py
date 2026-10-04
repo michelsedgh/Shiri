@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 
+from anyio import CancelScope
 
-async def bounded(awaitable, timeout, *, abandoned=None):
+
+async def bounded(awaitable, timeout, *, abandoned=None):  # noqa: ASYNC109 - owns child results across deadline races.
     """Wait once, cancel and join a pending child, and retire an abandoned result."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout if timeout is not None else None
@@ -27,7 +29,19 @@ async def bounded(awaitable, timeout, *, abandoned=None):
         try:
             if not task.done():
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                # Cancellation is sent once. A level-triggered HTTP scope or
+                # another Task.cancel() must not interrupt the child's reset
+                # or lose a resource returned during that reset.
+                joined = asyncio.gather(task, return_exceptions=True)
+                cancelled = False
+                with CancelScope(shield=True):
+                    while not joined.done():
+                        try:
+                            await asyncio.shield(joined)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError
             # A completed result already belongs to this caller. Do not yield
             # before returning it: Python3.10 gather yields even for done tasks,
             # and a cancellation there would strand the accepted resource.

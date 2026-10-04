@@ -1,7 +1,6 @@
 import asyncio
 from fractions import Fraction
 import math
-import os
 import struct
 import time
 from types import SimpleNamespace
@@ -9,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from shiri.rpc import RpcError
-from shiri.runtime.audio import AudioWorker, FifoWriter, GstMixer, SpeechSession
+from shiri.runtime.audio import AudioWorker, SpeechSession
 
 
 class RecordingMixer:
@@ -257,71 +256,6 @@ async def test_multiple_media_sections_and_rejected_audio_are_not_accepted(valid
         assert failure.value.code == "invalid_request"
         assert worker.session is None
     await worker.close()
-
-
-def test_fifo_reader_absence_never_blocks_or_builds_an_audio_backlog(tmp_path):
-    path = tmp_path / "audio.pipe"
-    os.mkfifo(path)
-    writer = FifoWriter(path)
-    before = time.monotonic()
-    for _ in range(100):
-        writer.write(bytes(3840))
-    assert time.monotonic() - before < 0.2
-    assert writer.written_bytes == 0 and writer.dropped_bytes == 384000
-    assert writer.fd is None and not writer.reader_present
-
-
-def test_full_fifo_drops_complete_frames_and_reconnects_after_reader_exit(tmp_path):
-    path = tmp_path / "audio.pipe"
-    os.mkfifo(path)
-    reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    writer = FifoWriter(path)
-    payload = bytes(3840)
-    try:
-        for _ in range(100):
-            writer.write(payload)
-        assert writer.dropped_bytes > 0
-        data = os.read(reader, 1024 * 1024)
-        assert len(data) % 4 == 0
-        assert writer.written_bytes + writer.dropped_bytes == 100 * len(payload)
-        os.close(reader)
-        reader = None
-        writer.write(payload)
-        assert writer.fd is None and not writer.reader_present
-        reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        writer.write(payload)
-        assert os.read(reader, len(payload)) == payload
-    finally:
-        if reader is not None:
-            os.close(reader)
-        writer.close()
-
-
-def test_fifo_writer_rejects_regular_files_and_symlinks(tmp_path):
-    regular = tmp_path / "regular"
-    regular.write_bytes(b"untouched")
-    symlink = tmp_path / "link"
-    symlink.symlink_to(regular)
-    for path in (regular, symlink):
-        with pytest.raises(RuntimeError):
-            FifoWriter(path)
-    assert regular.read_bytes() == b"untouched"
-
-
-def test_ducking_is_bounded_and_recovers_after_speech_stops():
-    gains = []
-    mixer = GstMixer.__new__(GstMixer)
-    mixer._gain, mixer.error = 1.0, None
-    mixer.music = SimpleNamespace(set_property=lambda _key, value: gains.append(value))
-    mixer.bus = SimpleNamespace(pop_filtered=lambda _types: None)
-    mixer.Gst = SimpleNamespace(MessageType=SimpleNamespace(ERROR=1, EOS=2))
-    for _ in range(10):
-        mixer.tick(music_active=True, speech_active=True, duck_gain=0.28, elapsed=0.01)
-    assert gains[-1] == pytest.approx(0.28)
-    for _ in range(30):
-        mixer.tick(music_active=True, speech_active=False, duck_gain=0.28, elapsed=0.01)
-    assert gains[-1] == pytest.approx(1.0)
-    assert all(0.28 <= gain <= 1.0 for gain in gains)
 
 
 async def test_real_aiortc_local_speech_decodes_to_bounded_mono_pcm():

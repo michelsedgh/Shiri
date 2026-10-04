@@ -52,7 +52,7 @@ def test_private_planner_reaches_both_actual_broker_seams_without_mutating_globa
     assert candidate.set_outputs.__code__ is Broker.set_outputs.__code__
     assert candidate.reconcile.__globals__['room_buffer_ms'](rooms[0]) == 40
     assert candidate._material.__globals__['room_buffer_ms'](rooms[0]) == 40
-    assert candidate._start_room.__globals__['backend_configs'].keywords == {'minimum_latency':True}
+    assert candidate._start_room is Broker._start_room
     assert Broker.reconcile.__globals__['latency_plan'] is original is latency_plan
     assert Broker.set_outputs.__globals__['latency_plan'] is original
     assert latency_plan(rooms).common_horizon_ms == 140
@@ -559,7 +559,7 @@ async def test_music_mode_refuses_missing_lab_before_resource_setup(monkeypatch)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('other',['speech_stress','zone_faults','latency_probe'])
+@pytest.mark.parametrize('other',['speech_stress','zone_faults'])
 async def test_music_mode_cannot_mix_with_other_experiments_before_resource_setup(other):
     with pytest.raises(RuntimeFailure,match='mutually exclusive'):
         await group.run_check(music_minimum=True,**{other:True})
@@ -606,7 +606,7 @@ async def test_missing_tail_wait_is_bounded_and_never_catches_sticky_guard_failu
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("options",[{"music_startup":True},{"music_minimum":1},{"finite_speech":True}])
+@pytest.mark.parametrize("options",[{"music_minimum":1},{"finite_speech":True}])
 async def test_minimum_music_never_admits_another_mode_or_nonboolean_profile(options):
     with pytest.raises(RuntimeFailure):
         await group.run_check(**({"music_minimum":True}|options))

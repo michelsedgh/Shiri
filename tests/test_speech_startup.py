@@ -419,7 +419,7 @@ async def test_recent_active_native_mix_requires_no_prepare_or_program_mutation(
     await native.prepare_speech(identity, prep)
     assert not prep.idle and not prep.output_bed and not overlay.sent and len(writer.packets) == 1
     assert native.actor.owns(token) and writer.packets == [initial]
-    assert all(request[2]["action"] in {"observe", "begin"} for request in client.requests[2:])
+    assert [request[2]["action"] for request in client.requests[2:]] == ["begin"]
     assert sum(request[2]["action"] == "begin" for request in client.requests[2:]) == 1
     await native.close()
 
@@ -454,7 +454,8 @@ async def test_paused_phone_prepares_output_bed_without_native_program_writes(pr
     assert native.mixer.route == route and native.operation_generation == operation
     assert writer.packets == packets and not overlay.sent
     actions = [body["action"] for _method, path, body in client.requests if path == "/api/player/shiri-speech-ready"]
-    assert actions[0] == "observe" and "prepare" in actions and "ready" in actions and actions[-1] == "begin"
+    assert actions[0] == "begin" and "prepare" in actions and actions[-1] == "begin"
+    assert "observe" not in actions and "ready" not in actions
     assert all(body["session_id"] == grant.session.hex() for _method, path, body in client.requests
                if path == "/api/player/shiri-speech-ready")
     native.retire_speech(identity)

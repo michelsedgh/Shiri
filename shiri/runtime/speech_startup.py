@@ -1,4 +1,4 @@
-"""Private proposal: exact idle readiness before late speech TTL admission.
+"""Exact native readiness and ownership before late speech admission.
 
 This owns a bounded per-negotiation prefix and exact backend voice admission.
 It never mutates music ownership or program clocks. Original receive/prepare times remain in its
@@ -163,7 +163,7 @@ class SpeechPreparation:
         }
 
 
-async def complete(preparation, client, body, *, owned, bed, send, admit, interval=0.01):
+async def complete(preparation, client, body, *, owned, send, admit, interval=0.01):
     """Each response proves the exact request; calls never run in media ticks."""
     preparation.body = dict(body)
     preparation.owned = owned
@@ -219,17 +219,11 @@ async def complete(preparation, client, body, *, owned, bed, send, admit, interv
     try:
 
         async def run():
-            observation = None
-            needs_preparation = preparation.idle
-            if not preparation.idle:
-                # A retained phone source may be paused or have never emitted
-                # PCM. Observe first so recent music needs no output setup.
-                observation = await exchange("observe")
-                needs_preparation = not observation["ready"]
-                preparation.output_bed = needs_preparation
-                if needs_preparation:
-                    observation = None
-            if needs_preparation:
+            prepared = False
+
+            async def prepare_outputs():
+                nonlocal prepared
+                preparation.output_bed = True
                 while True:
                     if not owned():
                         preparation.fail("source_or_session_changed")
@@ -237,62 +231,61 @@ async def complete(preparation, client, body, *, owned, bed, send, admit, interv
                     if reply["connected"]:
                         break
                     await asyncio.sleep(interval)
-                if (
-                    not reply["output_count"]
-                    or not 0 < reply["prepared_monotonic_ns"] <= preparation.now_ns()
-                ):
+                if (not reply["output_count"]
+                        or not 0 < reply["prepared_monotonic_ns"] <= preparation.now_ns()):
                     preparation.fail("outputs_not_connected")
+                prepared = True
                 preparation.phase = "waiting_for_mix"
-                bed(preparation)
+
+            # Idle sources require an exact output preparation, including when
+            # transports are already warm. Active music can admit immediately.
+            if preparation.idle:
+                await prepare_outputs()
             if preparation.commit_required:
                 await preparation.negotiated.wait()
-            while True:
-                if not owned():
-                    preparation.fail("source_or_session_changed")
-                reply = observation or await exchange("ready" if needs_preparation else "observe")
-                observation = None
-                if reply["ready"]:
-                    if needs_preparation and reply["mixed_monotonic_ns"] < reply["prepared_monotonic_ns"]:
-                        preparation.fail("mix_predates_preparation")
-                    # One owned task serializes BEGIN attempts. Only an exact
-                    # not-ready echo permits bounded retry; no uncertain request
-                    # is repeated or abandoned before observed cancellation.
-                    async def begin():
-                        async def attempts():
-                            last = None
-                            while True:
-                                if not owned():
-                                    if last is not None:
-                                        return last
-                                    preparation.fail("voice_begin_owner_changed")
-                                preparation.begin_dispatched = True
-                                preparation.begin_inflight = True
-                                result = await exchange("begin", require_owned=False)
-                                preparation.begin_inflight = False
-                                preparation.begin_reply = dict(result)
-                                if result["ready"]:
-                                    return result
-                                last = result
-                                await asyncio.sleep(interval)
 
-                        remaining = (preparation.deadline_ns - preparation.now_ns()) / 1e9
-                        return await bounded(attempts(), remaining)
+            async def begin():
+                async def attempts():
+                    last = None
+                    while True:
+                        if not owned():
+                            if last is not None:
+                                return last
+                            preparation.fail("voice_begin_owner_changed")
+                        preparation.begin_dispatched = True
+                        preparation.begin_inflight = True
+                        result = await exchange("begin", require_owned=False)
+                        preparation.begin_inflight = False
+                        preparation.begin_reply = dict(result)
+                        if result["ready"]:
+                            if prepared and result["mixed_monotonic_ns"] < result["prepared_monotonic_ns"]:
+                                preparation.fail("mix_predates_preparation")
+                            return result
+                        last = result
+                        # BEGIN atomically checks the exact source, outputs and
+                        # fresh mix. A definitive not-ready result is the only
+                        # retry authority; uncertain BEGIN is never replayed.
+                        if not prepared:
+                            await prepare_outputs()
+                        await asyncio.sleep(interval)
 
-                    preparation.begin_task = asyncio.create_task(begin(), name="speech-voice-begin")
-                    preparation.begin_task.add_done_callback(
-                        lambda task: task.exception() if not task.cancelled() else None
-                    )
-                    await asyncio.wait({preparation.begin_task})
-                    admitted = preparation.begin_task.result()
-                    preparation.begin_reply = dict(admitted)
-                    if not admitted["ready"]:
-                        preparation.fail("voice_begin_not_ready")
-                    if not owned():
-                        preparation.fail("voice_begin_owner_changed")
-                    admit(preparation.speech_id)
-                    preparation.ready(admitted, send)
-                    return preparation.receipt()
-                await asyncio.sleep(interval)
+                remaining = (preparation.deadline_ns - preparation.now_ns()) / 1e9
+                return await bounded(attempts(), remaining)
+
+            preparation.begin_task = asyncio.create_task(begin(), name="speech-voice-begin")
+            preparation.begin_task.add_done_callback(
+                lambda task: task.exception() if not task.cancelled() else None
+            )
+            await asyncio.wait({preparation.begin_task})
+            admitted = preparation.begin_task.result()
+            preparation.begin_reply = dict(admitted)
+            if not admitted["ready"]:
+                preparation.fail("voice_begin_not_ready")
+            if not owned():
+                preparation.fail("voice_begin_owner_changed")
+            admit(preparation.speech_id)
+            preparation.ready(admitted, send)
+            return preparation.receipt()
 
         remaining = (preparation.deadline_ns - preparation.now_ns()) / 1e9
         if remaining <= 0:

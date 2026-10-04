@@ -10,8 +10,6 @@ No current card index is saved as durable hardware identity.
 """
 from __future__ import annotations
 
-import re
-
 from .alsa_identity import PCMIdentityError, validate_fingerprint
 
 
@@ -47,23 +45,3 @@ def render_pcm_config(pin, conversion: bool) -> str:
         return ("pcm.shiri {\n  type plug\n  slave.pcm {\n"
                 + _hardware(card, device, subdevice, "    ") + "  }\n}\n")
     return "pcm.shiri {\n" + _hardware(card, device, subdevice, "  ") + "}\n"
-
-
-def render_bridge_config(pin, device: str) -> str:
-    """Render one typed Loopback capture and one exact BlueALSA A2DP target.
-
-    OwnTone writes the pinned snd_aloop DEV1/SUBDEV pair; the host bridge reads
-    the opposite DEV0/SUBDEV pair on that same current card. The bridge keeps
-    using the host system bus. Bluetooth pairing and plugin availability need
-    separate runtime validation; this renderer does not claim either.
-    """
-    match = re.fullmatch(r"bluealsa:DEV=([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}),PROFILE=a2dp", device) if isinstance(device, str) else None
-    if match is None or match[1].upper() in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}:
-        raise PCMIdentityError("Bluetooth output needs one exact A2DP device address without aliases or wildcard targets")
-    (card, playback_device, subdevice), fingerprint = _endpoint(pin)
-    if (fingerprint["kind"] != "virtual" or fingerprint["binding"] != "loopback"
-            or playback_device != 1 or not 0 <= subdevice <= 7):
-        raise PCMIdentityError("Bluetooth bridge needs the exact pinned snd_aloop DEV1 playback pair")
-    return ("pcm.shiri_capture {\n" + _hardware(card, 0, subdevice, "  ") + "}\n"
-            "pcm.shiri_target {\n  type bluealsa\n"
-            f'  device "{match[1].upper()}"\n  profile "a2dp"\n}}\n')

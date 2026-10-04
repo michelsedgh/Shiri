@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from pydantic import Field, ValidationError
 
-from shiri.domain import Conflict, NotFound, Room, StrictModel, ValidationIssue
+from shiri.domain import Conflict, Room, StrictModel, ValidationIssue
 
 ANALYSIS_VERSION = "shared-adc-probe-v1"
 RATE = 48000
@@ -540,73 +540,42 @@ class CalibrationSession:
         return session
 
 
-class CalibrationSessions:
-    """Bounded process-local cache; SQLite owns durable sessions and receipts."""
-    def __init__(self, *, capacity=MAX_ACTIVE):
-        self.sessions = {}
-        self.capacity = capacity
+def create_session(room, *, target_id, reference_id, capture_device, geometry, max_lag_ms, geometry_correction_ms,
+                   reference_room=None, playback_context=None):
+    numpy()
+    assigned = {speaker.id: speaker for speaker in room.speakers}
+    reference_room = reference_room or room
+    reference_outputs = {speaker.id: speaker for speaker in reference_room.speakers}
+    if (room.id == reference_room.id and target_id == reference_id or target_id not in assigned
+            or reference_id not in reference_outputs):
+        raise ValidationIssue("Choose two different exact room/speaker endpoints already assigned to their rooms")
+    session = CalibrationSession(secrets.token_urlsafe(24), room.id, target_id, reference_id, room.revision,
+                                 fingerprint(room), assigned[target_id].offset_ms, capture_device, geometry,
+                                 max_lag_ms, geometry_correction_ms, reference_room_id=reference_room.id,
+                                 reference_revision=reference_room.revision, reference_configuration=fingerprint(reference_room),
+                                 playback_context=playback_context or "Same-room playback through the declared music source")
+    session.result = summary([], session.previous_offset_ms)
+    session.probe_metadata = {"sample_rate": RATE, "markers": MARKERS, "duration_seconds": PROBE_SECONDS, "seed": session.seed,
+                              "marker_seconds": BURST_SECONDS, "first_marker_seconds": START, "interval_seconds": INTERVAL,
+                              "numpy_version": numpy().__version__, "sha256": hashlib.sha256(probe_wav(session.seed)).hexdigest()}
+    return session
 
-    def prune(self):
-        now = time.monotonic()
-        for key in list(self.sessions):
-            if self.sessions[key].deadline <= now:
-                del self.sessions[key]
-        for session in sorted(self.sessions.values(), key=lambda item: item.created_at)[:-MAX_HISTORY]:
-            del self.sessions[session.id]
 
-    def get(self, room_id, session_id):
-        self.prune()
-        session = self.sessions.get(session_id)
-        if not session or session.room_id != room_id:
-            raise NotFound("Calibration session does not exist in this room or has expired")
-        return session
+def check_recording(session, *, verification=False):
+    records = session.verification_recordings if verification else session.recordings
+    if session.rolled_back or (session.applied_revision is not None) != verification:
+        raise Conflict("This session is not accepting recordings for that measurement stage")
+    if len(records) >= MAX_RECORDINGS:
+        raise Conflict("Recording limit reached; export this evidence and start a new session")
 
-    def list(self, room_id):
-        self.prune()
-        return [session.public() for session in self.sessions.values() if session.room_id == room_id]
 
-    def remove_room(self, room_id):
-        for key, session in list(self.sessions.items()):
-            if session.room_id == room_id:
-                del self.sessions[key]
-
-    def create(self, room, *, target_id, reference_id, capture_device, geometry, max_lag_ms, geometry_correction_ms,
-               reference_room=None, playback_context=None, enforce_capacity=True):
-        self.prune()
-        numpy()
-        if enforce_capacity and sum(session.applied_revision is None for session in self.sessions.values()) >= self.capacity:
-            raise Conflict("Too many calibration sessions; close an existing session before starting another")
-        assigned = {speaker.id: speaker for speaker in room.speakers}
-        reference_room = reference_room or room
-        reference_outputs = {speaker.id: speaker for speaker in reference_room.speakers}
-        if (room.id == reference_room.id and target_id == reference_id or target_id not in assigned
-                or reference_id not in reference_outputs):
-            raise ValidationIssue("Choose two different exact room/speaker endpoints already assigned to their rooms")
-        session = CalibrationSession(secrets.token_urlsafe(24), room.id, target_id, reference_id, room.revision,
-                                     fingerprint(room), assigned[target_id].offset_ms, capture_device, geometry,
-                                     max_lag_ms, geometry_correction_ms, reference_room_id=reference_room.id,
-                                     reference_revision=reference_room.revision, reference_configuration=fingerprint(reference_room),
-                                     playback_context=playback_context or "Same-room playback through the declared music source")
-        self.sessions[session.id] = session
-        session.result = summary([], session.previous_offset_ms)
-        session.probe_metadata = {"sample_rate": RATE, "markers": MARKERS, "duration_seconds": PROBE_SECONDS, "seed": session.seed,
-                                  "marker_seconds": BURST_SECONDS, "first_marker_seconds": START, "interval_seconds": INTERVAL,
-                                  "numpy_version": numpy().__version__, "sha256": hashlib.sha256(probe_wav(session.seed)).hexdigest()}
-        return session
-
-    def check_recording(self, session, *, verification=False):
-        records = session.verification_recordings if verification else session.recordings
-        if session.rolled_back or (session.applied_revision is not None) != verification:
-            raise Conflict("This session is not accepting recordings for that measurement stage")
-        if len(records) >= MAX_RECORDINGS:
-            raise Conflict("Recording limit reached; export this evidence and start a new session")
-    def add_result(self, session, result, *, verification=False):
-        self.check_recording(session, verification=verification)
-        records = session.verification_recordings if verification else session.recordings
-        if any(record["pcm_sha256"] == result["pcm_sha256"] and record["sample_rate"] == result["sample_rate"]
-               for record in session.recordings + session.verification_recordings):
-            raise Conflict("This PCM recording was already analyzed; repetitions require fresh captures")
-        records.append(result)
-        if not verification:
-            session.result = summary(records, session.previous_offset_ms)
-        return session.public()
+def add_result(session, result, *, verification=False):
+    check_recording(session, verification=verification)
+    records = session.verification_recordings if verification else session.recordings
+    if any(record["pcm_sha256"] == result["pcm_sha256"] and record["sample_rate"] == result["sample_rate"]
+           for record in session.recordings + session.verification_recordings):
+        raise Conflict("This PCM recording was already analyzed; repetitions require fresh captures")
+    records.append(result)
+    if not verification:
+        session.result = summary(records, session.previous_offset_ms)
+    return session.public()

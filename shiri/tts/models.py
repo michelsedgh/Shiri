@@ -92,7 +92,9 @@ class ModelSpec:
 
 
 def _number(value, lower: float, upper: float) -> bool:
-    return type(value) in (int, float) and math.isfinite(value) and lower <= value <= upper
+    # JSON integers need not fit a float. Reject their range before isfinite
+    # attempts that conversion, so malformed options remain validation errors.
+    return type(value) in (int, float) and lower <= value <= upper and math.isfinite(value)
 
 
 _KOKORO_VOICES = (

@@ -168,7 +168,7 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     auth = (None if settings.simulation or settings.allow_unauthenticated
             else Auth(token or settings.api_token_file.read_text().strip()))
     service = RoomService(store, runtime)
-    tts = TextSpeechCoordinator(service, worker_url=settings.tts_worker_url,
+    tts = TextSpeechCoordinator(service, worker_url=settings.tts_worker_url, max_rooms=settings.max_rooms,
                                worker_token=(settings.tts_worker_token_file.read_text().strip()
                                              if settings.tts_worker_url else None))
     readiness = RoomReadinessCoordinator(service, tts, automatic=(
@@ -181,8 +181,9 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
             try:
                 reconciled = await service.reconcile()
                 async with service._mutation:
-                    await readiness.reconcile_locked()
-                    await readiness.maintain_locked(reconciled.get("runtime"))
+                    rooms = await service._store("list_rooms")
+                    await readiness.reconcile_locked(rooms)
+                    await readiness.maintain_locked(reconciled.get("runtime"), rooms=rooms)
             except Exception:
                 log.exception("Desired room configuration could not reconcile")
             try:

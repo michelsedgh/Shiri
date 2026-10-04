@@ -283,22 +283,48 @@ async def test_inflight_state_does_not_restore_invalidated_cache(client, monkeyp
     service = client._transport.app.state.service
     entered, release = asyncio.Event(), asyncio.Event()
     original = service.runtime.call
-    health_calls = 0
     async def backend(operation, payload=None):
-        nonlocal health_calls
-        if operation == "health":
-            health_calls += 1
-            if health_calls == 2:
-                entered.set()
-                await release.wait()
+        if operation == "interfaces":
+            entered.set()
+            await release.wait()
         return await original(operation, payload)
     monkeypatch.setattr(service.runtime, "call", backend)
     old = asyncio.create_task(service.state())
-    await entered.wait()
+    await asyncio.wait_for(entered.wait(), 1)
     await room(client)
     release.set()
-    assert (await old)["rooms"] == []
+    assert (await asyncio.wait_for(old, 1))["rooms"] == []
     assert len((await service.state())["rooms"]) == 1
+
+
+async def test_room_deletion_during_discovery_does_not_fail_the_whole_state(client, monkeypatch):
+    service = client._transport.app.state.service
+    configured = await enabled(client, await room(client))
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = service.runtime.call
+
+    async def backend(operation, payload=None):
+        if operation == "interfaces":
+            entered.set()
+            await release.wait()
+        return await original(operation, payload)
+
+    monkeypatch.setattr(service.runtime, "call", backend)
+    pending = asyncio.create_task(client.get("/api/v1/state"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        disabled = await service.update(configured["id"], RoomPatch(enabled=False), configured["revision"])
+        await service.delete(configured["id"], disabled["room"]["revision"])
+        release.set()
+        response = await asyncio.wait_for(pending, 1)
+        assert response.status_code == 200
+        observed = response.json()["rooms"][0]
+        assert observed["id"] == configured["id"]
+        assert observed["outputs_error"] == "Room is not known to the runtime"
+        assert (await client.get("/api/v1/state")).json()["rooms"] == []
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 1)
 
 
 async def test_phone_volume_is_durable_and_stale_ui_cannot_overwrite_it(client, monkeypatch):

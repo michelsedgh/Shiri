@@ -9,7 +9,7 @@ import conftest
 from shiri.runtime import namespace_policy as policy
 
 
-@pytest.mark.parametrize("module", ["test_linux_lifecycle.py", "test_linux_audio.py",
+@pytest.mark.parametrize("module", ["test_linux_lifecycle.py",
                                    "test_native_lab_work_permissions.py", "test_future_native_units.py"])
 def test_actual_linux_and_unknown_modules_keep_real_root_and_uid_enforcement(module, tmp_path, monkeypatch):
     original_root, original_owner = policy.ROOT, policy._root_owned

@@ -391,7 +391,7 @@ async def test_idle_fixture_launch_is_refused_before_any_receiver_replacement(mu
     elif mutation == "duration":
         arguments["duration_seconds"] = 420
     elif mutation == "music_mode":
-        arguments["music_startup"] = True
+        arguments["music_minimum"] = True
     elif mutation == "already_started":
         start = 123
     else:

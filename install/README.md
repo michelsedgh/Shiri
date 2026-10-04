@@ -1,7 +1,7 @@
 # Candidate installation and service-state adoption
 
-The rebuild is a candidate. Complete fresh-host installation, native Cast
-input, phone/group interoperability and physical final-speaker timing remain
+The rebuild is a candidate. Complete fresh-host installation,
+phone/group interoperability and physical final-speaker timing remain
 required gates. Distinct unprivileged room workers, exact device/ioctl limits,
 socket publication and recovery have passed dedicated real-kernel checks.
 Those checks and the staged service harness do not cover the full
@@ -55,8 +55,8 @@ Without the wheelhouse, normal pytest runs the lock/command checks and explicitl
 skips the actual offline build cases. The project test environment is a separate
 prerequisite; these commands do not install pytest.
 
-Installation requires Python 3.10 or newer, systemd with cgroup v2, the system
-GI/GStreamer audio typelibs and plugins, and the Linux networking/ALSA tools
+Installation requires Python 3.10 or newer, systemd with cgroup v2,
+and the Linux networking/ALSA tools
 installed by the script. `install/install.sh --with-backends` builds the pinned
 patched daemons; without that option, provision a reviewed compatible backend
 tree before activation. Stock OwnTone, Shairport or Avahi binaries do not satisfy
@@ -67,6 +67,13 @@ does not start the default units or replace an existing API token. Stop the
 services and every manual process using the installation before updating an
 existing executable tree; installation does not make a running daemon switch
 versions atomically. Review `/etc/shiri/shiri.env` before explicit activation.
+
+The native production route does not require GStreamer, system Python GI, or an
+ALSA loopback card. Its Python audio dependencies are the pinned PyAV, NumPy and
+aiortc wheels. `SHIRI_INSTALL_LOOPBACK=1` explicitly provisions and loads
+`snd-aloop` for virtual-device qualification; ordinary network, physical wired
+and Bluetooth outputs do not need that development option. Existing host
+loopback configuration is preserved on upgrades.
 
 The separate private cold-speech proposal adds the required `-ready1` OwnTone
 feature and its authenticated idle-output/first-dispatch preparation endpoint.

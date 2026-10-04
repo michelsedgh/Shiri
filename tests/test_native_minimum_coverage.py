@@ -199,8 +199,8 @@ def test_original_sticky_fault_context_cannot_drop_minimum_verifier():
 
 
 @pytest.mark.parametrize('arguments', [{'minimum_policy': 1}, {'minimum_policy': 'yes'},
-    {'minimum_policy': True, 'latency_probe': True}, {'minimum_policy': True, 'music_minimum': True},
-    {'minimum_policy': True, 'music_soak': True}, {'minimum_policy': True, 'music_startup': True}])
+    {'minimum_policy': True, 'music_minimum': True},
+    {'minimum_policy': True, 'music_soak': True}])
 async def test_minimum_flag_cannot_enter_other_prepared_or_historical_experiments(monkeypatch, arguments):
     pytest.importorskip('aiortc')
     group = load('minimum_flag_admission_test', 'check_native_grouping.py')
@@ -228,7 +228,6 @@ def test_runtime_minimum_calendars_and_recovery_checks_are_explicit():
     group = ast.parse((HERE/'check_native_grouping.py').read_text())
     body = next(node for node in group.body if getattr(node, 'name', None) == 'run_check')
     text = ast.unparse(body)
-    assert 'elif latency_epoch is None and (not minimum_policy)' in text
     assert 'broker_class = IsolatedBroker' in text
     assert 'declared_horizon_ns = minimum_timing.horizon_ns' in text
     assert 'common_start = time.monotonic_ns() + 4000000000' in text

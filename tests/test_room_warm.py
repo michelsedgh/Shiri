@@ -854,8 +854,9 @@ async def test_invalid_runtime_activity_shape_is_ignored_without_breaking_mainte
     await state(rig, auto_hold(rig))
 
 
-def test_default_policy_is_adaptive_with_explicit_continuous_and_on_demand_choices():
-    assert Settings().speaker_readiness == "adaptive"
+def test_default_policy_keeps_rooms_ready_with_explicit_power_saving_choices():
+    assert Settings().speaker_readiness == "ready"
+    assert Settings(speaker_readiness="adaptive").speaker_readiness == "adaptive"
     assert Settings(speaker_readiness="ready").speaker_readiness == "ready"
     assert Settings(speaker_readiness="on_demand").speaker_readiness == "on_demand"
     for value in (True, False, None, "always", ""):

@@ -13,7 +13,6 @@ import asyncio
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from functools import partial
 import importlib.util
 import hashlib
 import json
@@ -30,8 +29,7 @@ import numpy as np
 from shiri.deadline import bounded
 from shiri.domain import Room
 from shiri.runtime.broker import Broker
-from shiri.runtime.configuration import backend_configs
-from shiri.runtime.latency import LatencyPlan, minimum_latency_plan
+from shiri.runtime.latency import LatencyPlan, latency_plan
 from shiri.runtime.system import RuntimeFailure, atomic_json, root_directory
 from shiri.runtime.timing import Kind, Packet, RATE
 
@@ -106,7 +104,7 @@ def producer_profile():
 
 def candidate_plan(definitions):
     definitions = list(definitions)
-    rooms = minimum_latency_plan(definitions).rooms
+    rooms = latency_plan(definitions).rooms
     for definition in definitions:
         room = Room.model_validate(definition)
         if room.enabled:
@@ -137,9 +135,6 @@ def broker_class(base):
                 Broker.set_outputs, latency_plan=candidate_plan, room_buffer_ms=room_buffer_ms
             ),
             "_material": bind(Broker._material, room_buffer_ms=room_buffer_ms),
-            "_start_room": bind(
-                Broker._start_room, backend_configs=partial(backend_configs, minimum_latency=True)
-            ),
         },
     )
 

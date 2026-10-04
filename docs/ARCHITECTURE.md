@@ -1,487 +1,241 @@
 # Shiri architecture
 
-Every Shiri zone must expose an AirPlay 2 input receiver,
-routing native phone playback to its explicitly assigned mixed
-speaker outputs. Listeners use existing phone casting controls; the admin web
-interface is not a playback prerequisite. Room configuration is
-durable intent; running processes, discovered devices and acknowledged backend
-state are observations. A saved assignment never means an unreachable speaker
-is playing.
+Shiri exposes an AirPlay 2 receiver for each enabled room and sends its music
+and targeted speech to explicitly assigned outputs. A room is a zone, not a
+physical speaker. Different rooms may play different programs; native iPhone
+multi-room selection supplies a common music presentation timeline. The web
+interface manages configuration and diagnostics, but ordinary phone playback
+uses the phone's existing AirPlay controls.
 
-The persisted API term `room` denotes that configured zone. TTS targets the
-exact zone, and native iPhone selection of multiple AirPlay 2 zones must retain
-synchronization through the final output stage. These requirements are defined
-in [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md).
+This describes the October 4 workspace. Its refactor has not been deployed.
+[Product requirements](PRODUCT_REQUIREMENTS.md) define behavior;
+[the live handoff](LIVE_TEST_HANDOFF.md) identifies the installed release.
+Cast speaker output is supported; Cast input is deferred and Bluetooth input
+is excluded.
 
-This document distinguishes the required architecture from the current clean
-candidate on `codex/shiri-rebuild`. Verified native multi-zone output timing
-remains a release gate. The user explicitly deferred Cast input on October 1;
-its future adapter must meet the same source ownership boundary. Cast speaker
-outputs remain supported. The source actor and AirPlay
-runtime ownership boundary are implemented. The release
-gates in [REBUILD.md](REBUILD.md) remain open.
-
-## Required receiver and source boundary
+## Processes and responsibilities
 
 ```mermaid
 flowchart LR
-    iPhone[Native iPhone AirPlay controls] --> AP[Zone AirPlay 2 receiver]
-    AP --> Owner[One explicit zone music owner]
-    Owner --> Mix[Zone music and TTS mix]
-    Nobly[Exact-zone TTS] --> Mix
-    Mix --> Engine[Output engine preserving required group timing]
-    Engine --> Speakers[Assigned mixed speaker outputs]
+    Phone[iPhone AirPlay] --> Receiver[Per-room Shairport receiver]
+    Receiver -->|timestamped stereo PCM| Audio[Per-room audio worker]
+    Audio -->|framed music FIFO| Output[Per-room OwnTone]
+    Nobly[Nobly or web text request] --> API[Rootless Linux API]
+    API --> DB[(SQLite intent)]
+    API -->|one inference at a time| Model[Resident Mac model worker]
+    Model -->|incremental mono PCM| API
+    API -->|persistent speech stream| Broker[Linux resource broker]
+    Broker -->|persistent speech stream| Audio
+    Audio -->|separate late speech socket| Output
+    Output --> Network[AirPlay and Cast outputs]
+    Output --> Wired[Explicit wired ALSA endpoint]
+    Output --> Bridge[Descriptor-only Bluetooth worker]
+    Bridge --> BT[Maintained BlueALSA / paired speaker]
+    Broker -->|owns launch and recovery| Receiver
+    Broker -->|owns launch and recovery| Audio
+    Broker -->|owns launch and recovery| Output
 ```
 
-AirPlay and any future Cast adapter must share an explicit source policy. Takeover, rejection,
-volume, pause, stop and disconnect need source/session identities; callbacks
-from a superseded producer must not affect the current owner. TTS remains a
-separate bounded overlay: lower the music gain while its timeline continues,
-mix speech, then restore gain smoothly. It must not pause, seek, restart or
-reconnect music, or disconnect the phone. `shiri/source.py` defines the policy;
-`runtime/source.py` serializes grants, downstream barriers and final writes.
-`runtime/native.py` binds exact AirPlay transport handles and forwards native
-volume through durable receipts. A future supported Cast input adapter must
-use this same ownership boundary; no Cast receiver is currently installed.
-
-The policy grants the newest serialized input request and issues an exact
-token containing zone, actor incarnation, protocol, producer session identity
-and monotonically increasing grant epoch. End/volume callbacks require that
-whole current token. Takeover revokes only the previous token; reused native
-IDs or callbacks from a previous actor cannot change the new owner. An
-identical admission request from the current producer is idempotent.
-The admission ID must identify the exact connection or speech negotiation
-incarnation. An adapter must combine a reusable native ID with a fresh
-connection generation; otherwise a new connection could be mistaken for a
-replay of the live producer. That generated ID remains stable for retries of
-one genuine admission, and exact native identifiers are never guessed.
-
-Adapters must serialize genuine admission requests, commit state before
-actions, advance epochs within an actor and begin a fresh actor incarnation
-after restart. Retired incarnations cannot regain authority. Takeover emits
-`revoke_input` for the old token before
-`grant_input` for the new token. Before admitting new PCM, the adapter must
-acknowledge the old route's quiescence, or atomically fence it and discard its
-buffered PCM. Media can arrive before a control callback and stopping a producer
-can take time: every PCM write needs `owns_input`, not just a start-time check.
-`permits_action` rejects queued grants, volume changes and mix-gain changes
-made obsolete by newer state. Its check and effect initiation must share the
-zone actor's serialization; a backend without token fences must remain
-serialized through bounded acknowledgment so an old asynchronous write cannot
-finish after a newer one. A revoke uses an adapter handle bound to that exact
-old token, never a generic handle for the current AirPlay source.
-
-| Event | Required identity | Result |
+| Owner | Responsibility | Principal implementation |
 | --- | --- | --- |
-| `input_requested` | Exact zone, protocol and producer session ID including connection generation | Newest admission wins; current identical admission is idempotent |
-| `input_ended` | Whole current `SourceToken` | Ends only that music owner |
-| `input_volume_changed` | Whole current `SourceToken`, integer 0–100 | Changes only the current producer's volume |
-| `tts_started` | Exact zone, bounded negotiation identity and finite gain 0–1 | Grants a separate `OverlayToken`; changes music mix gain only |
-| `tts_ended` | Whole current `OverlayToken` | Restores music gain without changing its owner or timeline |
+| API / room service | Validate requests, authenticate callers, save intent and reconcile observations | `api.py`, `service.py`, `store.py` |
+| Text coordinator | Exact routing, per-room FIFO, shared inference scheduling and delivery lifecycle | `tts/coordinator.py` |
+| Mac generation worker | Selected model, warmup, generation, decoder reset and process recovery | `tts/worker.py`, `tts/backend.py` |
+| Broker | Privileged resources, room processes, device grants and launch identity | `runtime/broker.py`, `runtime/system.py`, `runtime/units.py` |
+| Audio worker | Admit one speech producer per room, pace PCM, own cancellation and native source ingress | `runtime/audio.py`, `runtime/native.py` |
+| OwnTone | Final speech/music mix, output gain, timing and transport sessions | Pinned source plus `install/patches` |
 
-Speech has its own monotonically increasing epoch. Reused speech IDs and late
-end/gain actions cannot restore a newer overlay's gain. TTS never emits music
-grant/revoke actions; gain transitions must be applied smoothly by the mixer.
-The most recent overlay token is retained as a gain-action fence after its end,
-without retaining a live speech owner.
-Turning a delayed playback-status callback into a new admission would bypass
-the policy. The reducer's tests establish event and action rules, not native
-receiver enforcement, atomic physical takeover or acoustic behavior.
+The API imports no privileged network implementation. The model runs on the
+Mac, separately from the Linux audio services. Each room has its own output
+player so one room's playback does not serialize another room's delivery.
+The single model scheduler protects mutable decoder state; it does not own
+speaker timing.
 
-Before future Cast input is enabled, discovery, authentication, media playback and streaming must be
-validated using stock phones and existing apps. An OwnTone Chromecast output
-is not an inbound receiver; advertising mDNS alone or demonstrating a custom
-sender does not pass this requirement. No Cast input adapter has passed the
-admission tests. Cast input is deferred for this release.
-[Receiver evaluation](RECEIVER_RESEARCH.md), [current feasibility](CAST_INPUT_FEASIBILITY.md)
+## Text to speech
 
-## Implemented candidate process and audio boundaries
+The selected model loads and warms when the Mac worker starts. A successful
+selection is saved atomically beside its credential, or at `--state-file`.
+It overrides the initial `--preload` choice on restart. A supervisor detects
+child failure and reloads that selection with bounded backoff. Idle readiness
+means keeping the model resident, without continuously generating discarded
+audio. A new voice or language may still initialize model-specific state.
 
-```mermaid
-flowchart LR
-    UI[Browser] --> API[Rootless FastAPI API]
-    AI[Future Nobly client] --> API
-    API --> DB[(SQLite room intent)]
-    API -->|bounded Unix socket RPC| Broker[Privileged Linux broker]
-    Broker --> Receiver[Per-room Shairport Sync + NQPTP]
-    Phone[AirPlay source] --> Receiver
-    Receiver --> Native[Private credential-checked timestamped PCM]
-    Native --> Mixer[Per-room native music and speech worker]
-    AI -->|negotiated WebRTC audio| Mixer
-    Mixer --> FIFO[Bounded framed PCM FIFO preserving presentation time]
-    FIFO --> OwnTone[Per-room OwnTone sender]
-    OwnTone --> AirPlay[AirPlay outputs]
-    OwnTone --> Cast[Chromecast outputs]
-    OwnTone --> Local[Configured wired ALSA device]
-    OwnTone --> Final[Identity-checked final PCM socket]
-    Final --> Bridge[Descriptor-only Bluetooth output worker]
-    Broker -->|exact PCM and restricted controller descriptors| Bridge
-    Bridge --> BlueALSA[Maintained BlueALSA SBC encoder]
-    BlueALSA --> Bluetooth[Paired Bluetooth speaker]
-```
+Text admission resolves an exact room UUID or saved Nobly binding. There is
+no default room or name/IP fallback. One room has one active job and two
+waiting texts. A full queue rejects explicitly. Repeating a retained request
+ID with identical intent returns the same job; changed intent conflicts.
+Waiting jobs retain text, not synthesized waveforms.
 
-The product API imports no GStreamer or privileged networking code. It validates
-requests, enforces authentication, saves room intent and reconciles that intent
-through a small RPC contract. The broker alone creates namespaces and starts
-owned processes. Each audio worker mixes music with one speech producer; it
-does not discover or open network speakers.
+`replace_job_id` must name the active job in that same room. The coordinator
+retires that exact job, places the replacement before existing waiting jobs,
+and leaves their order intact. A stale ID, another room's job or a waiting job
+cannot implicitly interrupt the active voice. The explicit cancellation API
+can cancel an exact queued job without affecting playback.
 
-The root broker retains its singleton, manifest and setup/cleanup authority.
-The current launcher uses fixed separate non-root room identities for input,
-output and decoding workers, private mount views and exact device grants.
-OwnTone waits behind a root-controlled launch gate until its exact cgroup has
-verified persistent kernel bind policies and those identities are saved. Local
-outputs inherit a filter allowing only libasound's necessary read/preference
-control ioctls; hardware parameters follow an opened-PCM identity check.
-Executables and configuration are read-only to workers; writable database,
-cache and FIFO paths are private. Network input workers have no root DAC
-authority or host system D-Bus access. The combined boundary passed actual
-Ubuntu kernel and guarded virtual PCM checks; full playback and crash coverage
-remain explicit in [REBUILD.md](REBUILD.md).
+A room's active job waits for the shared inference slot. Once the model accepts
+generation, native room preparation and PCM reception proceed together. A
+bounded audio queue lets inference finish and reset its decoder while that
+room continues speaking. Another room can then generate and play independently.
+Each active room retains at most 60 seconds of 48 kHz mono S16 audio (5.76 MB,
+plus object overhead). There are at most eight rooms, one benchmark and 32
+retained job records. The worker owns decoder cleanup and its bounded process
+retirement fallback. The coordinator observes that retirement before releasing
+normal inference ownership; an unreachable worker is reported as unconfirmed.
 
-Hook RPC admits only the expected daemon UID and its exact room's bounded
-music/volume signals. Those credentials do not authorize general broker
-operations and differ from the rootless administration API's socket rights.
-The native socket checks the exact receiver UID and every media callback
-requires the admitted incarnation, session, epoch and native generation.
+One authenticated Unix-socket admission creates two persistent binary hops:
+API → broker → audio worker. Frames contain at most 960 samples (20 ms), exact
+sequence and sample positions, and receive bounded acknowledgments. Each hop
+has one frame in flight. The audio worker paces against its Linux monotonic
+sample calendar. No frame opens a control connection or queries SQLite.
+The Mac's clock never schedules speakers. HTTP NDJSON remains the separate
+Mac-to-API generation transport.
 
-The PCM contract is 48 kHz, stereo, signed 16-bit little-endian between mixer
-and OwnTone. Speech is decoded and resampled to 48 kHz mono before mixing.
-The patched Shairport backend delivers the actual first-sample presentation
-anchor with 48 kHz stereo S16 PCM through a private versioned socket. Input
-format, complete frame count and clock provenance are checked at this boundary;
-the foundation's ALSA receiver capture path remains earlier evidence rather
-than proof of this new path.
-Queues and FIFO writes are bounded. If the reader vanishes or the pipe fills,
-the worker drops live audio and records counters instead of retaining an
-unbounded backlog of stale speech.
+The stream binds the room route, selected outputs, session and launch. Route
+changes retire admitted streams before reassigning output resources. A lost
+admission or retirement acknowledgment retains the fence until the original
+launch stops; an explicit refusal that proves no ownership can release only
+its own attempt. Caller cancellation cannot abandon the owned cleanup task.
+Sequence errors, disconnects, deadlines and bounded duration all retire the
+exact voice. Delivered device-buffer audio may have a short tail; cancellation
+never flushes or restarts music.
 
-Explicit local outputs request `audio.software_volume = true` from the
-maintained OwnTone 29.3 extension. The validated foundation used the
-`29.3-shiri-swvol1` build marker; subsequent timing, source-transition and
-opened-PCM identity extensions have separate reviewed patches and exact markers.
-Preflight must require the exact features used by its profile. Upstream's hardware-mixer path rejects
-mixerless Loopback and can reuse a PCM address as an invalid control address.
-The extension scales a private copy at final PCM submission using the current
-local session's volume, including buffered and draining audio. It leaves other
-outputs' samples and OwnTone's playback timing unchanged, creates no shared
-ALSA mixer controls and preserves the upstream hardware-mixer default when
-the option is absent. This local output volume is separate from TTS's music
-duck gain; speech must never restart or replace a music/output session.
-The dedicated Ubuntu API-to-final-PCM check exercised this extension: local
-volume `100 → 50 → 100` changed the observed music amplitude by the expected
-cubic gain while the sampled program, selection and process identities stayed
-stable. Exact results and the synthetic/Loopback scope are recorded in
-[REBUILD.md](REBUILD.md). Physical speaker and Bluetooth verification remain
-required.
+The public WebRTC offer/control/close API remains available for clients that
+already generate audio. It uses the same room speech ownership and late mix,
+with its own negotiated transport and decoder. A competing WebRTC or text
+producer cannot replace the current producer by reusing its IDs. Nobly's
+external-ID WebRTC endpoint admits offers; follow-up control addresses the
+returned stable room UUID so rebinding cannot redirect an old close.
+See [local TTS](LOCAL_TTS.md) for setup, API examples and measurement fields.
 
-Bluetooth uses a separate descriptor-only output worker. The root broker
-admits one exact paired A2DP endpoint through the maintained BlueALSA service
-and hands only its validated PCM pipe and restricted controller descriptors to
-that worker. OwnTone sends its clocked, volume-adjusted final PCM over an exact
-published socket; the worker forwards it without another scheduler or sample
-conversion. It has no host D-Bus connection or ALSA nodes. The prior Loopback
-return/host-bus worker route is replaced. Real private-daemon SBC/controller
-and separate kernel publication checks passed; the combined broker/OwnTone/
-BlueALSA route and physical device remain acceptance gates. See
-[BLUETOOTH_OUTPUT.md](BLUETOOTH_OUTPUT.md) for ownership, bounds and evidence.
+## Music ownership and final mixing
 
-OwnTone owns speaker delivery, buffering and playback timing. Its documented
-pipe input supports an AirPlay receiver forwarding audio into an OwnTone
-multiroom router. [OwnTone pipe input documentation](https://owntone.github.io/owntone-server/library/)
+`source.py` defines one music owner. `runtime/source.py` serializes grants,
+revocation, output barriers and final music writes. A new genuine receiver
+admission supersedes the old owner; a replay of the current admission is
+idempotent. Tokens bind room, actor incarnation, protocol, producer session and
+grant epoch. Native connection/flush generations additionally fence transport
+callbacks. Every PCM write checks current ownership, not merely the first one.
+An old phone's delayed volume, end or disconnect callback cannot affect its
+successor. Restart creates a fresh actor incarnation.
 
-## Room identity and ownership
+The native receiver supplies 48 kHz stereo S16 PCM and the original sample
+presentation anchor through a credential-checked socket. The audio worker
+preserves music samples and timing through a bounded framed FIFO. It performs
+no Python per-sample mix and emits no synthetic music bed for speech.
+OwnTone admits mono speech on a separate authenticated socket and mixes it at
+its final player stage, before output conversion. Consequently speech does
+not wait for the music relay horizon.
 
-Rooms have UUID identities and at most eight explicit ALSA Loopback slots. A
-display name, advertised AirPlay name, exact optional Nobly room ID and Linux
-interface are separate fields. Display and AirPlay names must be unique after
-case folding. The receiver name is bounded to 50 UTF-8 bytes and cannot contain
-Shairport's hostname/version substitutions. Configuration text is escaped by
-the runtime adapter rather than interpolated as raw configuration syntax.
+Active music requires one atomic native speech BEGIN. An idle player uses
+PREPARE then BEGIN; a retained paused source can request bounded preparation
+when the first BEGIN definitively reports that it is not ready. Exact backend
+acknowledgments and fresh mix evidence remain mandatory. Model scheduling and
+queued text do not duck music. The native mixer controls the gain envelope;
+its Python heartbeat runs every 100 ms while first PCM/control acts immediately.
+Text uses a 300 ms attack and 600 ms release, applied concurrently with speech,
+not as a mandatory delay before the first sample. WebRTC retains its native
+40/250 ms envelope.
 
-Speaker assignments use numeric OwnTone output IDs, never IP addresses or a
-best-effort name match. A network output is exclusive across all rooms,
-including disabled rooms. AirPlay 1 and AirPlay 2 representations of the same
-OwnTone ID do not create two independently owned speakers. Local output ID `0`
-is scoped by the configured physical ALSA endpoint because every OwnTone
-instance can expose its own local output with that ID. Equivalent `hw`/`plughw`
-forms and default device/subdevice indexes share one ownership key; BlueALSA
-MAC address case does not create a second endpoint. Numeric ALSA card indexes
-remain normalizable for explicit migration/audit analysis, but room admission
-and actual playback reject them. Device/subdevice indexes may remain numeric.
-The playback address preserves an explicitly requested `plughw` converter;
-canonicalizing an ownership key must not remove rate/format conversion.
-An existing database containing a numeric card fails startup read-only
-validation with an operator-repair message; it is not rewritten or mapped to
-whichever card currently occupies that index. Legacy migration likewise needs
-an operator-supplied named endpoint. Automatically assigned names for identical
-USB cards can also reorder, so named admission alone is not a physical identity
-guarantee. Stable provisioned card IDs or serial/udev identity and verified
-rejection on mismatch remain required hardening.
-Selecting local audio requires an explicit device; the default is disabled.
-Configured local devices are exclusive even for disabled rooms without a
-selected local output, because enabling a Bluetooth bridge opens that device.
+Speech changes only the music mix gain. It cannot seek, pause, revoke the
+phone, replace its timeline, select different speakers or restart transports.
+EOF drains the accepted voice; cancellation drops its unsent audio; expiry
+restores gain even while peer cleanup is still pending. Output admission,
+software mixing and a listener hearing speech are distinct observations.
 
-Local device values are restricted to explicit `hw`/`plughw` hardware routes or
-`bluealsa:DEV=MAC,PROFILE=a2dp`. Arbitrary ALSA plugins, `file` routes, embedded
-configuration and untrusted aliases are rejected before reaching a privileged
-process. Quoting a plugin string would not stop that plugin from writing files
-with the process's privileges.
+## Output readiness and timing
 
-Nobly room routing requires an exact saved external ID and one matching room.
-Missing bindings fail visibly. No default room, guessed slug, name fallback or
-first available room receives the speech. Nobly itself has not been built or
-connected; Shiri provides the room-addressed integration boundary.
+Enabled rooms default to `ready`: Shiri maintains their exact assigned output
+connections through idle periods without continuous silent playback. Explicit
+`adaptive` and `on_demand` policies remain available where standby is preferred.
+Readiness retains exact route/launch leases; a stale renewal cannot revive a
+retired configuration. Missing members degrade the complete group and clear
+live selection rather than silently playing a subset or substitute.
 
-`POST /api/v1/nobly/rooms/{external_id}/speech` admits offers only. Binding
-resolution and the bounded runtime admission acknowledgment share the same
-guard as room edits, so rebinding cannot change the destination mid-admission.
-Successful speech responses include `admitted_room_id`, the stable room UUID.
-Control and close use `/api/v1/rooms/{admitted_room_id}/speech`; the external-ID
-endpoint rejects those follow-ups with an actionable error. A later binding
-move therefore cannot redirect an old session's close into its successor.
-The existing broker's active session-to-room ownership rejects a lost-offer-
-acknowledgment retry that would retarget a retained session after rebinding.
-There is no second ephemeral ownership map in the API service.
+Music keeps the phone presentation time `P`. Each room needs an output buffer
+`B`; all enabled rooms share `H = max(B) + 100 ms`. The framed input carries
+`P + H`, OwnTone arms at `P + H − B`, and its output buffer restores `B`.
 
-Each room accepts one WebRTC speech session with explicit `session_id` and
-`request_id`. The session ID identifies one exact producer/negotiation
-generation and remains stable only for retries of that generation. A competing
-producer receives a conflict. Negotiation, transport
-failure, cancellation, inactivity and room shutdown dispose that session. Music
-ducking follows audible received audio, with bounded attack/release, rather than
-the mere existence of a WebRTC connection. This establishes music/speech
-mixing. Arbitration between phones and input protocols remains required work,
-including stale-event protection and real device verification.
+| Route, zero offset | B | H when this is the slowest enabled route |
+| --- | ---: | ---: |
+| Local ALSA / framed Bluetooth | 40 ms | 140 ms |
+| Cast / Pulse | 250 ms | 350 ms |
+| AirPlay 1 / 2 | 500 ms | 600 ms |
 
-The optional text path resolves a room UUID or exact Nobly binding once at
-admission. A bounded job retains that UUID, a client request ID and a hash of its
-immutable intent. Repeating the same retained request returns the existing job;
-reusing its ID for different text or routing conflicts. Binding edits cannot
-redirect subsequent audio or cancellation.
+Negative per-output offsets enlarge B enough to preserve that route's lead;
+positive offsets cannot lower its floor. The plan is frozen for the program
+incarnation. Speech never changes it. AirPlay's floor includes actual protocol
+arithmetic, so reducing it blindly can wrap a receiver's unsigned latency.
+[Timing](TIMING_RESEARCH.md) explains clock conversion and the current tests.
 
-MLX generation runs in an isolated persistent Mac process, separate from Linux
-speaker routing. Registered models are pinned; HTTP callers choose model IDs,
-voices and languages rather than arbitrary files or repositories. Prewarm audio
-is discarded. A model job streams normalized mono PCM through one stateful
-resampler; the API paces private 20 ms frames into the same room producer slot
-used by WebRTC. Sequence/frame positions and an exact stream identity fence
-replay, stale finish and stale cancellation. This path avoids Opus input and
-WebRTC prefetch, while preserving OwnTone's output timing and music calendar.
+OwnTone owns all final output timing. Offsets correct measured constant delay,
+not jitter or drift. Changing offsets during playback is an explicit
+administrative operation that may restart that output session; speech never
+performs it. Cast and mixed physical transports do not have a universal precise
+synchronization guarantee. Native iPhone grouping and final speaker alignment
+still need physical measurements.
 
-One generation job is active at a time. Normal cancellation closes the generator,
-discards its resampler tail and resets its decoder before a bounded explicit
-acknowledgment permits warm reuse. A missing acknowledgment, uncertain error or
-hung model discards the process. Neither warmup nor waiting for generation ducks
-music. Received audible speech uses the existing smooth gain envelope. Model
-generation, room admission and physical acoustic onset remain distinct clocks
-and measurements. See [local TTS](LOCAL_TTS.md) for the concrete API and bounds.
+## Durable configuration and observed state
 
-The speech path must preserve continuous music playback and phone ownership.
-Offer, received speech, control, close, timeout and failure handling must never
-invoke music pause/seek/restart, reconnect output sessions or replace the
-music producer. Only music mix gain changes, with smooth restoration.
-The actual Linux two-tone mixer test provides a basis for checking music gain
-under speech, but physical output continuity and phone-control continuity
-remain required evidence. There is no exclusive TTS interruption policy.
+SQLite owns room definitions, optimistic revisions, exact Nobly bindings,
+speaker assignments, volume receipts and calibration history. Up to eight
+UUID rooms use stable runtime slots; these are not ALSA Loopback requirements.
+Enabled rooms share one LAN interface, enforced in the save transaction.
+Network outputs remain exclusive across room assignments, including disabled
+rooms. Local output identity uses its explicitly enrolled physical endpoint;
+there is no default device or numeric-card guess.
 
-## Durable intent and reconciliation
+Strict models reject unknown/coerced fields and nonfinite values. WAL, full
+synchronization, foreign keys and bounded busy timeouts preserve committed
+intent. Startup audits schema and data before writable access, including
+retained WAL/journal files; it never replaces malformed user state with a new
+empty database. Necessary schema migration and ownership recovery remain part
+of the supported upgrade path.
 
-Pydantic models reject unknown fields, implicit numeric coercion, nonfinite
-gains and out-of-range volumes or offsets. SQLite owns room, slot, name,
-external-binding and speaker uniqueness. Mutations and operational events
-commit together with WAL, full synchronization, foreign keys and a bounded
-busy timeout. Optimistic room revisions prevent one browser from silently
-overwriting another browser's edit. Full-disk and malformed-database failures
-surface errors; they do not replace user state with an empty installation.
-Startup validates the managed column order/types/defaults, primary and unique
-keys, collations, foreign-key actions, checks and generated-ID semantics. SQL
-keyword case, comments and harmless nonunique indexes do not change that
-contract. Unmanaged tables, views and triggers fail closed. The bounded room
-audit also recomputes canonical names, physical devices and speaker ownership,
-checks retained calibration and volume receipts, and rejects inconsistent
-derived keys without repairing them. Deleted-room receipts/events remain
-valid history; intentionally retained profiles are validated as a stream.
-Existing files receive WAL-aware read-only validation before writable startup,
-so rejecting a crashed invalid database cannot trigger a last-writer checkpoint
-or discard committed WAL intent. A missing or empty main file with a retained
-WAL, shared-memory or journal companion is rejected before writable access,
-including dangling companion symlinks. Validation is repeated under the normal
-write transaction before accepting the store.
+Room loading uses two joined SELECTs regardless of speaker count. A state or
+reconciliation cycle passes one captured room/health snapshot through its
+consumers and refreshes after a causally relevant phone-volume acknowledgment.
+A concurrent room deletion cannot invalidate unrelated discovery. Calibration
+reads SQLite directly, without a second write-only session cache. Browser
+updates retain room cards and focus when only other rooms or volatile
+observations change.
 
-Phone volume callbacks have durable event identities. Their receipt and room
-revision commit in the same transaction. If an acknowledgment is lost, replay
-returns the original committed revision even when a newer UI edit exists.
-This prevents a coalesced phone update from being incorrectly rebased on, and
-overwriting, that newer UI intent. Receipt history is bounded to 10,000 events.
+Phone volume commits its exact event receipt and room revision together. A
+lost acknowledgment replays the original revision; it cannot rebase an old
+phone event over a newer web edit. Saved intent and acknowledged backend state
+remain separate. Reconciliation reports pending, running, degraded or error;
+health verifies processes and current launch identities with bounded recovery
+backoff. Late results from an old launch cannot restart or overwrite its successor.
 
-Saving intent succeeds independently of the backend reaching that intent. API
-responses report whether runtime reconciliation was accepted; room status and
-diagnostics expose pending, starting, running, degraded or error states. Backend
-selection requires acknowledgment and readback. A missing member of a requested
-speaker group leaves the room degraded and clears the live selection instead
-of silently playing a partial or old group.
+## Privilege and resource ownership
 
-Each room converges serially toward its newest definition. Shared sender
-reservations cover rooms that are still starting. Material changes to the
-receiver or local device restart the relevant runtime; ordinary speaker,
-volume and timing changes use the backend control adapter. Health checks
-observe processes, namespaces, DHCP state, audio worker and OwnTone rather than
-treating a remembered PID as health. Recovery uses bounded backoff.
+Receiver namespaces have their own LAN macvlan/DHCP identities, private D-Bus,
+Avahi and NQPTP memory. Room output instances share a sender namespace and its
+timing services. The broker alone creates these resources. Its durable manifest
+binds installation, namespace inode, interfaces, process invocation and cgroup;
+cleanup never trusts a name prefix. A failed stop retains ownership for recovery.
 
-## Network lifecycle
+Input, output, audio and Bluetooth workers use separate non-root identities,
+private mounts, read-only code/configuration and exact device/socket grants.
+A kernel bind policy is installed before the output launch gate opens. Local
+ALSA opens verify device identity and constrain control ioctls. Bluetooth's
+worker receives only the validated PCM and restricted controller descriptors,
+with no host D-Bus access or independent sample scheduler. A speaker-managed
+Bluetooth group is one assigned endpoint through its primary speaker.
 
-Receiver namespaces have their own LAN macvlan, DHCP identity, private D-Bus,
-Avahi and NQPTP shared-memory isolation. OwnTone instances share one sender
-namespace and sender timing services, while retaining separate player
-instances and control ports. The host reaches the sender through a private
-veth link using a subnet checked against existing routes. The receiver LAN
-interface must be suitable for multiple MAC addresses; VM bridging is a
-deployment requirement, not something a successful DHCP lease proves.
+HTTP control is authenticated by default; browser sessions are HttpOnly and
+cross-origin mutations are rejected. Unix RPC checks peer users, bounds input
+and deadlines, and transfers stream cleanup ownership explicitly. The Mac
+worker has its own private credential. The privileged broker boundary and
+exact identity checks solve distinct failure modes; collapsing them would
+weaken recovery and routing, without removing speaker buffering.
+See [daemon privileges](DAEMON_PRIVILEGES.md),
+[Bluetooth output](BLUETOOTH_OUTPUT.md), and [installation](../install/README.md).
 
-The durable ownership manifest records installation identity, namespace inode,
-interface MAC/alias and process identity. Cleanup must verify ownership before
-stopping a process, releasing a DHCP lease or deleting a namespace. It never
-authorizes host cleanup by a name prefix alone. A failed teardown retains
-ownership so recovery can inspect and retry it.
+## Evidence and release status
 
-The API listens on loopback by default. Installation credentials protect
-control requests; browser sessions are HTTP-only and cross-origin mutations
-are rejected. Unix socket RPC verifies peer users and bounds message size and
-duration. LAN exposure requires an explicit deployment choice and TLS at the
-HTTP boundary. These controls do not imply that the legacy VM has already been
-replaced by this runtime.
-
-## Timing and supported transports
-
-| Transport | Current route | Timing claim |
-| --- | --- | --- |
-| AirPlay 1 / AirPlay 2 speaker | OwnTone network output | Protocol timing within one sender; physical accuracy still measured |
-| Chromecast speaker | OwnTone network output | Approximate alignment; precise mixed-protocol sync is not promised |
-| Wired ALSA speaker | Explicit Linux hardware endpoint | Device buffering and drift must be measured |
-| Paired Bluetooth speaker | OwnTone final PCM → descriptor-only worker → maintained BlueALSA SBC encoder | Combined route still under validation; device/adapter buffering, drift and physical verification pending |
-| PulseAudio | Recognized backend capability | Requires an installed/configured adapter; not enabled by the ALSA runtime automatically |
-| Google Cast as an input | Deferred by the user | A future adapter needs stock-phone discovery, authentication, media and streaming validation |
-| WebRTC speech | One bounded room audio session | Mixed into that room before OwnTone delivery |
-
-OwnTone's Chromecast documentation explicitly excludes precise synchronization
-with other output types. Device discovery therefore does not establish
-compatibility or acoustic timing quality. [OwnTone Chromecast documentation](https://owntone.github.io/owntone-server/audio-outputs/chromecast/)
-
-OwnTone exposes a per-output `offset_ms` in the range `-2000..2000`; a positive
-value delays that output. Shiri stores this correction by speaker identity so
-it survives deselection. This corrects a measured constant relative delay, not
-clock drift or variable jitter. [OwnTone 29.3 output API](https://github.com/owntone/owntone-server/blob/29.3/docs/json-api.md#change-an-output)
-
-An offset readback confirms the configured value, not its acoustic effect.
-OwnTone 29.3 cannot change the offset inside an active playback session; its
-paused-output path tears down that session so the next start uses the value.
-The adapter pauses when necessary, changes/readbacks the offsets and resumes.
-That is an explicit administrative calibration operation; no speech admission,
-media, close or failure path may invoke it.
-Failure during that sequence must remain visible. [OwnTone 29.3 player implementation](https://github.com/owntone/owntone-server/blob/29.3/src/player.c#L2743-L2771)
-
-## Required native grouping and the timestamp-preserving candidate
-
-The current unit of playback is one room's OwnTone instance. Speakers selected
-by that instance receive one room program. Different room instances remain
-independent players even when they share a LAN namespace or PTP
-daemon. Playing the same file independently in two rooms does not synchronize
-those rooms. Receiver-side synchronization from an iPhone also does not prove
-that independent FIFO/player relay stages preserve that common presentation
-timeline at the final speakers.
-
-Native iPhone multi-zone selection is required behavior. The implementation
-preserves the group's shared presentation timeline through capture, mixing
-and OwnTone's existing timestamped input seam. It must still verify final
-outputs during startup, regrouping and long playback. The
-[timing audit and bounded experiment](TIMING_RESEARCH.md) records the original
-clock-provenance loss and the maintained correction. Portable callback tests
-and successful native builds establish that correction's exercised contracts;
-the two-zone final-PCM test and later phone/acoustic evidence remain required.
-
-The next native candidate implements a timestamp-preserving boundary instead
-of scheduling speakers outside OwnTone. Its pinned Shairport backend receives
-the native first-sample presentation time and original RTP frame position from
-the actual playback callback, after resampling and partial-frame skipping.
-Every connection has a fresh producer identity; flushes advance an exact native
-generation. An authenticated source transition fences and discards old queued
-music, waits for downstream output acknowledgments, then grants the new route.
-Every final music write checks that exact live token. Speech admission, media
-and close never invoke this source transition or replace its music owner.
-
-Each block carries a fresh paired `CLOCK_MONOTONIC_RAW`/`CLOCK_MONOTONIC`
-measurement. The `shiri-timed2` producer retries a scheduling-disrupted clock
-triple at most four times and admits only samples completed before a total
-five-millisecond deadline. OS preemption can return later, in which case the
-sample fails. The receiving
-limit stays at one millisecond; retries preserve the native presentation time,
-RTP position and exact PCM payload. Exhaustion closes the exact producer route
-without sending an invalid mapping or advancing its timed-frame counters. The
-mixer preserves the mapped native deadline and adds one frozen common relay
-horizon. The current policy freezes `H = max(enabled room B) + 100 ms`:
-zero-offset local/framed Bluetooth uses B40/H140, Cast/Pulse B250/H350 and
-AirPlay B500/H600. Selected negative speaker corrections enlarge B to retain
-the route's required lead and can raise the common horizon; positive offsets
-never lower a route's floor. Every enabled zone shares that horizon, including
-zones with different output leads. See [the timing policy](TIMING_RESEARCH.md).
-The framed OwnTone input subtracts
-its existing output buffer duration before supplying `INPUT_FLAG_SYNC`; the
-existing player timer starts absolutely at that program anchor. Its output
-buffer then adds the duration back. This avoids inventing independent
-receive-time origins or accidentally adding another two seconds to the declared
-horizon. Late or missing first anchors, stale operations, repeated native
-presentation times and old flush generations fail closed.
-
-Portable tests compile the actual patched callbacks, pipe reader, input-marker
-boundary and both player timer variants under address/undefined-behavior
-sanitizers. Two independent receiver connections with different arrival times
-and RTP origins retain the same native group deadline; modeled transport delays
-still require explicit compensation. These tests establish the exercised code
-contracts, not real output scheduling or acoustic alignment. New-profile Linux
-PCM evidence and stock-phone/physical-speaker acceptance remain mandatory.
-OwnTone's Cast output does not currently provide a proven precise presentation
-clock or a receiver-queue flush acknowledgment. Constant offsets cannot remove
-unmeasured jitter or drift.
-
-The speech producer now uses a separate bounded Unix datagram endpoint. The
-output daemon owns its private directory and authenticates the exact audio UID,
-room UUID and launch generation. OwnTone polls it without blocking on its player
-thread and mixes mono speech into the shared stereo PCM immediately before
-output conversion. This removes the native-ingress wait from announcements;
-it does not bypass device buffers or cold playback activation. A 250 ms packet
-age/queue bound prevents stale accumulation. Ordinary EOF drains valid voice
-samples, and absent media cannot hold music ducked indefinitely. Producer health
-distinguishes input activity and datagram delivery from actual backend gain;
-final-output measurements remain authoritative. A concurrent source-only flush
-can still discard already-transmitted speech in device buffers; seamless takeover
-remains a separate gate. Speech itself never invokes that flush.
-
-The pinned Shairport configuration documents an optional progress metadata
-anchor containing an RTP frame position and its intended local
-`CLOCK_MONOTONIC_RAW` presentation time, in nanoseconds, using `phb0`/`phbt`
-messages, with `CLOCK_MONOTONIC` as the documented fallback. It is emitted
-when the frame enters the backend buffer, ahead of presentation. This is a
-concrete research path for carrying receiver timing provenance across the
-relay. Baseline metadata is enabled using a private `metadata/shairport.pipe`,
-with cover art disabled and a 100 ms pipe timeout. Disabling metadata in the
-pinned receiver caused an actual startup crash and was reverted. Progress
-anchors remain disabled and unconsumed. The next framed profile carries the
-actual native playback callback anchor directly rather than parsing these
-optional progress messages; the validated foundation's raw FIFO erased it.
-The anchor option has not been validated in this candidate and does not
-establish final-output synchronization or justify
-a new speaker scheduler without evidence.
-[Pinned Shairport configuration](https://github.com/mikebrady/shairport-sync/blob/7bad231c18368dbd26f298577f6210e36e4b0797/scripts/shairport-sync.conf#L305-L318)
-
-`runtime/backend.py` is the OwnTone adapter boundary. If reproducible acoustic
-evidence identifies an OwnTone output defect, fix and pin that backend first.
-A different backend requires measured improvement, compatible real devices,
-ownership/recovery tests and an explicit migration plan. Sendspin is a candidate
-because its protocol defines timestamped audio and continuous clock offset and
-drift estimation; a specification's targets do not prove a deployed endpoint's
-accuracy or make existing AirPlay/Cast speakers native Sendspin clients.
-[Sendspin protocol specification](https://www.sendspin-audio.com/build/spec/#clock-synchronization)
-
-See [CALIBRATION.md](CALIBRATION.md) for the measurement stages and
-[REBUILD.md](REBUILD.md) for verification evidence and release gates.
+The current software review and integrated checks are recorded in
+[the October 4 review](REPO_REVIEW_2026-10-04.md).
+[Release verification](REBUILD.md) maps the maintained checks and remaining
+gates. Previous live observations and artifact hashes remain in dated
+checkpoints. The October 4 refactor has no new live-model, systemd deployment,
+phone, speaker or acoustic acceptance result.

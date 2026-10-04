@@ -541,34 +541,30 @@ def test_producer_environment_does_not_inherit_root_only_lab_profile():
     assert not any(item.startswith(lab.ENVIRONMENT + "=") for item in environment)
 
 
-def test_legacy_guard_body_is_preserved_and_new_modes_use_the_same_actual_profile():
-    source = ROOT / "tests/linux/check_native_grouping.py"
-    tree = ast.parse(source.read_text())
-    legacy = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "legacy_snapshot"
-    )
-    assert isinstance(legacy.body[0], ast.If)
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "process_birth"
-        and [getattr(arg, "value", None) for arg in node.args] == [2444]
-        for node in ast.walk(legacy)
-    )
+def test_hardware_snapshot_requires_explicit_lab_and_delegates_exact_profile():
+    tree = ast.parse((ROOT / "tests/linux/check_native_grouping.py").read_text())
+    snapshot = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "legacy_snapshot")
+    namespace = {"require": lab.require, "NATIVE_LAB": None}
+    exec(compile(ast.Module(body=[snapshot], type_ignores=[]), "<hardware snapshot>", "exec"), namespace)
+    with pytest.raises(RuntimeFailure, match="explicit native lab profile"):
+        namespace["legacy_snapshot"]()
+    receipt = {"exact_profile": "retained"}
+    namespace["NATIVE_LAB"] = SimpleNamespace(protected_snapshot=lambda: receipt)
+    assert namespace["legacy_snapshot"]() is receipt
+
+
+def test_manual_supervisors_share_explicit_profile_admission():
     for name in (
-        "run_native_grouping",
-        "run_native_zone_faults",
-        "run_native_speech_stress",
-        "run_native_latency_probe",
-        "run_native_bluetooth_route",
+        "run_native_grouping", "run_native_zone_faults", "run_native_speech_stress",
+        "run_native_latency_probe", "run_native_bluetooth_route",
     ):
         text = (ROOT / f"tests/linux/{name}.py").read_text()
-        assert "manifest['installation_id'].startswith('b265')" in text
-        assert "inner.get('native_lab') != result['native_lab']" in text
-        assert "native_lab_admission" in text and "before parent cleanup" in text
+        assert "startswith('b265')" not in text
+        assert "native_lab_admission" in text
     for name in ("run_native_latency_probe", "run_native_bluetooth_route"):
         text = (ROOT / f"tests/linux/{name}.py").read_text()
-        assert "'tests/linux/native_lab.py'" in text and "'tests/linux/check_airplay_tts.py'" in text
+        assert "'tests/linux/native_lab.py'" in text and "'tests/linux/native_lab_audio.py'" in text
 
 
 @pytest.mark.parametrize("in_use", [False, True])

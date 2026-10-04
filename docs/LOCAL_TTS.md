@@ -1,6 +1,10 @@
 # Local streaming speech
 
-**October 3 startup qualification:** initial metadata, natural-EOF drain,
+The architecture and API below describe the October 4 workspace refactor,
+which has not been deployed. Dated measurements describe earlier releases;
+they do not measure the new room queues or persistent speech transport.
+
+**Historical October 3 startup qualification:** initial metadata, natural-EOF drain,
 cold-music input repairs and the `outputclock1` timing controls are installed.
 Cold idle speech lost its opening words with the Sonos output's automatic PTP
 timing. A controlled temporary NTP comparison preserved the entire phrase
@@ -25,21 +29,32 @@ The optional native macOS worker runs MLX on Apple Silicon. The Linux Shiri
 router, including the Ubuntu VM, handles room selection, speaker preparation,
 playback pacing and mixing. A VM does not provide the worker access to Metal.
 
-For direct PCM, the router establishes its sample calendar once from the room
-AudioWorker's first admitted-frame receipt over private local RPC. Both use the
-same Linux monotonic clock. The receipt's exact marker and integer timestamp
-must fit the first-send/reply interval. Initial dispatch time precedes the
-receiver's stream; reply delay after admission and later stalls still count as
-lateness. The Mac's model clock never sets this playback calendar.
+For direct PCM, the room AudioWorker establishes and paces its sample calendar
+from the first admitted frame. One authenticated admission opens persistent
+binary connections through the broker to that worker. Each frame carries exact
+sequence and sample positions and receives a bounded acknowledgment; it causes
+no new connection or database query. The router verifies the first receipt
+against its send/reply interval using the same Linux monotonic clock. The Mac's
+model clock never sets this playback calendar.
 
-The worker keeps one model loaded in a separate spawned process and warms it
-without playing the warmup audio. Generated mono audio passes through one
+The worker loads the selected model at startup in a separate spawned process,
+warms it without playing the warmup audio, and keeps it resident. A supervisor
+recovers a failed child with bounded retry backoff. Generated mono audio passes through one
 stateful resampler per utterance to become 48 kHz signed 16-bit PCM. The worker
 streams PCM records over its authenticated private HTTP connection; the router
 delivers them in frames of at most 20 ms through the existing room audio runtime.
 The text path does not add the WebRTC speech input's jitter prefetch buffer.
 
-Room backend preparation starts alongside generation. Shiri forwards speech
+Each room has one active reply and two waiting text slots. Different
+rooms play independently while one FIFO inference scheduler safely shares the
+model. Generated audio can accumulate within the existing 60-second duration
+bound, allowing the next room to generate once the decoder resets while the
+previous room is still speaking. An active reply may itself wait for the model.
+Waiting replies in the same room hold text
+only and start in order after its preceding reply retires.
+
+Room backend preparation starts alongside its admitted generation, after any
+model scheduling wait. Queued text does not duck music. Shiri forwards speech
 once both audio and the room backend are ready. First generated audio therefore
 does not establish when a speaker makes sound. Output protocol buffering, a
 sleeping speaker, the generated waveform's leading quiet and network conditions
@@ -229,6 +244,14 @@ require the pinned local assets. The Qwen assets are about 1.7 GB, Kokoro about
 0.33 GB plus voice assets, and Soprano about 0.22 GB. The worker only holds one
 model at a time and applies a 3 GiB MLX allocation limit.
 
+The worker remembers the last successfully selected model in
+`selected-model.json` beside the token file; `--state-file` changes that path.
+On restart the saved selection takes precedence over `--preload`. With no saved
+selection, `--preload` defaults to `kokoro-82m`. Failed model loads do not replace
+the saved successful selection. The selected model remains loaded after normal
+speech and recovers after an unexpected process failure; no continuous
+discarded-inference loop runs while idle.
+
 Configure the router with the Mac's reachable address and a private copy of the
 same worker credential:
 
@@ -260,17 +283,20 @@ In the web interface, open **Speech voices**, choose a model and load it. Run
 opening a room's speakers. A completed measurement has an explicit browser
 preview for listening on the browser's audio device. Use a room's **Speak** button when ready to hear the
 result. The selected room must be enabled and have assigned speakers. **Stop**
-cancels the active job.
+cancels the selected job, including an exact queued reply.
 
-Stopping first retires the exact room speech stream, then waits for the private
-worker's decoder cleanup before releasing the generation slot. Closing its HTTP
-connection alone is insufficient. A bounded read-only readiness check confirms
-worker retirement; it never retries generation or cancels another model job.
+Stopping retires the exact room speech stream and joins that job's decoder
+cleanup if generation is still active. These cleanup operations can overlap.
+Closing generation HTTP alone is insufficient: a bounded read-only readiness
+check observes worker retirement before releasing normal inference ownership.
+Stopping playback after its generation finished cannot cancel the next room's
+generation. Unreachable-worker cleanup is reported as unconfirmed.
 The same owned cleanup survives Stop arriving during natural completion or a
 disconnected cancelling caller. Unconfirmed cleanup is reported explicitly.
 
 Switching models performs a new load and warmup. Speech and quiet measurements
-share one active job slot; changing models during an active job is refused.
+share inference, but different rooms have independent delivery sessions.
+Changing models while any reply is active or waiting is refused.
 
 ## Preparing for an anticipated reply
 
@@ -394,7 +420,9 @@ utterance. A caller should generate it before sending the request:
 }
 ```
 
-Omitted model, voice and language use the documented defaults. `speed` defaults
+Omitted model, voice and language use the documented defaults. Send `model_id`
+explicitly when the resident selection is not Kokoro; omitting it still requests
+`kokoro-82m`. `speed` defaults
 to 1.0 and may vary only for a model advertising speed support. Built-in models
 reject instruction control. Clients select registry IDs, never model URLs,
 weight files or local paths. Encode external room IDs as URL path components.
@@ -406,9 +434,18 @@ software delivery finished; it does not certify that a microphone heard it.
 If the submission response is lost, query the same `request_id`. Repeating the
 same request with the same ID returns the existing job, while changing its text,
 target or options conflicts. Do not immediately send a new ID after a timeout:
-the original utterance may already be playing. Receipts are the latest 32 jobs
-in memory, so this recovery guarantee ends after eviction or a router restart.
+the original utterance may already be playing. At most 32 receipts are retained
+in memory; unfinished jobs are never evicted. This recovery guarantee ends
+after completed-receipt eviction or a router restart.
 An intentional repeat of a completed utterance needs a new ID.
+
+When a room is occupied, up to two additional replies are queued in arrival
+order. Further submissions return a conflict so Nobly can retry deliberately.
+To interrupt, include `"replace_job_id": "<exact active request_id>"` in a new
+text request. The replacement waits for that owner's cleanup, then takes its
+place ahead of existing queued replies. Those queued replies are preserved.
+A stale ID, another room's job, or a queued job cannot be an interruption target.
+Deleting a queued job cancels only that waiting reply. Other rooms continue.
 
 ## Bounds and cancellation
 
@@ -418,27 +455,37 @@ to 180 seconds; model load and prewarm to 120 seconds. The backend defaults to
 The public text API does not expose that token override or the generation
 interval. Reaching a model's token cap is an explicit failure rather than a
 successful truncated utterance. A model may fail on a long request before any
-character or duration bound is reached.
+character or duration bound is reached. These operation budgets exclude room
+and model queue waits. A request for the selected model can also wait up to
+125 seconds for its automatic recovery before generation is admitted.
 
-There is one active generation across rooms and benchmarks. Requests are not
-silently queued behind another utterance. Normal cancellation retains the model
+There is one active generation across rooms and benchmarks, with explicit
+`queued` status and scheduling metrics. Room playback does not hold the model
+slot. Normal cancellation retains the model
 only after the child closes its generator, discards resampler history, resets
 the decoder and acknowledges retirement. The parent keeps one owned pipe reader
 and drains queued old PCM before accepting a successor. An uncertain error or
-missing acknowledgment within two seconds terminates the process; select
-**Load model** again after that fallback. Normal completion also keeps it warm.
+missing acknowledgment within two seconds terminates the process; the supervisor
+reloads and warms the selected model after that fallback. Normal completion
+keeps it warm.
 Stopping drops unsent audio and restores speech ownership, but already delivered
 speaker or protocol buffers can still contain audio briefly.
 
 Completed quiet benchmarks expose an explicit browser audio preview. Preview
 audio never autoplays or selects room speakers. At most 12 MiB of completed
-samples are retained in API memory, plus the one bounded active generation;
+samples are retained in API memory, plus bounded active audio (at most 5.76 MB
+per speaking room and one active quiet measurement, excluding object overhead);
 old samples expire while their job status remains available. Failed, partial,
 cancelled and room-speech jobs do not expose a preview. Restarting the API
 clears this ephemeral history. `GET /api/v1/tts/jobs/{id}/sample.wav` uses the
 same API authentication policy as the job itself.
 
 ## Measured latency and its meaning
+
+The following retained measurements predate the October 4 refactor. Earlier
+router timings began at job execution and used the previous per-frame control
+path; current request-entry metrics include admission and queue waits. These
+records establish no speedup or acoustic result for the new transport.
 
 Private, quiet measurements ran on this Mac's M3 with 8 CPU cores and 16 GiB
 memory while the existing four-vCPU Ubuntu VM was running. Models ran
@@ -480,24 +527,35 @@ and first generation about 0.97 seconds. Kokoro's first generation took about
 asset. Explicit asset installation and silent prewarm keep those steps out of
 normal user speech. File caches, compilation and contention change cold timings.
 
-The following metrics answer different questions:
+Router metrics start when the coordinator receives the accepted text, before
+its admission lock and room lookup. They include waiting behind other replies.
+Generation metrics remain durations from the worker's own clock. The following
+metrics answer different questions:
 
+- `admission_ms`: request entry through exact room and queue admission.
+- `room_queue_wait_ms`: time waiting for this room's earlier replies to retire.
+- `generation_wait_ms`: time waiting for the shared inference slot.
+- `worker_admission_ms`: request entry through the worker accepting generation;
+  includes any selected-model recovery wait.
 - `first_pcm_ms`: generation start to the first normalized PCM emitted.
 - `first_non_silent_pcm_ms`: generation start to emission of the first chunk
   containing samples above the measurement threshold.
 - `leading_silence_ms`: quiet samples at the beginning of the generated waveform,
   using a threshold of −60 dB relative to full scale.
-- `backend_ready_ms`: router job start to confirmation that the room speech
+- `backend_ready_ms`: router request entry to confirmation that the room speech
   backend is connected and its local startup contract completed. This is not
   a receiver clock-lock or acoustic-readiness measurement.
-- `first_worker_pcm_received_ms`: router job start to its first received worker
+- `first_worker_pcm_received_ms`: router request entry to its first received worker
   PCM record, before waiting for the room. Available while generation continues.
 - `received_audio_s`: duration of validated PCM consumed from the worker so far.
 - `delivered_audio_s`: duration accepted by the room so far, or retained in the
   sample for a quiet benchmark. A refused frame does not advance it.
-- `room_admission_ms`: router job start to acceptance of its first room PCM frame.
-- `first_pcm_dispatch_ms`: router job start to sending its first room PCM RPC.
-- `first_pcm_rpc_ms`: elapsed first-frame RPC time, including dispatch and reply.
+- `room_admission_ms`: router request entry to acceptance of its first room PCM frame.
+- `first_pcm_dispatch_ms`: router request entry to sending its first binary PCM frame.
+- `first_pcm_rpc_ms`: retained field name for the first frame's acknowledged
+  round trip on the persistent stream; no new frame RPC connection is opened.
+- `generation_released_ms`: request entry through decoder retirement, after
+  which the next room can generate even if this room is still speaking.
 - `worker_cleanup_confirmed`: whether bounded worker retirement was observed
   before the job became terminal and its generation slot was released.
 - `total_ms`: the full delivery and cleanup duration. Room speech is submitted
@@ -515,8 +573,8 @@ waveform observations for the retained texts and voices, not a guarantee that
 every reply is audible at the first generated chunk.
 
 Generation and router timings have different starting clocks; do not subtract
-or add them as if they were consecutive stages. Generation timing can include
-consumer backpressure during actual paced playback. Use quiet measurements for
+or add them as if they were consecutive stages. Room playback no longer paces
+the worker's generation stream. Use quiet measurements for
 model comparisons and room metrics for delivery diagnosis. An acoustic test
 with room microphones remains necessary to establish heard latency and sync.
 

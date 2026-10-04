@@ -1,8 +1,8 @@
-"""One room's PCM mixer and bounded WebRTC speech receiver.
+"""One room's native music ingress and bounded speech receiver.
 
-OwnTone owns output delivery and synchronization. This process only combines a
-48 kHz ALSA receiver stream with one room-addressed speech stream. It never
-opens network speakers. An absent FIFO reader cannot block the mixer or RPC.
+Music preserves the phone's presentation timeline through a framed FIFO. Speech
+uses a separate late-mix socket; OwnTone owns mixing and final output timing.
+This worker never opens network speakers.
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from array import array
 import asyncio
 import contextlib
 from dataclasses import dataclass, field
-import errno
 import fcntl
 import logging
 import math
@@ -23,185 +22,14 @@ import stat
 import time
 from uuid import uuid4
 
-from shiri.rpc import RpcError, call_rpc, serve_rpc
+from shiri.rpc import AdmissionRefused, RpcError, StreamReply, serve_rpc
+from shiri.speech_stream import MAX_FRAMES as MAX_SPEECH_FRAMES, serve_speech
 from .latency import MINIMUM_LOCAL_OUTPUT_BUFFER_MS
 from .pcm_speech import PcmSpeech
 
 log = logging.getLogger(__name__)
 RATE = 48000
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-
-
-class FifoWriter:
-    """Atomic, nonblocking PCM writes. Drop live audio rather than build backlog."""
-    def __init__(self, path: Path):
-        self.path = path
-        self.fd = None
-        self.written_bytes = 0
-        self.dropped_bytes = 0
-        self.reader_present = False
-        self.packet_bytes = os.pathconf(path, "PC_PIPE_BUF") // 4 * 4
-        if self.packet_bytes < 4:
-            raise RuntimeError("Audio FIFO cannot write atomic stereo frames")
-        if not stat.S_ISFIFO(path.lstat().st_mode):
-            raise RuntimeError("The audio output must be an existing FIFO")
-
-    def close(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-        self.reader_present = False
-
-    def write(self, data: bytes):
-        if self.fd is None:
-            try:
-                self.fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-            except OSError as exc:
-                if exc.errno != errno.ENXIO:
-                    raise
-                self.dropped_bytes += len(data)
-                return
-        # PIPE_BUF-sized writes are atomic. Every packet contains whole stereo
-        # frames, so a full pipe never leaves a partial sample in the stream.
-        if len(data) % 4:
-            raise ValueError("Output PCM must contain complete stereo frames")
-        for start in range(0, len(data), self.packet_bytes):
-            packet = data[start:start + self.packet_bytes]
-            try:
-                count = os.write(self.fd, packet)
-                self.written_bytes += count
-                self.reader_present = True
-            except BlockingIOError:
-                self.dropped_bytes += len(data) - start
-                return
-            except BrokenPipeError:
-                self.close()
-                self.dropped_bytes += len(data) - start
-                return
-
-
-class GstMixer:
-    def __init__(self, capture: str, fifo: Path, *, test_source=False):
-        # Linux system GI is loaded only in this worker, never in API imports.
-        import gi
-        gi.require_version("Gst", "1.0")
-        from gi.repository import Gst
-        Gst.init(None)
-        self.Gst = Gst
-        self.writer = FifoWriter(fifo)
-        self.active = False
-        self.error = None
-        self._speech_end = 0
-        self._gain = 1.0
-        self.pipeline = Gst.Pipeline.new("room-mixer")
-        def element(factory, name, **properties):
-            value = Gst.ElementFactory.make(factory, name)
-            if value is None:
-                raise RuntimeError(f"Missing GStreamer element: {factory}")
-            for key, setting in properties.items():
-                value.set_property(key.replace("_", "-"), setting)
-            self.pipeline.add(value)
-            return value
-        def caps(name, description):
-            return element("capsfilter", name, caps=Gst.Caps.from_string(description))
-        def link(*elements):
-            for before, after in zip(elements, elements[1:], strict=False):
-                if not before.link(after):
-                    raise RuntimeError(f"Could not connect {before.name} to {after.name}")
-        self.mix = element("audiomixer", "mix", ignore_inactive_pads=True, latency=40_000_000,
-                           output_buffer_duration=20_000_000)
-        bed = element("audiotestsrc", "clock-bed", is_live=True, wave=4, samplesperbuffer=960)
-        link(bed, caps("bed-format", "audio/x-raw,format=F32LE,rate=48000,channels=2"), self.mix)
-        source = (element("audiotestsrc", "music-source", is_live=True, wave=0, freq=440,
-                          volume=0.1, samplesperbuffer=960) if test_source else
-                  element("alsasrc", "music-source", device=capture, buffer_time=120000,
-                          latency_time=20000, provide_clock=False))
-        music_queue = element("queue", "music-queue", max_size_time=200_000_000,
-                              max_size_bytes=0, max_size_buffers=0, leaky=2)
-        self.music = element("volume", "music-volume")
-        link(source, caps("music-capture-format", "audio/x-raw,format=S16LE,rate=48000,channels=2"),
-             music_queue, element("audioconvert", "music-convert"),
-             element("audioresample", "music-resample"),
-             caps("music-format", "audio/x-raw,format=F32LE,rate=48000,channels=2"), self.music, self.mix)
-        self.speech = element("appsrc", "speech-source", is_live=True, format=Gst.Format.TIME,
-                              block=False, max_bytes=24000, leaky_type=2,
-                              caps=Gst.Caps.from_string("audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved"))
-        link(self.speech, element("queue", "speech-queue", max_size_time=250_000_000,
-                                 max_size_bytes=0, max_size_buffers=0, leaky=2),
-             element("audioconvert", "speech-convert"), element("audioresample", "speech-resample"),
-             caps("speech-format", "audio/x-raw,format=F32LE,rate=48000,channels=2"), self.mix)
-        sink = element("appsink", "output", emit_signals=True, sync=False, max_buffers=2, drop=True)
-        link(self.mix, element("audioconvert", "output-convert"),
-             caps("output-format", "audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"), sink)
-        sink.connect("new-sample", self._output)
-        self.bus = self.pipeline.get_bus()
-        if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("The room audio pipeline could not start")
-
-    def _output(self, sink):
-        sample = sink.emit("pull-sample")
-        if sample is None:
-            return self.Gst.FlowReturn.EOS
-        if self.active:
-            buffer = sample.get_buffer()
-            try:
-                self.writer.write(buffer.extract_dup(0, buffer.get_size()))
-            except OSError as exc:
-                self.error = f"Audio FIFO write failed: {exc.strerror}"
-                return self.Gst.FlowReturn.ERROR
-        else:
-            self.writer.close()
-        return self.Gst.FlowReturn.OK
-
-    def now_ns(self):
-        clock = self.pipeline.get_clock()
-        if clock is None:
-            return 0
-        return max(0, clock.get_time() - self.pipeline.get_base_time())
-
-    def push_speech(self, data: bytes, samples: int):
-        if samples <= 0 or samples > RATE // 5 or len(data) != samples * 2:
-            raise RpcError("invalid_media", "Speech audio frame has an invalid size")
-        now = self.now_ns()
-        # These are PCM mixer timestamps, not speaker clock corrections.
-        if self._speech_end < now or self._speech_end > now + 250_000_000:
-            self._speech_end = now + 60_000_000
-        buffer = self.Gst.Buffer.new_allocate(None, len(data), None)
-        buffer.fill(0, data)
-        buffer.pts = self._speech_end
-        buffer.duration = samples * self.Gst.SECOND // RATE
-        self._speech_end += buffer.duration
-        result = self.speech.emit("push-buffer", buffer)
-        if result != self.Gst.FlowReturn.OK:
-            raise RpcError("audio_unavailable", "Speech audio pipeline rejected a frame")
-
-    def tick(self, *, music_active: bool, speech_active: bool, duck_gain: float, elapsed: float):
-        self.active = music_active or speech_active
-        target = duck_gain if speech_active else 1.0
-        duration = 0.04 if target < self._gain else 0.25
-        change = elapsed / duration
-        self._gain = min(target, self._gain + change) if target > self._gain else max(target, self._gain - change)
-        self.music.set_property("volume", self._gain)
-        while True:
-            message = self.bus.pop_filtered(self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS)
-            if message is None:
-                break
-            if message.type == self.Gst.MessageType.ERROR:
-                err, _debug = message.parse_error()
-                self.error = str(err)
-            else:
-                self.error = "Audio pipeline ended unexpectedly"
-        if self.error:
-            raise RuntimeError(self.error)
-
-    def health(self):
-        return {"ready": self.error is None, "audio_active": self.active, "music_gain": self._gain,
-                "fifo_reader": self.writer.reader_present, "written_bytes": self.writer.written_bytes,
-                "dropped_bytes": self.writer.dropped_bytes, "error": self.error}
-
-    def close(self):
-        self.pipeline.set_state(self.Gst.State.NULL)
-        self.writer.close()
 
 
 @dataclass(eq=False)
@@ -262,6 +90,8 @@ class AudioWorker:
         return float(gain)
 
     async def dispatch(self, operation, payload):
+        if operation == "speech-stream":
+            return await self.open_speech(payload)
         if operation == "warm":
             return await self.warm(payload)
         if operation == "health":
@@ -289,23 +119,12 @@ class AudioWorker:
             if set(payload) != {"revision"}:
                 raise RpcError("invalid_request", "Control intent requires an exact room revision")
             return self.native.control_intent(payload["revision"])
-        if operation == "music":
-            if self.native:
-                raise RpcError("invalid_request", "Native music activity requires an exact admitted producer token")
-            if type(payload.get("active")) is not bool:
-                raise RpcError("invalid_request", "Music activity must be a boolean")
-            self.music_active = payload["active"]
-            return {"ok": True}
         if operation != "speech":
             raise RpcError("invalid_request", "Unknown audio operation")
         gain = self.identity(payload)
         action = payload.get("action", "offer")
         if action == "offer":
             return await self.offer(payload, gain)
-        if action == "prepare-pcm":
-            return await self.prepare_pcm(payload, gain)
-        if action in {"pcm", "finish"}:
-            return await self.direct_pcm(payload)
         if action not in {"control", "close"}:
             raise RpcError("invalid_request", "Unknown speech action")
         async with self._lock:
@@ -313,9 +132,7 @@ class AudioWorker:
             if current is not None and current.session_id != payload["session_id"]:
                 raise RpcError("session_conflict", "Another speech producer owns this room")
             if current is not None and current.pcm is not None:
-                if current.request_id != payload["request_id"]:
-                    raise RpcError("session_conflict", "Direct speech requires its exact request identity")
-                current.pcm.identity(payload)
+                raise RpcError("session_conflict", "Generated speech is owned by its admitted binary connection")
             if action == "control" and current is None:
                 raise RpcError("not_found", "This speech session does not exist")
             if action == "control" and current:
@@ -454,14 +271,8 @@ class AudioWorker:
                 raise RpcError("audio_unavailable", "The audio worker cannot admit another speech producer")
             if self._disposals:
                 raise RpcError("audio_unavailable", "Earlier speech retirement is still being observed")
-            old = self.session
-            if old is not None:
-                if (old.session_id != payload["session_id"] or old.request_id != payload["request_id"]
-                        or old.pcm is None or old.duck_on_prepare != duck_on_prepare):
-                    raise RpcError("session_conflict", "Another speech producer owns this room")
-                if old.answer is not None:
-                    return old.answer
-                raise RpcError("conflict", "This direct speech stream is still preparing")
+            if self.session is not None:
+                raise AdmissionRefused("session_conflict", "Another speech producer owns this room")
             current = SpeechSession(payload["session_id"], payload["request_id"], None, gain,
                                     negotiation=asyncio.current_task(), pcm=PcmSpeech(),
                                     duck_on_prepare=duck_on_prepare)
@@ -497,7 +308,57 @@ class AudioWorker:
             await self._release(current, wait=not isinstance(exc, asyncio.CancelledError))
             raise
 
-    async def direct_pcm(self, payload):
+    async def open_speech(self, payload):
+        try:
+            gain = self.identity(payload)
+        except RpcError as exc:
+            raise AdmissionRefused(exc.code, str(exc)) from exc
+        try:
+            prepared = await self.prepare_pcm(payload, gain)
+        except RpcError as exc:
+            # prepare_pcm joins its exact retirement on ordinary errors. Only
+            # a clean owner boundary proves that admission owns no resources;
+            # a failed disposal deliberately carries no such assurance.
+            if self.session is None and not self._disposals and self._cleanup_error is None:
+                raise AdmissionRefused(exc.code, str(exc)) from exc
+            raise
+        current = self.session
+        identity = {"session_id": prepared["session_id"], "request_id": prepared["request_id"],
+                    "stream_id": prepared["stream_id"]}
+        worker = self
+
+        class AdmittedSpeech:
+            async def send_pcm(self, pcm, sequence, frame_index):
+                if (not isinstance(pcm, bytes) or not 0 < len(pcm) <= 1920 or len(pcm) % 2
+                        or type(sequence) is not int or type(frame_index) is not int
+                        or frame_index < 0 or frame_index + len(pcm)//2 > MAX_SPEECH_FRAMES):
+                    raise RpcError("invalid_media", "Speech exceeds its admitted audio duration")
+                if worker.session is not current:
+                    raise RpcError("session_conflict", "The admitted speech stream has retired")
+                stream = current.pcm
+                if sequence != stream.sequence + 1 or frame_index != stream.frames:
+                    raise RpcError("invalid_media", "Speech sequence or frame position does not match")
+                if stream.first_admitted_ns is not None:
+                    target_ns = stream.first_admitted_ns + frame_index * 1_000_000_000 // RATE
+                    await asyncio.sleep(max(0, target_ns - time.monotonic_ns()) / 1e9)
+                    if time.monotonic_ns() - target_ns > 150_000_000:
+                        raise RpcError("media_underrun", "Speech missed its admitted sample calendar")
+                return await worker.direct_pcm({**identity, "action": "pcm", "sequence": sequence,
+                                                "frame_index": frame_index}, data=pcm)
+
+            async def finish(self, final_sequence, final_frame_index):
+                return await worker.direct_pcm({**identity, "action": "finish",
+                                                "final_sequence": final_sequence,
+                                                "final_frame_index": final_frame_index})
+
+            async def close(self):
+                await worker._release(current)
+                return {"ok": True, "closed": True, **current.pcm.receipt()}
+
+        session = AdmittedSpeech()
+        return StreamReply(prepared, lambda reader, writer: serve_speech(reader, writer, session), session.close)
+
+    async def direct_pcm(self, payload, *, data=None):
         failure = None
         async with self._lock:
             current = self.session
@@ -514,7 +375,7 @@ class AudioWorker:
                 result = {"ok": True, "finished": True, **current.pcm.receipt()}
             else:
                 try:
-                    data, samples, now, next_ns, audible = current.pcm.decode(payload)
+                    data, samples, now, next_ns, audible = current.pcm.decode(payload, data=data)
                     preparation = self.mixer.speech_preparation
                     if (preparation is None or preparation.identity is not current or preparation.retired
                             or preparation.phase != "ready" or not preparation.owned()):
@@ -570,7 +431,7 @@ class AudioWorker:
                 raise RpcError("audio_unavailable", "Earlier speech retirement is still being observed; retry after cleanup")
             old = self.session
             if old:
-                if old.session_id != payload["session_id"]:
+                if old.session_id != payload["session_id"] or old.pcm is not None:
                     raise RpcError("session_conflict", "Another speech producer owns this room")
                 if old.request_id == payload["request_id"]:
                     if old.answer is not None:
@@ -766,24 +627,32 @@ class AudioWorker:
             task.exception()
 
     async def _close_resources(self):
-        if self._warm_expiry_task is not None:
-            self._warm_expiry_task.cancel()
-            await asyncio.gather(self._warm_expiry_task, return_exceptions=True)
-        async with self._warm_lock:
-            if self._warm_deadlines:
-                self._warm_deadlines.clear()
-                await self._release_warm_aggregate()
+        async with contextlib.AsyncExitStack() as cleanup:
+            cleanup.callback(self.mixer.close)
+            # A missing warm-release acknowledgement must remain visible,
+            # but cannot abandon independent speech/native resources.
+            cleanup.push_async_callback(self._close_media_resources)
+            if self._warm_expiry_task is not None:
+                self._warm_expiry_task.cancel()
+                await asyncio.gather(self._warm_expiry_task, return_exceptions=True)
+            async with self._warm_lock:
+                if self._warm_deadlines:
+                    self._warm_deadlines.clear()
+                    await self._release_warm_aggregate()
+
+    async def _close_media_resources(self):
         async with self._lock:
             current, self.session = self.session, None
-        if current:
-            self._start_disposal(current)
-        if self.native:
-            self._native_cleanup = asyncio.create_task(self.native.close(), name="room-native-cleanup")
-            self._native_cleanup.add_done_callback(self._observe_cleanup)
-        tasks = set(self._disposals)
-        if self._native_cleanup:
-            tasks.add(self._native_cleanup)
         try:
+            if current:
+                self._start_disposal(current)
+        finally:
+            if self.native:
+                self._native_cleanup = asyncio.create_task(self.native.close(), name="room-native-cleanup")
+                self._native_cleanup.add_done_callback(self._observe_cleanup)
+            tasks = set(self._disposals)
+            if self._native_cleanup:
+                tasks.add(self._native_cleanup)
             if tasks:
                 _done, pending = await asyncio.wait(tasks, timeout=self._cleanup_timeout)
                 if pending:
@@ -791,14 +660,9 @@ class AudioWorker:
                     raise RpcError("audio_unavailable", self._cleanup_error)
                 for task in tasks:
                     task.result()
-        finally:
-            self.mixer.close()
 
 
 async def run(args):
-    if args.signal:
-        await call_rpc(args.socket, "music", {"active": args.signal == "music-start"}, timeout=3)
-        return
     directory = Path(args.room_dir)
     fifo = directory / "pipes" / "audio.pipe"
     # Broker ownership prevents duplicate workers; this lock also protects the
@@ -814,48 +678,47 @@ async def run(args):
     mixer = None
     speech_output = None
     try:
-        if args.native:
-            import json
-            from .backend import OwnToneClient
-            from .native import NativeController, NativeMixer
-            from .speech_output import SpeechOutput
-            credential_fd = os.open(args.own_password_file, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                info = os.fstat(credential_fd)
-                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4096
-                        or info.st_uid not in {0, os.getuid()} or stat.S_IMODE(info.st_mode) & 0o007):
-                    raise RuntimeError("OwnTone worker credential is not an owned private regular file")
-                with os.fdopen(credential_fd, closefd=False) as credential:
-                    password = json.load(credential).get("password")
-                if not isinstance(password, str) or not 16 <= len(password) <= 256:
-                    raise RuntimeError("OwnTone worker credential is invalid")
-            finally:
-                os.close(credential_fd)
-            client = OwnToneClient(args.own_url, password=password)
-            speech_output = SpeechOutput(Path(args.speech_socket), args.room_id,
-                                         args.speech_launch_generation, args.output_uid)
-            speech_output.open()
-            mixer = NativeMixer(fifo, speech_output=speech_output,
-                                relay_delay_ns=args.relay_delay_ms*1_000_000,
-                                output_buffer_ms=args.output_buffer_ms)
-            native = NativeController(args.room_id, mixer, client, control_revision=args.control_revision, control_volume=args.control_volume)
-            await native.initialize()
-            await native.listen(Path(args.native_socket or directory / "input" / "music.sock"),
-                                native_uid=args.native_uid, mode=0o660)
-            if args.signal_socket:
-                await native.start_volume_bridge(args.signal_socket, args.signal_generation)
-        else:
-            mixer = GstMixer(args.capture, fifo, test_source=args.test_source)
+        import json
+        from .backend import OwnToneClient
+        from .native import NativeController, NativeMixer
+        from .speech_output import SpeechOutput
+        credential_fd = os.open(args.own_password_file, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(credential_fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4096
+                    or info.st_uid not in {0, os.getuid()} or stat.S_IMODE(info.st_mode) & 0o007):
+                raise RuntimeError("OwnTone worker credential is not an owned private regular file")
+            with os.fdopen(credential_fd, closefd=False) as credential:
+                password = json.load(credential).get("password")
+            if not isinstance(password, str) or not 16 <= len(password) <= 256:
+                raise RuntimeError("OwnTone worker credential is invalid")
+        finally:
+            os.close(credential_fd)
+        client = OwnToneClient(args.own_url, password=password)
+        speech_output = SpeechOutput(Path(args.speech_socket), args.room_id,
+                                     args.speech_launch_generation, args.output_uid)
+        speech_output.open()
+        mixer = NativeMixer(fifo, speech_output=speech_output,
+                            relay_delay_ns=args.relay_delay_ms*1_000_000,
+                            output_buffer_ms=args.output_buffer_ms)
+        native = NativeController(args.room_id, mixer, client, control_revision=args.control_revision, control_volume=args.control_volume)
+        await native.initialize()
+        await native.listen(Path(args.native_socket or directory / "input" / "music.sock"),
+                            native_uid=args.native_uid, mode=0o660)
+        if args.signal_socket:
+            await native.start_volume_bridge(args.signal_socket, args.signal_generation)
     except BaseException:
-        if native:
-            await native.close()
-        if mixer:
-            mixer.close()
-        elif speech_output:
-            speech_output.close()
-        if client:
-            await client.close()
-        os.close(lock_fd)
+        # Unwind every acquired resource even if an earlier close fails.
+        async with contextlib.AsyncExitStack() as cleanup:
+            cleanup.callback(os.close, lock_fd)
+            if client:
+                cleanup.push_async_callback(client.close)
+            if mixer:
+                cleanup.callback(mixer.close)
+            elif speech_output:
+                cleanup.callback(speech_output.close)
+            if native:
+                cleanup.push_async_callback(native.close)
         raise
     worker = AudioWorker(mixer, native=native)
     stop = asyncio.Event()
@@ -872,28 +735,28 @@ async def run(args):
             await worker.tick(now - last)
             last = now
             try:
-                await asyncio.wait_for(stop.wait(), timeout=0.01)
+                await asyncio.wait_for(stop.wait(), timeout=0.1)
             except asyncio.TimeoutError:
                 pass
     finally:
-        if server:
-            server.close()
-            await server.wait_closed()
-        await worker.close()
-        if client:
-            await client.close()
-        os.close(lock_fd)
-        if server:
-            with contextlib.suppress(FileNotFoundError):
-                Path(args.socket).unlink()
+        async with contextlib.AsyncExitStack() as cleanup:
+            # Release the worker lock last, after unlinking its endpoint. A
+            # successor can then bind without an old cleanup removing it.
+            cleanup.callback(os.close, lock_fd)
+            if client:
+                cleanup.push_async_callback(client.close)
+            if server:
+                cleanup.callback(Path(args.socket).unlink, missing_ok=True)
+            cleanup.push_async_callback(worker.close)
+            if server:
+                server.close()
+                await server.wait_closed()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", required=True)
-    parser.add_argument("--room-dir")
-    parser.add_argument("--capture")
-    parser.add_argument("--native", action="store_true", help="Preserve native receiver timing through framed PCM")
+    parser.add_argument("--room-dir", required=True)
     parser.add_argument("--room-id")
     parser.add_argument("--native-socket")
     parser.add_argument("--native-uid", type=int)
@@ -908,26 +771,18 @@ def main():
     parser.add_argument("--signal-generation")
     parser.add_argument("--control-revision", type=int, default=1)
     parser.add_argument("--control-volume", type=int, default=50)
-    parser.add_argument("--signal", choices=["music-start", "music-stop"])
-    parser.add_argument("--test-source", action="store_true", help="Use a test oscillator instead of ALSA")
     args = parser.parse_args()
-    if not args.signal:
-        if not args.room_dir:
-            parser.error("--room-dir is required for a worker")
-        if args.native:
-            if (not args.room_id or args.native_uid is None or args.native_uid < 0
-                    or not args.own_url or not args.own_password_file
-                    or not args.speech_socket or not args.speech_launch_generation
-                    or args.output_uid is None or args.output_uid <= 0
-                    or args.output_buffer_ms is None or not MINIMUM_LOCAL_OUTPUT_BUFFER_MS <= args.output_buffer_ms <= 4250
-                    or args.relay_delay_ms is None or not args.output_buffer_ms <= args.relay_delay_ms <= 10000):
-                parser.error("Native mode requires exact music and speech endpoints, identities and bounded timing")
-            if not 0 <= args.control_volume <= 100:
-                parser.error("Control volume must be between zero and one hundred")
-            if args.control_revision < 1 or bool(args.signal_socket) != bool(args.signal_generation):
-                parser.error("Native signals require both socket and generation, with a positive control revision")
-        elif not args.capture:
-            parser.error("--capture is required for the legacy ALSA worker")
+    if (not args.room_id or args.native_uid is None or args.native_uid < 0
+            or not args.own_url or not args.own_password_file
+            or not args.speech_socket or not args.speech_launch_generation
+            or args.output_uid is None or args.output_uid <= 0
+            or args.output_buffer_ms is None or not MINIMUM_LOCAL_OUTPUT_BUFFER_MS <= args.output_buffer_ms <= 4250
+            or args.relay_delay_ms is None or not args.output_buffer_ms <= args.relay_delay_ms <= 10000):
+        parser.error("Audio requires exact music and speech endpoints, identities and bounded timing")
+    if not 0 <= args.control_volume <= 100:
+        parser.error("Control volume must be between zero and one hundred")
+    if args.control_revision < 1 or bool(args.signal_socket) != bool(args.signal_generation):
+        parser.error("Native signals require both socket and generation, with a positive control revision")
     logging.basicConfig(level=logging.INFO)
     asyncio.run(run(args))
 

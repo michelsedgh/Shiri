@@ -24,7 +24,7 @@ class Settings:
     trusted_proxy_ips: str = "127.0.0.1,::1"
     tts_worker_url: str | None = None
     tts_worker_token_file: Path | None = None
-    speaker_readiness: str = "adaptive"
+    speaker_readiness: str = "ready"
 
     def __post_init__(self):
         if type(self.speaker_readiness) is not str or self.speaker_readiness not in {"adaptive", "ready", "on_demand"}:
@@ -79,7 +79,7 @@ class Settings:
             tts_worker_url=os.environ.get("SHIRI_TTS_WORKER_URL") or None,
             tts_worker_token_file=(Path(os.environ["SHIRI_TTS_WORKER_TOKEN_FILE"])
                                    if os.environ.get("SHIRI_TTS_WORKER_TOKEN_FILE") else None),
-            speaker_readiness=os.environ.get("SHIRI_SPEAKER_READINESS", "adaptive"),
+            speaker_readiness=os.environ.get("SHIRI_SPEAKER_READINESS", "ready"),
         )
 
 

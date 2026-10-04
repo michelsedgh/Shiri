@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import dbus_next.aio
 from dbus_next import MessageType
+from anyio import CancelScope
 import httpx
 import pytest
 
@@ -38,6 +39,57 @@ async def test_pending_child_is_cancelled_and_joined_before_caller_cancellation_
     with pytest.raises(asyncio.CancelledError):
         await caller
     assert caller.cancelled() and finished.is_set()
+
+
+@pytest.mark.parametrize("cancellation", ["scope", "repeated_task"])
+async def test_caller_cancellation_cannot_interrupt_owned_child_cleanup(cancellation):
+    entered, retiring, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    retired = []
+    resource = object()
+    scope = None
+
+    async def child():
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            retiring.set()
+            await release.wait()
+            return resource
+
+    async def own():
+        nonlocal scope
+        if cancellation == "scope":
+            with CancelScope() as scope:
+                await bounded(child(), 1, abandoned=retired.append)
+        else:
+            await bounded(child(), 1, abandoned=retired.append)
+
+    caller = asyncio.create_task(own())
+    try:
+        await entered.wait()
+        if cancellation == "scope":
+            scope.cancel()
+        else:
+            caller.cancel()
+        await retiring.wait()
+        if cancellation == "repeated_task":
+            caller.cancel()
+        # Give the join and level-triggered cancellation several turns while
+        # the resource's actual retirement is still deliberately blocked.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not caller.done() and retired == []
+        release.set()
+        if cancellation == "scope":
+            await caller
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        assert retired == [resource]
+    finally:
+        release.set()
+        await asyncio.gather(caller, return_exceptions=True)
 
 
 async def test_same_turn_completed_result_is_abandoned_on_cancel_before_acceptance():
@@ -292,7 +344,7 @@ async def test_cancelled_readiness_offer_retires_exact_peer_and_cannot_control_s
     previous, caller, retiring = client.request, None, {}
     async def request(method, path, *, json):
         reply = await previous(method, path, json=json)
-        if not retiring and path == '/api/player/shiri-speech-ready' and json['action'] in {'ready', 'observe'}:
+        if not retiring and path == '/api/player/shiri-speech-ready' and json['action'] == 'begin':
             retiring.update(session=worker.session, preparation=native.mixer.speech_preparation)
             asyncio.get_running_loop().call_soon(caller.cancel)
         return reply

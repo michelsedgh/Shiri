@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Manual two-zone native-clock / API speech check; never runs under pytest.
 
-Run only in the known empty b265 Linux candidate, supervised by an external
+Run only in an explicitly admitted disposable native lab, supervised by an external
 whole-process watchdog. It opens Loopback sub7 in both directions, selects
 ONLY the corresponding virtual local0 outputs, and never opens sub0 or sub2.
 Synthetic native SOCK_SEQPACKET producers run in exact receiver-UID units.
@@ -61,6 +61,7 @@ from shiri.rpc import call_rpc
 from shiri.runtime.broker import Broker
 from shiri.runtime.layout import directory, file_owner
 from shiri.runtime.system import RuntimeFailure, atomic_json, process_birth, root_directory
+from shiri.runtime.latency import latency_plan
 from shiri.runtime.timing import Clock, FLAG_AIRPLAY2, FLAG_GROUP_LEADER, Kind, Packet, RATE, RELAY_DELAY_NS
 from shiri.runtime.units import Bind, VIEW
 from shiri.settings import Settings
@@ -96,7 +97,7 @@ _probe_spec.loader.exec_module(kernel_probe)
 _lan_spec = importlib.util.spec_from_file_location('native_group_isolated_lan', HERE.with_name('isolated_group_lan.py'))
 isolated_lan = importlib.util.module_from_spec(_lan_spec)
 _lan_spec.loader.exec_module(isolated_lan)
-_spec = importlib.util.spec_from_file_location('native_group_observation', HERE.with_name('check_airplay_api_tts.py'))
+_spec = importlib.util.spec_from_file_location('native_group_observation', HERE.with_name('native_lab_observation.py'))
 observation = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(observation)
 _evidence_spec = importlib.util.spec_from_file_location('native_group_failure_evidence', HERE.with_name('group_failure_evidence.py'))
@@ -126,14 +127,6 @@ class FrozenWorkerTiming(NamedTuple):
 
 
 @lru_cache(maxsize=1)
-def load_legacy_profile_module():
-    spec = importlib.util.spec_from_file_location('native_group_legacy_profile', HERE.with_name('native_group_legacy_profile.py'))
-    profile = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(profile)
-    return profile
-
-
-@lru_cache(maxsize=1)
 def load_minimum_coverage_module():
     spec = importlib.util.spec_from_file_location('native_group_minimum_coverage', HERE.with_name('native_minimum_coverage.py'))
     module = importlib.util.module_from_spec(spec)
@@ -143,18 +136,17 @@ def load_minimum_coverage_module():
 
 
 def candidate_worker_timing(definitions, healths):
-    # This baseline measures the historical H1000/B500 experiment, whose
-    # actual broker/config binding is explicit below, independently of defaults.
+    # Freeze the production route policy before any source or PCM exists.
     try:
-        plan = load_legacy_profile_module().plan(definitions)
+        plan = latency_plan(definitions)
     except ValueError as exc:
         raise RuntimeFailure('Candidate worker plan has invalid saved definitions') from exc
     enabled = [room for room in definitions if room.enabled]
     require(len(enabled) == 2 and set(healths) == {room.id for room in enabled}
             and all(room.speakers and all(speaker.offset_ms == 0 for speaker in room.speakers)
                     for room in enabled), 'Candidate first baseline requires exactly two selected zero-offset rooms')
-    require(plan.common_horizon_ms == 1000 and all(room.output_buffer_ms == 500 for room in plan.rooms),
-            'Candidate first baseline requires the explicit H1000/B500 plan')
+    require(plan.common_horizon_ms == 140 and all(room.output_buffer_ms == 40 for room in plan.rooms),
+            'Candidate first baseline requires the production H140/B40 plan')
     for room in plan.rooms:
         health = healths[room.room_id]
         require(isinstance(health, dict) and {'ready', 'error', 'source'} <= health.keys()
@@ -532,8 +524,6 @@ async def hold_bluetooth_receiver_after_end(config, connection, path, state, sto
 async def producer(config_path):
     """Receiver credentials are set by the owned unit, never by a root socket."""
     config = json.loads(Path(config_path).read_text())
-    if 'music_startup' in config:
-        return await load_music_module().producer(config, globals())
     if 'music_minimum' in config:
         return await load_minimum_music_module().producer(config, globals())
     if 'music_soak' in config:
@@ -543,16 +533,9 @@ async def producer(config_path):
             'Producer duration must be the explicit90s baseline,180s fault,420s stress or480s latency bound')
     require(os.geteuid() == config['uid'] != 0 and os.getegid() == config['gid'], 'Producer credential mismatch')
     expected_lead = 220_000_000 if config.get('leader') is True else 80_000_000
-    candidate_timing = config.get('candidate_timing')
-    candidate_adverse = (candidate_timing == {'horizon_ms': 1000, 'buffer_ms': 500}
-                         and duration == 480 and config.get('leader') is True
-                         and config.get('arrival_lead_ns') == -750_000_000)
-    require(candidate_timing is None or candidate_adverse,
-            'Producer candidate timing must be its exact declared H1/B500 adverse case')
     require(type(config.get('leader')) is bool and type(config.get('arrival_lead_ns')) is int
-            and (config['arrival_lead_ns'] == expected_lead or duration == 480
-                 and config['leader'] and config['arrival_lead_ns'] == -1_950_000_000 or candidate_adverse),
-            'Producer arrival lead must be its declared baseline or explicit adverse latency case')
+            and config['arrival_lead_ns'] == expected_lead,
+            'Producer arrival lead must be its declared route timing')
     path = Path(config['status'])
     command = Path(config['command'])
     stop = asyncio.Event()
@@ -740,8 +723,7 @@ async def launch_api(path, settings, account, group, *, interface='enp0s1'):
 class Capture(observation.OutputCapture):
     """Same proven continuity observer, with common absolute Gst clock anchors."""
     def __init__(self, device, shared_clock, base_time_ns, clock_offset_ns):
-        super().__init__(start=False)
-        self.source.set_property('device', device)
+        super().__init__(device, start=False)
         # This fixed native fixture can start observing before OwnTone opens
         # playback. Pin its declared 48k contract so an otherwise unconstrained
         # capture cannot lock the shared Loopback pair at ALSA's 44.1k default.
@@ -1282,17 +1264,8 @@ def record_group_alignment(report, series, *, frame_continuity=None):
 
 
 def legacy_snapshot():
-    if NATIVE_LAB is not None:
-        return NATIVE_LAB.protected_snapshot()
-    birth = process_birth(2444)
-    require(birth is not None, 'Known legacy PID2444 is absent; refuse this hardware scope')
-    status = {f'{direction}/sub{slot}': Path(f'/proc/asound/Loopback/{direction}/sub{slot}/status').read_text()
-              for direction in ('pcm0p', 'pcm0c', 'pcm1p', 'pcm1c') for slot in (0, 2)}
-    # Dynamic hw_ptr counters are not a configuration identity. Retain exact
-    # owner_pid/state fields while avoiding a false change as legacy music moves.
-    stable = {key: '\n'.join(line for line in text.splitlines() if line.split(':', 1)[0].strip() in {'state', 'owner_pid'})
-              if text.strip() != 'closed' else 'closed' for key, text in status.items()}
-    return {'pid': 2444, 'birth': birth, 'slot0_2_owner_state': stable}
+    require(NATIVE_LAB is not None, 'An explicit native lab profile is required before hardware observation')
+    return NATIVE_LAB.protected_snapshot()
 
 
 async def verify_original_receiver(broker, state, original, expected, pid, birth, held_cgroup, *, stopped=False):
@@ -1348,7 +1321,7 @@ async def verify_original_receiver(broker, state, original, expected, pid, birth
 
 
 async def launch_producer(broker, state, root, common_start_ns, *, duration_seconds=MAX_DURATION,
-                          arrival_lead_ns=None, frozen_timing=None, music_startup=False, music_minimum=False, music_soak=False,
+                          arrival_lead_ns=None, frozen_timing=None, music_minimum=False, music_soak=False,
                           bluetooth_receiver_idle=False):
     # Preparation only: the original receiver must be idle and its exact unit
     # must stop before its canonical reservation can be replaced. An arbitrary
@@ -1357,12 +1330,12 @@ async def launch_producer(broker, state, root, common_start_ns, *, duration_seco
     require(type(duration_seconds) is int and (duration_seconds in {MAX_DURATION, 180, 420, 480}
             or music_soak is True and duration_seconds == 1830),
             'Refuse an undeclared native producer duration before replacement')
-    require(all(type(mode) is bool for mode in (music_startup, music_minimum, music_soak))
-            and sum((music_startup, music_minimum, music_soak)) <= 1, 'Music experiment admission must be exclusive boolean')
+    require(all(type(mode) is bool for mode in (music_minimum, music_soak))
+            and sum((music_minimum, music_soak)) <= 1, 'Music experiment admission must be exclusive boolean')
     require(type(bluetooth_receiver_idle) is bool and (not bluetooth_receiver_idle or (
         duration_seconds == 180 and state.desired.id == A and state.bluetooth_admission is not None
         and isinstance(state.desired.local_audio_device, str) and state.desired.local_audio_device.startswith('bluealsa:DEV=')
-        and not any((music_startup, music_minimum, music_soak)) and frozen_timing is None
+        and not any((music_minimum, music_soak)) and frozen_timing is None
         and type(common_start_ns) is int and common_start_ns == 0 and arrival_lead_ns is None
     )), 'Idle receiver hold requires only the exact descriptor-backed Bluetooth A fixture')
     if music_soak:
@@ -1371,21 +1344,11 @@ async def launch_producer(broker, state, root, common_start_ns, *, duration_seco
     if music_minimum:
         load_minimum_music_module().admit_launch(state.desired, duration_seconds, common_start_ns, arrival_lead_ns,
                                                  frozen_timing, FrozenWorkerTiming, lab=NATIVE_LAB)
-    if music_startup:
-        load_music_module().admit_launch(state.desired, duration_seconds, common_start_ns, arrival_lead_ns,
-                                         frozen_timing, FrozenWorkerTiming, lab=NATIVE_LAB)
     baseline_lead = 220_000_000 if state.desired.id == A else 80_000_000
     if arrival_lead_ns is None:
         arrival_lead_ns = baseline_lead
-    candidate_adverse = duration_seconds == 480 and state.desired.id == A and arrival_lead_ns == -750_000_000
-    if candidate_adverse:
-        require(NATIVE_LAB is not None and type(frozen_timing) is FrozenWorkerTiming
-                and frozen_timing.horizon_ns == 1_000_000_000
-                and frozen_timing.buffers_ms == tuple((identifier, 500) for identifier in sorted((A, B))),
-                'Refuse undeclared candidate adverse lead without its measured frozen lab plan')
     require(type(arrival_lead_ns) is int and (arrival_lead_ns == baseline_lead
-            or duration_seconds == 480 and state.desired.id == A and arrival_lead_ns == -1_950_000_000
-            or candidate_adverse or music_startup or music_minimum or music_soak),
+            or music_minimum or music_soak),
             'Refuse undeclared native arrival lead before replacement')
     original = state.processes.get('shairport')
     require(original is not None, 'Original receiver is missing; refuse synthetic replacement')
@@ -1399,16 +1362,6 @@ async def launch_producer(broker, state, root, common_start_ns, *, duration_seco
     try:
         await verify_original_receiver(broker, state, original, expected, pid, birth, held_cgroup)
         health = await call_rpc(broker._worker_socket(state), 'health', {}, timeout=2)
-        if candidate_adverse:
-            require(isinstance(health, dict) and {'ready', 'error', 'source'} <= health.keys()
-                    and health['ready'] is True and health['error'] is None
-                    and isinstance(health['source'], dict) and {'ready', 'owner'} <= health['source'].keys()
-                    and health['source']['ready'] is True and health['source']['owner'] is None
-                    and type(health.get('timing_relay_delay_ms')) is int and health['timing_relay_delay_ms'] == 1000
-                    and type(health.get('output_buffer_ms')) is int and health['output_buffer_ms'] == 500,
-                    'Candidate adverse receiver lost ready source or actual worker timing before its exact stop')
-        if music_startup:
-            load_music_module().require_idle_worker(health)
         if music_minimum:
             load_minimum_music_module().require_idle_worker(health)
         if music_soak:
@@ -1432,14 +1385,10 @@ async def launch_producer(broker, state, root, common_start_ns, *, duration_seco
         'group': GROUP, 'common_start_ns': common_start_ns,
         'arrival_lead_ns': arrival_lead_ns,
         'wide_bracket': state.desired.id == B, 'leader': state.desired.id == A}
-    if music_startup:
-        producer_config['music_startup'] = load_music_module().PRODUCER_PROFILE
     if music_minimum:
         producer_config['music_minimum'] = load_minimum_music_module().PRODUCER_PROFILE
     if music_soak:
         producer_config['music_soak'] = load_soak_module().producer_profile()
-    if candidate_adverse:
-        producer_config['candidate_timing'] = {'horizon_ms': 1000, 'buffer_ms': 500}
     if duration_seconds != MAX_DURATION:
         producer_config['duration_seconds'] = duration_seconds
     if bluetooth_receiver_idle:
@@ -1504,19 +1453,6 @@ async def enrollment(api, device):
     return reply['device']
 
 
-_music_module = None
-
-
-def load_music_module():
-    global _music_module
-    if _music_module is None:
-        spec = importlib.util.spec_from_file_location('native_group_music_startup', HERE.with_name('native_music_startup.py'))
-        _music_module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = _music_module
-        spec.loader.exec_module(_music_module)
-    return _music_module
-
-
 _epoch_module = None
 
 
@@ -1570,22 +1506,22 @@ def epoch_result_path(value):
     return path
 
 
-async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_stress=False, zone_faults=False, latency_probe=False, latency_epoch=None, latency_result=None, finite_speech=False, music_startup=False, music_minimum=False, music_soak=False, soak_buffer_ms=None, soak_horizon_ms=None, minimum_policy=False):
-    require(all(type(mode) is bool for mode in (speech_stress, zone_faults, latency_probe, finite_speech, music_startup, music_minimum, music_soak)),
+async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_stress=False, zone_faults=False, latency_epoch=None, latency_result=None, finite_speech=False, music_minimum=False, music_soak=False, soak_buffer_ms=None, soak_horizon_ms=None, minimum_policy=False):
+    require(all(type(mode) is bool for mode in (speech_stress, zone_faults, finite_speech, music_minimum, music_soak)),
             'Speech stress, zone faults and latency probe must be explicit boolean modes')
-    require(sum((speech_stress, zone_faults, latency_probe, latency_epoch is not None, music_startup, music_minimum, music_soak)) <= 1,
+    require(sum((speech_stress, zone_faults, latency_epoch is not None, music_minimum, music_soak)) <= 1,
             'Speech stress, zone faults and latency probe are mutually exclusive')
-    require(not finite_speech or (latency_epoch is not None and not any((speech_stress, zone_faults, latency_probe))),
+    require(not finite_speech or (latency_epoch is not None and not any((speech_stress, zone_faults))),
             'Finite speech requires its separate explicit prepared epoch')
     require(music_soak or soak_buffer_ms is None and soak_horizon_ms is None, 'Soak timing arguments require explicit soak mode')
     require(type(minimum_policy) is bool and (not minimum_policy or NATIVE_LAB is not None
-            and not any((latency_probe, latency_epoch is not None, finite_speech, music_startup, music_minimum, music_soak))),
+            and not any((latency_epoch is not None, finite_speech, music_minimum, music_soak))),
             'Minimum coverage is an explicit clean-lab grouping/stress/fault policy only')
     if music_soak:
         load_soak_module().configure(soak_buffer_ms, soak_horizon_ms)
-    epoch = (load_soak_module() if music_soak else load_minimum_music_module() if music_minimum else load_music_module() if music_startup
+    epoch = (load_soak_module() if music_soak else load_minimum_music_module() if music_minimum
              else load_epoch_module() if latency_epoch is not None else None)
-    if music_startup or music_minimum or music_soak:
+    if music_minimum or music_soak:
         require(NATIVE_LAB is not None, 'Music startup requires the explicit clean lab')
         latency_epoch = epoch.Phase(str(uuid4()), 0, 'native')
     require(latency_epoch is None or type(latency_epoch) is epoch.Phase, 'Latency epoch must be an explicit prepared phase')
@@ -1602,7 +1538,7 @@ async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_str
         faults = importlib.util.module_from_spec(fault_spec)
         sys.modules[fault_spec.name] = faults
         fault_spec.loader.exec_module(faults)
-    if latency_probe or latency_epoch is not None:
+    if latency_epoch is not None:
         latency_spec = importlib.util.spec_from_file_location('native_group_latency_probe', HERE.with_name('native_latency_probe.py'))
         latency = importlib.util.module_from_spec(latency_spec)
         sys.modules[latency_spec.name] = latency
@@ -1616,8 +1552,6 @@ async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_str
         report['mode'] = 'music_soak'
     elif music_minimum:
         report['mode'] = 'music_minimum'
-    elif music_startup:
-        report['mode'] = 'music_startup'
     elif stress:
         report['mode'] = 'speech_stress'
     elif faults:
@@ -1631,8 +1565,6 @@ async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_str
         result_path = RESULT.with_name('shiri-v2-native-music-soak-result.json')
     elif music_minimum:
         result_path = RESULT.with_name('shiri-v2-native-music-minimum-result.json')
-    elif music_startup:
-        result_path = RESULT.with_name('shiri-v2-native-music-startup-result.json')
     elif latency_epoch is not None:
         result_path = epoch_result_path(latency_result)
     epoch_context = None
@@ -1650,12 +1582,9 @@ async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_str
         require(sys.platform == 'linux' and os.geteuid() == 0, 'Run explicitly as Linux root')
         require(type(original_netns_fd) is int and original_netns_fd >= 3,
                 'Run through the supervisor with its inherited original namespace descriptor')
+        require(NATIVE_LAB is not None, 'An explicit native lab profile is required')
         manifest = json.loads((STATE/'ownership.json').read_text())
-        if NATIVE_LAB is not None:
-            report['native_lab'] = native_lab_admission(manifest, report.get('mode', 'grouping'), original_netns_fd=original_netns_fd)
-        else:
-            require(manifest['installation_id'].startswith('b265') and not manifest['networks'] and not manifest['processes'],
-                    'Known candidate manifest must be intact and empty; no concurrent hardware harness')
+        report['native_lab'] = native_lab_admission(manifest, report.get('mode', 'grouping'), original_netns_fd=original_netns_fd)
         report['installation_id'] = manifest['installation_id']
         require(BINARIES.is_dir() and IDENTITIES.is_file(), 'Pinned next9 candidate and static UID map are required')
         observation.base.closed_slot()
@@ -1680,10 +1609,8 @@ async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_str
         # service. A nonexistent production default must not stand in for the
         # disposable API's real credential/state boundary.
         api_process, token = await launch_api(temporary, settings, account, group, interface=lan.interface)
-        if music_startup or music_minimum or music_soak:
+        if music_minimum or music_soak:
             broker_class = epoch.broker_class(IsolatedBroker)
-        elif latency_epoch is None and not minimum_policy:
-            broker_class = load_legacy_profile_module().broker_class(IsolatedBroker)
         else:
             broker_class = IsolatedBroker
         broker = broker_class(settings, parent_namespace)
@@ -2034,29 +1961,6 @@ async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_str
                             'Minimum fault coverage lost the exact pre-PCM broker plan')
                 fault_observer = await faults.exercise(context)
                 report['producer_final'] = {key: producer_status(handle) for key, handle in producers.items()}
-            if latency:
-                tone.stop()
-                await asyncio.wait_for(peer.close(), 4)
-                require(peer.connectionState == 'closed', 'Baseline peer must close before explicit latency markers')
-                report['protected_producer_final'] = deepcopy(report['producer_final'])
-                async def handoff_latency_controls():
-                    done.set()
-                    await monitor
-                context = latency.LatencyContext(api=api, broker=broker, states=room_states,
-                    captures=captures, producers=producers, pcm_guards=pcm_guards, report=report,
-                    temporary=temporary, clock=clock, base_time=base_time, clock_offset=offset,
-                    capture_factory=capture_class, guard_factory=FinalPcmGuard, launch_producer=launch_producer,
-                    publish_command=publish_command, producer_status=producer_status,
-                    onset_index=music_onset_index, retain_capture=retain_failed_capture,
-                    handoff=handoff_latency_controls, target=A, untouched=B, binding=bindings[A],
-                    declared_horizon_ns=declared_horizon_ns, frozen_timing=frozen_timing,
-                    group=SimpleNamespace(capture_snapshot=capture_snapshot,
-                        declared_capture=declared_capture, modulation=modulation, measure_alignment=measure_alignment,
-                        validate_alignment=validate_alignment, calibrate_capture=calibrate_capture,
-                        failure_evidence=failure_evidence, FrozenWorkerTiming=FrozenWorkerTiming,
-                        require_untouched_music_health=require_untouched_music_health))
-                fault_observer = await latency.exercise(context)
-                report['producer_final'] = {key: producer_status(handle) for key, handle in producers.items()}
             # Retirement races happen after the protected uninterrupted proof.
             done.set()
             await monitor
@@ -2083,16 +1987,9 @@ async def run_check(parent_namespace=None, original_netns_fd=None, *, speech_str
             # A source flush may legitimately clear its PCM buffers. Start a fresh
             # A observer after this explicit cutover; never relabel earlier gaps as
             # continuous. B's original capture remains independently continuous.
-            if latency:
-                # The matrix armed this restored-zero A observer. Its final queued
-                # content/sequence must be checked after proven NULL before the
-                # established explicit takeover replaces it.
-                report['latency_probe']['restored_capture_before_takeover'] = await latency.close_capture(
-                    context, 'latency-restored-zero-before-takeover')
-            else:
-                await asyncio.wait_for(asyncio.to_thread(captures[A].close), 3)
-                require(captures[A].pipeline.get_state(0).state == captures[A].Gst.State.NULL,
-                        'Initial A observer did not release before explicit source cutover')
+            await asyncio.wait_for(asyncio.to_thread(captures[A].close), 3)
+            require(captures[A].pipeline.get_state(0).state == captures[A].Gst.State.NULL,
+                    'Initial A observer did not release before explicit source cutover')
             report['cleanup']['initial_a_capture_null'] = True
             publish_command(producers[A]['command'], {'generation': 3, 'action': 'takeover'}, producers[A]['account'])
             async def replaced():
@@ -2314,8 +2211,6 @@ if __name__ == '__main__':
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--speech-stress', action='store_true', help='Explicit20 audible sessions per zone; run via the stress supervisor')
     modes.add_argument('--zone-faults', action='store_true', help='Explicit exact-room backend failures; run via the fault supervisor')
-    modes.add_argument('--latency-probe', action='store_true', help='Explicit per-zone latency matrix; run via the latency supervisor')
-    modes.add_argument('--music-startup', action='store_true', help='Explicit cold MUSIC-only H750/B500 pre-BEGIN calendar; separate supervisor')
     modes.add_argument('--music-minimum', action='store_true', help='Explicit cold MUSIC-only H140/B40 route candidate; separate supervisor')
     modes.add_argument('--music-soak', action='store_true', help='Explicit bounded thirty-minute digital music soak')
     parser.add_argument('--soak-buffer-ms', type=int)
@@ -2339,8 +2234,8 @@ if __name__ == '__main__':
         for name in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(name, task.cancel)
         return await run_check(args.parent_namespace, args.original_netns_fd,
-                               speech_stress=args.speech_stress, zone_faults=args.zone_faults, latency_probe=args.latency_probe,
-                               latency_epoch=selected_epoch, latency_result=args.latency_result, finite_speech=args.finite_speech, music_startup=args.music_startup, music_minimum=args.music_minimum,
+                               speech_stress=args.speech_stress, zone_faults=args.zone_faults,
+                               latency_epoch=selected_epoch, latency_result=args.latency_result, finite_speech=args.finite_speech, music_minimum=args.music_minimum,
                                music_soak=args.music_soak, soak_buffer_ms=args.soak_buffer_ms, soak_horizon_ms=args.soak_horizon_ms,
                                minimum_policy=args.minimum_policy)
     raise SystemExit(asyncio.run(producer(args.producer)) if args.producer else asyncio.run(supervised()))

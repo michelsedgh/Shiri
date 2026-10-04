@@ -17,12 +17,11 @@ def profile(room):
 
 
 def render(tmp_path, room, framed, **extra):
-    options = dict(native_timing=True, audio_uid=962, own_username='shiri-output-3',
+    options = dict(audio_uid=962, own_username='shiri-output-3',
                    view_directory=Path('/run/shiri-worker'), framed_output=framed)
     options.update(extra)
     return backend_configs(room, tmp_path/'room', {'interface': 'receiver0'},
-                           {'api_host_ip': '10.211.0.1', 'api_ip': '10.211.0.2'},
-                           broker_socket=tmp_path/'broker.sock', all_receiver_names=[],
+                           all_receiver_names=[],
                            password='private-never-trusted-on-LAN', **options)
 
 
@@ -64,7 +63,7 @@ def test_invalid_handoff_cannot_write_partial_backend_configuration(tmp_path, ro
     assert not (tmp_path/'room').exists()
 
 
-@pytest.mark.parametrize('wrong', ['extra', 'missing', 'root', 'untimed', 'hardware', 'pin'])
+@pytest.mark.parametrize('wrong', ['extra', 'missing', 'root', 'hardware', 'pin'])
 def test_framed_output_cannot_acquire_unadmitted_hardware_or_root_profile(tmp_path, room, wrong):
     framed, extra = profile(room), {}
     if wrong == 'extra':
@@ -73,8 +72,6 @@ def test_framed_output_cannot_acquire_unadmitted_hardware_or_root_profile(tmp_pa
         del framed['peer_uid']
     elif wrong == 'root':
         extra['own_username'] = 'root'
-    elif wrong == 'untimed':
-        extra['native_timing'] = False
     elif wrong == 'hardware':
         room = room.model_copy(update={'local_audio_device': 'hw:CARD=KitchenDAC,DEV=0'})
     else:
@@ -85,6 +82,7 @@ def test_framed_output_cannot_acquire_unadmitted_hardware_or_root_profile(tmp_pa
 
 
 def test_unselected_profile_retains_local_route_and_uses_native_local_buffer(tmp_path, room):
+    room = room.model_copy(update={'local_audio_device': 'hw:CARD=KitchenDAC,DEV=0'})
     _receiver, own = render(tmp_path, room, None)
     assert 'type = "alsa"' in own.read_text()
     assert 'start_buffer_ms = 40' in own.read_text()
@@ -95,6 +93,8 @@ def test_unselected_profile_retains_local_route_and_uses_native_local_buffer(tmp
 def test_selected_negative_compensation_has_real_margin_in_both_output_profiles(tmp_path, room, framed):
     room = room.model_copy(update={'speakers': [
         SpeakerRef(id='0', name='Exact Bluetooth output', protocol='alsa', offset_ms=-2000)]})
+    if not framed:
+        room = room.model_copy(update={'local_audio_device': 'hw:CARD=KitchenDAC,DEV=0'})
     _receiver, own = render(tmp_path, room, profile(room) if framed else None)
     text = own.read_text()
     assert 'start_buffer_ms = 2040' in text

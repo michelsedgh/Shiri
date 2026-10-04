@@ -24,6 +24,8 @@ from shiri.tts.models import DEFAULT_MODEL_ID, MAX_GENERATED_SECONDS, Generation
 WARM_FIRST_PCM_SECONDS = 2
 WARM_RECEIPT_SECONDS = 600
 WARM_RECEIPT_LIMIT = 128
+RECOVERY_POLL_SECONDS = 1.0
+RECOVERY_MAX_BACKOFF_SECONDS = 30.0
 
 
 @dataclass
@@ -122,10 +124,15 @@ def _child(connection, spec, cache_dir, allow_download, cancel_event=None):
 
 
 class ModelWorker:
-    def __init__(self, *, registry_file=None, cache_dir=None, allow_download=False):
+    def __init__(self, *, registry_file=None, cache_dir=None, allow_download=False, state_file=None):
         self.registry_file = registry_file
         self.cache_dir = cache_dir
         self.allow_download = allow_download
+        self.state_file = state_file
+        self.selected_model = None
+        self._supervisor_task = None
+        self._closing = False
+        self.recovery_attempts = 0
         self.process = None
         self.connection = None
         self.cancel_event = None
@@ -143,11 +150,91 @@ class ModelWorker:
         self._warm_cancel_lock = asyncio.Lock()
 
     def status(self):
+        self._observe_ready_process()
         self._prune_warm_receipts()
         receipt = self.warm_receipts.get(self._latest_warm)
         return {"state": self.state, "model_id": self.model_id, "busy": self.state == "busy",
                 "error": self.error, "warmup": self.warmup, "operation": self.operation,
+                "selected_model_id": self.selected_model,
+                "automatic_recovery": bool(self._supervisor_task is not None
+                                           and not self._supervisor_task.done() and not self._closing),
+                "recovery_attempts": self.recovery_attempts,
                 "model_warm": receipt.public() if receipt else None}
+
+    def _saved_selection(self):
+        if self.state_file is None:
+            return None
+        try:
+            descriptor = os.open(self.state_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
+                    or info.st_mode & 0o022 or info.st_size > 4096):
+                raise ValueError("The saved model selection must be a bounded, owned regular file")
+            data = stream.read(4097)
+        if len(data) > 4096:
+            raise ValueError("The saved model selection is too large")
+        value = json.loads(data)
+        if not isinstance(value, dict) or set(value) != {"version", "model_id"} or type(value["version"]) is not int or value["version"] != 1:
+            raise ValueError("Invalid saved model selection")
+        return get_model(value["model_id"], self.registry_file).id
+
+    def _save_selection(self, model_id):
+        if self.state_file is not None:
+            from shiri.runtime.system import atomic_json
+            atomic_json(self.state_file, {"version": 1, "model_id": model_id})
+
+    async def _persist_selection(self, model_id):
+        # Cancelling to_thread does not stop its filesystem write. Keep the
+        # selection lock until that exact write ends, so it cannot overwrite a
+        # later model choice after its cancelled caller has returned.
+        writing = asyncio.create_task(asyncio.to_thread(self._save_selection, model_id))
+        interrupted = False
+        with CancelScope(shield=True):
+            while not writing.done():
+                try:
+                    await asyncio.shield(writing)
+                except asyncio.CancelledError:
+                    interrupted = True
+            writing.result()
+            # Once the durable write commits, recovery must follow that choice
+            # even if the caller no longer waits for its acknowledgement.
+            self.selected_model = model_id
+        if interrupted:
+            raise asyncio.CancelledError
+
+    async def start(self, preload_model=None):
+        """Restore one resident model; recovery never runs periodic inference."""
+        if self._supervisor_task is not None:
+            return
+        self.selected_model = await asyncio.to_thread(self._saved_selection) or preload_model
+        if self.selected_model is not None:
+            await self.load(self.selected_model, persist=False)
+        self._supervisor_task = asyncio.create_task(self._supervise(), name="tts-model-recovery")
+
+    async def _supervise(self):
+        backoff = RECOVERY_POLL_SECONDS
+        while not self._closing:
+            await asyncio.sleep(backoff)
+            self._observe_ready_process()
+            if self.state == "ready":
+                backoff = RECOVERY_POLL_SECONDS
+            elif self.selected_model and self.state in {"failed", "stopped"} and not self.lock.locked():
+                self.recovery_attempts += 1
+                await self.load(self.selected_model, persist=False)
+                await asyncio.shield(self.load_task)
+                backoff = min(RECOVERY_MAX_BACKOFF_SECONDS, backoff * 2) if self.state != "ready" else RECOVERY_POLL_SECONDS
+
+    def _observe_ready_process(self):
+        # An idle child can exit without an HTTP stream left to observe EOF.
+        # Keep its handles for _load/close to reap, but stop advertising stale
+        # readiness or treating an explicit same-model reload as a no-op.
+        if self.state == "ready" and (self.process is None or not self.process.is_alive()):
+            self.state = "failed"
+            self.error = ("The model worker exited; automatic recovery is pending"
+                          if self._supervisor_task is not None else "The model worker exited; load the model again")
 
     def _prune_warm_receipts(self):
         now = time.monotonic()
@@ -171,6 +258,7 @@ class ModelWorker:
         self._warm_id(request_id)
         spec = get_model(model_id, self.registry_file)
         request = validate_request(spec, GenerationRequest(text="Hi.", max_tokens=128))
+        self._observe_ready_process()
         self._prune_warm_receipts()
         old = self.warm_receipts.get(request_id)
         if old is not None:
@@ -192,7 +280,7 @@ class ModelWorker:
             return receipt.public()
         await self.lock.acquire()
         self.state, self.operation = "busy", "warming"
-        iterator = self.stream(request)
+        iterator = self._events(request)
         receipt.iterator = iterator
         # Enter the iterator's cleanup owner before scheduling: cancelling a
         # task before its first turn otherwise never runs that task's finally.
@@ -205,13 +293,13 @@ class ModelWorker:
         iterator = receipt.iterator
         outcome = "failed"
         try:
-            if json.loads(first).get("type") != "format":
+            if first.get("type") != "format":
                 raise ValueError("Model priming did not establish its PCM format")
             with fail_after(WARM_FIRST_PCM_SECONDS):
-                event = json.loads(await iterator.__anext__())
+                event = await iterator.__anext__()
                 if event.get("type") != "pcm":
                     raise ValueError("Model priming did not produce a first PCM chunk")
-                pcm = base64.b64decode(event["pcm_base64"], validate=True)
+                pcm = event["pcm"]
                 if not pcm or len(pcm) % 2 or len(pcm) > 1920:
                     raise ValueError("Model priming returned invalid PCM")
                 receipt.first_pcm_ms = (time.monotonic() - receipt.began) * 1000
@@ -343,16 +431,21 @@ class ModelWorker:
         except (Exception, asyncio.CancelledError):
             return False
 
-    async def load(self, model_id):
+    async def load(self, model_id, *, persist=True):
         spec = get_model(model_id, self.registry_file)
-        if self.lock.locked() or self.state == "loading":
+        self._observe_ready_process()
+        if self._closing or self.lock.locked() or self.state == "loading":
             raise ValueError("A model operation is already active")
         if self.state == "ready" and self.model_id == model_id:
+            if persist:
+                async with self.lock:
+                    await self._persist_selection(model_id)
+                    self.selected_model = model_id
             return
         self.state, self.model_id, self.error = "loading", model_id, None
-        self.load_task = asyncio.create_task(self._load(spec))
+        self.load_task = asyncio.create_task(self._load(spec, persist=persist))
 
-    async def _load(self, spec):
+    async def _load(self, spec, *, persist=True):
         async with self.lock:
             try:
                 await self._terminate()
@@ -367,6 +460,9 @@ class ModelWorker:
                 message = await self._receive(120)
                 if message.get("type") != "ready":
                     raise RuntimeError(message.get("error", "Model did not become ready"))
+                if persist and self.state_file is not None:
+                    await self._persist_selection(spec.id)
+                self.selected_model = spec.id
                 self.warmup = message.get("warmup")
                 self.state = "ready"
             except asyncio.CancelledError:
@@ -382,6 +478,17 @@ class ModelWorker:
         model_id = payload.get("model_id")
         spec = get_model(model_id, self.registry_file)
         request = validate_request(spec, {key: value for key, value in payload.items() if key != "model_id"})
+        self._observe_ready_process()
+        if self._supervisor_task is not None and self.selected_model == model_id:
+            try:
+                with fail_after(125):
+                    while not self._closing and self.state in {"stopped", "failed", "loading"}:
+                        if self.load_task is not None and not self.load_task.done():
+                            await asyncio.shield(self.load_task)
+                        else:
+                            await asyncio.sleep(.05)
+            except TimeoutError as exc:
+                raise ValueError("The selected speech model did not recover within its loading budget") from exc
         # Validate first: malformed or wrong-model requests cannot displace a
         # useful prime. A real utterance joins that exact owner's reset before
         # acquiring the one reader/decoder, and never cancels another utterance.
@@ -394,28 +501,41 @@ class ModelWorker:
         return request
 
     async def stream(self, request):
+        """HTTP encoding is separate from the one native generation owner."""
+        events = self._events(request)
+        try:
+            async for event in events:
+                if event["type"] == "pcm":
+                    event = {"type": "pcm", "pcm_base64": base64.b64encode(event["pcm"]).decode("ascii")}
+                yield json.dumps(event, allow_nan=False) + "\n"
+        finally:
+            with CancelScope(shield=True):
+                await events.aclose()
+
+    async def _events(self, request):
         completed = False
         failed = False
         try:
             self.connection.send(request)
             deadline = time.monotonic() + 180
-            yield json.dumps({"type": "format", "format": "s16le", "sample_rate": 48000, "channels": 1}) + "\n"
+            yield {"type": "format", "format": "s16le", "sample_rate": 48000, "channels": 1}
             while True:
                 message = await self._receive(max(0, deadline - time.monotonic()))
                 kind = message.get("type")
                 if kind == "pcm":
-                    message = {"type": "pcm", "pcm_base64": base64.b64encode(message["pcm"]).decode("ascii")}
+                    pcm = message["pcm"]
+                    if not isinstance(pcm, bytes) or not pcm or len(pcm) % 2 or len(pcm) > 1920:
+                        raise ValueError("Invalid native model PCM frame")
                 elif kind == "end":
-                    pass
+                    json.dumps(message, allow_nan=False)
                 elif kind == "error":
                     failed = True
                     self.error = message.get("error")
                 else:
                     raise ValueError("Unexpected model worker message")
-                encoded = json.dumps(message, allow_nan=False) + "\n"
                 if kind == "end":
                     completed = True
-                yield encoded
+                yield message
                 if kind in {"end", "error"}:
                     break
         except asyncio.CancelledError:
@@ -423,7 +543,7 @@ class ModelWorker:
         except Exception as exc:
             failed = True
             self.error = str(exc)[:512]
-            yield json.dumps({"type": "error", "error": self.error}) + "\n"
+            yield {"type": "error", "error": self.error}
         finally:
             # Starlette disconnect cancellation can be level-triggered. Keep
             # cleanup shielded and bounded while retaining the producer lock.
@@ -437,6 +557,11 @@ class ModelWorker:
                 self.lock.release()
 
     async def close(self):
+        self._closing = True
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            await asyncio.gather(self._supervisor_task, return_exceptions=True)
+            self._supervisor_task = None
         if self._active_warm is not None:
             await self.cancel_warm(self._active_warm.request_id, reason="shutdown")
         if self.load_task is not None and not self.load_task.done():
@@ -447,15 +572,15 @@ class ModelWorker:
 
 
 def create_worker_app(*, token: str, registry_file: Path | None = None, cache_dir: Path | None = None,
-                      allow_download=False, preload_model: str | None = None, worker=None):
+                      allow_download=False, preload_model: str | None = None, state_file: Path | None = None, worker=None):
     if len(token) < 32:
         raise ValueError("Use a private worker token with at least 32 characters")
-    worker = worker or ModelWorker(registry_file=registry_file, cache_dir=cache_dir, allow_download=allow_download)
+    worker = worker or ModelWorker(registry_file=registry_file, cache_dir=cache_dir,
+                                   allow_download=allow_download, state_file=state_file)
 
     @asynccontextmanager
     async def lifespan(app):
-        if preload_model:
-            await worker.load(preload_model)
+        await worker.start(preload_model)
         try:
             yield
         finally:

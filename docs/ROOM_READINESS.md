@@ -11,8 +11,8 @@ admitting a voice, playing audio, and lowering music.
 
 | Value | Behavior | Tradeoff |
 | --- | --- | --- |
-| `adaptive` (default) | Prepare an enabled room at startup; retain its connection for five minutes after recent music or a speech request. Nobly may extend readiness with a presence hint. | Avoid repeated setup during use while allowing unused rooms to return to standby. The first request after a long idle can need setup. |
-| `ready` | Keep enabled rooms connected automatically. | Prioritize first-request latency; device-specific standby and power effects require measurement. |
+| `ready` (default) | Keep enabled rooms connected automatically, including after long idle periods. | Prioritize first-request latency, as selected in the October 4 product requirements; device-specific standby and power effects require measurement. |
+| `adaptive` | Prepare an enabled room at startup; retain its connection for five minutes after recent music or a speech request. Nobly may extend readiness with a presence hint. | Explicit power-saving option; the first request after a long idle can need setup. |
 | `on_demand` | Leave connection setup to actual playback and explicit hints. | Least proactive connection activity; cold requests include setup. |
 
 Automatic holds have sixty-second deadlines and renew every thirty seconds.

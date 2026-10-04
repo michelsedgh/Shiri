@@ -7,21 +7,20 @@ It does not claim that OwnTone or a physical speaker rendered these samples.
 """
 
 import asyncio
-import base64
 import os
 from pathlib import Path
 import socket
 import struct
 from tempfile import TemporaryDirectory
-import time
 from uuid import UUID
 
 import pytest
 
-from shiri.rpc import call_rpc, serve_rpc
+from shiri.rpc import serve_rpc
+from shiri.speech_stream import open_speech
 from shiri.runtime.audio import AudioWorker
 from shiri.runtime.speech_output import HEADER, HEADER_BYTES, PCM, SpeechOutput
-from test_pcm_speech import ending, opening
+from test_pcm_speech import opening
 from test_speech_startup import native_controller
 
 
@@ -68,7 +67,7 @@ async def test_real_rpc_and_datagrams_preserve_entire_paced_speech_before_eof(se
                     first_pcm.set()
 
         capturing = asyncio.create_task(capture(), name="silent-datagram-capture")
-        preparing = asyncio.create_task(call_rpc(rpc_path, "speech", opening()))
+        preparing = asyncio.create_task(open_speech(rpc_path, opening()))
         try:
             await asyncio.wait_for(client.prepare_entered.wait(), 1)
             if setup_seconds:
@@ -76,29 +75,17 @@ async def test_real_rpc_and_datagrams_preserve_entire_paced_speech_before_eof(se
             assert not captured and not output.sent_frames
             client.connect()
             client.first_mix()
-            prepared = await asyncio.wait_for(preparing, 1)
+            channel = await asyncio.wait_for(preparing, 1)
             assert not captured and not writer.packets
-            started_ns = time.monotonic_ns()
             for index, pcm in enumerate(original):
-                deadline_ns = started_ns + index * 20_000_000
-                delay = (deadline_ns - time.monotonic_ns()) / 1e9
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                await call_rpc(rpc_path, "speech", {
-                    "action": "pcm", "session_id": prepared["session_id"],
-                    "request_id": prepared["request_id"], "stream_id": prepared["stream_id"],
-                    "sequence": index + 1, "frame_index": index * packet_samples,
-                    "pcm_base64": base64.b64encode(pcm).decode("ascii"),
-                })
+                await channel.send_pcm(pcm, index + 1, index * packet_samples)
                 if index == 0:
                     await asyncio.wait_for(first_pcm.wait(), 1)
                     assert captured[0][1] == original[0]
                     assert len(captured) == 1 and not producer_finished
                 await worker.tick(0.02)
             producer_finished = True
-            result = await call_rpc(rpc_path, "speech", ending(
-                prepared, sequence=frames, frames=frames * packet_samples,
-            ))
+            result = await channel.finish(frames, frames * packet_samples)
             await asyncio.wait_for(capturing, 1)
             assert result["admitted_frames"] == frames * packet_samples
             assert b"".join(packet for _, packet, _ in captured) == expected

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import json
 import math
@@ -14,6 +14,7 @@ import time
 from uuid import uuid4
 
 import httpx
+from anyio import CancelScope
 from pydantic import Field, field_validator
 
 from shiri.domain import Conflict, DomainError, NotFound, StrictModel
@@ -25,6 +26,7 @@ WORKER_SETTLE_SECONDS = 8
 
 class TextSpeechRequest(StrictModel):
     request_id: str = Field(default_factory=lambda: uuid4().hex, pattern=r"^[0-9a-f]{32}$")
+    replace_job_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     text: str = Field(min_length=1, max_length=2000)
     model_id: str = Field(default=DEFAULT_MODEL_ID, min_length=1, max_length=128)
     voice: str | None = Field(default=None, max_length=128)
@@ -53,6 +55,11 @@ class SpeechJob:
     cancel_requested: bool = False
     fingerprint: str = ""
     audio: bytearray | None = None
+    replaces: str | None = None
+    route_fingerprint: str | None = None
+    activate: asyncio.Event = field(default_factory=asyncio.Event)
+    received_at: float = field(default_factory=time.monotonic)
+    admitted_at: float = field(default_factory=time.monotonic)
 
     def public(self):
         return {"id": self.id, "kind": self.kind, "room_id": self.room_id, "state": self.state,
@@ -61,15 +68,19 @@ class SpeechJob:
 
 
 class TextSpeechCoordinator:
-    def __init__(self, service, *, worker_url=None, worker_token=None, client=None):
+    def __init__(self, service, *, worker_url=None, worker_token=None, client=None, max_rooms=8):
         self.service = service
         self.url = worker_url.rstrip("/") if worker_url else None
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5),
                                                 headers={"Authorization": "Bearer " + (worker_token or "")},
                                                 trust_env=False)
         self.jobs = OrderedDict()
-        self.active = None
+        self.active = {}
+        self.pending = {}
+        self.max_rooms = max_rooms
         self._lock = asyncio.Lock()
+        self._generation_lock = asyncio.Lock()
+        self._closing = False
 
     def require_worker(self):
         if not self.url:
@@ -172,38 +183,82 @@ class TextSpeechCoordinator:
             return {"state": "unavailable", "model_id": model_id}
 
     async def admit(self, payload: TextSpeechRequest, *, room_id=None, external_id=None, benchmark=False):
+        received_at = time.monotonic()
         self.require_worker()
         fingerprint = hashlib.sha256(json.dumps({"request": payload.model_dump(), "room_id": room_id,
                                                "external_id": external_id, "benchmark": benchmark},
                                               sort_keys=True).encode()).hexdigest()
-        # Resolve an external binding exactly once under the room mutation lock.
-        # Every continuation and cancellation retains this admitted UUID.
-        async with self.service._mutation:
+        # The store resolves one coherent routing snapshot. Our short admission
+        # lock fences request replay and room ownership, independently of slow
+        # reconciliation or changes to an unrelated room.
+        async with self._lock:
+            if self._closing:
+                raise Conflict("Speech admission is shutting down")
             previous = self.jobs.get(payload.request_id)
             if previous:
                 if previous.fingerprint != fingerprint:
                     raise Conflict("This request ID already belongs to different speech or routing intent")
                 return previous.public()
             if not benchmark:
-                room = (await self.service.resolve_nobly(external_id) if external_id is not None
-                        else await self.service._store("get_room", room_id))
+                room = await self.service.resolve_text_speech(room_id=room_id, external_id=external_id)
                 if not room.enabled or not room.speakers:
                     raise Conflict("Enable the target room and select its speakers before speaking")
                 room_id = room.id
                 readiness = getattr(self.service, "warm_coordinator", None)
                 if readiness is not None:
                     readiness.touch(room_id)
-            async with self._lock:
-                if self.active:
-                    raise Conflict("A speech job is already active; finish or cancel it first")
-                job = SpeechJob(payload.request_id, "benchmark" if benchmark else "speech", room_id,
-                                fingerprint=fingerprint)
-                while len(self.jobs) >= 32:
-                    self.jobs.popitem(last=False)
-                self.jobs[job.id] = job
-                self.active = job.id
-                job.task = asyncio.create_task(self._run(job, payload))
-                return job.public()
+            key = None if benchmark else room_id
+            current = self.active.get(key)
+            if payload.replace_job_id is not None:
+                if benchmark or current != payload.replace_job_id:
+                    raise Conflict("Interruption requires the exact active speech job in this room")
+                if self.jobs[current].replaces is not None:
+                    raise Conflict("This room is still retiring its previous interruption")
+            elif current is not None:
+                if benchmark:
+                    raise Conflict("A quiet benchmark is already active")
+                if len(self.pending.get(key, ())) >= 2:
+                    raise Conflict("This room already has two waiting replies; wait or cancel an exact queued job")
+            if not benchmark and current is None and sum(key is not None for key in self.active) >= self.max_rooms:
+                raise Conflict("Speech capacity is limited to the configured rooms")
+            while len(self.jobs) >= 32:
+                expired = next((identity for identity, item in self.jobs.items()
+                                if item.task is None or item.task.done()), None)
+                if expired is None:
+                    raise Conflict("Speech receipt capacity is busy; wait for retiring requests")
+                del self.jobs[expired]
+            job = SpeechJob(payload.request_id, "benchmark" if benchmark else "speech", room_id,
+                            fingerprint=fingerprint, replaces=current if payload.replace_job_id is not None else None,
+                            received_at=received_at, admitted_at=time.monotonic())
+            job.metrics["admission_ms"] = (job.admitted_at - received_at) * 1000
+            if not benchmark:
+                from shiri.readiness import transport_fingerprint
+                job.route_fingerprint = transport_fingerprint(room)
+            self.jobs[job.id] = job
+            if current is None or job.replaces is not None:
+                self.active[key] = job.id
+                job.activate.set()
+            else:
+                self.pending.setdefault(key, deque()).append(job.id)
+            job.task = asyncio.create_task(self._run(job, payload))
+            return job.public()
+
+    def _release(self, job):
+        key = None if job.kind == "benchmark" else job.room_id
+        waiting = self.pending.get(key)
+        if waiting and job.id in waiting:
+            waiting.remove(job.id)
+        if self.active.get(key) == job.id:
+            del self.active[key]
+            if not self._closing and waiting:
+                while waiting:
+                    next_job = self.jobs[waiting.popleft()]
+                    if not next_job.cancel_requested:
+                        self.active[key] = next_job.id
+                        next_job.activate.set()
+                        break
+        if waiting is not None and not waiting:
+            self.pending.pop(key, None)
 
     def get(self, job_id):
         if job_id not in self.jobs:
@@ -243,43 +298,156 @@ class TextSpeechCoordinator:
                 # A cancelled task that never entered _run has no finally to
                 # retire its slot. Do this synchronously before joining: the
                 # HTTP caller itself may disconnect during that await.
-                job.state = "cancelled"
-                if self.active == job.id:
-                    self.active = None
+                if job.replaces is not None:
+                    async def retire_unstarted():
+                        await self.cancel(job.replaces)
+                        job.replaces = None
+                        job.state = "cancelled"
+                        self._release(job)
+                    job.started = True
+                    job.task = asyncio.create_task(retire_unstarted())
+                else:
+                    job.state = "cancelled"
+                    self._release(job)
             await asyncio.shield(asyncio.gather(job.task, return_exceptions=True))
         return job.public()
+
+    async def _generate(self, job, payload, records, admitted, started):
+        """Own inference only; room playback never holds this shared slot."""
+        attempted = False
+        queued_at = time.monotonic()
+        try:
+            async with self._generation_lock:
+                job.metrics["generation_wait_ms"] = (time.monotonic() - queued_at) * 1000
+                job.state = "generating"
+                got_format, got_end = False, False
+                received_frames = 0
+                end_metrics = {}
+                try:
+                    attempted = True
+                    job.metrics["generation_requested_ms"] = (time.monotonic() - started) * 1000
+                    async with self.client.stream("POST", self.url + "/v1/generate",
+                            json=payload.model_dump(exclude_none=True, exclude={"request_id", "replace_job_id"})) as response:
+                        if response.status_code != 200:
+                            attempted = False
+                            body = await response.aread()
+                            raise Conflict(json.loads(body).get("error", "Generation was refused"))
+                        # A recovering resident model can delay HTTP admission.
+                        # Do not own/duck a room until its actual decoder is ready.
+                        admitted.set()
+                        job.metrics["worker_admission_ms"] = (time.monotonic() - started) * 1000
+                        async for line in response.aiter_lines():
+                            if not line or len(line) > 16_384:
+                                raise ValueError("Invalid generation stream record")
+                            event = json.loads(line)
+                            kind = event.get("type")
+                            if kind == "format":
+                                if got_format or event != {"type": "format", "format": "s16le", "sample_rate": 48000, "channels": 1}:
+                                    raise ValueError("Generation format changed or is unsupported")
+                                got_format = True
+                            elif kind == "pcm":
+                                if not got_format or got_end:
+                                    raise ValueError("Audio arrived outside its admitted generation")
+                                pcm = base64.b64decode(event["pcm_base64"], validate=True)
+                                if not pcm or len(pcm) % 2 or len(pcm) > 1920:
+                                    raise ValueError("Invalid generation PCM frame")
+                                received_frames += len(pcm) // 2
+                                if received_frames > 48000 * MAX_GENERATED_SECONDS:
+                                    raise ValueError("Speech exceeds the audio duration limit")
+                                job.metrics.setdefault("first_worker_pcm_received_ms", (time.monotonic() - started) * 1000)
+                                job.metrics["received_audio_s"] = received_frames / 48000
+                                await records.put(("pcm", pcm))
+                            elif kind == "end":
+                                if got_end or not got_format or received_frames == 0:
+                                    raise ValueError("Incomplete or repeated generation completion")
+                                got_end = True
+                                end_metrics = event.get("metrics", {})
+                                if not isinstance(end_metrics, dict):
+                                    raise ValueError("Invalid generation completion metrics")
+                            elif kind == "error":
+                                raise ValueError(str(event.get("error", "Generation failed"))[:512])
+                            else:
+                                raise ValueError("Unknown generation stream record")
+                        if not got_end:
+                            raise ValueError("Generation connection ended before natural completion")
+                    aliases = {"first_pcm_ms": "first_pcm_ms", "first_nonquiet_pcm_ms": "first_non_silent_pcm_ms",
+                               "leading_silence_ms": "leading_silence_ms", "rtf": "realtime_factor",
+                               "generated_audio_seconds": "audio_duration_s", "generation_ms": "generation_ms"}
+                    for source, target in aliases.items():
+                        value = end_metrics.get(source)
+                        if (type(value) in (int, float) and 0 <= value <= 1e12 and math.isfinite(value)):
+                            job.metrics[target] = value
+                    await records.put(("end", None))
+                except Exception as exc:
+                    while not records.empty():
+                        records.get_nowait()
+                    await records.put(("error", exc))
+                finally:
+                    if attempted:
+                        # Keep the one model slot until the previous decoder is
+                        # reusable. This retirement is independent of playback.
+                        cleanup = asyncio.create_task(self._settle_worker())
+                        cancelled = False
+                        with CancelScope(shield=True):
+                            while not cleanup.done():
+                                try:
+                                    await asyncio.shield(cleanup)
+                                except asyncio.CancelledError:
+                                    cancelled = True
+                            confirmed = cleanup.result()
+                            job.metrics["worker_cleanup_confirmed"] = confirmed
+                            if not confirmed:
+                                job.error = job.error or "Generation worker cleanup could not be confirmed; inspect worker diagnostics"
+                        if cancelled:
+                            raise asyncio.CancelledError
+                    job.metrics["generation_released_ms"] = (time.monotonic() - started) * 1000
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A failed generation must discard unsent buffered speech, rather
+            # than let a consumer play seconds of a known incomplete utterance.
+            while not records.empty():
+                records.get_nowait()
+            await records.put(("error", exc))
 
     async def _run(self, job, payload):
         job.started = True
         if job.kind == "benchmark":
             job.audio = bytearray()
-        started = time.monotonic()
+        started = job.received_at
         identity = {"session_id": "tts-" + job.id, "request_id": job.id}
-        preparation = None
-        prepared = None
+        if job.route_fingerprint is not None:
+            identity["transport_fingerprint"] = job.route_fingerprint
+        # One room can retain at most 60 seconds of PCM. A record bound also
+        # prevents tiny malicious frames from growing Python object overhead.
+        records = None
+        generation_admitted = asyncio.Event()
+        producer = preparation = None
+        prepared = channel = None
         finished = False
-        generation_attempted = False
         terminal_state = "failed"
         frame_index, sequence = 0, 1
-        received_frames = 0
         pace_start = None
         job.metrics.update(received_audio_s=0.0, delivered_audio_s=0.0)
         try:
-            # The generation endpoint atomically validates the warmed model
-            # and acquires its slot. A catalog preflight adds a network round
-            # trip and can become stale before that authoritative admission.
-            job.state = "generating"
+            await job.activate.wait()
+            job.metrics["room_queue_wait_ms"] = (time.monotonic() - job.admitted_at) * 1000
+            if job.replaces is not None:
+                await self.cancel(job.replaces)
+                job.replaces = None
+            records = asyncio.Queue(maxsize=int(MAX_GENERATED_SECONDS * 50) + 2)
+            producer = asyncio.create_task(self._generate(job, payload, records, generation_admitted, started))
             if job.kind == "speech":
                 async def prepare_room():
+                    nonlocal channel
+                    # Queued inference must not duck music for the duration of
+                    # another room's generation. Start both once our turn begins.
+                    await generation_admitted.wait()
                     prepare_sent_ns = time.monotonic_ns()
                     job.metrics["room_prepare_requested_ms"] = (time.monotonic() - started) * 1000
-                    receipt = await self.service.speech(job.room_id, {
-                        **identity, "action": "prepare-pcm", "duck_on_prepare": True,
-                    })
+                    channel = await self.service.open_text_speech(job.room_id, {**identity, "duck_on_prepare": True})
+                    receipt = channel.prepared
                     if receipt.get("ok") and receipt.get("stream_id"):
-                        # Preparation and generation run concurrently. Record
-                        # confirmation here rather than when PCM later joins
-                        # the ready backend; that would include model wait.
                         job.metrics["backend_ready_ms"] = (time.monotonic() - started) * 1000
                         duck_ns = receipt.get("duck_requested_monotonic_ns")
                         verified = type(duck_ns) is int and prepare_sent_ns <= duck_ns <= time.monotonic_ns()
@@ -292,101 +460,43 @@ class TextSpeechCoordinator:
                     return receipt
 
                 preparation = asyncio.create_task(prepare_room())
-            generation_attempted = True
-            job.metrics["generation_requested_ms"] = (time.monotonic() - started) * 1000
-            async with self.client.stream("POST", self.url + "/v1/generate",
-                                          json=payload.model_dump(exclude_none=True, exclude={"request_id"})) as response:
-                if response.status_code != 200:
-                    generation_attempted = False
-                    body = await response.aread()
-                    raise Conflict(json.loads(body).get("error", "Generation was refused"))
-                got_format, got_end = False, False
-                async for line in response.aiter_lines():
-                    if not line or len(line) > 16_384:
-                        raise ValueError("Invalid generation stream record")
-                    event = json.loads(line)
-                    kind = event.get("type")
-                    if kind == "format":
-                        if got_format or event != {"type": "format", "format": "s16le", "sample_rate": 48000, "channels": 1}:
-                            raise ValueError("Generation format changed or is unsupported")
-                        got_format = True
-                    elif kind == "pcm":
-                        if not got_format or got_end:
-                            raise ValueError("Audio arrived outside its admitted generation")
-                        pcm = base64.b64decode(event["pcm_base64"], validate=True)
-                        if not pcm or len(pcm) % 2 or len(pcm) > 1920:
-                            raise ValueError("Invalid generation PCM frame")
-                        if frame_index + len(pcm) // 2 > 48000 * MAX_GENERATED_SECONDS:
-                            raise ValueError("Speech exceeds the audio duration limit")
-                        # This is the router's first observed PCM, before room
-                        # readiness or pacing can wait. Engine timing arrives
-                        # only with EOS and uses a separate generation clock.
-                        if "first_worker_pcm_received_ms" not in job.metrics:
-                            job.metrics["first_worker_pcm_received_ms"] = (time.monotonic() - started) * 1000
-                        received_frames += len(pcm) // 2
-                        job.metrics["received_audio_s"] = received_frames / 48000
-                        if preparation is not None and prepared is None:
-                            prepared = await asyncio.shield(preparation)
-                            if not prepared.get("ok") or not prepared.get("stream_id"):
-                                raise Conflict(prepared.get("error", "Room did not become ready"))
-                        if job.kind == "speech":
-                            if pace_start is not None:
-                                target = pace_start + frame_index / 48000
-                                await asyncio.sleep(max(0, target - time.monotonic()))
-                                if time.monotonic() - target > .15:
-                                    raise ValueError("PCM delivery missed its live playback deadline")
-                            sent_ns = time.monotonic_ns()
-                            receipt = await self.service.speech(job.room_id, {**identity, "action": "pcm",
-                                "stream_id": prepared["stream_id"], "sequence": sequence,
-                                "frame_index": frame_index, "pcm_base64": event["pcm_base64"]})
-                            replied_ns = time.monotonic_ns()
-                            if not receipt.get("ok") or receipt.get("next_sequence") != sequence + 1:
-                                raise Conflict(receipt.get("error", "Room refused speech audio"))
-                            if pace_start is None:
-                                admitted_ns = receipt.get("first_pcm_admitted_monotonic_ns")
-                                # API and room AudioWorker share the Linux kernel
-                                # clock over private local RPC. First dispatch
-                                # can be slow before the receiver begins; reply
-                                # latency after that admission remains lateness.
-                                if (receipt.get("pcm_clock") != "room_audio_worker_monotonic; admission_not_acoustic"
-                                        or type(admitted_ns) is not int or not sent_ns <= admitted_ns <= replied_ns):
-                                    raise ValueError("Room PCM admission clock could not be verified")
-                                pace_start = admitted_ns / 1_000_000_000
-                                job.metrics["room_admission_ms"] = (pace_start - started) * 1000
-                                job.metrics["first_pcm_dispatch_ms"] = (sent_ns / 1_000_000_000 - started) * 1000
-                                job.metrics["first_pcm_rpc_ms"] = (replied_ns - sent_ns) / 1_000_000
-                            job.state = "playing"
-                        else:
-                            job.audio.extend(pcm)
-                        frame_index += len(pcm) // 2
-                        job.metrics["delivered_audio_s"] = frame_index / 48000
-                        sequence += 1
-                    elif kind == "end":
-                        if got_end or not got_format or frame_index == 0:
-                            raise ValueError("Incomplete or repeated generation completion")
-                        got_end = True
-                        metrics = event.get("metrics", {})
-                        aliases = {"first_pcm_ms": "first_pcm_ms", "first_nonquiet_pcm_ms": "first_non_silent_pcm_ms",
-                                   "leading_silence_ms": "leading_silence_ms", "rtf": "realtime_factor",
-                                   "generated_audio_seconds": "audio_duration_s", "generation_ms": "generation_ms"}
-                        for source, target in aliases.items():
-                            value = metrics.get(source)
-                            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                                if math.isfinite(value) and value >= 0:
-                                    job.metrics[target] = value
-                        if job.kind == "speech":
-                            receipt = await self.service.speech(job.room_id, {**identity, "action": "finish",
-                                "stream_id": prepared["stream_id"], "final_sequence": sequence - 1,
-                                "final_frame_index": frame_index})
-                            if not receipt.get("ok") or not receipt.get("finished"):
-                                raise Conflict(receipt.get("error", "Room could not complete speech"))
-                            finished = True
-                    elif kind == "error":
-                        raise ValueError(str(event.get("error", "Generation failed"))[:512])
-                    else:
-                        raise ValueError("Unknown generation stream record")
-                if not got_end:
-                    raise ValueError("Generation connection ended before natural completion")
+            while True:
+                kind, value = await records.get()
+                if kind == "error":
+                    raise value
+                if kind == "end":
+                    if job.kind == "speech":
+                        receipt = await channel.finish(sequence - 1, frame_index)
+                        if not receipt.get("ok") or not receipt.get("finished"):
+                            raise Conflict(receipt.get("error", "Room could not complete speech"))
+                        finished = True
+                    break
+                pcm = value
+                if preparation is not None and prepared is None:
+                    prepared = await asyncio.shield(preparation)
+                    if not prepared.get("ok") or not prepared.get("stream_id"):
+                        raise Conflict(prepared.get("error", "Room did not become ready"))
+                if job.kind == "speech":
+                    sent_ns = time.monotonic_ns()
+                    receipt = await channel.send_pcm(pcm, sequence, frame_index)
+                    replied_ns = time.monotonic_ns()
+                    if not receipt.get("ok") or receipt.get("next_sequence") != sequence + 1:
+                        raise Conflict(receipt.get("error", "Room refused speech audio"))
+                    if pace_start is None:
+                        admitted_ns = receipt.get("first_pcm_admitted_monotonic_ns")
+                        if (receipt.get("pcm_clock") != "room_audio_worker_monotonic; admission_not_acoustic"
+                                or type(admitted_ns) is not int or not sent_ns <= admitted_ns <= replied_ns):
+                            raise ValueError("Room PCM admission clock could not be verified")
+                        pace_start = admitted_ns / 1_000_000_000
+                        job.metrics["room_admission_ms"] = (pace_start - started) * 1000
+                        job.metrics["first_pcm_dispatch_ms"] = (sent_ns / 1_000_000_000 - started) * 1000
+                        job.metrics["first_pcm_rpc_ms"] = (replied_ns - sent_ns) / 1_000_000
+                    job.state = "playing"
+                else:
+                    job.audio.extend(pcm)
+                frame_index += len(pcm) // 2
+                job.metrics["delivered_audio_s"] = frame_index / 48000
+                sequence += 1
             terminal_state = "completed"
         except asyncio.CancelledError:
             terminal_state = "cancelled"
@@ -395,31 +505,34 @@ class TextSpeechCoordinator:
         finally:
             async def retire():
                 nonlocal prepared
+                if job.replaces is not None:
+                    await self.cancel(job.replaces)
+                    job.replaces = None
+                if producer is not None and not producer.done() and terminal_state != "completed":
+                    producer.cancel()
                 if preparation is not None and not finished:
                     try:
-                        if prepared is None:
-                            # The runtime RPC owns its 15-second deadline.
-                            # Retain its exact admission result and cleanup.
-                            prepared = await asyncio.shield(preparation)
-                        if prepared and prepared.get("stream_id"):
-                            await self.service.speech(job.room_id, {**identity, "action": "close", "stream_id": prepared["stream_id"]})
+                        if not generation_admitted.is_set():
+                            preparation.cancel()
+                            await asyncio.gather(preparation, return_exceptions=True)
+                        else:
+                            if prepared is None:
+                                prepared = await asyncio.shield(preparation)
+                            if channel is not None:
+                                await channel.close()
                     except Exception:
                         job.error = job.error or "Speech cleanup could not be confirmed; inspect room diagnostics"
-                if generation_attempted:
-                    confirmed = await self._settle_worker()
-                    job.metrics["worker_cleanup_confirmed"] = confirmed
-                    if not confirmed:
-                        job.error = job.error or "Generation worker cleanup could not be confirmed; inspect worker diagnostics"
+                if producer is not None:
+                    await asyncio.gather(producer, return_exceptions=True)
 
-            # DELETE can first arrive during natural-completion cleanup. Keep
-            # that bounded retirement independently owned even then, and join
-            # it before publishing cancellation or opening the admission slot.
             retirement = asyncio.create_task(retire())
-            try:
-                await asyncio.shield(retirement)
-            except asyncio.CancelledError:
-                terminal_state = "cancelled"
-                await asyncio.shield(retirement)
+            with CancelScope(shield=True):
+                while not retirement.done():
+                    try:
+                        await asyncio.shield(retirement)
+                    except asyncio.CancelledError:
+                        terminal_state = "cancelled"
+            retirement.result()
             if terminal_state != "completed":
                 job.audio = None
             job.state = terminal_state
@@ -427,11 +540,10 @@ class TextSpeechCoordinator:
                 self._retain_sample(job)
             job.metrics["total_ms"] = (time.monotonic() - started) * 1000
             job.metrics["delivered_audio_s"] = frame_index / 48000
-            # No await separates terminal publication from exact slot release.
-            if self.active == job.id:
-                self.active = None
+            self._release(job)
 
     async def close(self):
-        if self.active:
-            await self.cancel(self.active)
+        self._closing = True
+        await asyncio.gather(*(self.cancel(identity) for identity, job in tuple(self.jobs.items())
+                               if job.task is not None and not job.task.done()))
         await self.client.aclose()

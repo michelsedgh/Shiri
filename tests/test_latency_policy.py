@@ -142,7 +142,7 @@ def test_room_and_identity_bounds_are_explicit():
         room_buffer_ms(500)
 
 
-@pytest.mark.parametrize("protocol,lead", [("airplay1", 500), ("airplay2", 500), ("alsa", 250),
+@pytest.mark.parametrize("protocol,lead", [("airplay1", 500), ("airplay2", 500), ("alsa", 40),
                                            ("pulseaudio", 250), ("chromecast", 250)])
 def test_per_speaker_admission_helper_is_strict_and_route_specific(protocol, lead):
     speaker = SpeakerRef(id="1", name="Exact endpoint", protocol=protocol, offset_ms=-2000)
@@ -158,7 +158,7 @@ def test_per_speaker_admission_helper_is_strict_and_route_specific(protocol, lea
 @pytest.mark.parametrize("airplay", ["airplay1", "airplay2"])
 @pytest.mark.parametrize("other", ["alsa", "pulseaudio", "chromecast"])
 def test_all_offsets_in_mixed_room_satisfy_both_constraints_without_universal_inflation(airplay, other):
-    # A local endpoint needs2250 for-2000; an AirPlay endpoint independently
+    # A local endpoint needs2040 for-2000; an AirPlay endpoint independently
     # crosses that floor only when its500ms lead requires it. Verify minimality
     # against every selected endpoint, rather than duplicating the max formula.
     for offset in range(-2000, 2001):

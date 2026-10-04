@@ -7,8 +7,6 @@ in this Linux process, never a speaker's acoustic render time.
 """
 
 from array import array
-import base64
-import binascii
 import sys
 import time
 from uuid import uuid4
@@ -58,21 +56,13 @@ class PcmSpeech:
         if self.closed:
             raise RpcError("not_found", "This direct speech stream has ended")
 
-    def decode(self, payload):
+    def decode(self, payload, *, data):
         self.identity(payload)
         sequence, frame_index = payload.get("sequence"), payload.get("frame_index")
         if (type(sequence) is not int or sequence != self.sequence + 1
                 or type(frame_index) is not int or frame_index != self.frames):
             raise RpcError("invalid_media", "Direct speech sequence or frame position does not match")
-        encoded = payload.get("pcm_base64")
-        if not isinstance(encoded, str) or not 0 < len(encoded) <= MAX_SAMPLES * 8 // 3:
-            raise RpcError("invalid_media", "Direct speech requires a bounded canonical PCM frame")
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error):
-            raise RpcError("invalid_media", "Direct speech PCM is not canonical base64") from None
-        if (not data or len(data) % 2 or len(data) > MAX_SAMPLES * 2
-                or base64.b64encode(data).decode("ascii") != encoded):
+        if not isinstance(data, bytes) or not data or len(data) % 2 or len(data) > MAX_SAMPLES * 2:
             raise RpcError("invalid_media", "Direct speech PCM has an invalid frame size or encoding")
         now = self.now_ns()
         samples = len(data) // 2

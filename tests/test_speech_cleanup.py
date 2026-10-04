@@ -11,7 +11,8 @@ import pytest
 from shiri.rpc import RpcError, call_rpc, serve_rpc
 from shiri.runtime.audio import AudioWorker, SpeechSession
 from test_audio import FakePeer, RecordingMixer, request
-from test_native_audio import begin, controller, pcm
+from test_native_audio import LateSpeech, begin, controller, pcm
+from test_speech_startup import native_controller
 from shiri.runtime.native import NativeHandle
 
 
@@ -61,7 +62,8 @@ async def native_worker(peer, **kwargs):
 
 def unchanged_program(native, client, handle, token):
     assert native.actor.owns(token) and not handle.closed
-    assert len(client.requests) == 2, "Speech must not invoke any source/player/flush command"
+    source_requests = [item for item in client.requests if item[1] != "/api/player/shiri-speech-ready"]
+    assert len(source_requests) == 2, "Speech must not invoke any source/player/flush command"
 
 
 async def test_canceled_close_joins_receiver_and_negotiation_finally_without_a_cycle(valid_sdp):
@@ -187,7 +189,10 @@ async def test_expiry_never_waits_for_peer_close_or_holds_program_ducked(expiry)
     now = time.monotonic()
     worker.session = session = SpeechSession("owner", "request", peer, .2, created=now - 31,
                                              last_media=now if expiry == "continuous_silence" else 0)
-    native.mixer._gain = native.mixer._target_gain = .2
+    overlay = LateSpeech(accepted=True)
+    native.mixer.speech_output = overlay
+    native.mixer.tick(music_active=True, speech_active=True, duck_gain=.2, elapsed=.01)
+    assert overlay.controls[-1] == (True, .2)
     try:
         await asyncio.wait_for(worker.tick(.01), .1)
         assert worker.session is None and native.mixer._target_gain == 1
@@ -195,7 +200,7 @@ async def test_expiry_never_waits_for_peer_close_or_holds_program_ducked(expiry)
         assert not session.disposal.done() and not session.disposed
         for sequence in range(1, 31):
             await native.message(pcm(grant, sequence=sequence, frame_index=sequence * 480), handle)
-        assert native.mixer._gain == pytest.approx(1)
+        assert overlay.controls[-1][0] is False
         assert writer.packets[-1].pcm == struct.pack("<960h", *([1000] * 960))
         unchanged_program(native, client, handle, handle.token)
         health = await worker.dispatch("health", {})
@@ -271,8 +276,9 @@ async def test_real_aiortc_cancelled_close_finishes_ice_and_preserves_native_pro
             frame.sample_rate, frame.pts, frame.time_base = 48000, self.count, Fraction(1, 48000)
             self.count += 960
             return frame
-    native, writer, client = controller()
-    await native.initialize()
+    native, writer, client, overlay = await native_controller()
+    client.connect()
+    client.first_mix()
     handle = NativeHandle(native)
     grant = await native.begin(begin(), handle)
     worker = AudioWorker(native.mixer, native=native)
@@ -313,9 +319,11 @@ async def test_real_aiortc_cancelled_close_finishes_ice_and_preserves_native_pro
         unchanged_program(native, client, handle, token)
         await worker.tick(.02)
         for sequence in range(30):
-            await native.message(pcm(grant, sequence=sequence, frame_index=sequence * 480), handle)
-        assert native.mixer._gain == pytest.approx(1)
-        assert not native.mixer.speech and writer.packets[-1].pcm == struct.pack("<960h", *([1000] * 960))
+            now = time.monotonic_ns()
+            await native.message(pcm(grant, sequence=sequence, frame_index=sequence * 480,
+                                     monotonic_before_ns=now - 200, monotonic_after_ns=now), handle)
+        assert overlay.owner is None and overlay.controls[-1][0] is False
+        assert writer.packets[-1].pcm == struct.pack("<960h", *([1000] * 960))
         unchanged_program(native, client, handle, token)
     finally:
         await sender.close()

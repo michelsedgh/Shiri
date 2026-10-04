@@ -11,6 +11,10 @@ class SocketRuntime:
     async def call(self, operation: str, payload: dict | None = None):
         return await call_rpc(self.socket_path, operation, payload)
 
+    async def open_speech(self, payload: dict):
+        from shiri.speech_stream import open_speech
+        return await open_speech(self.socket_path, payload)
+
 
 class SimulatedRuntime:
     """Explicitly labelled development backend; never accesses a physical speaker."""
@@ -18,6 +22,9 @@ class SimulatedRuntime:
         self.rooms = {}
         self.selected = {}
         self.sessions = {}
+
+    async def open_speech(self, payload: dict):
+        raise RpcError("unsupported", "Simulation does not admit or play real audio")
 
     async def call(self, operation: str, payload: dict | None = None):
         payload = payload or {}

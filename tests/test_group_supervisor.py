@@ -159,7 +159,7 @@ async def test_supervisor_launches_through_inherited_exact_namespace_fd_without_
     nodes.mkdir()
     original = tmp_path/'original-namespace'
     original.write_text('original host namespace')
-    (state/'ownership.json').write_text(json.dumps({'installation_id': 'b265-exact-installation',
+    (state/'ownership.json').write_text(json.dumps({'installation_id': 'exact-lab-installation',
                                                    'processes': {}, 'networks': {}}))
     inner, calls, launches, inherited = tmp_path/'inner.json', [], [], []
 
@@ -198,7 +198,7 @@ async def test_supervisor_launches_through_inherited_exact_namespace_fd_without_
         assert (host.st_dev, host.st_ino) == (original.stat().st_dev, original.stat().st_ino)
         # A new inner report comes from this exact launch, avoiding stale-pass
         # reports while no child, systemd unit or network resource is created.
-        atomic_json(inner, {'started_at': datetime.now(timezone.utc).isoformat(), 'passed': True})
+        atomic_json(inner, {'started_at': datetime.now(timezone.utc).isoformat(), 'passed': True, 'native_lab': {'fixture': 'exact'}})
         child = Child(cooperative=True)
         child.returncode = 0
         child.exited.set()
@@ -220,7 +220,8 @@ async def test_supervisor_launches_through_inherited_exact_namespace_fd_without_
         'sys': SimpleNamespace(platform='linux', executable=sys.executable), 'Runner': Runner,
         'RuntimeFailure': RuntimeFailure, 'atomic_json': atomic_json, 'boot_id': lambda: 'boot-A',
         'root_directory': directory, 'RESULT': tmp_path/'result.json', 'HERE': SOURCE,
-        'group': SimpleNamespace(NATIVE_LAB=None, WORK=work, STATE=state, RESULT=inner, PROJECT=tmp_path,
+        'group': SimpleNamespace(NATIVE_LAB=object(), native_lab_admission=lambda *_: {'fixture': 'exact'},
+            WORK=work, STATE=state, RESULT=inner, PROJECT=tmp_path,
             isolated_lan=SimpleNamespace(namespace_identity=lambda fd: (os.fstat(fd).st_dev, os.fstat(fd).st_ino)),
             observation=SimpleNamespace(base=SimpleNamespace(closed_slot=lambda: None, host_snapshot=snapshot)),
             legacy_snapshot=lambda: 'unchanged legacy')})
@@ -235,7 +236,7 @@ async def test_supervisor_launches_through_inherited_exact_namespace_fd_without_
     else:
         assert outcome == 0 and result['passed'] is True and len(launches) == 1
         assert list(nodes.iterdir()) == []
-        assert result['cleanup'] == {'parent_namespace_deleted': True, 'original_host_and_legacy_preserved': True}
+        assert result['cleanup'] == {'parent_namespace_deleted': True, 'original_host_and_legacy_preserved': True, 'native_lab_preserved': True}
         assert result['original_namespace_identity'] == {'st_dev': original.stat().st_dev, 'st_ino': original.stat().st_ino}
         for descriptor in inherited:
             with pytest.raises(OSError):

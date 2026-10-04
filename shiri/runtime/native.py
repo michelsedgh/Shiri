@@ -6,9 +6,7 @@ relay delay. A source-only backend flush barrier precedes each ownership grant.
 """
 from __future__ import annotations
 
-from array import array
 import asyncio
-from collections import deque
 from dataclasses import replace
 import json
 import logging
@@ -17,7 +15,6 @@ from pathlib import Path
 import socket
 import stat
 import struct
-import sys
 import time
 from uuid import UUID, uuid4
 
@@ -27,7 +24,7 @@ from .music_startup import MusicStartupTrace
 from .source import SourceActor
 from .speech_startup import SpeechPreparation, complete as complete_speech_startup, retire_backend
 from .timing import (
-    Clock, FLAG_AIRPLAY2, FLAG_GAP, FLAG_SPEECH_ONLY, FramedFifoWriter,
+    FLAG_AIRPLAY2, FLAG_SPEECH_ONLY, FramedFifoWriter,
     HEADER_BYTES, Kind, MAX_FRAMES, Packet, RATE, RELAY_DELAY_NS, StreamFence,
     TimingError, ZERO_UUID, output_packet,
 )
@@ -102,13 +99,7 @@ class NativeMixer:
         self.token = None
         self.route = None
         self.error = None
-        self.speech = deque()
-        self.maximum_speech_frames = RATE // 4
-        self.speech_dropped_frames = 0
-        self._gain = 1.0
         self._target_gain = 1.0
-        self._idle_frame = 0
-        self._idle_next_ns = 0
         self._idle_hold_ns = 0
         self._speech_input_until_ns = 0
         self._last_native_ns = 0
@@ -120,12 +111,10 @@ class NativeMixer:
 
     def fence(self, token):
         # The actor invokes this under the same lock as every final FIFO write.
-        # Speech is a separate bounded queue and producer: leave both intact.
+        # Speech is a separate native producer; leave its admission intact.
         self.token = token
         self._last_native_ns = 0
         self._last_packet = None
-        self._idle_next_ns = 0
-        self._idle_frame = 0
 
     def arm(self, owner):
         self.route = owner
@@ -154,50 +143,22 @@ class NativeMixer:
     def push_speech(self, data: bytes, samples: int):
         if type(samples) is not int or not 0 < samples <= RATE // 5 or len(data) != samples * 2:
             raise RpcError("invalid_media", "Speech audio frame has an invalid size")
-        if self.speech_output is not None:
-            # The private backend mixes these samples on its player thread,
-            # after waiting for the music anchor. Do not put them in the early
-            # native program queue or apply early ducking to queued music.
-            preparation = self.speech_preparation
-            if preparation is not None:
-                preparation.push(data, samples, self._speech_gain, self._send_speech)
-            else:
-                # Existing independent unit fixtures may omit preparation; the
-                # production AudioWorker establishes it before RTC callbacks.
-                self._send_speech(data, samples, self._speech_gain)
-            return
-        values = array("h", data)
-        if sys.byteorder != "little":
-            values.byteswap()
-        self.speech.extend(values)
-        excess = len(self.speech) - self.maximum_speech_frames
-        for _ in range(max(0, excess)):
-            self.speech.popleft()
-        self.speech_dropped_frames += max(0, excess)
-        # Padding carries even a short idle utterance through OwnTone's buffers.
-        # This never changes an active music owner or invokes a backend command.
-        self._idle_hold_ns = self.now_ns() + self.relay_delay_ns + 500_000_000
+        if self.speech_output is None:
+            raise RpcError("audio_unavailable", "Speech requires its authenticated native output")
+        # Native mixing occurs after the music presentation anchor. Speech
+        # must never be injected into or change the earlier music FIFO.
+        preparation = self.speech_preparation
+        if preparation is not None:
+            preparation.push(data, samples, self._speech_gain, self._send_speech)
+        else:
+            # Music-only unit fixtures may exercise the output seam directly;
+            # production AudioWorker always establishes exact preparation.
+            self._send_speech(data, samples, self._speech_gain)
 
     def set_speech_gain(self, gain):
         self._speech_gain = gain
         if self.speech_output is not None:
             self.speech_output.set_gain(gain)
-
-    def _mix(self, pcm, frames):
-        values = array("h", pcm)
-        if sys.byteorder != "little":
-            values.byteswap()
-        for index in range(frames):
-            target = self._target_gain
-            step = 1.0 / (RATE * (0.04 if target < self._gain else 0.25))
-            self._gain = (min(target, self._gain + step) if target > self._gain
-                          else max(target, self._gain - step))
-            voice = self.speech.popleft() if self.speech else 0
-            for channel in (index * 2, index * 2 + 1):
-                values[channel] = max(-32768, min(32767, round(values[channel] * self._gain) + voice))
-        if sys.byteorder != "little":
-            values.byteswap()
-        return values.tobytes()
 
     def accept(self, packet: Packet, token):
         if self.actor is None:
@@ -207,8 +168,6 @@ class NativeMixer:
             nonlocal mapped
             output, mapped = output_packet(packet, packet.pcm, token, now_ns=self.now_ns(),
                                            relay_delay_ns=self.relay_delay_ns)
-            if self.speech_output is None:
-                output = replace(output, pcm=self._mix(packet.pcm, packet.frames))
             self.writer.write(output)
             self._last_native_ns = self.now_ns()
             self._last_packet = packet
@@ -226,54 +185,18 @@ class NativeMixer:
             self.speech_output.control(speech_active, duck_gain)
         if self.error:
             raise RuntimeError(self.error)
-        if self.speech_output is not None:
-            # The authenticated backend owns an output-only speech clock even
-            # when the room has no music owner. Synthetic FIFO silence would
-            # compete with that bed and make a paused input wait for its full
-            # capacity before a fresh mix, aging the original packet anchor.
-            # Actual music still enters only through accept() at its original P.
-            return
-        if self.actor is None or self.token is not None or self.route is None:
-            return
-        preparation = self.speech_preparation
-        preparing_bed = bool(preparation and not preparation.retired and preparation.idle
-                             and preparation.phase in {"waiting_for_mix", "waiting_for_negotiation", "ready"})
-        if not self.speech and now > self._idle_hold_ns and not preparing_bed:
-            self.writer.close()
-            self._idle_next_ns = 0
-            return
-        if not self._idle_next_ns:
-            self._idle_next_ns = now
-        if self._idle_next_ns > now:
-            return
-        gap = now - self._idle_next_ns > 250_000_000
-        if gap:
-            self._idle_next_ns = now
-        incarnation, session, epoch, generation = self.route
-        if session != ZERO_UUID:
-            return
-        lead_ns = ((self.output_buffer_ms+100)*1_000_000 if self.speech_output is not None
-                   else self.relay_delay_ns)
-        packet = Packet(Kind.PCM, session, incarnation=incarnation, epoch=epoch, generation=generation,
-                        frame_index=self._idle_frame, flags=FLAG_SPEECH_ONLY | (FLAG_GAP if gap else 0),
-                        frames=960, pcm=bytes(3840), clock=Clock.MONOTONIC,
-                        presentation_ns=self._idle_next_ns + lead_ns)
-        def write():
-            self.writer.write(packet if self.speech_output is not None
-                              else replace(packet, pcm=self._mix(packet.pcm, packet.frames)))
-            self._idle_frame += packet.frames
-            self._idle_next_ns += 20_000_000
-        self.actor.write_idle(write)
+        # OwnTone owns idle speech timing and the gain envelope. No synthetic
+        # music FIFO bed or per-sample Python mixer is needed here.
 
     def health(self):
         speech_input_active = self.now_ns() < self._speech_input_until_ns
         return {"ready": self.error is None,
-                "audio_active": self.token is not None or bool(self.speech) or speech_input_active,
+                "audio_active": self.token is not None or speech_input_active,
                 "speech_input_active": speech_input_active,
-                "music_gain": self._gain if self.speech_output is None else None,
+                "music_gain": None,
                 "music_target_gain": self._target_gain, "fifo_reader": self.writer.reader_present,
                 "written_bytes": self.writer.written_bytes, "dropped_bytes": self.writer.dropped_bytes,
-                "speech_dropped_frames": self.speech_dropped_frames, "native_blocks": self.blocks,
+                "speech_dropped_frames": 0, "native_blocks": self.blocks,
                 "timing_relay_delay_ms": self.relay_delay_ns // 1_000_000,
                 "output_buffer_ms": self.output_buffer_ms,
                 **(self.speech_output.health() if self.speech_output is not None else {}),
@@ -287,7 +210,6 @@ class NativeMixer:
 
     def close(self):
         self.writer.close()
-        self.speech.clear()
         if self.speech_output is not None:
             self.speech_output.close()
 
@@ -490,7 +412,7 @@ class NativeController:
                         return await controller.client.request(method, path, **kwargs)
                 return await controller.client.request(method, path, **kwargs)
         return await complete_speech_startup(preparation, SetupClient(), body, owned=owned,
-            bed=lambda value: None, send=self.mixer._send_speech,
+            send=self.mixer._send_speech,
             admit=admit)
 
     def negotiated_speech(self, identity):

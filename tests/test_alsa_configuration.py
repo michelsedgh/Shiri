@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from shiri.runtime.alsa_configuration import render_bridge_config, render_pcm_config
+from shiri.runtime.alsa_configuration import render_pcm_config
 from shiri.runtime.alsa_identity import PCMIdentityError
 
 
@@ -78,35 +78,6 @@ def test_live_pin_and_physical_endpoint_guards_precede_rendering():
         render_pcm_config(pin, True)
 
 
-def test_bridge_has_fixed_reverse_pair_and_exact_bluetooth_plugin_fields():
-    pin = Pin(card=4, subdevice=6)
-    assert render_bridge_config(pin, "bluealsa:DEV=aa:bb:cc:dd:ee:ff,PROFILE=a2dp") == (
-        "pcm.shiri_capture {\n  type hw\n  card 4\n  device 0\n  subdevice 6\n}\n"
-        "pcm.shiri_target {\n  type bluealsa\n  device \"AA:BB:CC:DD:EE:FF\"\n  profile \"a2dp\"\n}\n")
-    assert pin.validations == 1
-
-
-@pytest.mark.parametrize("device", [None, "bluealsa", "bluealsa:DEV=00:00:00:00:00:00,PROFILE=a2dp",
-    "bluealsa:DEV=FF:FF:FF:FF:FF:FF,PROFILE=a2dp", "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=sco",
-    "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp,SRV=untrusted", "/tmp/asound.conf",
-    'bluealsa:DEV=AA:BB:CC:DD:EE:FF"\n@hooks,PROFILE=a2dp'])
-def test_bridge_rejects_wildcards_arbitrary_aliases_profiles_and_dsl(device):
-    pin = Pin()
-    with pytest.raises(PCMIdentityError, match="exact A2DP"):
-        render_bridge_config(pin, device)
-    assert pin.validations == 0
-
-
-@pytest.mark.parametrize("kind", ["wrong-device", "physical-usb"])
-def test_bridge_requires_a_real_loopback_playback_pair(kind):
-    pin = Pin(device=0 if kind == "wrong-device" else 1)
-    if kind == "physical-usb":
-        pin.fingerprint = {"version": 1, "kind": "usb", "binding": "serial", "vid": "1234", "pid": "5678",
-                           "serial": "USB", "interface": "00", "configuration": 1, "device": 1, "subdevice": 7}
-    with pytest.raises(PCMIdentityError, match="snd_aloop DEV1"):
-        render_bridge_config(pin, "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp")
-
-
 @pytest.fixture
 def asound():
     path = ctypes.util.find_library("asound")
@@ -129,20 +100,19 @@ def asound():
     return SimpleNamespace(lib=lib, pointer=pointer)
 
 
-@pytest.mark.parametrize("mode", ["plain", "plug", "bridge"])
+@pytest.mark.parametrize("mode", ["plain", "plug"])
 def test_actual_alsa_parser_accepts_configuration_and_proves_integer_card_without_global_import(asound, mode):
     lib, pointer = asound.lib, asound.pointer
     pin = Pin()
-    text = (render_bridge_config(pin, "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp") if mode == "bridge"
-            else render_pcm_config(pin, mode == "plug"))
+    text = render_pcm_config(pin, mode == "plug")
     root, stream = pointer(), pointer()
     assert lib.snd_config_top(ctypes.byref(root)) == 0
     data = text.encode()
     try:
         assert lib.snd_input_buffer_open(ctypes.byref(stream), data, len(data)) == 0
         assert lib.snd_config_load(root, stream) == 0
-        prefix = "pcm.shiri_capture" if mode == "bridge" else "pcm.shiri.slave.pcm" if mode == "plug" else "pcm.shiri"
-        for key, expected in [("card", 5), ("device", 0 if mode == "bridge" else 1), ("subdevice", 7)]:
+        prefix = "pcm.shiri.slave.pcm" if mode == "plug" else "pcm.shiri"
+        for key, expected in [("card", 5), ("device", 1), ("subdevice", 7)]:
             node, number, string = pointer(), ctypes.c_long(), ctypes.c_char_p()
             assert lib.snd_config_search(root, f"{prefix}.{key}".encode(), ctypes.byref(node)) == 0
             assert lib.snd_config_get_integer(node, ctypes.byref(number)) == 0 and number.value == expected
@@ -150,11 +120,6 @@ def test_actual_alsa_parser_accepts_configuration_and_proves_integer_card_withou
         for forbidden in ["ctl", "pcm.default", "pcm.hw", "defaults", "@hooks"]:
             unused = pointer()
             assert lib.snd_config_search(root, forbidden.encode(), ctypes.byref(unused)) < 0
-        if mode == "bridge":
-            for key, expected in [("type", "bluealsa"), ("device", "AA:BB:CC:DD:EE:FF"), ("profile", "a2dp")]:
-                node, string = pointer(), ctypes.c_char_p()
-                assert lib.snd_config_search(root, f"pcm.shiri_target.{key}".encode(), ctypes.byref(node)) == 0
-                assert lib.snd_config_get_string(node, ctypes.byref(string)) == 0 and string.value.decode() == expected
     finally:
         if stream:
             lib.snd_input_close(stream)

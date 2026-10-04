@@ -40,7 +40,7 @@ if group.NATIVE_LAB is not None:
 INNER_RESULT = fixture.RESULT
 
 SOURCE_FILES = (
-    'tests/linux/native_lab.py', 'tests/linux/check_airplay_tts.py', 'tests/linux/check_airplay_api_tts.py',
+    'tests/linux/native_lab.py', 'tests/linux/native_lab_audio.py', 'tests/linux/native_lab_observation.py',
     'tests/linux/run_native_bluetooth_route.py', 'tests/linux/native_bluetooth_route.py',
     'tests/linux/check_native_bluetooth_route.py', 'tests/linux/check_bluealsa_private_bus.py',
     'tests/native/private_bluealsa_exec.c', 'tests/linux/check_native_grouping.py',
@@ -171,11 +171,10 @@ async def run(binary, digest):
         result['binary_sha256'] = digest
         result['source_files'] = source_receipts(group.PROJECT)
         result['source_proof_scope'] = 'Exact named source bytes; reviewed whole-tree admission belongs to the external immutable staging manifest'
+        if group.NATIVE_LAB is None:
+            raise RuntimeFailure('An explicit native lab profile is required')
         manifest = json.loads((group.STATE/'ownership.json').read_text())
-        if group.NATIVE_LAB is not None:
-            result['native_lab'] = group.native_lab_admission(manifest, 'bluetooth_route')
-        elif not manifest['installation_id'].startswith('b265') or manifest['networks'] or manifest['processes']:
-            raise RuntimeFailure('Known candidate must be idle before creating a test namespace')
+        result['native_lab'] = group.native_lab_admission(manifest, 'bluetooth_route')
         if node.exists():
             raise RuntimeFailure('Supervisor namespace already exists; refusing adoption')
         group.observation.base.closed_slot()

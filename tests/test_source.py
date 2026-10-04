@@ -6,10 +6,10 @@ from uuid import uuid4
 from pydantic import ValidationError
 import pytest
 
-from shiri.domain import Conflict, ValidationIssue
+from shiri.domain import ValidationIssue
 from shiri.source import (
     ApplySourceVolume, GrantInput, InputEnded, InputRequested, InputVolumeChanged,
-    OverlayToken, RevokeInput, SetMusicGain, SourceState, SourceToken, TtsEnded, TtsStarted,
+    RevokeInput, SourceState, SourceToken,
     owns_input, permits_action, reduce_source,
 )
 
@@ -113,74 +113,12 @@ def test_fresh_incarnation_rejects_late_callbacks_even_with_reused_native_id_and
 def test_events_for_another_zone_cannot_route_implicitly(zone):
     another = SourceState(zone_id=str(uuid4()))
     foreign = request(another).state.owner
-    foreign_overlay = reduce_source(another, TtsStarted(zone_id=another.zone_id, session_id="speech")).state.overlay
     events = [InputRequested(zone_id=another.zone_id, protocol="chromecast", session_id="B"),
-              InputEnded(token=foreign), InputVolumeChanged(token=foreign, volume=0),
-              TtsStarted(zone_id=another.zone_id, session_id="speech"), TtsEnded(token=foreign_overlay)]
+              InputEnded(token=foreign), InputVolumeChanged(token=foreign, volume=0)]
     for event in events:
         with pytest.raises(ValidationIssue, match="another exact zone"):
             reduce_source(zone, event)
     assert zone.owner is None and zone.epoch == 0
-
-
-def test_tts_only_changes_mix_gain_while_music_owner_and_volume_continue(zone):
-    active = request(zone).state
-    speech = reduce_source(active, TtsStarted(zone_id=zone.zone_id, session_id="speech-A", duck_gain=.2))
-    assert music(speech.state) == music(active)
-    assert speech.actions == (SetMusicGain(token=speech.state.overlay, gain=.2),)
-    volume = reduce_source(speech.state, InputVolumeChanged(token=active.owner, volume=65)).state
-    assert volume.volume == 65 and volume.music_gain == .2 and volume.owner == active.owner
-    ended = reduce_source(volume, TtsEnded(token=volume.overlay))
-    assert music(ended.state) == music(volume) and ended.state.music_gain == 1
-    assert ended.actions == (SetMusicGain(token=volume.overlay, gain=1),)
-    assert not any(isinstance(action, (GrantInput, RevokeInput)) for action in (*speech.actions, *ended.actions))
-
-
-def test_takeover_during_speech_keeps_ducking_and_ending_speech_never_restores_old_phone(zone):
-    airplay = request(zone).state
-    speech = reduce_source(airplay, TtsStarted(zone_id=zone.zone_id, session_id="speech-A")).state
-    cast = request(speech, "chromecast", "phone-B").state
-    assert cast.tts_session_id == "speech-A" and cast.music_gain == .28
-    ended = reduce_source(cast, TtsEnded(token=cast.overlay))
-    assert ended.state.owner == cast.owner and ended.state.epoch == cast.epoch
-    assert ended.actions == (SetMusicGain(token=cast.overlay, gain=1),)
-    stale_airplay_end = reduce_source(ended.state, InputEnded(token=airplay.owner))
-    assert stale_airplay_end.state == ended.state
-
-
-def test_tts_can_overlay_idle_zone_and_input_end_does_not_end_speech(zone):
-    idle_speech = reduce_source(zone, TtsStarted(zone_id=zone.zone_id, session_id="speech-A")).state
-    assert idle_speech.owner is None and idle_speech.epoch == 0
-    music_and_speech = request(idle_speech).state
-    ended_music = reduce_source(music_and_speech, InputEnded(token=music_and_speech.owner)).state
-    assert ended_music.owner is None and ended_music.tts_session_id == "speech-A" and ended_music.music_gain == .28
-
-
-def test_conflicting_tts_is_rejected_and_stale_tts_end_cannot_unduck_successor(zone):
-    first = reduce_source(zone, TtsStarted(zone_id=zone.zone_id, session_id="speech-A")).state
-    replay = reduce_source(first, TtsStarted(zone_id=zone.zone_id, session_id="speech-A"))
-    assert replay.state == first and replay.actions == ()
-    for event in (TtsStarted(zone_id=zone.zone_id, session_id="speech-B"),
-                  TtsStarted(zone_id=zone.zone_id, session_id="speech-A", duck_gain=.5)):
-        with pytest.raises(Conflict):
-            reduce_source(first, event)
-    ended = reduce_source(first, TtsEnded(token=first.overlay)).state
-    second = reduce_source(ended, TtsStarted(zone_id=zone.zone_id, session_id="speech-B")).state
-    late = reduce_source(second, TtsEnded(token=first.overlay))
-    assert not late.accepted and late.state == second and not late.actions
-
-
-def test_reused_overlay_id_and_previous_incarnation_cannot_restore_new_overlay_gain(zone):
-    first = reduce_source(zone, TtsStarted(zone_id=zone.zone_id, session_id="reused-id")).state
-    idle = reduce_source(first, TtsEnded(token=first.overlay)).state
-    next_overlay = reduce_source(idle, TtsStarted(zone_id=zone.zone_id, session_id="reused-id")).state
-    assert next_overlay.overlay.epoch > first.overlay.epoch
-    restarted = SourceState(zone_id=zone.zone_id)
-    fresh = reduce_source(restarted, TtsStarted(zone_id=zone.zone_id, session_id="reused-id")).state
-    assert fresh.overlay.epoch == first.overlay.epoch and fresh.incarnation != first.incarnation
-    for current in (next_overlay, fresh):
-        result = reduce_source(current, TtsEnded(token=first.overlay))
-        assert result.state == current and not result.accepted and not result.actions
 
 
 @pytest.mark.parametrize("event", [
@@ -188,11 +126,8 @@ def test_reused_overlay_id_and_previous_incarnation_cannot_restore_new_overlay_g
     {"event": "input_requested", "protocol": "airplay2", "session_id": " A"},
     {"event": "input_requested", "protocol": "airplay2", "session_id": "A\x00"},
     {"event": "input_requested", "protocol": "airplay2", "session_id": "A", "command": "pause"},
-    {"event": "tts_started", "session_id": "speech", "duck_gain": float("nan")},
-    {"event": "tts_started", "session_id": "speech", "duck_gain": True},
-    {"event": "tts_started", "session_id": "speech", "duck_gain": -.1},
 ])
-def test_event_contract_rejects_unknown_protocols_fields_coercion_and_invalid_gain(zone, event):
+def test_event_contract_rejects_unknown_protocols_fields_and_invalid_identity(zone, event):
     with pytest.raises(ValidationError):
         reduce_source(zone, {"zone_id": zone.zone_id, **event})
 
@@ -234,30 +169,15 @@ def test_delayed_actions_and_every_old_pcm_write_are_fenced_after_takeover(zone)
     assert not any(permits_action(restarted, action) for action in successor.actions)
 
 
-def test_queued_same_source_volume_and_overlay_gain_do_not_replay_over_newer_state(zone):
+def test_queued_same_source_volume_does_not_replay_over_newer_state(zone):
     active = request(zone).state
     previous = reduce_source(active, InputVolumeChanged(token=active.owner, volume=65))
     newest = reduce_source(previous.state, InputVolumeChanged(token=active.owner, volume=0))
     assert not permits_action(newest.state, previous.actions[0])
     assert permits_action(newest.state, newest.actions[0])
-    speech = reduce_source(newest.state, TtsStarted(zone_id=zone.zone_id, session_id="speech"))
-    ended = reduce_source(speech.state, TtsEnded(token=speech.state.overlay))
-    following = reduce_source(ended.state, TtsStarted(zone_id=zone.zone_id, session_id="speech", duck_gain=.28))
-    assert not permits_action(following.state, speech.actions[0])
-    assert not permits_action(following.state, ended.actions[0])
-    assert permits_action(following.state, following.actions[0])
 
 
 def test_action_fences_also_reject_another_exact_zone(zone):
     another = request(SourceState(zone_id=str(uuid4())))
     assert not owns_input(zone, another.state.owner)
     assert not any(permits_action(zone, action) for action in another.actions)
-
-
-def test_gain_actions_require_exact_overlay_identity_even_after_end(zone):
-    started = reduce_source(zone, TtsStarted(zone_id=zone.zone_id, session_id="speech-A"))
-    impostor = OverlayToken.model_validate({**started.state.overlay.model_dump(), "session_id": "speech-B"})
-    assert not permits_action(started.state, SetMusicGain(token=impostor, gain=started.state.music_gain))
-    ended = reduce_source(started.state, TtsEnded(token=started.state.overlay))
-    assert permits_action(ended.state, ended.actions[0])
-    assert not permits_action(ended.state, SetMusicGain(token=impostor, gain=1))

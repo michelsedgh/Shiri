@@ -742,12 +742,9 @@ async def run_check(binary, digest, parent_namespace, original_netns_fd):
         require(sys.platform == 'linux' and os.geteuid() == 0
                 and os.environ.get('SHIRI_PRIVATE_BLUETOOTH_ROUTE_TEST') == '1', 'Explicit Linux root private-route opt-in is required')
         require(type(original_netns_fd) is int and original_netns_fd >= 3, 'Run through the isolated supervisor')
+        require(group.NATIVE_LAB is not None, 'An explicit native lab profile is required')
         manifest = json.loads((group.STATE/'ownership.json').read_text())
-        if group.NATIVE_LAB is not None:
-            report['native_lab'] = group.native_lab_admission(manifest, 'bluetooth_route', original_netns_fd=original_netns_fd)
-        else:
-            require(manifest['installation_id'].startswith('b265') and not manifest['networks'] and not manifest['processes'],
-                    'Known candidate must be idle and exact; no concurrent fixture')
+        report['native_lab'] = group.native_lab_admission(manifest, 'bluetooth_route', original_netns_fd=original_netns_fd)
         route.private.validated_binary(binary, digest)
         group.observation.base.closed_slot()
         legacy, baseline = group.legacy_snapshot(), await group.observation.base.host_snapshot()
@@ -929,12 +926,11 @@ async def run_check(binary, digest, parent_namespace, original_netns_fd):
                 manifest = json.loads((group.STATE/'ownership.json').read_text())
                 require(manifest['installation_id'] == report['installation_id'] and not manifest['processes'] and not manifest['networks'],
                         'Actual candidate ownership remains after cleanup')
-                if group.NATIVE_LAB is not None:
-                    require(group.native_lab_admission(manifest, 'bluetooth_route', original_netns_fd=original_netns_fd)
-                            == report['native_lab'], 'Clean lab admission changed during cleanup')
+                require(group.native_lab_admission(manifest, 'bluetooth_route', original_netns_fd=original_netns_fd)
+                        == report['native_lab'], 'Clean lab admission changed during cleanup')
                 group.observation.base.closed_slot()
                 require(await group.observation.base.host_snapshot() == baseline and group.legacy_snapshot() == legacy,
-                        'Host, legacyPID or protectedPCM baseline changed')
+                        'Host or protected PCM baseline changed')
                 report['cleanup'].update(empty_manifest=True, slot7_closed=True, host_and_legacy_preserved=True)
             except Exception as exc:
                 errors.append('host cleanup: '+type(exc).__name__)

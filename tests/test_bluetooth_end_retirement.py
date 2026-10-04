@@ -13,9 +13,7 @@ from shiri.runtime.system import RuntimeFailure
 
 ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "tests/linux/check_native_bluetooth_route.py"
-GROUP = ROOT / "tests/linux/check_native_grouping.py"
 HEALTHY_AST = "1b71e0f399506b138e7a29112186f329dd56d043be6b29f04926ef44d43f5a7c"
-PRODUCER_FILE = "270d02c249af63c51e5f884ffa08490dcd8ea14ad675b7c167f0d79ea7c4f10a"
 
 
 def require(condition, message):
@@ -188,8 +186,7 @@ def test_counter_or_clock_rollback_cannot_fabricate_a_silence_window(change):
         observe(guard, bridge, health, receiver, now, packets=packets, chunks=chunks)
 
 
-def test_all_daemon_identity_and_producer_guards_preserve_the_reviewed_bytes():
-    assert hashlib.sha256(GROUP.read_bytes()).hexdigest() == PRODUCER_FILE
+def test_bluetooth_daemon_identity_guard_preserves_the_reviewed_contract():
     tree = ast.parse(MANUAL.read_text())
     exercise = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
                     and node.name == "exercise")

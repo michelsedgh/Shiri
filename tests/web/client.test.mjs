@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ApiClient, ApiError, RoomStore, canSaveSelection, protocolName, roomHealth, speakerState, reductionPercent, safeHttpUrl, calibrationMatchesRoom, calibrationEvidenceScope, validCalibrationSession, validLocalDeviceInventory, validLocalBindingAck, validLocalDeviceURI } from '../../shiri/web/app.js';
+import { ApiClient, ApiError, RoomStore, canSaveSelection, protocolName, roomHealth, roomCardSignature, speakerState, reductionPercent, safeHttpUrl, calibrationMatchesRoom, calibrationEvidenceScope, validCalibrationSession, validLocalDeviceInventory, validLocalBindingAck, validLocalDeviceURI } from '../../shiri/web/app.js';
 
 function deferred() {
   let resolve, reject;
@@ -190,6 +190,17 @@ test('a failed discovery query cannot advertise speech readiness', () => {
 
 test('simulation never claims physical playback readiness', () => {
   assert.equal(roomHealth(room({ speakers: [{ id: '101' }], outputs: [{ id: '101', available: true, selected: true }] }), { simulation: true }).ready, false);
+});
+
+test('card identity ignores volatile observations but includes control revision and visible readiness', () => {
+  const value = room({ speakers: [{ id: '101', name: 'Speaker' }], outputs: [{ id: '101', available: true, selected: true }],
+    runtime: { status: 'running', last_health_at: 'before' }, readiness: { hold: { remaining_ms: 60000 } } });
+  const before = roomCardSignature(value, {});
+  assert.equal(roomCardSignature({ ...value, runtime: { ...value.runtime, last_health_at: 'after' },
+    readiness: { hold: { remaining_ms: 12345 } } }, {}), before);
+  assert.notEqual(roomCardSignature({ ...value, revision: 2 }, {}), before);
+  assert.notEqual(roomCardSignature({ ...value, outputs: [] }, {}), before);
+  assert.notEqual(roomCardSignature(value, {}, { writeError: 'Not saved' }), before);
 });
 
 test('protocol names reflect capabilities without claiming universal synchronization', () => {

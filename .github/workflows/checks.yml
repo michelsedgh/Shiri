@@ -11,18 +11,14 @@ jobs:
         with:
           node-version: '22'
       - name: Linux audio dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-venv python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-alsa libjson-c-dev libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libsbc-dev pkg-config
-      - name: Enable ALSA loopback when the runner kernel provides it
-        run: sudo modprobe snd-aloop || echo 'This runner lacks snd-aloop; the ALSA bridge check will explicitly skip.'
+        run: sudo apt-get update && sudo apt-get install -y python3-venv libasound2 libjson-c-dev libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libsbc-dev pkg-config
       - name: Install project and verification tools
         run: |
-          /usr/bin/python3 -m venv --system-site-packages .venv
+          /usr/bin/python3 -m venv .venv
           .venv/bin/pip install --require-hashes --only-binary=:all: -r install/build_requirements.lock
           .venv/bin/pip install --no-build-isolation '.[audio,test]'
           .venv/bin/python -m playwright install --with-deps chromium
-      - name: Python validation and real PCM mixer
-        env:
-          SHIRI_LINUX_AUDIO_TESTS: '1'
+      - name: Python validation and native audio contracts
         run: |
           .venv/bin/ruff check shiri tests
           .venv/bin/python - <<'PY'

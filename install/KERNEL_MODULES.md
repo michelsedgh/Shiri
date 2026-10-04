@@ -1,14 +1,16 @@
 # Loopback driver installation
 
-Shiri needs the Linux `snd-aloop` driver. A fresh official Ubuntu Jammy ARM64
-cloud image boots kernel `5.15.0-194-generic` without that optional driver.
-The installer now checks this immediately after its runtime APT dependencies,
-before compiling helpers or creating the application virtual environment.
+Shiri's native production audio paths do not need `snd-aloop`. Virtual-device
+qualification can opt in with `SHIRI_INSTALL_LOOPBACK=1`. A fresh official
+Ubuntu Jammy ARM64 cloud image boots kernel `5.15.0-194-generic` without that
+optional driver. For this explicit option, the installer checks availability
+after its runtime APT dependencies, before compiling helpers or creating the
+application virtual environment.
 
 `kernel_modules.py` first performs an actual dry-run module probe, ignoring
 an `install` replacement in modprobe configuration. An available module or
 built-in driver needs no package lookup, APT refresh or kernel change. The
-existing final `modprobe snd-aloop` step still loads the driver; a dry-run
+guarded `modprobe snd-aloop` step then loads the driver; a dry-run
 success does not prove that loading will succeed on a particular host.
 
 Automatic provisioning is limited to Ubuntu's exact running generic kernel.

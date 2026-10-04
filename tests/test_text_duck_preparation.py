@@ -6,7 +6,7 @@ import pytest
 from shiri.rpc import RpcError
 from shiri.runtime.audio import AudioWorker
 import test_pcm_speech
-from test_pcm_speech import ending, media, opening
+from test_pcm_speech import deliver, ending, media, opening
 from test_speech_startup import native_controller
 
 ready_worker = test_pcm_speech.ready_worker
@@ -19,14 +19,15 @@ def text_opening():
 async def test_text_fade_waits_for_exact_begin_but_not_first_generated_audio():
     native, writer, client, overlay = await native_controller()
     worker = AudioWorker(native.mixer, native=native)
-    pending = asyncio.create_task(worker.dispatch("speech", text_opening()))
+    pending = asyncio.create_task(worker.open_speech(text_opening()))
     try:
         await asyncio.wait_for(client.prepare_entered.wait(), 1)
         await worker.tick(.05)
         assert not overlay.owner and not overlay.controls and not overlay.sent
         client.connect()
         client.first_mix()
-        prepared = await asyncio.wait_for(pending, 1)
+        admission = await asyncio.wait_for(pending, 1)
+        prepared = admission.result
         assert overlay.envelope == (300, 600)
         assert overlay.controls[-1] == (True, .17)
         assert prepared["duck_requested_monotonic_ns"] > 0
@@ -37,7 +38,7 @@ async def test_text_fade_waits_for_exact_begin_but_not_first_generated_audio():
         for _ in range(8):
             await worker.tick(.05)
         assert all(active for active, _gain in overlay.controls)
-        await worker.dispatch("speech", ending(prepared, action="close"))
+        await admission.close()
         assert worker.session is None and overlay.owner is None
         assert client.requests[-1][2]["action"] == "cancel"
         assert not worker._disposals
@@ -48,12 +49,13 @@ async def test_text_fade_waits_for_exact_begin_but_not_first_generated_audio():
 
 async def test_text_keeps_one_envelope_through_quiet_generated_pcm(ready_worker):
     worker, _native, _writer, _client, overlay = ready_worker
-    prepared = await worker.dispatch("speech", text_opening())
-    await worker.dispatch("speech", media(prepared, value=0))
+    admission = await worker.open_speech(text_opening())
+    prepared = admission.result
+    await deliver(worker, media(prepared, value=0))
     await worker.tick(.05)
     assert worker.session.last_audible == 0
     assert overlay.controls[-1] == (True, .17)
-    await worker.dispatch("speech", ending(prepared))
+    await worker.direct_pcm(ending(prepared))
     assert worker.session is None and overlay.owner is None
 
 
@@ -62,20 +64,23 @@ async def test_failed_first_fade_retires_the_exact_voice_and_allows_successor(re
     original = overlay.control
     overlay.control = lambda *_args: False
     with pytest.raises(RpcError, match="music fade"):
-        await worker.dispatch("speech", text_opening())
+        await worker.open_speech(text_opening())
     assert worker.session is None and overlay.owner is None and not worker._disposals
     assert client.requests[-1][2]["action"] == "cancel"
     overlay.control = original
-    successor = await worker.dispatch("speech", text_opening())
-    assert successor["duck_requested_monotonic_ns"] > 0
+    successor = await worker.open_speech(text_opening())
+    assert successor.result["duck_requested_monotonic_ns"] > 0
 
 
-async def test_prepared_replay_cannot_switch_the_admitted_fade_policy(ready_worker):
+async def test_duplicate_admission_cannot_switch_the_admitted_fade_policy(ready_worker):
     worker, _native, _writer, _client, overlay = ready_worker
-    prepared = await worker.dispatch("speech", text_opening())
-    with pytest.raises(RpcError, match="Another speech producer"):
-        await worker.dispatch("speech", opening())
-    assert await worker.dispatch("speech", text_opening()) == prepared
+    admission = await worker.open_speech(text_opening())
+    current, controls = worker.session, list(overlay.controls)
+    for request in (opening(), text_opening()):
+        with pytest.raises(RpcError, match="Another speech producer"):
+            await worker.open_speech(request)
+    assert worker.session is current
+    assert current.answer == admission.result and overlay.controls == controls
     assert overlay.envelope == (300, 600)
 
 
@@ -84,6 +89,6 @@ async def test_invalid_request_fade_policy_never_admits_a_voice(ready_worker, fl
     worker, _native, _writer, client, overlay = ready_worker
     before = len(client.requests)
     with pytest.raises(RpcError, match="boolean"):
-        await worker.dispatch("speech", {**opening(), "duck_on_prepare": flag})
+        await worker.open_speech({**opening(), "duck_on_prepare": flag})
     assert worker.session is None and overlay.owner is None
     assert len(client.requests) == before and not overlay.controls

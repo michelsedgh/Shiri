@@ -27,10 +27,10 @@ from shiri.runtime.system import RuntimeFailure
 ENVIRONMENT = 'SHIRI_NATIVE_LAB_PROFILE'
 PROFILE_ROOT = Path('/etc/shiri-rehearsal')
 MARKER = Path('/etc/shiri-rehearsal-identity.json')
-MODES = {'grouping', 'zone_faults', 'speech_stress', 'latency_probe', 'bluetooth_route', 'finite_speech', 'music_startup', 'music_minimum', 'music_soak'}
+MODES = {'grouping', 'zone_faults', 'speech_stress', 'latency_probe', 'bluetooth_route', 'finite_speech', 'music_minimum', 'music_soak'}
 REQUIRED_SOURCE = {
-    'tests/linux/native_lab.py', 'tests/linux/check_airplay_tts.py',
-    'tests/linux/check_airplay_api_tts.py', 'tests/linux/check_native_grouping.py',
+    'tests/linux/native_lab.py', 'tests/linux/native_lab_audio.py',
+    'tests/linux/native_lab_observation.py', 'tests/linux/check_native_grouping.py',
     'tests/linux/run_native_grouping.py', 'tests/linux/run_native_zone_faults.py',
     'tests/linux/run_native_speech_stress.py', 'tests/linux/run_native_latency_probe.py',
     'tests/linux/run_native_bluetooth_route.py', 'tests/linux/check_native_bluetooth_route.py',

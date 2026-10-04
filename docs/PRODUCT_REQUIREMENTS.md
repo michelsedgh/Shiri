@@ -24,6 +24,29 @@ later. Keep those release checks visible, but do not use their deferral to
 leave implementable software unfinished or describe untested interoperability
 as verified.
 
+On 2026-10-04 the user confirmed the following latency and concurrency policy:
+
+- Load and warm the selected local TTS model when the generation service starts,
+  retain it while Shiri runs, and recover it after a worker failure. Keep the
+  current native Mac generation and Linux audio runtime deployment.
+- Keep every enabled room's assigned speaker connections ready, including after
+  long idle periods. This policy favors fast first sound over deepest standby.
+- Different rooms must accept different texts and play their replies
+  independently. A shared model may serialize inference; room playback must not
+  hold that shared generation slot. Bound pending work and retained audio.
+- Another reply for an occupied room queues in order within a small per-room
+  limit and must not implicitly interrupt it. Nobly
+  explicitly identifies the exact job to replace; a stale interruption must
+  never cancel a newer reply. Audio already queued by a speaker may have a
+  bounded tail, and interruption must not flush or restart music.
+- Prioritize time from accepted text to first audible speech throughout model
+  scheduling, preparation and delivery. Report measured software stages
+  separately from unmeasured speaker/acoustic delay. Preserve complete selected
+  output groups and the native phone grouping timeline while reducing overhead.
+- Remove obsolete implementation paths, duplicate state and tests of removed
+  behavior; preserve distinct routing, continuity, recovery and timing checks.
+  Document the resulting architecture and its remaining physical acceptance.
+
 ## A zone is a virtual casting destination
 
 An administrator creates a zone, names it, and assigns speakers to it. Every
@@ -137,5 +160,5 @@ matrices are still open. Production replacement also requires the later
 physical checks. Chromecast input does not block this release under the revised
 scope; any future implementation must pass the stock-phone receiver gates.
 
-See [REBUILD.md](REBUILD.md) for the review loop and actual evidence, and
-[RECEIVER_RESEARCH.md](RECEIVER_RESEARCH.md) for inbound receiver evaluation.
+See [REBUILD.md](REBUILD.md) for verification and release gates, and
+[Cast input scope](CAST_INPUT_FEASIBILITY.md) for the deferred receiver decision.

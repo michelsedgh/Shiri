@@ -276,7 +276,7 @@ async def test_real_coroutine_finite_seam_calls_original_observer_without_old_ma
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kwargs', [{'finite_speech': True}, {'finite_speech': 1},
-    {'finite_speech': True, 'latency_probe': True}, {'finite_speech': True, 'speech_stress': True}])
+    {'finite_speech': True, 'speech_stress': True}])
 async def test_direct_finite_child_requires_explicit_epoch_and_exclusive_boolean_mode(kwargs):
     with pytest.raises(RuntimeFailure):
         await supervisor.group.run_check(**kwargs)

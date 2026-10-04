@@ -1,5 +1,11 @@
 # Live test handoff — October 3, 2026
 
+This records the installed October 3 release. The October 4 workspace refactor
+has not been deployed; its always-ready default, room queues and persistent
+speech stream are described in [architecture](ARCHITECTURE.md) and
+[the review](REPO_REVIEW_2026-10-04.md). The artifact identities and observations
+below remain tied to their original release.
+
 The `duck1-warm1` release is installed in the VM and Mac worker. Open
 **http://shiri-speaker-test.local:8080/** and connect an iPhone to
 **Shiri Test Living Room**. The VM starts its normal Shiri services on boot;

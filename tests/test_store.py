@@ -91,6 +91,93 @@ def test_returned_speaker_list_is_a_snapshot_not_an_unsaved_database_mutation(st
     assert store.get_room(room.id).speakers == [output()]
 
 
+def test_room_snapshots_batch_profiles_and_preserve_room_speaker_order(store):
+    expected = []
+    for index in range(8):
+        room = create(store, f"Room {index}", local_audio_device=f"hw:CARD=Speaker{index}")
+        speakers = [output(str(index * 10 + 3), airplay_timing="ntp", balance_percent=63, offset_ms=-17),
+                    output("0", "alsa", balance_percent=29),
+                    output(str(index * 10 + 2), "chromecast", offset_ms=51)]
+        expected.append(store.assign_speakers(room.id, speakers, room.revision))
+    statements = []
+    store._connection.set_trace_callback(statements.append)
+    try:
+        assert store.list_rooms() == expected
+        reads = [statement for statement in statements if statement.lstrip().upper().startswith(("SELECT", "PRAGMA"))]
+        assert len(reads) == 2  # Bounded independently of rooms and speaker count.
+        statements.clear()
+        assert store.get_room(expected[3].id) == expected[3]
+        reads = [statement for statement in statements if statement.lstrip().upper().startswith(("SELECT", "PRAGMA"))]
+        assert len(reads) == 2
+    finally:
+        store._connection.set_trace_callback(None)
+
+
+def test_batched_room_and_profile_reads_share_one_sqlite_snapshot(store):
+    room = create(store)
+    room = store.assign_speakers(room.id, [output(balance_percent=23)], room.revision)
+    changed = []
+    with Store(store.path) as other:
+        def between_reads(statement):
+            if "FROM room_speakers AS s" in statement and not changed:
+                changed.append(other.update_speaker_balance(room.id, "1", 89, room.revision))
+        store._connection.set_trace_callback(between_reads)
+        try:
+            assert store.list_rooms() == [room]
+        finally:
+            store._connection.set_trace_callback(None)
+        assert store.list_rooms() == changed
+
+
+def test_resolve_nobly_uses_exact_binding_and_includes_disabled_room_profiles(store):
+    room = create(store, nobly_room_id="Kitchen/UPPER")
+    room = store.assign_speakers(room.id, [output(balance_percent=42, airplay_timing="ptp")], room.revision)
+    assert store.resolve_nobly("Kitchen/UPPER") == room
+    for value in ("kitchen/upper", "Kitchen/UPPER ", "missing"):
+        with pytest.raises(NotFound):
+            store.resolve_nobly(value)
+
+
+def test_enabled_network_conflict_rolls_back_settings_revision_and_event(store):
+    first, second = create(store), create(store, "Bedroom")
+    first = store.update_room(first.id, RoomPatch(enabled=True), first.revision)
+    second = store.update_room(second.id, RoomPatch(interface="eth1"), second.revision)
+    events = store.list_events()
+    with pytest.raises(Conflict, match="same LAN interface"):
+        store.update_room(second.id, RoomPatch(enabled=True, volume=91), second.revision)
+    assert store.get_room(second.id) == second
+    assert store.list_events() == events
+    first = store.update_room(first.id, RoomPatch(enabled=False), first.revision)
+    assert store.update_room(second.id, RoomPatch(enabled=True), second.revision).enabled
+
+
+def test_independent_stores_cannot_enable_conflicting_networks(tmp_path):
+    path = tmp_path / "lan.sqlite3"
+    with Store(path) as first, Store(path) as second:
+        rooms = [first.create_room(RoomCreate(name=f"Room {index}", interface=f"eth{index}")) for index in range(2)]
+        barrier = threading.Barrier(2)
+        def enable(store, room):
+            barrier.wait()
+            try:
+                return store.update_room(room.id, RoomPatch(enabled=True), room.revision)
+            except Conflict:
+                return None
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(enable, store, room) for store, room in zip((first, second), rooms, strict=True)]
+            assert sum(future.result() is not None for future in futures) == 1
+        assert sum(room.enabled for room in first.list_rooms()) == 1
+
+
+def test_old_conflicting_networks_can_be_opened_and_disabled_for_recovery(tmp_path):
+    path = tmp_path / "old-lan.sqlite3"
+    with Store(path) as store:
+        rooms = [store.create_room(RoomCreate(name=f"Room {index}", interface=f"eth{index}")) for index in range(2)]
+        store._connection.execute("UPDATE rooms SET enabled=1")
+    with Store(path) as store:
+        assert all(room.enabled for room in store.list_rooms())
+        assert not store.update_room(rooms[1].id, RoomPatch(enabled=False), rooms[1].revision).enabled
+
+
 def test_failed_name_change_rolls_back_revision_and_audit_event(store):
     kitchen = create(store)
     bedroom = create(store, "Bedroom")

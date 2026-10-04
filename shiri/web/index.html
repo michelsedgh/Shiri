@@ -103,6 +103,7 @@
         <div class="tts-submit-actions"><button id="tts-speak" class="button primary" type="submit" hidden disabled>Speak in room</button><button id="tts-prepare" class="button quiet" type="button" hidden disabled>Prepare room quietly</button><button id="tts-benchmark" class="button quiet" type="button" disabled>Measure model latency</button></div>
         <p class="hint">Measuring a model generates speech quietly. It does not send audio to your room speakers.</p>
       </form>
+      <div id="tts-queue" class="tts-submit-actions" role="group" aria-label="Room speech queue" hidden></div>
       <section id="tts-job" class="tts-job" aria-labelledby="tts-job-title" hidden>
         <div class="tts-job-heading"><h3 id="tts-job-title">Speech progress</h3><button id="tts-cancel" class="button quiet" type="button" disabled>Stop job</button></div>
         <p id="tts-job-status" class="notice" role="status"></p>

@@ -68,6 +68,70 @@ function speechReadyRoom() {
     outputs: [{ id: '101', name: 'Kitchen speaker', protocol: 'airplay2', selected: true, available: true, assignable: true, offset_ms: 0, sync_quality: 'native' }] });
 }
 
+test('room cards preserve unrelated controls and focus across volatile state refreshes', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+  let reads = 0;
+  await page.route('**/api/v1/**', async (route) => {
+    reads += 1;
+    const first = roomValue({ runtime: { status: 'running', last_health_at: String(reads) },
+      readiness: { hold: { remaining_ms: 60000 - reads * 1000 } } });
+    const second = roomValue({ id: '00000000-0000-4000-8000-000000000002', name: reads > 1 ? 'Bedroom updated' : 'Bedroom', revision: reads });
+    await route.fulfill({ json: snapshot([first, second], false) });
+  });
+  await page.goto(base);
+  await page.getByRole('heading', { name: 'Living room', exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.retainedControl = document.querySelector('.room-card button');
+    window.retainedControl.focus();
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await page.getByRole('heading', { name: 'Bedroom updated', exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.retainedControl.isConnected && document.activeElement === window.retainedControl), true);
+  assert.deepEqual(errors, []);
+}));
+
+test('another room can queue speech while the worker is busy and retains independent cancellation', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+  const first = speechReadyRoom();
+  const second = { ...speechReadyRoom(), id: '00000000-0000-4000-8000-000000000002', name: 'Bedroom' };
+  const jobs = new Map(), admissions = [];
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request(), url = new URL(request.url());
+    if (url.pathname.endsWith('/tts/models')) {
+      await route.fulfill({ json: ttsCatalog({ worker: { state: jobs.size ? 'busy' : 'ready', model_id: 'qwen', operation: jobs.size ? 'generating' : null } }) }); return;
+    }
+    if (url.pathname.endsWith('/tts')) {
+      const body = request.postDataJSON(), roomId = url.pathname.split('/')[4];
+      const job = { id: body.request_id, room_id: roomId, kind: 'speech', state: jobs.size ? 'queued' : 'playing', metrics: {} };
+      jobs.set(job.id, job); admissions.push(job);
+      await route.fulfill({ status: 202, json: job }); return;
+    }
+    if (url.pathname.includes('/tts/jobs/')) {
+      const job = jobs.get(url.pathname.split('/').at(-1));
+      if (request.method() === 'DELETE') job.state = 'cancelled';
+      await route.fulfill({ json: job }); return;
+    }
+    await route.fulfill({ json: snapshot([first, second], false) });
+  });
+  await page.goto(base);
+  await page.locator('.room-card').filter({ has: page.getByRole('heading', { name: first.name, exact: true }) }).getByRole('button', { name: 'Speak', exact: true }).click();
+  await page.locator('#tts-speak:not(:disabled)').waitFor();
+  await page.locator('#tts-speak').click();
+  await page.locator('#tts-job-status').filter({ hasText: 'Sending speech' }).waitFor();
+  await page.keyboard.press('Escape');
+  await page.locator('.room-card').filter({ has: page.getByRole('heading', { name: second.name, exact: true }) }).getByRole('button', { name: 'Speak', exact: true }).click();
+  await page.locator('#tts-worker-status').filter({ hasText: 'generating speech' }).waitFor();
+  await page.locator('#tts-speak:not(:disabled)').waitFor();
+  await page.locator('#tts-speak').click();
+  await page.locator('#tts-job-status').filter({ hasText: 'Queued' }).waitFor();
+  await page.locator('#tts-cancel').click();
+  await page.locator('#tts-job-status').filter({ hasText: 'Job stopped' }).waitFor();
+  assert.equal(admissions.length, 2);
+  assert.equal(admissions[0].room_id, first.id);
+  assert.equal(admissions[0].state, 'playing');
+  assert.equal(admissions[1].room_id, second.id);
+  assert.equal(admissions[1].state, 'cancelled');
+  assert.deepEqual(errors, []);
+}));
+
 test('speech availability explains an unconfigured worker without changing room audio', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
   const writes = [];
   await page.route('**/api/v1/**', async (route) => {
@@ -85,6 +149,46 @@ test('speech availability explains an unconfigured worker without changing room 
   assert.equal(await page.locator('#tts-speak').isVisible(), false);
   assert.deepEqual(writes, []);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  assert.deepEqual(errors, []);
+}));
+
+test('a room queues two replies and can cancel one waiting reply without interrupting its current speech', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+  const room = speechReadyRoom(), jobs = new Map(), admissions = [], cancelled = [];
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request(), url = new URL(request.url());
+    if (url.pathname.endsWith('/tts/models')) { await route.fulfill({ json: ttsCatalog({ worker: { state: jobs.size ? 'busy' : 'ready', model_id: 'qwen' } }) }); return; }
+    if (url.pathname.endsWith('/tts')) {
+      const body = request.postDataJSON();
+      const job = { id: body.request_id, room_id: room.id, kind: 'speech', state: jobs.size ? 'queued' : 'playing', metrics: {} };
+      jobs.set(job.id, job); admissions.push(job);
+      await route.fulfill({ status: 202, json: job }); return;
+    }
+    if (url.pathname.includes('/tts/jobs/')) {
+      const job = jobs.get(url.pathname.split('/').at(-1));
+      if (request.method() === 'DELETE') { job.state = 'cancelled'; cancelled.push(job.id); }
+      await route.fulfill({ json: job }); return;
+    }
+    await route.fulfill({ json: snapshot([room], false) });
+  });
+  await page.goto(base);
+  await page.getByRole('button', { name: 'Speak', exact: true }).click();
+  for (let index = 0; index < 3; index += 1) {
+    await page.locator('#tts-speak:not(:disabled)').waitFor();
+    await page.locator('#tts-text').fill(`Reply ${index + 1}.`);
+    await page.locator('#tts-speak').click();
+    await page.locator('#tts-job-status').filter({ hasText: index ? 'Queued' : 'Sending speech' }).waitFor();
+    await page.waitForFunction((count) => document.querySelectorAll('#tts-queue button').length === count, index + 1);
+  }
+  assert.equal(await page.locator('#tts-speak').isDisabled(), true);
+  assert.equal(await page.locator('#tts-queue button').count(), 3);
+  await page.locator('#tts-queue button').nth(1).click();
+  await page.locator('#tts-cancel').click();
+  await page.locator('#tts-job-status').filter({ hasText: 'Job stopped' }).waitFor();
+  assert.equal(await page.locator('#tts-speak').isDisabled(), false);
+  assert.equal(admissions[0].state, 'playing');
+  assert.equal(admissions[1].state, 'cancelled');
+  assert.equal(admissions[2].state, 'queued');
+  assert.deepEqual(cancelled, [admissions[1].id]);
   assert.deepEqual(errors, []);
 }));
 

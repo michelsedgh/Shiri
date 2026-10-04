@@ -30,7 +30,7 @@ def doctor(settings):
         else:
             path = shutil.which(command)
         report["checks"].append({"name": command, "available": bool(path), "path": path})
-    for module in ["gi", "aiortc", "av"]:
+    for module in ["aiortc", "av", "numpy"]:
         result = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, timeout=10)
         report["checks"].append({"name": "python:" + module, "available": result.returncode == 0})
     report["hardware_ready"] = sys.platform == "linux" and all(item["available"] for item in report["checks"])
@@ -67,6 +67,8 @@ def main():
     tts_worker.add_argument("--token-file", type=Path, required=True)
     tts_worker.add_argument("--cache-dir", type=Path)
     tts_worker.add_argument("--registry", type=Path)
+    tts_worker.add_argument("--state-file", type=Path,
+                            help="Persist the selected resident model (default: selected-model.json beside the token)")
     from shiri.tts.models import DEFAULT_MODEL_ID
     tts_worker.add_argument("--preload", default=DEFAULT_MODEL_ID)
     tts_worker.add_argument("--allow-download", action="store_true", help="Allow pinned model downloads during explicit loading")
@@ -81,7 +83,8 @@ def main():
         from shiri.tts.worker import create_worker_app, read_worker_token
         app = create_worker_app(token=read_worker_token(args.token_file), registry_file=args.registry,
                                 cache_dir=args.cache_dir, allow_download=args.allow_download,
-                                preload_model=args.preload or None)
+                                preload_model=args.preload or None,
+                                state_file=args.state_file or args.token_file.parent / "selected-model.json")
         uvicorn.run(app, host=args.host, port=args.port, workers=1, timeout_graceful_shutdown=10,
                     proxy_headers=False)
     elif args.command == "serve":

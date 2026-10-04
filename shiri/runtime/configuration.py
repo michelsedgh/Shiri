@@ -8,13 +8,12 @@ from pathlib import Path
 import re
 import shlex
 import stat
-import sys
 from uuid import UUID
 from xml.sax.saxutils import escape
 
 from .system import RuntimeFailure
 from .latency import (
-    MINIMUM_LOCAL_OUTPUT_BUFFER_MS, minimum_room_buffer_ms, minimum_speaker_lead_ms, room_buffer_ms, speaker_lead_ms,
+    MINIMUM_LOCAL_OUTPUT_BUFFER_MS, room_buffer_ms, speaker_lead_ms,
 )
 
 
@@ -112,50 +111,37 @@ def backend_configs(
     room,
     directory: Path,
     receiver: dict,
-    sender: dict,
     *,
-    broker_socket: Path,
     all_receiver_names: list[str],
     password: str,
     view_directory: Path | None = None,
     output_state_directory: Path | None = None,
     own_username: str = "root",
-    native_timing: bool = False,
     audio_uid: int | None = None,
     music_socket: Path | None = None,
     pcm_identity_file: Path | None = None,
     framed_output: dict | None = None,
     speech_output: dict | None = None,
     output_buffer_ms: int | None = None,
-    minimum_latency: bool | None = None,
 ) -> tuple[Path, Path]:
+    if type(audio_uid) is not int or not 0 < audio_uid < 2**32:
+        raise RuntimeFailure("Native timing requires the exact private audio worker UID")
     view = view_directory or directory
-    if minimum_latency is None:
-        minimum_latency = native_timing is True
-    if type(minimum_latency) is not bool or minimum_latency and native_timing is not True:
-        raise RuntimeFailure("Minimum buffering requires an explicit native candidate profile")
-    lead_policy = minimum_speaker_lead_ms if minimum_latency else speaker_lead_ms
     if output_buffer_ms is None:
-        # Native rooms use the route plan. The explicit legacy PCM profile
-        # retains its original protocol lead; it cannot silently admit B40.
-        output_buffer_ms = minimum_room_buffer_ms(room) if minimum_latency else max(
-            500, room_buffer_ms(room),
-            max((speaker_lead_ms(speaker) - speaker.offset_ms for speaker in room.speakers), default=0),
-        )
-    minimum_buffer = MINIMUM_LOCAL_OUTPUT_BUFFER_MS if minimum_latency else 251
-    if type(output_buffer_ms) is not int or not minimum_buffer <= output_buffer_ms <= 4250:
+        output_buffer_ms = room_buffer_ms(room)
+    if type(output_buffer_ms) is not int or not MINIMUM_LOCAL_OUTPUT_BUFFER_MS <= output_buffer_ms <= 4250:
         raise RuntimeFailure("OwnTone output buffering requires a bounded protocol lead")
     # The broker has already admitted the hardware device before replacing it
     # with the private mapped PCM name. Validate the selected speaker leads
     # here without reinterpreting that internal name as a public device.
-    if any(output_buffer_ms < lead_policy(speaker) - (min(0, speaker.offset_ms) if minimum_latency else speaker.offset_ms)
+    if any(output_buffer_ms < speaker_lead_ms(speaker) - min(0, speaker.offset_ms)
            for speaker in room.speakers):
         raise RuntimeFailure("OwnTone output buffering cannot retain a selected speaker's required timing lead")
     speech_settings = ""
     if speech_output is not None:
         if (type(speech_output) is not dict
                 or set(speech_output) != {"socket", "peer_uid", "room_id", "launch_generation"}
-                or not native_timing or own_username == "root"
+                or own_username == "root"
                 or speech_output["socket"] != view / "overlay" / "speech.sock"
                 or len(os.fsencode(speech_output["socket"])) >= 108
                 or type(speech_output["peer_uid"]) is not int or not 0 < speech_output["peer_uid"] < 2**32
@@ -178,7 +164,7 @@ def backend_configs(
     if framed_output is not None:
         expected_keys = {"socket", "peer_uid", "room_id", "launch_generation", "rate", "channels", "format_code"}
         if (type(framed_output) is not dict or set(framed_output) != expected_keys
-                or not native_timing or own_username == "root" or pcm_identity_file is not None
+                or own_username == "root" or pcm_identity_file is not None
                 or not isinstance(room.local_audio_device, str)
                 or not room.local_audio_device.lower().startswith("bluealsa:")):
             raise RuntimeFailure("Framed Bluetooth output requires one exact isolated admitted output profile")
@@ -200,41 +186,13 @@ def backend_configs(
         if (not exact_room or not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None
                 or generation == "0" * 32):
             raise RuntimeFailure("Framed Bluetooth output must belong to this exact room and nonempty launch generation")
+    if (room.local_audio_device and room.local_audio_device.lower().startswith("bluealsa:")
+            and framed_output is None):
+        raise RuntimeFailure("Bluetooth output requires its admitted private framed handoff")
     prepare_room(directory)
     own_state = output_state_directory or view
-    if native_timing and (type(audio_uid) is not int or audio_uid < 0):
-        raise RuntimeFailure("Native timing requires the exact private audio worker UID")
     shairport = directory / "config" / "shairport.conf"
-    phone_volume = (
-        shlex.join(
-            [
-                sys.executable,
-                "-m",
-                "shiri.runtime.volume",
-                "--socket",
-                str(broker_socket),
-                "--room-id",
-                room.id,
-            ]
-        )
-        + " "
-    )
-    music_hook = [
-        sys.executable,
-        "-m",
-        "shiri.runtime.audio",
-        "--socket",
-        str(directory / "audio.sock"),
-        "--signal",
-    ]
-    volume_hook = "" if native_timing else f"  run_this_when_volume_is_set = {quote(phone_volume)};\n"
-    session_controls = "" if native_timing else f"""sessioncontrol = {{
-  run_this_before_play_begins = {quote(shlex.join(music_hook + ["music-start"]))};
-  run_this_after_play_ends = {quote(shlex.join(music_hook + ["music-stop"]))};
-  wait_for_completion = "yes";
-}};
-"""
-    receiver_settings = (f"""shiri = {{
+    receiver_settings = f"""shiri = {{
   socket = {quote(music_socket or view / "input" / "music.sock")};
   peer_uid = {audio_uid};
   volume_socket = {quote((music_socket or view / "input" / "music.sock").with_name("volume.sock"))};
@@ -242,14 +200,7 @@ def backend_configs(
   output_format = "S16_LE";
   output_channels = 2;
 }};
-""" if native_timing else f"""alsa = {{
-  output_device = {quote(f"hw:Loopback,0,{room.slot}")};
-  output_rate = 48000;
-  output_format = "S16_LE";
-  output_channels = 2;
-  use_precision_timing = "no";
-}};
-""")
+"""
     write_private(
         shairport,
         f"""general = {{
@@ -257,15 +208,15 @@ def backend_configs(
   service_type = "airplay2";
   interface = {quote(receiver["interface"])};
   port = 7000;
-  output_backend = {quote("shiri" if native_timing else "alsa")};
+  output_backend = "shiri";
   mdns_backend = "avahi";
   interpolation = "soxr";
   ignore_volume_control = "yes";
   default_airplay_volume = {room.volume * 0.3 - 30:.6f};
-{volume_hook}  audio_backend_buffer_desired_length_in_seconds = 0.15;
+  audio_backend_buffer_desired_length_in_seconds = 0.15;
   audio_backend_latency_offset_in_seconds = 0.0;
 }};
-{session_controls}{receiver_settings}metadata = {{
+{receiver_settings}metadata = {{
   enabled = "yes";
   include_cover_art = "no";
   pipe_name = {quote(view / "metadata" / "shairport.pipe")};
@@ -281,13 +232,8 @@ def backend_configs(
         f"shiri_airplay_timing {quote(speaker.id)} {{ protocol = {quote(speaker.airplay_timing)} }}"
         for speaker in room.speakers if speaker.airplay_timing != "auto"
     )
-    local_device = (
-        f"hw:Loopback,1,{room.slot}"
-        if room.local_audio_device and room.local_audio_device.lower().startswith("bluealsa")
-        else room.local_audio_device
-    )
     local_audio = (
-        f'type = "alsa"\n card = {quote(local_device)}\n software_volume = true\n'
+        f'type = "alsa"\n card = {quote(room.local_audio_device)}\n software_volume = true\n'
         f' nickname = {quote(room.name + " local speaker")}'
         if room.local_audio_device
         else 'type = "disabled"'
@@ -308,8 +254,6 @@ def backend_configs(
         if room.local_audio_device is None:
             raise RuntimeFailure("A PCM identity pin requires an explicit local output device")
         local_audio += f'\n pcm_identity_file = {quote(pcm_identity_file)}'
-    trusted = "" if native_timing or own_username != "root" else f'{quote(sender["api_host_ip"] + "/32")}, {quote(sender["api_ip"] + "/32")}'
-    framed = "  pipe_framed = true\n" if native_timing else ""
     write_private(
         owntone,
         f"""general {{
@@ -319,7 +263,7 @@ def backend_configs(
   loglevel = log
   cache_dir = {quote(own_state / "cache")}
   admin_password = {quote(password)}
-  trusted_networks = {{ {trusted} }}
+  trusted_networks = {{  }}
   websocket_port = 0
   ipv6 = no
   speaker_autoselect = no
@@ -334,7 +278,8 @@ library {{
   pipe_autostart = true
   pipe_sample_rate = 48000
   pipe_bits_per_sample = 16
-{framed}}}
+  pipe_framed = true
+}}
 audio {{ {local_audio} }}
 mpd {{
   port = 0

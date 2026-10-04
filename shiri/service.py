@@ -7,7 +7,7 @@ import re
 from shiri.domain import AirplayTiming, Conflict, NotFound, Room, RoomCreate, RoomPatch, SpeakerRef, ValidationIssue, speaker_key, validate_local_audio_device
 from shiri.rpc import RpcError
 from pydantic import ValidationError
-from shiri.calibration import CalibrationSession, CalibrationSessions, analyze_wav, available, fingerprint, probe_wav
+from shiri.calibration import CalibrationSession, add_result, analyze_wav, available, check_recording, create_session, fingerprint, probe_wav
 
 CAPABILITIES = {
     "inputs": {"airplay": True, "webrtc_speech": True, "google_cast": False},
@@ -52,7 +52,6 @@ class RoomService:
         self._phone_lock = asyncio.Lock()
         self._generation = 0
         self._cached_state = None
-        self.calibrations = CalibrationSessions()
         self._calibration_analysis = asyncio.Lock()
         self.warm_coordinator = None
 
@@ -76,10 +75,12 @@ class RoomService:
                 snapshot = await self.runtime.call("health")
             except RpcError:
                 return
+            changed = False
             for observed in snapshot.get("rooms", []):
                 update = observed.get("phone_volume_update") if isinstance(observed, dict) else None
                 if not isinstance(update, dict):
                     continue
+                changed = True
                 if (not isinstance(update.get("id"), str) or not 1 <= len(update["id"]) <= 128
                         or type(update.get("volume")) is not int or not 0 <= update["volume"] <= 100
                         or type(update.get("base_revision")) is not int or update["base_revision"] < 1):
@@ -101,6 +102,9 @@ class RoomService:
                     # Atomic receipts replay the original commit even if a
                     # newer UI command has changed the room before this ACK.
                     continue
+            # With no phone events this is already the dashboard observation.
+            # An ACK can change runtime volume/revision, so refresh after one.
+            return None if changed else snapshot
 
     async def reconcile(self):
         # Capture intent inside this lock, so an older background retry cannot
@@ -116,8 +120,14 @@ class RoomService:
 
     async def discover(self, room_id):
         room = await self._store("get_room", room_id)
+        return await self._discover_room(room)
+
+    async def _discover_room(self, room):
+        # State already owns a consistent desired-room snapshot. Reloading it
+        # here could turn a concurrent deletion into a failure of the whole
+        # dashboard, or mix newly saved timing with the older room definition.
         requested_timing = {speaker.id: speaker.airplay_timing for speaker in room.speakers if speaker.protocol == "airplay2"}
-        result = await self.runtime.call("outputs", {"room_id": room_id})
+        result = await self.runtime.call("outputs", {"room_id": room.id})
         raw = result.get("outputs")
         if not isinstance(raw, list) or len(raw) > 1024:
             raise RpcError("invalid_response", "Runtime did not return a bounded output list")
@@ -143,11 +153,14 @@ class RoomService:
         async with self._state_lock:
             if self._cached_state and time.monotonic() - self._cached_state[0] < 0.5:
                 return self._cached_state[1]
-            await self.sync_phone_volume()
+            snapshot = await self.sync_phone_volume()
             generation = self._generation
             rooms = await self._store("list_rooms")
             try:
-                snapshot, interfaces = await asyncio.gather(self.runtime.call("health"), self.runtime.call("interfaces"))
+                if snapshot is None:
+                    snapshot, interfaces = await asyncio.gather(self.runtime.call("health"), self.runtime.call("interfaces"))
+                else:
+                    interfaces = await self.runtime.call("interfaces")
                 snapshot.setdefault("error", None)
             except RpcError as exc:
                 snapshot, interfaces = {"ready": False, "simulation": False, "error": str(exc), "rooms": []}, {"interfaces": []}
@@ -163,7 +176,7 @@ class RoomService:
                 if room.enabled and info.get("status") in {"running", "degraded"}:
                     async with limit:
                         try:
-                            outputs = await self.discover(room.id)
+                            outputs = await self._discover_room(room)
                             for output in outputs:
                                 output["assigned_room_id"] = None
                                 if output["assignable"]:
@@ -260,7 +273,6 @@ class RoomService:
         async with self._mutation:
             await self._store("delete_room", room_id, revision)
             await self._revoke_changed_readiness()
-            self.calibrations.remove_room(room_id)
             self.invalidate()
             return {"ok": True, **await self.reconcile()}
 
@@ -321,14 +333,43 @@ class RoomService:
 
     async def speech(self, room_id: str, payload: dict):
         room: Room = await self._store("get_room", room_id)
-        if not room.enabled and payload.get("action", "offer") not in {"close", "finish"}:
+        if not room.enabled and payload.get("action", "offer") != "close":
             raise Conflict("Enable this room before sending speech")
-        if not room.speakers and payload.get("action", "offer") not in {"close", "finish"}:
+        if not room.speakers and payload.get("action", "offer") != "close":
             raise Conflict("Assign speakers to this room before sending speech")
-        if self.warm_coordinator is not None and payload.get("action", "offer") in {"offer", "prepare-pcm"}:
+        if self.warm_coordinator is not None and payload.get("action", "offer") == "offer":
             self.warm_coordinator.touch(room_id)
         result = await self.runtime.call("speech", {**payload, "room_id": room_id, "duck_gain": room.duck_gain})
         return {**result, "admitted_room_id": room.id}
+
+    async def resolve_text_speech(self, *, room_id=None, external_id=None):
+        """Capture one exact route without waiting for unrelated runtime edits.
+
+        The coordinator owns request replay and room admission. Followups use
+        this room UUID rather than resolving a movable external binding again.
+        The stream opener rechecks its transport fingerprint before playback.
+        """
+        room = (await self.resolve_nobly(external_id) if external_id is not None
+                else await self._store("get_room", room_id))
+        if not room.enabled or not room.speakers:
+            raise Conflict("Enable the target room and select speakers before sending speech")
+        return room
+
+    async def open_text_speech(self, room_id: str, identity: dict):
+        """Admit one owned audio stream; subsequent PCM bypasses SQLite."""
+        from shiri.readiness import transport_fingerprint
+
+        room = await self.resolve_text_speech(room_id=room_id)
+        fingerprint = transport_fingerprint(room)
+        expected = identity.get("transport_fingerprint", fingerprint)
+        if expected != fingerprint:
+            raise Conflict("Room routing changed after text admission; submit a new reply")
+        if self.warm_coordinator is not None:
+            self.warm_coordinator.touch(room.id)
+        return await self.runtime.open_speech({
+            **identity, "room_id": room.id, "duck_gain": room.duck_gain,
+            "transport_fingerprint": fingerprint,
+        })
 
     async def admit_nobly(self, external_id: str, payload: dict):
         if payload.get("action", "offer") != "offer":
@@ -344,11 +385,7 @@ class RoomService:
             return await self.speech(room.id, payload)
 
     async def resolve_nobly(self, external_id: str):
-        rooms = await self._store("list_rooms")
-        matches = [room for room in rooms if room.nobly_room_id == external_id]
-        if len(matches) != 1:
-            raise NotFound("Nobly room is not bound to exactly one audio room")
-        return matches[0]
+        return await self._store("resolve_nobly", external_id)
 
     async def calibration_create(self, room_id, definition):
         async with self._mutation:
@@ -362,28 +399,18 @@ class RoomService:
                 raise ValidationIssue("Cross-zone calibration requires the current reference room revision and a declared common playback/grouping context")
             if definition.expected_reference_revision is not None and reference.revision != definition.expected_reference_revision:
                 raise Conflict("Reference room changed; reload before starting a calibration session")
-            session = self.calibrations.create(room, **definition.model_dump(exclude={"expected_revision", "reference_room_id", "expected_reference_revision"}),
-                                                reference_room=reference, enforce_capacity=False)
+            session = create_session(room, **definition.model_dump(exclude={"expected_revision", "reference_room_id", "expected_reference_revision"}),
+                                                reference_room=reference)
             async def persist():
-                try:
-                    return await self._save_calibration(session, expected_room_revision=room.revision, expected_reference_revision=reference.revision)
-                except BaseException:
-                    self.calibrations.sessions.pop(session.id, None)
-                    raise
+                return await self._save_calibration(session, expected_room_revision=room.revision, expected_reference_revision=reference.revision)
             return (await _calibration_completion(asyncio.create_task(persist()))).public()
 
     async def _load_calibration(self, room_id, session_id):
-        session = CalibrationSession.from_record(await self._store("get_calibration", room_id, session_id))
-        self.calibrations.sessions[session.id] = session
-        self.calibrations.prune()
-        return session
+        return CalibrationSession.from_record(await self._store("get_calibration", room_id, session_id))
 
     async def _save_calibration(self, session, **kwargs):
         saved = await self._store("save_calibration", session.record(), session.generation, **kwargs)
-        retained = CalibrationSession.from_record(saved)
-        self.calibrations.sessions[retained.id] = retained
-        self.calibrations.prune()
-        return retained
+        return CalibrationSession.from_record(saved)
 
     async def calibration_get(self, room_id, session_id):
         return (await self._load_calibration(room_id, session_id)).public()
@@ -410,7 +437,7 @@ class RoomService:
             raise Conflict("Another recording is being analyzed; wait for it to finish before importing again")
         async with self._calibration_analysis:
             session = await self._load_calibration(room_id, session_id)
-            self.calibrations.check_recording(session, verification=verification)
+            check_recording(session, verification=verification)
             self._calibration_probe_bytes(session)
             analysis = asyncio.create_task(asyncio.to_thread(analyze_wav, data, session.seed, session.max_lag_ms,
                                                              session.geometry_correction_ms))
@@ -463,7 +490,7 @@ class RoomService:
                     except RpcError:
                         import_environment["runtime_unavailable"] = True
                 result["environment_at_import"] = import_environment
-                self.calibrations.add_result(session, result, verification=verification)
+                add_result(session, result, verification=verification)
                 if backend is not None:
                     session.verification_backend.append(backend)
                 async def persist():
@@ -490,7 +517,6 @@ class RoomService:
                 saved, record = await self._store("commit_calibration_offset", room_id, session_id, revision, session.generation, rollback=rollback,
                                                    expected_reference_revision=expected_reference_revision)
                 retained = CalibrationSession.from_record(record)
-                self.calibrations.sessions[retained.id] = retained
                 self.invalidate()
                 outcome = {"room": saved.model_dump(mode="json"), **await self.reconcile()}
                 retained.application = {"runtime_accepted": outcome["runtime_accepted"], "pending_reason": outcome.get("pending_reason"),
@@ -513,6 +539,5 @@ class RoomService:
         async with self._mutation:
             async def remove():
                 await self._store("delete_calibration", room_id, session_id)
-                self.calibrations.sessions.pop(session_id, None)
                 return {"ok": True}
             return await _calibration_completion(asyncio.create_task(remove()))

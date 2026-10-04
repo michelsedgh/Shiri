@@ -1,4 +1,9 @@
-# Whole-house audio assessment — updated October 3, 2026
+# Whole-house audio assessment — measurements through October 3, 2026
+
+The October 4 refactor supersedes the original readiness and single-job design.
+Current behavior is documented in [architecture](ARCHITECTURE.md) and
+[the review](REPO_REVIEW_2026-10-04.md); it has not been deployed. The physical
+and compute measurements below retain their original scope.
 
 Shiri's current AirPlay music engine is usable on the live test VM. The user
 confirmed first play, phone-to-web and web-to-phone master volume, and playback
@@ -270,7 +275,7 @@ estimated timing. Then expand the capture fleet and measurement graph.
 
 The eight-zone limit is a conservative implementation allocation, not a
 measured limit of this Mac. `MAX_ROOMS=8`, settings/database validation, fixed
-daemon identity slots and Bluetooth/local Loopback mapping currently agree on
+daemon identity slots and per-room network/port allocation currently agree on
 that capacity. Six role identities per slot plus shared identities reserve a
 fixed identity bank. Raising one constant leaves other allocations inconsistent.
 
@@ -350,40 +355,21 @@ are retained privately in
 
 ## Speaker standby and reconnection
 
-Current room health checks run every five seconds and failed starts use bounded
-backoff up to 60 seconds. Native output protocols already have their own
-heartbeats. OwnTone also stops idle outputs; keeping a zone's services alive
-does not necessarily keep the physical speaker transport warm. Bluetooth output
-admission currently requires an already-connected, unambiguous paired A2DP
-endpoint. It does not implement a general powered-off-speaker wake feature.
+Enabled rooms now default to `ready`: exact assigned output sessions remain
+held through idle periods without continuous silent playback. The installed
+October 3 release used `adaptive`; [room readiness](ROOM_READINESS.md) describes
+the current policy, renewable leases and explicit alternatives.
 
-Add a persisted, per-speaker policy with progressively stronger modes:
+Health and bounded recovery observe actual processes/transports. A stale
+discovery entry does not prove a speaker is awake. Readiness never substitutes
+another speaker or an IP match for the saved endpoint, and does not create a
+music source merely to prevent standby.
 
-| Mode | Intended behavior |
-| --- | --- |
-| Normal | Current protocol health, idle release and bounded reconnect |
-| Warm for a period | Retain an owned healthy transport for a limited interaction/idle window where supported |
-| Always ready | Opt-in supported transport retention, with schedules and visible health |
-| Continuous silent audio | Opt-in only when real hardware tests show it necessary and effective |
-
-Implement retention inside the backend's actual transport lifecycle and
-ownership rules. Do not invent a music session to conceal standby. Observe
-whether silence really prevents a given speaker's sleep; some devices can
-detect silence. Continuous audio uses energy/network capacity and may hold a
-session another controller wants. Give it an expiry, quiet schedule and clear
-release behavior.
-
-Use jittered, staggered checks, bounded concurrency, exponential backoff and a
-circuit breaker. Reconnect only the saved device identity; an IP alone does
-not identify a speaker. Avoid broad network scans or duplicate heartbeats
-already supplied by OwnTone. Retaining a stale discovery entry is not proof
-that the speaker is awake and does not reserve its address.
-
-For Bluetooth, an opted-in reconnect should connect the exact paired primary,
-observe its connection, retire the old worker/lease and admit the new endpoint
-generation. Vendor followers remain the primary's responsibility. A generic
-BlueZ connection attempt cannot turn on every unplugged or powered-off remote
-speaker. [BlueZ device connection API](https://bluez.readthedocs.io/en/latest/device-api/).
+Physical idle/wake behavior still needs device measurements. Bluetooth output
+requires an already-connected, unambiguous paired A2DP endpoint; it cannot turn
+on an unplugged or powered-off speaker. A speaker-managed group's followers
+remain its primary speaker's responsibility. The current implementation does
+not add per-speaker schedules or continuous silent-audio policies.
 
 ## Nobly listening, echo control and video
 
@@ -416,7 +402,7 @@ called video-ready.
    native grouping without treating processor headroom as network capacity.
 3. Measure physical streamed-speech onset, prefix/completion and cancel tail on
    one fast route and the existing Sonos route. Optimize measured contributors.
-4. Add per-speaker standby/reconnect policy with physical idle/wake/recovery
+4. Verify the current always-ready policy with physical idle/wake/recovery
    measurements and bounded network behavior.
 5. Define the room-agent capture/playback-reference contract and prove two
    independent Orin microphones against a shared-clock reference.

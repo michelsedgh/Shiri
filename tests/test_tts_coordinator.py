@@ -66,6 +66,8 @@ class Runtime:
         self.admitted_pcm = []
         self.now_ns = time.monotonic_ns
         self.prepare_entered = asyncio.Event()
+        self.retired = asyncio.Event()
+        self.first_pcm = asyncio.Event()
         self.prepare_gate = None
         self.refuse = None
 
@@ -89,16 +91,50 @@ class Runtime:
         assert payload["stream_id"] in self.streams
         receiver = self.receivers[payload["stream_id"]]
         if action == "pcm":
-            data, samples, now, next_ns, audible = receiver.decode(payload)
+            data, samples, now, next_ns, audible = receiver.decode(payload, data=payload["pcm"])
             self.admitted_pcm.append((payload["stream_id"], payload["sequence"], data, now))
+            self.first_pcm.set()
             return receiver.admitted(samples, now, next_ns, audible)
         if action in {"finish", "close"}:
             if action == "finish":
                 receiver.finish(payload)
             self.streams.remove(payload["stream_id"])
             del self.receivers[payload["stream_id"]]
+            self.retired.set()
             return {"ok": True, "finished": action == "finish"}
         raise AssertionError(action)
+
+    async def open_speech(self, identity):
+        """Paced room substitute; production uses the binary worker channel."""
+        import shiri.tts.coordinator as clock_module
+        runtime = self
+        prepared = await self.call("speech", {**identity, "action": "prepare-pcm"})
+
+        class Channel:
+            pace_start = None
+
+            async def send_pcm(self, data, sequence, frame_index):
+                if self.pace_start is not None:
+                    target = self.pace_start + frame_index / 48000
+                    await clock_module.asyncio.sleep(max(0, target - clock_module.time.monotonic()))
+                    if clock_module.time.monotonic() - target > .15:
+                        raise ValueError("PCM delivery missed its live playback deadline")
+                result = await runtime.call("speech", {**identity, "action": "pcm", "stream_id": prepared["stream_id"],
+                    "sequence": sequence, "frame_index": frame_index, "pcm": data})
+                if self.pace_start is None and type(result.get("first_pcm_admitted_monotonic_ns")) is int:
+                    self.pace_start = result["first_pcm_admitted_monotonic_ns"] / 1e9
+                return result
+
+            async def finish(self, final_sequence, final_frame_index):
+                return await runtime.call("speech", {**identity, "action": "finish", "stream_id": prepared["stream_id"],
+                    "final_sequence": final_sequence, "final_frame_index": final_frame_index})
+
+            async def close(self):
+                return await runtime.call("speech", {**identity, "action": "close", "stream_id": prepared["stream_id"]})
+
+        channel = Channel()
+        channel.prepared = prepared
+        return channel
 
 
 @pytest.fixture
@@ -183,7 +219,7 @@ async def test_nobly_binding_is_exact_and_continuations_keep_admitted_uuid(rig):
     assert [(call["sequence"], call["frame_index"]) for call in calls if call["action"] == "pcm"] == [(1, 0), (2, 960)]
     assert calls[-1]["final_sequence"] == 2 and calls[-1]["final_frame_index"] == 1440
     assert not rig.runtime.streams and all(stream.closed for stream in rig.streams)
-    assert coordinator.active is None
+    assert not coordinator.active
 
 
 async def test_generation_endpoint_admits_atomically_without_a_catalog_preflight(rig):
@@ -195,15 +231,14 @@ async def test_generation_endpoint_admits_atomically_without_a_catalog_preflight
     assert job.metrics["room_prepare_requested_ms"] >= 0
 
 
-async def test_authoritative_generation_refusal_retires_the_prepared_fade_intent(rig):
+async def test_authoritative_generation_refusal_never_prepares_or_ducks_a_room(rig):
     rig.status = 409
     coordinator = rig.coordinator()
     job = await complete(coordinator, await coordinator.admit(request(), external_id="Kitchen/exact"))
     assert job.state == "failed" and job.error == "Injected worker refusal"
     assert [value.url.path for value in rig.requests] == ["/v1/generate"]
-    assert [call["action"] for call in rig.runtime.calls] == ["prepare-pcm", "close"]
-    assert rig.runtime.calls[0]["duck_on_prepare"] is True
-    assert not rig.runtime.streams and coordinator.active is None
+    assert rig.runtime.calls == []
+    assert not rig.runtime.streams and not coordinator.active
 
 
 async def test_request_id_replay_keeps_original_uuid_after_binding_moves_without_regenerating(rig):
@@ -378,7 +413,7 @@ async def test_cancel_while_first_admission_reply_waits_closes_exact_stream_with
     await asyncio.wait_for(admitted.wait(), 1)
     result = await asyncio.wait_for(coordinator.cancel(accepted["id"]), 1)
     assert result["state"] == "cancelled" and result["metrics"]["worker_cleanup_confirmed"] is True
-    assert len(rig.runtime.admitted_pcm) == 1 and not rig.runtime.streams and coordinator.active is None
+    assert len(rig.runtime.admitted_pcm) == 1 and not rig.runtime.streams and not coordinator.active
     assert rig.runtime.calls[-1]["action"] == "close"
     assert rig.runtime.calls[-1]["stream_id"] == "stream-tts-" + accepted["id"]
     assert len([r for r in rig.requests if r.url.path == "/v1/generate"]) == 1
@@ -439,6 +474,7 @@ async def test_received_progress_precedes_room_readiness_and_engine_completion(r
     clock[0] += .62
     rig.runtime.prepare_gate.set()
     await asyncio.wait_for(rig.pause_entered.wait(), 1)
+    await asyncio.wait_for(rig.runtime.first_pcm.wait(), 1)
     public = job.public()
     assert public["state"] == "playing" and not job.task.done()
     assert public["metrics"]["received_audio_s"] == .02
@@ -459,7 +495,7 @@ async def test_received_progress_does_not_claim_delivery_when_room_refuses_pcm(r
     coordinator = rig.coordinator()
     job = await complete(coordinator, await coordinator.admit(request(), room_id=rig.room.id))
     assert job.state == "failed" and job.error == "Injected room refusal"
-    assert job.metrics["received_audio_s"] == .02 and job.metrics["delivered_audio_s"] == 0
+    assert job.metrics["received_audio_s"] == .03 and job.metrics["delivered_audio_s"] == 0
     assert job.metrics["first_worker_pcm_received_ms"] >= 0
     assert "room_admission_ms" not in job.metrics
 
@@ -490,7 +526,7 @@ async def test_cancel_waits_for_pending_preparation_then_closes_exact_admitted_s
     assert all(call["room_id"] == rig.room.id for call in rig.runtime.calls)
     assert rig.runtime.calls[-1]["stream_id"] == "stream-tts-" + admitted["id"]
     assert not rig.runtime.streams and all(stream.closed for stream in rig.streams)
-    assert coordinator.active is None
+    assert not coordinator.active
 
 
 async def test_cancellation_before_job_starts_releases_admission_and_marks_terminal_state(rig):
@@ -498,7 +534,7 @@ async def test_cancellation_before_job_starts_releases_admission_and_marks_termi
     admitted = await coordinator.admit(request(), room_id=rig.room.id)
     result = await coordinator.cancel(admitted["id"])
     assert result["state"] == "cancelled"
-    assert coordinator.active is None and rig.runtime.calls == []
+    assert not coordinator.active and rig.runtime.calls == []
     successor = await coordinator.admit(request(), benchmark=True)
     assert (await complete(coordinator, successor)).state == "completed"
 
@@ -516,7 +552,7 @@ async def test_aborted_canceller_cannot_leave_unstarted_job_queued_or_block_succ
     admitted = await asyncio.create_task(interrupted_caller())
     await asyncio.sleep(0)
     job = coordinator.get(admitted["id"])
-    assert job.task.done() and job.state == "cancelled" and coordinator.active is None
+    assert job.task.done() and job.state == "cancelled" and not coordinator.active
     assert (await coordinator.cancel(job.id))["state"] == "cancelled"
     assert (await complete(coordinator, await coordinator.admit(request(), benchmark=True))).state == "completed"
     assert rig.runtime.calls == []
@@ -536,7 +572,7 @@ async def test_repeated_cancellation_preserves_pending_exact_stream_cleanup(rig)
     results = await asyncio.wait_for(asyncio.gather(first, second), 1)
     assert all(result["state"] == "cancelled" for result in results)
     assert [call["action"] for call in rig.runtime.calls] == ["prepare-pcm", "close"]
-    assert not rig.runtime.streams and coordinator.active is None
+    assert not rig.runtime.streams and not coordinator.active
 
 
 @pytest.mark.parametrize("acknowledgment", [{"type": "cancelled"}, {"type": "end", "metrics": {}}])
@@ -546,6 +582,8 @@ async def test_http_cancel_waits_for_private_decoder_ack_before_retiring_slot(ri
     # The remote HTTP producer runs independently. Closing the client socket
     # triggers its cancellation but returns before its decoder reset/ACK.
     worker = ModelWorker()
+    worker.process = Mock()
+    worker.process.is_alive.return_value = True
     sent = []
     connection = SimpleNamespace(send=sent.append, close=Mock())
     worker.connection, worker.cancel_event = connection, threading.Event()
@@ -615,27 +653,29 @@ async def test_http_cancel_waits_for_private_decoder_ack_before_retiring_slot(ri
         await asyncio.wait_for(rig.runtime.prepare_entered.wait(), 1)
         cancelling = asyncio.create_task(coordinator.cancel(job.id))
         await asyncio.wait_for(busy_observed.wait(), 1)
-        assert not cancelling.done() and coordinator.active == job.id
+        await asyncio.wait_for(rig.runtime.retired.wait(), 1)
+        assert not cancelling.done() and job.id in coordinator.active.values()
         assert worker.state == "busy" and worker.lock.locked()
         assert job.state not in {"completed", "cancelled", "failed"}
         assert not rig.runtime.streams
         assert rig.runtime.calls[-1]["action"] == "close"
         assert rig.runtime.calls[-1]["stream_id"] == "stream-tts-" + job.id
-        with pytest.raises(Conflict, match="already active"):
-            await coordinator.admit(request(), benchmark=True)
+        waiting = await coordinator.admit(request(), room_id=rig.room.id)
+        assert waiting["state"] == "queued" and len(sent) == 1
+        assert (await coordinator.cancel(waiting["id"]))["state"] == "cancelled"
         with pytest.raises(Conflict, match="active speech job"):
             await coordinator.load(DEFAULT_MODEL_ID)
         if caller_disconnects:
             cancelling.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await cancelling
-            assert not job.task.done() and coordinator.active == job.id
+            assert not job.task.done() and job.id in coordinator.active.values()
         acknowledge.set()
         await asyncio.wait_for(job.task, 1)
         if not caller_disconnects:
             assert (await cancelling)["state"] == "cancelled"
         assert job.state == "cancelled" and job.metrics["worker_cleanup_confirmed"] is True
-        assert coordinator.active is None and worker.state == "ready" and not worker.lock.locked()
+        assert not coordinator.active and worker.state == "ready" and not worker.lock.locked()
         assert worker.connection is connection and not connection.close.called
         assert (await coordinator.cancel(job.id))["state"] == "cancelled"
         successor = await complete(coordinator, await coordinator.admit(request(), room_id=rig.room.id))
@@ -659,7 +699,7 @@ async def test_unconfirmed_remote_cleanup_has_finite_budget_without_retry_or_rem
     result = await asyncio.wait_for(coordinator.cancel(admitted["id"]), .5)
     assert result["state"] == "cancelled" and "worker cleanup could not be confirmed" in result["error"]
     assert result["metrics"]["worker_cleanup_confirmed"] is False
-    assert coordinator.active is None and not rig.runtime.streams
+    assert not coordinator.active and not rig.runtime.streams
     assert len([r for r in rig.requests if r.url.path == "/v1/generate"]) == 1
     assert all(r.method == "GET" for r in rig.requests if r.url.path != "/v1/generate")
     assert (await coordinator.cancel(admitted["id"])) == result
@@ -681,7 +721,7 @@ async def test_control_client_failure_during_retirement_cannot_leak_admission(ri
     result = await asyncio.wait_for(coordinator.cancel(admitted["id"]), .5)
     assert result["state"] == "cancelled" and result["metrics"]["worker_cleanup_confirmed"] is False
     assert "worker cleanup could not be confirmed" in result["error"]
-    assert coordinator.active is None and coordinator.get(admitted["id"]).task.done()
+    assert not coordinator.active and coordinator.get(admitted["id"]).task.done()
     assert not rig.runtime.streams and all(stream.closed for stream in rig.streams)
 
 
@@ -705,7 +745,9 @@ async def test_first_cancel_during_natural_finalization_joins_owned_retirement(r
                                         room_id=None if benchmark else rig.room.id)
     job = coordinator.get(admitted["id"])
     await asyncio.wait_for(retiring.wait(), 1)
-    assert job.state not in {"completed", "cancelled", "failed"} and coordinator.active == job.id
+    if not benchmark:
+        await asyncio.wait_for(rig.runtime.retired.wait(), 1)
+    assert job.state not in {"completed", "cancelled", "failed"} and job.id in coordinator.active.values()
     with pytest.raises(NotFound):
         coordinator.sample(job.id)
     cancelling = asyncio.create_task(coordinator.cancel(job.id))
@@ -714,20 +756,25 @@ async def test_first_cancel_during_natural_finalization_joins_owned_retirement(r
     repeated = asyncio.create_task(coordinator.cancel(job.id))
     await asyncio.sleep(0)
     assert not cancelling.done() and not repeated.done() and not job.task.done()
-    assert coordinator.active == job.id and not rig.runtime.streams
-    with pytest.raises(Conflict, match="already active"):
-        await coordinator.admit(request(), benchmark=True)
+    assert job.id in coordinator.active.values() and not rig.runtime.streams
+    if benchmark:
+        with pytest.raises(Conflict, match="already active"):
+            await coordinator.admit(request(), benchmark=True)
+    else:
+        waiting = await coordinator.admit(request(), room_id=rig.room.id)
+        assert waiting["state"] == "queued"
+        await coordinator.cancel(waiting["id"])
     if caller_disconnects:
         cancelling.cancel()
         with pytest.raises(asyncio.CancelledError):
             await cancelling
-        assert not job.task.done() and coordinator.active == job.id
+        assert not job.task.done() and job.id in coordinator.active.values()
     rig.worker_state = "ready"
     result = await asyncio.wait_for(repeated, 1)
     assert result["state"] == "cancelled" and result["metrics"]["worker_cleanup_confirmed"] is True
     if not caller_disconnects:
         assert (await cancelling) == result
-    assert job.task.done() and coordinator.active is None and job.audio is None
+    assert job.task.done() and not coordinator.active and job.audio is None
     assert [call["action"] for call in rig.runtime.calls] == ([] if benchmark else ["prepare-pcm", "pcm", "pcm", "finish"])
     rig.on_stream_close = None
     successor = await complete(coordinator, await coordinator.admit(request(), benchmark=True))
@@ -747,7 +794,7 @@ async def test_malformed_or_truncated_generation_closes_exact_room_stream(rig, e
     assert job.state == "failed" and job.error
     assert rig.runtime.calls[-1]["action"] == "close"
     assert not rig.runtime.streams and all(stream.closed for stream in rig.streams)
-    assert coordinator.active is None
+    assert not coordinator.active
 
 
 @pytest.mark.parametrize("refuse", ["generate", "pcm", "finish", "transport"])
@@ -761,8 +808,11 @@ async def test_worker_or_backend_failure_releases_speech_and_busy_state(rig, ref
     coordinator = rig.coordinator()
     job = await complete(coordinator, await coordinator.admit(request(), room_id=rig.room.id))
     assert job.state == "failed" and job.error
-    assert rig.runtime.calls[-1]["action"] == "close"
-    assert not rig.runtime.streams and coordinator.active is None
+    if refuse == "generate":
+        assert rig.runtime.calls == []
+    else:
+        assert rig.runtime.calls[-1]["action"] == "close"
+    assert not rig.runtime.streams and not coordinator.active
 
 
 async def test_busy_policy_is_explicit_and_completed_history_is_bounded(rig):
@@ -1011,7 +1061,7 @@ async def test_incompatible_load_response_is_explicit_unavailability_without_res
         with pytest.raises(RpcError) as error:
             await coordinator.load(DEFAULT_MODEL_ID)
         assert error.value.code == "audio_unavailable"
-        assert coordinator.active is None and not coordinator.jobs and rig.runtime.calls == []
+        assert not coordinator.active and not coordinator.jobs and rig.runtime.calls == []
     finally:
         await coordinator.close()
 
@@ -1031,7 +1081,7 @@ async def test_model_control_has_five_second_http_budget_separate_from_generatio
             with pytest.raises(RpcError) as error:
                 await coordinator.load(DEFAULT_MODEL_ID)
             assert error.value.code == "audio_unavailable"
-        assert rig.runtime.calls == [] and coordinator.active is None
+        assert rig.runtime.calls == [] and not coordinator.active
     finally:
         await coordinator.close()
 
@@ -1043,6 +1093,188 @@ async def test_valid_worker_load_refusal_remains_a_bounded_conflict(rig):
         with pytest.raises(Conflict) as error:
             await coordinator.load(DEFAULT_MODEL_ID)
         assert str(error.value) == "x" * 512
-        assert coordinator.active is None and rig.runtime.calls == []
+        assert not coordinator.active and rig.runtime.calls == []
     finally:
         await coordinator.close()
+
+
+async def test_different_rooms_play_different_text_while_first_room_still_playing(rig):
+    other = rig.store.update_room(rig.other.id, RoomPatch(enabled=True), rig.other.revision)
+    other = rig.store.assign_speakers(other.id, [SpeakerRef(id="102", name="Other speaker", protocol="airplay2")], other.revision)
+    rig.events = [FORMAT, *[pcm(value=1111) for _ in range(25)], END]
+    blocked, release = asyncio.Event(), asyncio.Event()
+    original_call = rig.runtime.call
+
+    async def call(operation, payload=None):
+        if operation == "speech" and payload["room_id"] == rig.room.id and payload["action"] == "pcm" and payload["sequence"] == 2:
+            blocked.set()
+            await release.wait()
+        return await original_call(operation, payload)
+
+    rig.runtime.call = call
+    coordinator = rig.coordinator()
+    first = await coordinator.admit(request().model_copy(update={"text": "Parent reply"}), room_id=rig.room.id)
+    try:
+        await asyncio.wait_for(blocked.wait(), 1)
+        first_job = coordinator.get(first["id"])
+        assert first_job.metrics["received_audio_s"] == .5
+        assert first_job.metrics["delivered_audio_s"] == .02
+        rig.events = [FORMAT, pcm(value=2222), pcm(value=2222), END]
+        second = await coordinator.admit(request().model_copy(update={"text": "Child reply"}), room_id=other.id)
+        second_job = await complete(coordinator, second)
+        assert second_job.state == "completed" and not first_job.task.done()
+        assert first_job.state == "playing"
+        assert [json.loads(item.content)["text"] for item in rig.requests if item.url.path == "/v1/generate"] == ["Parent reply", "Child reply"]
+        second_pcm = [item[2] for item in rig.runtime.admitted_pcm if item[0] == "stream-tts-" + second["id"]]
+        assert b"".join(second_pcm) == (2222).to_bytes(2, "little") * 1920
+        release.set()
+        assert (await complete(coordinator, first)).state == "completed"
+        first_pcm = [item[2] for item in rig.runtime.admitted_pcm if item[0] == "stream-tts-" + first["id"]]
+        assert b"".join(first_pcm) == (1111).to_bytes(2, "little") * (25 * 960)
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("pending_started", [False, True])
+async def test_room_queue_is_bounded_fifo_and_exact_queued_cancel_preserves_active_reply(rig, pending_started):
+    gate = rig.generate_gate = asyncio.Event()
+    coordinator = rig.coordinator()
+    first = await coordinator.admit(request().model_copy(update={"text": "First"}), room_id=rig.room.id)
+    await asyncio.wait_for(rig.runtime.prepare_entered.wait(), 1)
+    second = await coordinator.admit(request().model_copy(update={"text": "Cancel this queued reply"}), room_id=rig.room.id)
+    third = await coordinator.admit(request().model_copy(update={"text": "Third"}), room_id=rig.room.id)
+    assert second["state"] == third["state"] == "queued"
+    with pytest.raises(Conflict, match="two waiting"):
+        await coordinator.admit(request(), room_id=rig.room.id)
+    if pending_started:
+        await asyncio.sleep(0)
+    assert (await coordinator.cancel(second["id"]))["state"] == "cancelled"
+    assert not coordinator.get(first["id"]).task.done()
+    assert len([item for item in rig.requests if item.url.path == "/v1/generate"]) == 1
+    gate.set()
+    assert (await complete(coordinator, first)).state == "completed"
+    last = await complete(coordinator, third)
+    assert last.state == "completed" and last.metrics["room_queue_wait_ms"] > 0
+    assert [json.loads(item.content)["text"] for item in rig.requests if item.url.path == "/v1/generate"] == ["First", "Third"]
+    assert not coordinator.active and not coordinator.pending
+
+
+@pytest.mark.parametrize("cancel_replacement", [False, True])
+async def test_explicit_active_replacement_preserves_waiting_order_and_replay(rig, cancel_replacement):
+    rig.generate_gate = asyncio.Event()
+    coordinator = rig.coordinator()
+    first = await coordinator.admit(request().model_copy(update={"text": "Interrupted"}), room_id=rig.room.id)
+    await asyncio.wait_for(rig.runtime.prepare_entered.wait(), 1)
+    queued = await coordinator.admit(request().model_copy(update={"text": "Queued"}), room_id=rig.room.id)
+    with pytest.raises(Conflict, match="exact active"):
+        await coordinator.admit(request().model_copy(update={"replace_job_id": queued["id"]}), room_id=rig.room.id)
+    replacement = request().model_copy(update={"text": "Replacement", "replace_job_id": first["id"]})
+    rig.generate_gate = None
+    admitted = await coordinator.admit(replacement, room_id=rig.room.id)
+    if cancel_replacement:
+        # Exercise cancellation before the replacement task's first turn.
+        assert (await coordinator.cancel(admitted["id"]))["state"] == "cancelled"
+    else:
+        assert (await coordinator.admit(replacement, room_id=rig.room.id))["id"] == admitted["id"]
+        assert (await complete(coordinator, admitted)).state == "completed"
+    assert (await complete(coordinator, queued)).state == "completed"
+    assert coordinator.get(first["id"]).state == "cancelled"
+    expected = ["Interrupted", "Queued"] if cancel_replacement else ["Interrupted", "Replacement", "Queued"]
+    assert [json.loads(item.content)["text"] for item in rig.requests if item.url.path == "/v1/generate"] == expected
+    assert (await coordinator.admit(replacement, room_id=rig.room.id))["state"] == ("cancelled" if cancel_replacement else "completed")
+    assert not coordinator.active and not coordinator.pending and not rig.runtime.streams
+
+
+async def test_shutdown_cancels_room_queue_without_starting_waiting_replies(rig):
+    rig.generate_gate = asyncio.Event()
+    coordinator = rig.coordinator()
+    jobs = [await coordinator.admit(request(), room_id=rig.room.id) for _ in range(3)]
+    await asyncio.wait_for(rig.runtime.prepare_entered.wait(), 1)
+    await coordinator.close()
+    assert all(coordinator.get(job["id"]).state == "cancelled" for job in jobs)
+    assert len([item for item in rig.requests if item.url.path == "/v1/generate"]) == 1
+    assert not coordinator.active and not coordinator.pending and not rig.runtime.streams
+
+
+async def test_dedicated_speech_channel_owns_pacing_without_per_frame_room_lookups(rig, monkeypatch):
+    import shiri.tts.coordinator as module
+    from shiri.readiness import transport_fingerprint
+    calls, opened = [], []
+    clock = [100.0]
+    rig.runtime.now_ns = lambda: int(clock[0] * 1e9)
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0], monotonic_ns=rig.runtime.now_ns))
+    rig.events = [FORMAT, *[pcm() for _ in range(150)], END]
+    original_store = rig.service._store
+
+    async def store(method, *args, **kwargs):
+        calls.append(method)
+        return await original_store(method, *args, **kwargs)
+
+    class Channel:
+        def __init__(self, identity, prepared):
+            self.identity, self.prepared = identity, prepared
+
+        async def send_pcm(self, data, sequence, frame_index):
+            clock[0] += len(data) / 96000  # The room owns this presentation progress.
+            return await rig.runtime.call("speech", {**self.identity, "action": "pcm", "stream_id": self.prepared["stream_id"],
+                "sequence": sequence, "frame_index": frame_index, "pcm": data})
+
+        async def finish(self, final_sequence, final_frame_index):
+            return await rig.runtime.call("speech", {**self.identity, "action": "finish", "stream_id": self.prepared["stream_id"],
+                "final_sequence": final_sequence, "final_frame_index": final_frame_index})
+
+        async def close(self):
+            return await rig.runtime.call("speech", {**self.identity, "action": "close", "stream_id": self.prepared["stream_id"]})
+
+    async def open_speech(identity):
+        opened.append(identity)
+        prepared = await rig.runtime.call("speech", {**identity, "action": "prepare-pcm"})
+        return Channel(identity, prepared)
+
+    async def no_coordinator_pacing(_delay):
+        pytest.fail("The dedicated room stream owns media pacing")
+
+    rig.service.open_text_speech = RoomService.open_text_speech.__get__(rig.service)
+    rig.service._store = store
+    rig.runtime.open_speech = open_speech
+    monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": no_coordinator_pacing}))
+    coordinator = rig.coordinator()
+    job = await complete(coordinator, await coordinator.admit(request(), room_id=rig.room.id))
+    assert job.state == "completed"
+    assert len(opened) == 1 and opened[0]["transport_fingerprint"] == transport_fingerprint(rig.room)
+    assert calls == ["get_room", "get_room"]  # Admission and opening only, not each audio frame.
+    assert [item["action"] for item in rig.runtime.calls] == ["prepare-pcm", *["pcm"] * 150, "finish"]
+
+
+async def test_model_recovery_waits_before_opening_or_ducking_the_room(rig):
+    waiting, recovered = asyncio.Event(), asyncio.Event()
+
+    async def transport(incoming):
+        if incoming.url.path == "/v1/models":
+            return httpx.Response(200, json={"worker": {"state": "ready"}, "models": []})
+        waiting.set()
+        await recovered.wait()
+        return httpx.Response(200, stream=Records([FORMAT, pcm(), END]))
+
+    coordinator = rig.coordinator()
+    await coordinator.client._transport.aclose()
+    coordinator.client._transport = httpx.MockTransport(transport)
+    admitted = await coordinator.admit(request(), room_id=rig.room.id)
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        job = coordinator.get(admitted["id"])
+        assert rig.runtime.calls == [] and "room_prepare_requested_ms" not in job.metrics
+        recovered.set()
+        assert (await complete(coordinator, admitted)).state == "completed"
+        assert rig.runtime.calls[0]["action"] == "prepare-pcm"
+    finally:
+        recovered.set()
+
+
+async def test_text_admission_does_not_wait_for_unrelated_room_mutation(rig):
+    coordinator = rig.coordinator()
+    async with rig.service._mutation:
+        admitted = await asyncio.wait_for(coordinator.admit(request(), room_id=rig.room.id), 1)
+        job = await complete(coordinator, admitted)
+        assert job.state == "completed" and job.metrics["admission_ms"] >= 0
+        assert job.metrics["total_ms"] >= job.metrics["admission_ms"]

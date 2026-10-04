@@ -1,4 +1,4 @@
-"""Pure zone music ownership policy; no receiver or runtime is integrated yet.
+"""Pure music ownership policy used by each native zone actor.
 
 Adapters serialize admission requests through one zone actor. The newest
 request wins; an identical request from the current producer is idempotent.
@@ -26,8 +26,8 @@ its own token fence must remain serialized through bounded acknowledgment;
 checking only at initiation cannot prevent a reordered late write. A revoke
 still requires an
 adapter handle bound to that exact old token, never "current AirPlay source".
-Gain actions affect the mix, never phone playback or source transport. TTS
-must not pause, seek, restart, reconnect or disconnect the music producer.
+Speech ownership and ducking belong to the audio worker and native mixer.
+They do not participate in this music-source reducer.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from uuid import UUID, uuid4
 
 from pydantic import Field, TypeAdapter, field_validator, model_validator
 
-from .domain import Conflict, StrictModel, ValidationIssue
+from .domain import StrictModel, ValidationIssue
 
 InputProtocol = Literal["airplay2", "chromecast"]
 
@@ -73,38 +73,17 @@ class SourceToken(SessionToken):
     protocol: InputProtocol
 
 
-class OverlayToken(SessionToken):
-    """Separate speech generation; it never becomes a music source token."""
-
-
 class SourceState(ZoneIdentity):
     incarnation: str = Field(default_factory=lambda: str(uuid4()))
     epoch: int = Field(default=0, ge=0)
     owner: SourceToken | None = None
     volume: int = Field(default=50, ge=0, le=100)
-    overlay: OverlayToken | None = None
-    last_overlay: OverlayToken | None = None
-    tts_epoch: int = Field(default=0, ge=0)
-    music_gain: float = Field(default=1.0, ge=0, le=1, allow_inf_nan=False)
-
     _incarnation = field_validator("incarnation")(_uuid)
-
-    @property
-    def tts_session_id(self):
-        return self.overlay.session_id if self.overlay else None
 
     @model_validator(mode="after")
     def consistent(self):
         if self.owner and (self.owner.zone_id != self.zone_id or self.owner.incarnation != self.incarnation or self.owner.epoch != self.epoch):
             raise ValueError("Live source token must match its zone, incarnation and latest epoch")
-        if self.overlay and (self.overlay.zone_id != self.zone_id or self.overlay.incarnation != self.incarnation or self.overlay.epoch != self.tts_epoch):
-            raise ValueError("Speech overlay token must match its zone, incarnation and speech epoch")
-        if self.last_overlay and (self.last_overlay.zone_id != self.zone_id or self.last_overlay.incarnation != self.incarnation or self.last_overlay.epoch != self.tts_epoch):
-            raise ValueError("Latest speech token must match its zone, incarnation and speech epoch")
-        if self.overlay and self.overlay != self.last_overlay:
-            raise ValueError("Active speech overlay must be the latest speech token")
-        if self.overlay is None and self.music_gain != 1.0:
-            raise ValueError("Music gain must be restored when no speech overlay owns it")
         return self
 
 
@@ -127,20 +106,7 @@ class InputVolumeChanged(StrictModel):
     volume: int = Field(ge=0, le=100)
 
 
-class TtsStarted(ZoneIdentity):
-    event: Literal["tts_started"] = "tts_started"
-    session_id: str
-    duck_gain: float = Field(default=0.28, ge=0, le=1, allow_inf_nan=False)
-
-    _identity = field_validator("session_id")(_session)
-
-
-class TtsEnded(StrictModel):
-    event: Literal["tts_ended"] = "tts_ended"
-    token: OverlayToken
-
-
-SourceEvent = Annotated[InputRequested | InputEnded | InputVolumeChanged | TtsStarted | TtsEnded, Field(discriminator="event")]
+SourceEvent = Annotated[InputRequested | InputEnded | InputVolumeChanged, Field(discriminator="event")]
 EVENTS = TypeAdapter(SourceEvent)
 
 
@@ -160,19 +126,13 @@ class ApplySourceVolume(StrictModel):
     volume: int = Field(ge=0, le=100)
 
 
-class SetMusicGain(StrictModel):
-    action: Literal["set_music_gain"] = "set_music_gain"
-    token: OverlayToken
-    gain: float = Field(ge=0, le=1, allow_inf_nan=False)
-
-
-SourceAction = GrantInput | RevokeInput | ApplySourceVolume | SetMusicGain
+SourceAction = GrantInput | RevokeInput | ApplySourceVolume
 
 
 class SourceChange(StrictModel):
     state: SourceState
     accepted: bool
-    reason: Literal["granted", "already_owner", "ended", "volume_changed", "overlay_started", "overlay_ended", "already_active", "stale"]
+    reason: Literal["granted", "already_owner", "ended", "volume_changed", "stale"]
     actions: tuple[SourceAction, ...] = ()
 
 
@@ -195,9 +155,7 @@ def permits_action(state: SourceState, action: SourceAction) -> bool:
         return token != state.owner and token.epoch <= state.epoch
     if isinstance(action, GrantInput):
         return owns_input(state, token)
-    if isinstance(action, ApplySourceVolume):
-        return owns_input(state, token) and action.volume == state.volume
-    return token == state.last_overlay and action.gain == state.music_gain
+    return owns_input(state, token) and action.volume == state.volume
 
 
 def reduce_source(state: SourceState, event: SourceEvent | dict) -> SourceChange:
@@ -210,7 +168,7 @@ def reduce_source(state: SourceState, event: SourceEvent | dict) -> SourceChange
     """
     state = SourceState.model_validate(state)
     event = EVENTS.validate_python(event)
-    event_zone = event.token.zone_id if isinstance(event, (InputEnded, InputVolumeChanged, TtsEnded)) else event.zone_id
+    event_zone = event.token.zone_id if isinstance(event, (InputEnded, InputVolumeChanged)) else event.zone_id
     if event_zone != state.zone_id:
         raise ValidationIssue("Source event belongs to another exact zone")
 
@@ -225,25 +183,9 @@ def reduce_source(state: SourceState, event: SourceEvent | dict) -> SourceChange
                             protocol=event.protocol, session_id=event.session_id, epoch=state.epoch + 1)
         actions = ((RevokeInput(token=state.owner),) if state.owner else ()) + (GrantInput(token=owner),)
         return change("granted", owner=owner, epoch=owner.epoch, actions=actions)
-    if isinstance(event, (InputEnded, InputVolumeChanged)):
-        if event.token != state.owner:
-            return change("stale", accepted=False)
-        if isinstance(event, InputEnded):
-            return change("ended", owner=None, actions=(RevokeInput(token=event.token),))
-        return change("volume_changed", volume=event.volume,
-                      actions=(ApplySourceVolume(token=event.token, volume=event.volume),))
-    if isinstance(event, TtsStarted):
-        if state.tts_session_id:
-            if state.tts_session_id != event.session_id:
-                raise Conflict("Another speech overlay owns this zone")
-            if state.music_gain != event.duck_gain:
-                raise Conflict("Active speech overlay gain differs from the replayed request")
-            return change("already_active")
-        overlay = OverlayToken(zone_id=state.zone_id, incarnation=state.incarnation,
-                               session_id=event.session_id, epoch=state.tts_epoch + 1)
-        return change("overlay_started", overlay=overlay, last_overlay=overlay, tts_epoch=overlay.epoch, music_gain=event.duck_gain,
-                      actions=(SetMusicGain(token=overlay, gain=event.duck_gain),))
-    if event.token != state.overlay:
+    if event.token != state.owner:
         return change("stale", accepted=False)
-    return change("overlay_ended", overlay=None, music_gain=1.0,
-                  actions=(SetMusicGain(token=event.token, gain=1.0),))
+    if isinstance(event, InputEnded):
+        return change("ended", owner=None, actions=(RevokeInput(token=event.token),))
+    return change("volume_changed", volume=event.volume,
+                  actions=(ApplySourceVolume(token=event.token, volume=event.volume),))

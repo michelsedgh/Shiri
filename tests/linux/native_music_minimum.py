@@ -14,7 +14,7 @@ import asyncio
 from copy import deepcopy
 import importlib.util
 import hashlib
-from functools import lru_cache, partial
+from functools import lru_cache
 import json
 import math
 import os
@@ -28,8 +28,7 @@ from uuid import UUID, uuid4
 
 from shiri.domain import Room
 from shiri.runtime.broker import Broker
-from shiri.runtime.latency import LatencyPlan, minimum_latency_plan, minimum_room_buffer_ms
-from shiri.runtime.configuration import backend_configs
+from shiri.runtime.latency import LatencyPlan, latency_plan, room_buffer_ms
 from shiri.runtime.system import RuntimeFailure, atomic_json, root_directory
 from shiri.runtime.timing import Kind, Packet, RATE
 
@@ -70,7 +69,7 @@ def bind(function, **names):
 
 def candidate_plan(definitions):
     """Allow setup subsets, but never another enabled route or corrected speaker."""
-    plan = minimum_latency_plan(definitions)
+    plan = latency_plan(definitions)
     for definition in definitions:
         room = Room.model_validate(definition)
         if not room.enabled:
@@ -89,10 +88,9 @@ def broker_class(base):
     """Own test-only reconcile+selection bindings; all production gates retained."""
     require(issubclass(base, Broker), 'Music startup needs the actual isolated Broker')
     return type('MusicMinimumBroker', (base,), {
-        'reconcile': bind(Broker.reconcile, latency_plan=candidate_plan, room_buffer_ms=minimum_room_buffer_ms),
-        'set_outputs': bind(Broker.set_outputs, latency_plan=candidate_plan, room_buffer_ms=minimum_room_buffer_ms),
-        '_material': bind(Broker._material, room_buffer_ms=minimum_room_buffer_ms),
-        '_start_room': bind(Broker._start_room, backend_configs=partial(backend_configs, minimum_latency=True)),
+        'reconcile': bind(Broker.reconcile, latency_plan=candidate_plan, room_buffer_ms=room_buffer_ms),
+        'set_outputs': bind(Broker.set_outputs, latency_plan=candidate_plan, room_buffer_ms=room_buffer_ms),
+        '_material': bind(Broker._material, room_buffer_ms=room_buffer_ms),
     })
 
 

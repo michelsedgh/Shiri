@@ -423,23 +423,20 @@ async def test_dhcp_acquire_and_release_pass_captured_host_namespace_identity(tm
         assert args[args.index("-e") + 1] == "SHIRI_HOST_NETNS=net:[101]"
 
 
-def test_configuration_uses_modern_fixed_audio_parameters_and_activity_hooks(tmp_path):
+def test_configuration_uses_native_fixed_audio_parameters_without_activity_hooks(tmp_path):
     definition = room(airplay_name='Kitchen "speaker"')
     receiver = {"interface": "sr123"}
-    sender = {"api_host_ip": "10.190.1.1", "api_ip": "10.190.1.2"}
     airplay, own = backend_configs(
         definition,
         tmp_path,
         receiver,
-        sender,
-        broker_socket=tmp_path / "broker.sock",
         all_receiver_names=[definition.airplay_name],
-        password="private-secret",
+        password="private-secret", audio_uid=1234,
     )
     text = airplay.read_text()
     assert "output_rate = 48000;" in text and "output_channels = 2;" in text
     assert 'output_format = "S16_LE";' in text
-    assert "music-start" in text and "music-stop" in text
+    assert "run_this_" not in text and 'output_backend = "shiri"' in text
     assert "audio_backend_latency_offset_in_seconds = 0.0;" in text
     assert 'Kitchen \\"speaker\\"' in text
     assert 'type = "disabled"' in own.read_text()
@@ -645,19 +642,16 @@ def test_numeric_and_named_sound_card_aliases_have_one_live_identity(tmp_path):
     assert indexed == named == ("local", "hw:CARD=Speakers,DEV=0,SUBDEV=0")
 
 
-def test_bluetooth_configuration_uses_reverse_loopback_and_private_owntone_bus(tmp_path):
+def test_bluetooth_configuration_requires_admitted_framed_output_before_writing(tmp_path):
     definition = room(local_audio_device="bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp", slot=7)
-    _, own = backend_configs(
-        definition,
-        tmp_path,
-        {"interface": "sr123"},
-        {"api_host_ip": "10.190.1.1", "api_ip": "10.190.1.2"},
-        broker_socket=tmp_path / "broker.sock",
-        all_receiver_names=[],
-        password="private",
-    )
-    assert 'card = "hw:Loopback,1,7"' in own.read_text()
-    assert (tmp_path / "cache").is_dir()
+    directory = tmp_path / "refused"
+    with pytest.raises(RuntimeFailure, match="admitted private framed handoff"):
+        backend_configs(
+            definition, directory, {"interface": "sr123"},
+            all_receiver_names=[],
+            password="private", audio_uid=1234,
+        )
+    assert not directory.exists()
 
 
 @pytest.mark.asyncio

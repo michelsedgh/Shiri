@@ -2,16 +2,16 @@
 
 Shiri turns each configured zone into an **AirPlay 2 receiver**. Phones use their existing AirPlay controls, without a Shiri phone app. Shiri sends the incoming audio to that zone's assigned speakers, which can use different supported output protocols. TTS targets the same zones, lowering music volume while music keeps playing, then smoothly restoring it. The user deferred Chromecast input on October 1; Chromecast speaker outputs remain supported through OwnTone. The authoritative behavior and release requirements are in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md).
 
-The rebuilt software is **installed on the live Ubuntu VM**, with optional local text-to-speech generation on the Mac. The previous iPhone test confirmed first playback, phone/web volume feedback and resume after a 40-second pause. The current release adds selectable voices, generation measurements and an OwnTone repair for speech after idle input. See [the live test handoff](docs/LIVE_TEST_HANDOFF.md) for exact installed versions, validation and next tests.
+The last recorded live release is installed on the Ubuntu VM, with local text-to-speech generation on the Mac. The **October 4 workspace refactor is not deployed**: it adds independent room speech queues, persistent PCM delivery, selected-model recovery and always-ready output defaults, and removes obsolete audio paths. See [the repository review](docs/REPO_REVIEW_2026-10-04.md) for current changes and checks, and [the live test handoff](docs/LIVE_TEST_HANDOFF.md) for installed versions and listening results.
 
-Physical acoustic synchronization, native iPhone grouping across zones, mixed speaker transports and per-speaker balance still need measurements. Chromecast input is deferred; [receiver feasibility](docs/CAST_INPUT_FEASIBILITY.md) records why. Nobly is a future client, and Bluetooth input is excluded. Historical failures and the review record remain in [docs/REBUILD.md](docs/REBUILD.md).
+Physical acoustic synchronization, native iPhone grouping across zones, mixed speaker transports and per-speaker balance still need measurements. Chromecast input is deferred; [receiver feasibility](docs/CAST_INPUT_FEASIBILITY.md) records why. Nobly is a future client, and Bluetooth input is excluded. [Release verification](docs/REBUILD.md) maps the maintained checks and remaining gates.
 
 ## Supported paths and test boundaries
 
 | Path | Implementation | Practical limit |
 | --- | --- | --- |
 | AirPlay input | Pinned Shairport Sync AirPlay 2 receiver, one advertised receiver per enabled room | Linux, bridged LAN, working multicast and PTP |
-| Room-addressed speech | Text-to-speech with selectable local models, or streamed WebRTC audio; one producer per room | Optional MLX generation runs on Apple Silicon; one model job at a time. Nobly is a future client |
+| Room-addressed speech | Text-to-speech with selectable local models, or streamed WebRTC audio; independent playback per room | One shared MLX model on Apple Silicon serializes inference; each room has one active reply and two queued texts. Nobly is a future client |
 | AirPlay output | OwnTone 29.3 | Device authorization may require setup |
 | Google Cast output | OwnTone's Cast implementation | Cross-protocol synchronization is approximate; device support varies |
 | Wired/local output | Enrolled physical ALSA device, with opened-device identity checks | Software playback is qualified; each physical device still requires admission and measurement |
@@ -43,13 +43,18 @@ uv run python -m playwright install chromium
 SHIRI_BROWSER_TESTS=1 node --test tests/web/*.test.mjs
 ```
 
-Linux GStreamer integration tests additionally require the system GI and audio packages installed by `install/install.sh`:
+Native transport, FIFO continuity, late speech mixing and Bluetooth output checks
+exercise the production paths. The ordinary Python suite runs their portable
+parts; CI supplies Linux native libraries for the C and ALSA parser checks.
 
 ```sh
-SHIRI_LINUX_AUDIO_TESTS=1 .venv/bin/pytest -q tests/test_linux_audio.py
+.venv/bin/pytest -q tests/test_audio.py tests/test_native_audio.py tests/test_timing.py
 ```
 
-The Linux tests use generated PCM and local WebRTC peers. They do not select house speakers or substitute for physical-device testing.
+These tests use generated PCM and local WebRTC peers. They do not select house
+speakers or substitute for physical-device testing. Dedicated qualification
+harnesses under `tests/linux` have their own lab prerequisites; production no
+longer requires GStreamer or an ALSA loopback card.
 
 ## Ubuntu installation
 

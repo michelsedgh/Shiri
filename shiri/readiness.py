@@ -339,9 +339,10 @@ class RoomReadinessCoordinator:
             self._retire(lease, "released")
             return lease.public(self.now_ns())
 
-    async def reconcile_locked(self):
+    async def reconcile_locked(self, rooms=None):
         """Called under the service mutation guard after desired intent changes."""
-        rooms = {room.id: room for room in await self.service._store("list_rooms")}
+        rooms = {room.id: room for room in (
+            rooms if rooms is not None else await self.service._store("list_rooms"))}
         async with self._lock:
             self._prune()
             await self._expire_locked()
@@ -357,7 +358,7 @@ class RoomReadinessCoordinator:
     def touch(self, room_id):
         self._auto_until[room_id] = self.now_ns()+300_000_000_000
 
-    async def maintain_locked(self, observed=None):
+    async def maintain_locked(self, observed=None, *, rooms=None):
         """Autonomous connection readiness, called after runtime reconciliation.
 
         Successful holds renew every thirty seconds with a sixty-second crash
@@ -365,7 +366,8 @@ class RoomReadinessCoordinator:
         """
         if not self.automatic or self._closing:
             return
-        rooms = {room.id: room for room in await self.service._store("list_rooms")}
+        rooms = {room.id: room for room in (
+            rooms if rooms is not None else await self.service._store("list_rooms"))}
         raw_rooms = observed.get("rooms", []) if isinstance(observed, dict) else []
         activity = {entry["room_id"]: entry["activity"]
                     for entry in raw_rooms if isinstance(entry, dict)

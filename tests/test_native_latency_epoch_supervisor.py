@@ -1,5 +1,4 @@
 """Fresh-epoch controller fences; no VM, root namespace or audio is opened."""
-import ast
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -48,13 +47,6 @@ def write_report(path, value):
 
 def read_report(path):
     return supervisor.read_epoch_report(path, expected_uid=os.getuid())
-
-
-def test_legacy_run_body_is_byte_identical_to_reviewed_base():
-    source = PATH.read_text()
-    node = next(node for node in ast.parse(source).body if isinstance(node, ast.AsyncFunctionDef) and node.name == 'run')
-    body = '\n'.join(source.splitlines()[node.lineno-1:node.end_lineno])+'\n'
-    assert hashlib.sha256(body.encode()).hexdigest() == '19e8868874101a44d2bb624f8c275c12506942af7cbd7493e9bd369c63c3838a'
 
 
 def test_aware_datetime_window_accepts_equivalent_timezone_without_lexical_comparison():

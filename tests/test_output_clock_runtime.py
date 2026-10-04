@@ -33,9 +33,8 @@ def test_clock_config_uses_exact_identity_instead_of_duplicate_or_renamed_labels
     definition = room(speakers=speakers)
     def render(value, directory):
         return backend_configs(value, directory, {"interface": "receiver0"},
-            {"api_host_ip": "10.211.0.1", "api_ip": "10.211.0.2"},
-            broker_socket=tmp_path / "broker.sock", all_receiver_names=["House input"], password="private",
-            view_directory=Path('/run/shiri-worker'))[1].read_text()
+            all_receiver_names=["House input"], password="private",
+            view_directory=Path('/run/shiri-worker'), audio_uid=1234)[1].read_text()
     first = render(definition, tmp_path / "before")
     renamed = definition.model_copy(update={"speakers": [s.model_copy(update={"name": "Renamed"}) for s in speakers]})
     second = render(renamed, tmp_path / "after")

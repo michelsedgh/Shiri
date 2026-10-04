@@ -380,10 +380,14 @@ def test_plan_rejects_image_meta_upgrade_removal_pending_configuration(extra):
         module.exact_package_plan(valid + extra, [item])
 
 
-def test_installer_invokes_module_provisioning_before_build_or_venv():
+def test_installer_limits_module_provisioning_to_explicit_loopback_option():
     source = (Path(__file__).resolve().parents[1] / "install/install.sh").read_text()
     invocation = '/usr/bin/python3 -I "$SOURCE/install/kernel_modules.py"'
     assert source.count(invocation) == 1
-    assert source.index("gstreamer1.0-plugins-bad gstreamer1.0-alsa") < source.index(invocation)
+    guard = 'if [[ "${SHIRI_INSTALL_LOOPBACK:-0}" == 1 ]]; then'
+    start = source.index(guard)
+    end = source.index("\nfi", start)
+    assert start < source.index(invocation) < end
+    assert start < source.index("modprobe snd-aloop") < end
     assert source.index(invocation) < source.index('bash "$SOURCE/install/build_helpers.sh"')
     assert source.index(invocation) < source.index(" -I -m venv")

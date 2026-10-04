@@ -283,7 +283,7 @@ class Store:
         check = connection.execute("PRAGMA quick_check").fetchone()[0]
         if check != "ok" or connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise ValidationIssue("Database integrity check failed; database preserved")
-        Store._audit_intent(connection)
+        rooms = Store._audit_intent(connection, version)
         if version >= 2:
             from .calibration import MAX_ACTIVE, MAX_HISTORY
             if (connection.execute("SELECT 1 FROM calibration_sessions LIMIT 1 OFFSET ?", (MAX_HISTORY,)).fetchone()
@@ -291,23 +291,27 @@ class Store:
                 raise ValidationIssue("Stored calibration history exceeds its bounded capacity; database preserved")
             for row in connection.execute("SELECT * FROM calibration_sessions"):
                 record = Store._calibration_record(row)
-                room = Store._get_room(connection, record["room_id"])
+                room = rooms[record["room_id"]]
                 if record["room_revision"] > room.revision or record["applied_revision"] is not None and record["applied_revision"] > room.revision:
                     raise ValidationIssue("Stored calibration receipt is newer than its room; database preserved")
-                reference = connection.execute("SELECT revision FROM rooms WHERE id=?", (record["reference_room_id"],)).fetchone()
-                if reference is not None and record["reference_revision"] > reference["revision"]:
+                reference = rooms.get(record["reference_room_id"])
+                if reference is not None and record["reference_revision"] > reference.revision:
                     raise ValidationIssue("Stored calibration reference is newer than its room; database preserved")
 
     @staticmethod
-    def _audit_intent(connection: sqlite3.Connection) -> None:
+    def _audit_intent(connection: sqlite3.Connection, version=SCHEMA_VERSION) -> dict[str, Room]:
         """Reject logical corruption without repairing or rewriting saved intent."""
         rows = connection.execute("SELECT * FROM rooms ORDER BY slot").fetchall()
         if len(rows) > MAX_ROOMS:
             raise ValidationIssue("Stored room capacity is invalid; database preserved")
+        speakers = Store._speaker_rows_by_room(connection, version=version)
+        rooms = {}
         names, airplay_names, external_ids, local_devices, outputs = set(), set(), set(), set(), set()
         revisions, assigned_offsets = {}, {}
         for row in rows:
-            room = Store._get_room(connection, row["id"])
+            saved = speakers.get(row["id"], [])
+            room = Store._room_from_rows(row, saved)
+            rooms[room.id] = room
             revisions[room.id] = room.revision
             if (type(row["enabled"]) is not int or row["enabled"] not in {0, 1}
                     or row["name"] != room.name or row["airplay_name"] != room.airplay_name
@@ -324,7 +328,6 @@ class Store:
                 if key in local_devices:
                     raise ValidationIssue("Stored local audio devices conflict; database preserved")
                 local_devices.add(key)
-            saved = connection.execute("SELECT * FROM room_speakers WHERE room_id=? ORDER BY position", (room.id,)).fetchall()
             for position, (speaker, output) in enumerate(zip(room.speakers, saved, strict=True)):
                 key = speaker_key(speaker, room.local_audio_device)
                 if (output["position"] != position or output["name"] != speaker.name
@@ -352,13 +355,13 @@ class Store:
             raise ValidationIssue("Stored speaker profiles are invalid; database preserved") from exc
         if matched_profiles != assigned_offsets.keys():
             raise ValidationIssue("Stored speaker calibration does not match its profile; database preserved")
-        if connection.execute("PRAGMA user_version").fetchone()[0] >= 3:
+        if version >= 3:
             for balance in connection.execute("SELECT * FROM speaker_balances"):
                 if (type(balance["balance_percent"]) is not int or not 0 <= balance["balance_percent"] <= 100
                         or connection.execute("SELECT 1 FROM speaker_profiles WHERE identity_family=? AND identity_key=?",
                                               (balance["identity_family"], balance["identity_key"])).fetchone() is None):
                     raise ValidationIssue("Stored speaker balance is invalid; database preserved")
-        if connection.execute("PRAGMA user_version").fetchone()[0] >= 4:
+        if version >= 4:
             for timing in connection.execute("SELECT * FROM speaker_airplay_timing"):
                 try:
                     if timing["identity_family"] != "owntone":
@@ -385,6 +388,7 @@ class Store:
                     or type(receipt["committed_revision"]) is not int or receipt["committed_revision"] < 1
                     or receipt["room_id"] in revisions and receipt["committed_revision"] > revisions[receipt["room_id"]]):
                 raise ValidationIssue("Stored phone volume receipt is invalid; database preserved")
+        return rooms
 
     def initialize(self) -> None:
         """Recheck an opened store; initialization is also performed at construction."""
@@ -429,6 +433,33 @@ class Store:
         row = connection.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
         if row is None:
             raise NotFound("Room not found")
+        return Store._room_from_rows(row, Store._speaker_rows_by_room(connection, room_id).get(room_id, []))
+
+    @staticmethod
+    def _speaker_rows_by_room(connection: sqlite3.Connection, room_id: str | None = None, *, version=SCHEMA_VERSION):
+        # Startup audits read old schemas before migration. Normal reads use
+        # the current schema, without probing its version for each speaker.
+        balance = "COALESCE(b.balance_percent, 100)" if version >= 3 else "100"
+        timing = "COALESCE(t.airplay_timing, 'auto')" if version >= 4 else "'auto'"
+        statement = (f"SELECT s.*, {balance} AS balance_percent, "
+                     f"CASE WHEN s.protocol='airplay2' THEN {timing} ELSE 'auto' END AS airplay_timing "
+                     "FROM room_speakers AS s ")
+        if version >= 3:
+            statement += ("LEFT JOIN speaker_balances AS b ON "
+                          "b.identity_family=s.identity_family AND b.identity_key=s.identity_key ")
+        if version >= 4:
+            statement += ("LEFT JOIN speaker_airplay_timing AS t ON "
+                          "t.identity_family=s.identity_family AND t.identity_key=s.identity_key ")
+        if room_id is not None:
+            statement += "WHERE s.room_id=? "
+        statement += "ORDER BY s.room_id,s.position"
+        grouped = {}
+        for row in connection.execute(statement, (room_id,) if room_id is not None else ()):
+            grouped.setdefault(row["room_id"], []).append(row)
+        return grouped
+
+    @staticmethod
+    def _room_from_rows(row, outputs) -> Room:
         try:
             validate_local_audio_device(row["local_audio_device"])
         except ValueError as exc:
@@ -437,9 +468,8 @@ class Store:
             ) from exc
         try:
             speakers = [SpeakerRef(id=output["output_id"], name=output["name"], protocol=output["protocol"], offset_ms=output["offset_ms"],
-                                   balance_percent=Store._speaker_balance(connection, (output["identity_family"], output["identity_key"])),
-                                   airplay_timing=Store._speaker_airplay_timing(connection, (output["identity_family"], output["identity_key"]), output["protocol"]))
-                        for output in connection.execute("SELECT * FROM room_speakers WHERE room_id=? ORDER BY position", (room_id,)).fetchall()]
+                                   balance_percent=output["balance_percent"], airplay_timing=output["airplay_timing"])
+                        for output in outputs]
             return Room(
                 id=row["id"], slot=row["slot"], name=row["name"], airplay_name=row["airplay_name"],
                 nobly_room_id=row["nobly_room_id"], interface=row["interface"], local_audio_device=row["local_audio_device"],
@@ -459,26 +489,33 @@ class Store:
 
     @staticmethod
     def _speaker_balance(connection: sqlite3.Connection, identity: tuple[str, str]) -> int:
-        if connection.execute("PRAGMA user_version").fetchone()[0] < 3:
-            return 100
         row = connection.execute("SELECT balance_percent FROM speaker_balances WHERE identity_family=? AND identity_key=?", identity).fetchone()
         return row[0] if row else 100
 
     @staticmethod
     def _speaker_airplay_timing(connection: sqlite3.Connection, identity: tuple[str, str], protocol: str) -> AirplayTiming:
-        if protocol != "airplay2" or connection.execute("PRAGMA user_version").fetchone()[0] < 4:
+        if protocol != "airplay2":
             return "auto"
         row = connection.execute("SELECT airplay_timing FROM speaker_airplay_timing WHERE identity_family=? AND identity_key=?", identity).fetchone()
         return row[0] if row else "auto"
 
     def list_rooms(self) -> list[Room]:
         with self._transaction(write=False) as connection:
-            ids = [row[0] for row in connection.execute("SELECT id FROM rooms ORDER BY slot").fetchall()]
-            return [self._get_room(connection, room_id) for room_id in ids]
+            rows = connection.execute("SELECT * FROM rooms ORDER BY slot").fetchall()
+            speakers = self._speaker_rows_by_room(connection)
+            return [self._room_from_rows(row, speakers.get(row["id"], [])) for row in rows]
 
     def get_room(self, room_id: str) -> Room:
         with self._transaction(write=False) as connection:
             return self._get_room(connection, room_id)
+
+    def resolve_nobly(self, external_id: str) -> Room:
+        with self._transaction(write=False) as connection:
+            row = connection.execute("SELECT * FROM rooms WHERE nobly_room_id=?", (external_id,)).fetchone()
+            if row is None:
+                raise NotFound("Nobly room is not bound to exactly one audio room")
+            speakers = self._speaker_rows_by_room(connection, row["id"])
+            return self._room_from_rows(row, speakers.get(row["id"], []))
 
     def create_room(self, creation: RoomCreate) -> Room:
         if not isinstance(creation, RoomCreate):
@@ -552,6 +589,12 @@ class Store:
     @staticmethod
     def _update_row(connection: sqlite3.Connection, room: Room) -> None:
         Store._ensure_local_device_available(connection, room.local_audio_device, room_id=room.id)
+        # The runtime has one shared sender LAN. Reject incompatible enabled
+        # intent atomically, but always permit disabling an old conflicting room.
+        if room.enabled and connection.execute(
+            "SELECT 1 FROM rooms WHERE enabled=1 AND id<>? AND interface<>? LIMIT 1", (room.id, room.interface)
+        ).fetchone() is not None:
+            raise Conflict("Enabled rooms must share the same LAN interface; turn off the other rooms before changing networks")
         connection.execute(
             "UPDATE rooms SET name=?, name_key=?, airplay_name=?, airplay_name_key=?, nobly_room_id=?, interface=?, local_audio_device=?, enabled=?, volume=?, duck_gain=?, revision=? WHERE id=?",
             (room.name, room.name.casefold(), room.airplay_name, room.airplay_name.casefold(), room.nobly_room_id,
