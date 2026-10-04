@@ -2,11 +2,12 @@
 
 The October 4 workspace refactors room speech concurrency, persistent PCM
 transport, model recovery, output readiness and configuration reads, and removes
-retired audio implementations and latency experiments. It has not been deployed.
+retired audio implementations and latency experiments. It is now
+[installed on both hosts](CHECKPOINT_REFACTOR_2026-10-04.md).
 [The repository review](REPO_REVIEW_2026-10-04.md) records the root causes,
 implementation and current verification results.
 
-The last recorded live deployment is the October 3 `duck1-warm1` release.
+The previous live deployment was the October 3 `duck1-warm1` release.
 [The live handoff](LIVE_TEST_HANDOFF.md) and its linked checkpoints identify
 exact artifacts, installed state and rollback files. Earlier design proposals
 and experiment logs are available in Git history; they do not define the
@@ -72,8 +73,8 @@ Use these immutable records for exact scope and artifact identity:
 - [Quiet readiness release](CHECKPOINT_TTS_READINESS_2026-10-03.md)
 
 They are evidence records, not commands to reintroduce their retired designs.
-No October 4 live deployment, model-performance benchmark or acoustic test is
-claimed by the workspace refactor.
+The subsequent [October 4 deployment](CHECKPOINT_REFACTOR_2026-10-04.md) verifies
+service restarts and quiet generation/stream behavior; it adds no acoustic test.
 
 ## Remaining acceptance
 

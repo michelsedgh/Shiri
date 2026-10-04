@@ -7,7 +7,7 @@ multi-room selection supplies a common music presentation timeline. The web
 interface manages configuration and diagnostics, but ordinary phone playback
 uses the phone's existing AirPlay controls.
 
-This describes the October 4 workspace. Its refactor has not been deployed.
+This describes the [installed October 4 refactor](CHECKPOINT_REFACTOR_2026-10-04.md).
 [Product requirements](PRODUCT_REQUIREMENTS.md) define behavior;
 [the live handoff](LIVE_TEST_HANDOFF.md) identifies the installed release.
 Cast speaker output is supported; Cast input is deferred and Bluetooth input
@@ -237,5 +237,6 @@ The current software review and integrated checks are recorded in
 [the October 4 review](REPO_REVIEW_2026-10-04.md).
 [Release verification](REBUILD.md) maps the maintained checks and remaining
 gates. Previous live observations and artifact hashes remain in dated
-checkpoints. The October 4 refactor has no new live-model, systemd deployment,
-phone, speaker or acoustic acceptance result.
+checkpoints. The October 4 checkpoint records the actual service restarts,
+quiet model generation and silent stream checks. It adds no phone, speaker
+listening or acoustic acceptance result.

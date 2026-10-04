@@ -2,7 +2,8 @@
 
 The October 4 refactor supersedes the original readiness and single-job design.
 Current behavior is documented in [architecture](ARCHITECTURE.md) and
-[the review](REPO_REVIEW_2026-10-04.md); it has not been deployed. The physical
+[the review](REPO_REVIEW_2026-10-04.md); its deployment is recorded in
+[the October 4 checkpoint](CHECKPOINT_REFACTOR_2026-10-04.md). The physical
 and compute measurements below retain their original scope.
 
 Shiri's current AirPlay music engine is usable on the live test VM. The user

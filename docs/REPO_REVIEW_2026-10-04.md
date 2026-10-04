@@ -1,9 +1,10 @@
 # Architecture and latency review — October 4, 2026
 
 This review and refactor applies to the workspace based on `e56a694` on
-`codex/shiri-rebuild`. It changes software, tests and documentation. It has not
-been deployed to the live VM or Mac model service, and introduces no new
-microphone, live-model or physical-speaker measurement.
+`codex/shiri-rebuild`. It changes software, tests and documentation. The review
+initially preceded deployment. The subsequent authorized
+[rollout](CHECKPOINT_REFACTOR_2026-10-04.md) records actual VM/Mac installation
+and quiet checks; no microphone or physical-speaker measurement is added here.
 
 The agreed priority is Nobly text arriving at Shiri → the listener hearing
 speech, with independent rooms and uninterrupted music. The implementation now
@@ -226,7 +227,8 @@ full installed source build; real FFmpeg and SBC libraries were exercised.
 The isolated Linux environment has no host audio devices, privileged host
 access or live room services. It exercises Linux-specific software and
 Python 3.10 compatibility, not the installed systemd/network boundary or
-physical speakers. The live service and model installation remain unchanged.
+physical speakers. The subsequent live installation and quiet smoke checks are
+recorded separately in [the deployment checkpoint](CHECKPOINT_REFACTOR_2026-10-04.md).
 [Release verification](REBUILD.md) and [product acceptance](PRODUCT_REQUIREMENTS.md)
 identify the later hardware checks; [architecture](ARCHITECTURE.md) and
 [local TTS](LOCAL_TTS.md) document the resulting implementation.

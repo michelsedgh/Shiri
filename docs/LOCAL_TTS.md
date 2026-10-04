@@ -1,7 +1,8 @@
 # Local streaming speech
 
 The architecture and API below describe the October 4 workspace refactor,
-which has not been deployed. Dated measurements describe earlier releases;
+now installed as recorded in [the deployment checkpoint](CHECKPOINT_REFACTOR_2026-10-04.md).
+Dated measurements describe their specific releases;
 they do not measure the new room queues or persistent speech transport.
 
 **Historical October 3 startup qualification:** initial metadata, natural-EOF drain,

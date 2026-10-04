@@ -1,10 +1,23 @@
-# Live test handoff — October 3, 2026
+# Live test handoff — October 4, 2026
 
-This records the installed October 3 release. The October 4 workspace refactor
-has not been deployed; its always-ready default, room queues and persistent
-speech stream are described in [architecture](ARCHITECTURE.md) and
-[the review](REPO_REVIEW_2026-10-04.md). The artifact identities and observations
-below remain tied to their original release.
+The refactor is installed on the Ubuntu VM and Mac worker. Open
+**http://shiri-speaker-test.local:8080/** and refresh the page. Qwen is loaded
+and ready; Living Room Test is running with its saved Sonos assignment and
+an always-ready connection. Both Linux services remain enabled for boot.
+
+Use **Speak** to test replies, or select **Shiri Test Living Room** in the
+phone's AirPlay controls for music. Each room now keeps one active reply and
+two queued texts, with explicit exact-job interruption. The rollout preserved
+room revision84, master volume26, balance100%, offset0 and NTP timing.
+
+[The October 4 deployment checkpoint](CHECKPOINT_REFACTOR_2026-10-04.md) records
+exact artifacts, rollback and successful silent-stream/quiet-generation checks.
+Audible onset, new phone regression and physical grouping remain listening tests.
+
+## Previous installed release — October 3
+
+The following records the earlier release and its observations. Its adaptive
+default and single-job behavior are superseded by the October 4 deployment.
 
 The `duck1-warm1` release is installed in the VM and Mac worker. Open
 **http://shiri-speaker-test.local:8080/** and connect an iPhone to
