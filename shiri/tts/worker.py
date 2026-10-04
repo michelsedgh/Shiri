@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import hmac
 import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import stat
 import time
 
@@ -16,7 +19,40 @@ from anyio import CancelScope
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from shiri.tts.models import DEFAULT_MODEL_ID, MAX_GENERATED_SECONDS, get_models, get_model, validate_request
+from shiri.tts.models import DEFAULT_MODEL_ID, MAX_GENERATED_SECONDS, GenerationRequest, get_models, get_model, validate_request
+
+WARM_FIRST_PCM_SECONDS = 2
+WARM_RECEIPT_SECONDS = 600
+WARM_RECEIPT_LIMIT = 128
+
+
+@dataclass
+class ModelWarm:
+    request_id: str
+    model_id: str
+    began: float
+    began_unix_ms: float
+    state: str = "preparing"
+    accepted: bool = True
+    reason: str | None = None
+    error: str | None = None
+    first_pcm_ms: float | None = None
+    discarded_received_audio_ms: float = 0
+    retirement_ms: float | None = None
+    ended: float | None = None
+    task: asyncio.Task | None = None
+    iterator: object | None = None
+
+    def public(self):
+        return {"request_id": self.request_id, "model_id": self.model_id,
+                "state": self.state, "accepted": self.accepted, "reason": self.reason, "error": self.error,
+                "mode": "first_pcm_then_reset", "began_unix_ms": self.began_unix_ms,
+                "first_pcm_ms": self.first_pcm_ms,
+                "discarded_received_audio_ms": self.discarded_received_audio_ms,
+                "retirement_ms": self.retirement_ms,
+                "total_ms": (self.ended - self.began) * 1000 if self.ended is not None else None,
+                "age_ms": max(0, time.monotonic() - self.ended) * 1000 if self.ended is not None else None,
+                "room_audio_sent": False, "latency_guaranteed": False}
 
 
 def read_worker_token(path: Path):
@@ -100,10 +136,145 @@ class ModelWorker:
         self.error = None
         self.warmup = None
         self.lock = asyncio.Lock()
+        self.operation = None
+        self.warm_receipts = OrderedDict()
+        self._active_warm = None
+        self._latest_warm = None
+        self._warm_cancel_lock = asyncio.Lock()
 
     def status(self):
+        self._prune_warm_receipts()
+        receipt = self.warm_receipts.get(self._latest_warm)
         return {"state": self.state, "model_id": self.model_id, "busy": self.state == "busy",
-                "error": self.error, "warmup": self.warmup}
+                "error": self.error, "warmup": self.warmup, "operation": self.operation,
+                "model_warm": receipt.public() if receipt else None}
+
+    def _prune_warm_receipts(self):
+        now = time.monotonic()
+        for identity, receipt in list(self.warm_receipts.items()):
+            if receipt is not self._active_warm and receipt.ended is not None and now - receipt.ended >= WARM_RECEIPT_SECONDS:
+                del self.warm_receipts[identity]
+
+    @staticmethod
+    def _warm_id(request_id):
+        if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
+            raise ValueError("Model warm request_id requires 32 lowercase hexadecimal characters")
+
+    def warm_status(self, request_id):
+        self._warm_id(request_id)
+        self._prune_warm_receipts()
+        receipt = self.warm_receipts.get(request_id)
+        return receipt.public() if receipt else None
+
+    async def warm(self, model_id, request_id):
+        """One explicit, quiet hint. Never load a model or create a warm loop."""
+        self._warm_id(request_id)
+        spec = get_model(model_id, self.registry_file)
+        request = validate_request(spec, GenerationRequest(text="Hi.", max_tokens=128))
+        self._prune_warm_receipts()
+        old = self.warm_receipts.get(request_id)
+        if old is not None:
+            if old.model_id != model_id:
+                raise ValueError("Model warm request_id already belongs to a different model")
+            return old.public()
+        if len(self.warm_receipts) >= WARM_RECEIPT_LIMIT:
+            # A receipt is an idempotency fence for its entire retention, even
+            # when terminal. Eviction would silently re-run a retried hint.
+            raise ValueError("Model warm receipt capacity reached; wait for retained requests to expire")
+        receipt = ModelWarm(request_id, model_id, time.monotonic(), time.time() * 1000)
+        self.warm_receipts[request_id] = receipt
+        self._latest_warm = request_id
+        if self.lock.locked() or self.state != "ready" or self.model_id != model_id:
+            receipt.state, receipt.accepted = "skipped", False
+            receipt.reason = "busy" if self.lock.locked() or self.state == "busy" else (
+                "model_mismatch" if self.model_id != model_id else "model_not_ready")
+            receipt.ended = time.monotonic()
+            return receipt.public()
+        await self.lock.acquire()
+        self.state, self.operation = "busy", "warming"
+        iterator = self.stream(request)
+        receipt.iterator = iterator
+        # Enter the iterator's cleanup owner before scheduling: cancelling a
+        # task before its first turn otherwise never runs that task's finally.
+        first = await iterator.__anext__()
+        self._active_warm = receipt
+        receipt.task = asyncio.create_task(self._run_warm(receipt, first))
+        return receipt.public()
+
+    async def _run_warm(self, receipt, first):
+        iterator = receipt.iterator
+        outcome = "failed"
+        try:
+            if json.loads(first).get("type") != "format":
+                raise ValueError("Model priming did not establish its PCM format")
+            async with asyncio.timeout(WARM_FIRST_PCM_SECONDS):
+                event = json.loads(await iterator.__anext__())
+                if event.get("type") != "pcm":
+                    raise ValueError("Model priming did not produce a first PCM chunk")
+                pcm = base64.b64decode(event["pcm_base64"], validate=True)
+                if not pcm or len(pcm) % 2 or len(pcm) > 1920:
+                    raise ValueError("Model priming returned invalid PCM")
+                receipt.first_pcm_ms = (time.monotonic() - receipt.began) * 1000
+                receipt.discarded_received_audio_ms = len(pcm) / 96
+            outcome = "completed"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            receipt.reason = receipt.reason or "cancelled"
+            raise
+        except TimeoutError:
+            receipt.reason = "first_pcm_timeout"
+            receipt.error = "Model priming first PCM deadline exceeded"
+        except Exception as exc:
+            receipt.error = str(exc)[:512]
+        finally:
+            retirement = time.monotonic()
+            with CancelScope(shield=True):
+                try:
+                    # Raw Task.cancel() may arrive while reset is already in
+                    # progress. Shield the same close owner and still join it;
+                    # otherwise preemption turns a healthy reset into a kill.
+                    cleanup = asyncio.create_task(iterator.aclose())
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(cleanup)
+                        raise
+                finally:
+                    receipt.retirement_ms = (time.monotonic() - retirement) * 1000
+                    receipt.ended = time.monotonic()
+                    receipt.iterator = receipt.task = None
+                    if self.state != "ready" and outcome == "completed":
+                        outcome = "failed"
+                        receipt.error = "Model priming could not confirm a reusable decoder"
+                    # PCM arrival alone never claims completed readiness. The
+                    # reusable reset ACK/retirement is the terminal boundary.
+                    receipt.state = outcome
+                    if self._active_warm is receipt:
+                        self._active_warm = None
+
+    async def cancel_warm(self, request_id, *, reason="cancelled"):
+        """Retire only this warm owner; stale cancellation cannot stop speech."""
+        self._warm_id(request_id)
+        async with self._warm_cancel_lock:
+            receipt = self.warm_receipts.get(request_id)
+            if receipt is None or receipt is not self._active_warm:
+                return receipt.public() if receipt else None
+            receipt.reason = reason
+            task, iterator = receipt.task, receipt.iterator
+            with CancelScope(shield=True):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                # Also covers cancellation before the task's first turn.
+                if iterator is not None:
+                    await iterator.aclose()
+                if receipt.ended is None:
+                    receipt.state = "cancelled"
+                    receipt.ended = time.monotonic()
+                receipt.iterator = receipt.task = None
+                if self._active_warm is receipt:
+                    self._active_warm = None
+            return receipt.public()
 
     async def _receive(self, wait_seconds):
         connection = self.connection
@@ -211,10 +382,15 @@ class ModelWorker:
         model_id = payload.get("model_id")
         spec = get_model(model_id, self.registry_file)
         request = validate_request(spec, {key: value for key, value in payload.items() if key != "model_id"})
+        # Validate first: malformed or wrong-model requests cannot displace a
+        # useful prime. A real utterance joins that exact owner's reset before
+        # acquiring the one reader/decoder, and never cancels another utterance.
+        if self._active_warm is not None and self.model_id == model_id:
+            await self.cancel_warm(self._active_warm.request_id, reason="speech_priority")
         if self.lock.locked() or self.state != "ready" or self.model_id != model_id:
             raise ValueError("Load and warm the selected model before generating; one generation is allowed at a time")
         await self.lock.acquire()
-        self.state = "busy"
+        self.state, self.operation = "busy", "speech"
         return request
 
     async def stream(self, request):
@@ -257,9 +433,12 @@ class ModelWorker:
                 else:
                     await self._terminate()
                     self.state = "stopped" if not self.error else "failed"
+                self.operation = None
                 self.lock.release()
 
     async def close(self):
+        if self._active_warm is not None:
+            await self.cancel_warm(self._active_warm.request_id, reason="shutdown")
         if self.load_task is not None and not self.load_task.done():
             self.load_task.cancel()
             await asyncio.gather(self.load_task, return_exceptions=True)
@@ -318,6 +497,40 @@ def create_worker_app(*, token: str, registry_file: Path | None = None, cache_di
                 raise ValueError("Provide only model_id")
             await worker.load(payload["model_id"])
             return worker.status()
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/v1/warm", status_code=202)
+    async def warm(request: Request):
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict) or set(payload) != {"model_id", "request_id"}:
+                raise ValueError("Provide only model_id and request_id for a quiet model hint")
+            result = await worker.warm(payload["model_id"], payload["request_id"])
+            return {"warm": result, "worker": worker.status()}
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.get("/v1/warm/{request_id}")
+    async def warm_status(request_id: str):
+        try:
+            result = worker.warm_status(request_id)
+            if result is None:
+                return JSONResponse({"error": "Model warm request was not found or expired"}, status_code=404)
+            return {"warm": result, "worker": worker.status()}
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/v1/warm/cancel")
+    async def cancel_warm(request: Request):
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict) or set(payload) != {"request_id"}:
+                raise ValueError("Provide only the owned model warm request_id")
+            result = await worker.cancel_warm(payload["request_id"])
+            if result is None:
+                return JSONResponse({"error": "Model warm request was not found or expired"}, status_code=404)
+            return {"warm": result, "worker": worker.status()}
         except (ValueError, KeyError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
 

@@ -1,6 +1,38 @@
 # Live test handoff — October 3, 2026
 
-**Current speech status:** acknowledged initial AirPlay metadata, natural-EOF
+The `duck1-warm1` release is installed in the VM and Mac worker. Open
+**http://shiri-speaker-test.local:8080/** and connect an iPhone to
+**Shiri Test Living Room**. The VM starts its normal Shiri services on boot;
+the Mac worker now preloads the selected Qwen model on login.
+
+Rooms use adaptive connection retention by default: five minutes after use,
+without continuous silent audio. Nobly hints and an optional always-ready
+policy are available. The Speak panel includes **Prepare room quietly**;
+repeated clicks renew the same exact room/model hold. Preparation leaves music
+volume unchanged, and an actual speech request begins smooth ducking.
+
+The current 61-file wheel is
+`50bd36241ad6dbcab880ca1c397f6cee77896cb49eb696fab51d7075af9722ec`;
+OwnTone ends `outputclock1-duck1-warm1` with SHA-256
+`3d31ad79d937a0661222f32a10945bccc958f4f8318e7a7f7a46fdd57c2b7ba4`.
+Saved room volume 26/revision 84 and Sonos NTP timing were preserved.
+
+The controlled held-connection Qwen request admitted its first PCM to the room
+in 79.15 ms, before generation completed; all 4.64 seconds were delivered with
+zero dropped frames. This is software admission, not first audible sound.
+The AirPlay route still retains its 500 ms output buffer/600 ms common horizon.
+The user heard the complete greeting, including “Hello,” after the quiet hold.
+No new microphone, power or whole-house synchronization measurement is claimed.
+See [the current checkpoint](CHECKPOINT_TTS_READINESS_2026-10-03.md) for exact
+installed artifacts, recovery paths, test counts and measurement boundaries.
+
+## Historical outputclock1 handoff
+
+The following records the preceding checkpoint. Its artifact hashes and
+listening results belong to that release.
+
+
+**Previous speech status:** acknowledged initial AirPlay metadata, natural-EOF
 drain, live delivery progress, the cold-music input repair and `outputclock1`
 are installed. Cold idle speech lost opening words with this Sonos output's
 automatic PTP timing. The user heard the entire phrase during a controlled

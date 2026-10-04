@@ -281,6 +281,8 @@ class NativeMixer:
                 "clock_mapping_uncertainty_ns": self._last_mapping.uncertainty_ns if self._last_mapping else None,
                 "native_group_id": str(UUID(bytes=self._last_packet.group)) if self._last_packet and self._last_packet.group != ZERO_UUID else None,
                 "native_generation": self._last_packet.generation if self._last_packet else None,
+                "music_media_recent": bool(self._last_native_ns
+                    and 0 <= self.now_ns() - self._last_native_ns <= 1_000_000_000),
                 "error": self.error}
 
     def close(self):
@@ -383,6 +385,11 @@ class NativeController:
         self.connections = set()
         self.ingress_fault = None
         self.music_startup = MusicStartupTrace()
+        self._output_setup_lock = asyncio.Lock()
+        self._warm_generation = 0
+        self._warm_identity = None
+        self._warm_connected = False
+        self._warm_terminal = False
 
     @staticmethod
     def _revision(value):
@@ -469,9 +476,22 @@ class NativeController:
             return (not preparation.retired and self.mixer.speech_preparation is preparation
                     and state["ready"] and self.mixer.route == route and self.operation_generation == operation
                     and (state["owner"] is None) == preparation.idle)
-        return await complete_speech_startup(preparation, self.client, body, owned=owned,
+        def admit(speech_id):
+            if getattr(identity, "duck_on_prepare", False):
+                self.mixer.speech_output.begin(speech_id, attack_ms=300, release_ms=600)
+            else:
+                self.mixer.speech_output.begin(speech_id)
+        controller = self
+        class SetupClient:
+            async def request(self, method, path, **kwargs):
+                if (path == "/api/player/shiri-speech-ready"
+                        and kwargs.get("json", {}).get("action") == "prepare"):
+                    async with controller._output_setup_lock:
+                        return await controller.client.request(method, path, **kwargs)
+                return await controller.client.request(method, path, **kwargs)
+        return await complete_speech_startup(preparation, SetupClient(), body, owned=owned,
             bed=lambda value: None, send=self.mixer._send_speech,
-            admit=self.mixer.speech_output.begin)
+            admit=admit)
 
     def negotiated_speech(self, identity):
         preparation = self.mixer.speech_preparation
@@ -494,7 +514,142 @@ class NativeController:
         if preparation is not None:
             await retire_backend(preparation, self.client, natural=natural)
 
+    @staticmethod
+    def _warm_id(value):
+        if (type(value) is not str or len(value) != 32 or value == "0" * 32
+                or any(char not in "0123456789abcdef" for char in value)):
+            raise RpcError("invalid_request", "Connection warming requires an exact nonzero lease identity")
+        return value
+
+    def _warm_body(self, lease_id, action, deadline_ns=0):
+        self._warm_id(lease_id)
+        if self.mixer.speech_output is None:
+            raise RpcError("unsupported", "Connection warming requires the native room binding")
+        if self._warm_identity is None or self._warm_identity[0] != lease_id:
+            if action != "acquire" and not (action == "release" and self._warm_identity is None):
+                raise RpcError("session_conflict", "Another native connection lease owns this room")
+            if self._warm_generation >= 2**63 - 1:
+                raise RpcError("session_limit", "Native connection lease identities are exhausted")
+            self._warm_generation += 1
+            self._warm_identity = (lease_id, self._warm_generation)
+            self._warm_connected = self._warm_terminal = False
+        return {"room_id": self.mixer.speech_output.room.hex(),
+                "launch_generation": self.mixer.speech_output.launch.hex(),
+                "warm_id": lease_id, "lease_generation": self._warm_identity[1],
+                "action": action, "deadline_monotonic_ns": deadline_ns}
+
+    async def _warm_exchange(self, body, deadline_ns):
+        remaining = (deadline_ns - self.mixer.now_ns()) / 1e9
+        if remaining <= 0:
+            raise TimeoutError("Connection preparation exceeded its finite control budget")
+        reply = await asyncio.wait_for(self.client.request(
+            "POST", "/api/player/shiri-warm", json=body), timeout=remaining)
+        expected = set(body) | {"connected", "pending", "terminal", "prepared_monotonic_ns",
+                                "expires_monotonic_ns", "output_count"}
+        if (type(reply) is not dict or set(reply) != expected
+                or any(type(reply.get(key)) is not type(value) or reply[key] != value
+                       for key, value in body.items())
+                or any(type(reply[key]) is not bool for key in ("connected", "pending", "terminal"))
+                or any(type(reply[key]) is not int or not 0 <= reply[key] <= 2**63 - 1
+                       for key in ("prepared_monotonic_ns", "expires_monotonic_ns"))
+                or type(reply["output_count"]) is not int or not 0 <= reply["output_count"] <= 128
+                or reply["connected"] and (reply["pending"] or reply["terminal"]
+                    or not reply["output_count"] or not 0 < reply["prepared_monotonic_ns"] <= self.mixer.now_ns()
+                    or reply["expires_monotonic_ns"] <= self.mixer.now_ns())):
+            raise RpcError("audio_unavailable", "Native connection lease did not acknowledge its exact bounded identity")
+        self._warm_connected = reply["connected"]
+        self._warm_terminal = reply["terminal"]
+        return {"state": "connected" if reply["connected"] else "degraded",
+                **{key: reply[key] for key in expected - set(body)},
+                "lease_id": body["warm_id"], "lease_generation": body["lease_generation"],
+                "scope": "connection_only", "acoustic_ready": None}
+
+    async def warm_connection(self, lease_id, deadline_monotonic_ns):
+        """Prepare selected transports without speech, silence or music intent.
+
+        Only this explicit acquire can start a connection. The backend owns a
+        finite setup timer; its keepalive and lease timers never reconnect.
+        """
+        self._warm_id(lease_id)
+        now = self.mixer.now_ns()
+        if (type(deadline_monotonic_ns) is not int
+                or not now < deadline_monotonic_ns <= min(2**63 - 1, now + 300_000_000_000)):
+            raise RpcError("invalid_request", "Connection expiry must be within five minutes of admission")
+        async with self._output_setup_lock:
+            if self.closed or not self.actor.snapshot()["ready"]:
+                raise RpcError("audio_unavailable", "This native room cannot prepare an output connection")
+            existing = bool(self._warm_identity and self._warm_identity[0] == lease_id
+                            and self._warm_connected and not self._warm_terminal)
+            body = self._warm_body(lease_id, "acquire", deadline_monotonic_ns)
+            if self._warm_terminal:
+                raise RpcError("session_conflict", "This native connection lease has ended")
+            began = self.mixer.now_ns()
+            control_deadline = min(deadline_monotonic_ns, began + 3_000_000_000)
+            # Reserve a bounded cancellation lane inside the same total budget.
+            setup_deadline = min(control_deadline, began + 2_500_000_000)
+            try:
+                result = await self._warm_exchange(body, setup_deadline)
+                while result["pending"] and not result["terminal"]:
+                    await asyncio.sleep(.01)
+                    result = await self._warm_exchange({**body, "action": "observe",
+                                                       "deadline_monotonic_ns": 0}, setup_deadline)
+                if not result["connected"]:
+                    raise RpcError("audio_unavailable", "Selected room connections did not finish finite preparation")
+                return result
+            except BaseException:
+                # A failed additional caller must not retire a connection
+                # retained by an already admitted aggregate lease.
+                if not existing:
+                    await self._retire_warm_exact(body, control_deadline)
+                raise
+
+    async def _retire_warm_exact(self, body, control_deadline):
+        request = {**body, "action": "release", "deadline_monotonic_ns": 0}
+        async def retire():
+            result = await self._warm_exchange(request, control_deadline)
+            while result["pending"]:
+                await asyncio.sleep(.01)
+                result = await self._warm_exchange({**request, "action": "observe"}, control_deadline)
+            return result
+        task = asyncio.create_task(retire(), name="native-warm-retirement")
+        interrupted = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                interrupted = True
+        if interrupted:
+            raise asyncio.CancelledError
+        return result
+
+    async def observe_warm_connection(self, lease_id):
+        async with self._output_setup_lock:
+            body = self._warm_body(lease_id, "observe")
+            return await self._warm_exchange(body, self.mixer.now_ns() + 3_000_000_000)
+
+    async def adjust_warm_deadline(self, lease_id, deadline_monotonic_ns):
+        """Change the aggregate bound without SETUP or reconnecting a speaker."""
+        now = self.mixer.now_ns()
+        if (type(deadline_monotonic_ns) is not int
+                or not now < deadline_monotonic_ns <= min(2**63 - 1, now + 300_000_000_000)):
+            raise RpcError("invalid_request", "Connection expiry must be within five minutes of admission")
+        async with self._output_setup_lock:
+            body = self._warm_body(lease_id, "deadline", deadline_monotonic_ns)
+            return await self._warm_exchange(body, self.mixer.now_ns() + 3_000_000_000)
+
+    async def release_warm_connection(self, lease_id):
+        async with self._output_setup_lock:
+            body = self._warm_body(lease_id, "release")
+            return await self._retire_warm_exact(body, self.mixer.now_ns() + 3_000_000_000)
+
     async def _transition(self, owner):
+        async with self._output_setup_lock:
+            return await self._transition_outputs(owner)
+
+    async def _transition_outputs(self, owner):
         self.operation_generation += 1
         operation = self.operation_generation
         incarnation, session, epoch, generation = owner

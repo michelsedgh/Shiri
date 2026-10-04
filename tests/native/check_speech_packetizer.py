@@ -30,8 +30,13 @@ CODEC_SOURCE_SHA = {
 def run(source: Path, capture: Path, *, compiler=None, preimage=False):
     source = source.resolve(strict=True)
     capture = capture.resolve(strict=True)
-    output_clock = "-coldmusic1-outputclock1])" in (source / "configure.ac").read_text()
+    configure = (source / "configure.ac").read_text()
+    warm_lease = "-coldmusic1-outputclock1-duck1-warm1])" in configure
+    duck_envelope = warm_lease or "-coldmusic1-outputclock1-duck1])" in configure
+    output_clock = duck_envelope or "-coldmusic1-outputclock1])" in configure
     guard_name = "check_startup_metadata.py" if preimage else (
+        "check_warm_lease.py" if warm_lease else
+        "check_duck_envelope.py" if duck_envelope else
         "check_output_clock.py" if output_clock else "check_cold_music.py"
     )
     guard_spec = importlib.util.spec_from_file_location("packetizer_composed_source", HERE / guard_name)
@@ -42,9 +47,11 @@ def run(source: Path, capture: Path, *, compiler=None, preimage=False):
     for name, expected in CODEC_SOURCE_SHA.items():
         if preimage and name == "src/outputs/airplay.c":
             expected = guard.AIRPLAY_SHA
+        elif warm_lease and name in {"src/outputs.c", "src/outputs/airplay.c"}:
+            expected = guard.SOURCE_SHA[name]
         elif output_clock and name == "src/outputs/airplay.c":
-            # The additive config/discovery layer is strictly inverted by its
-            # guard before the immutable coldmusic1 codec guard is evaluated.
+            # Additive envelope/config layers are strictly inverted by their
+            # guards before the immutable coldmusic1 codec guard is evaluated.
             expected = guard.SOURCE_SHA[name]
         if hashlib.sha256((source / name).read_bytes()).hexdigest() != expected:
             raise ValueError("Unreviewed packetizer codec source: " + name)

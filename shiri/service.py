@@ -54,6 +54,11 @@ class RoomService:
         self._cached_state = None
         self.calibrations = CalibrationSessions()
         self._calibration_analysis = asyncio.Lock()
+        self.warm_coordinator = None
+
+    async def _revoke_changed_readiness(self):
+        if self.warm_coordinator is not None:
+            await self.warm_coordinator.reconcile_locked()
 
     async def _store(self, method, *args, **kwargs):
         return await asyncio.to_thread(getattr(self.store, method), *args, **kwargs)
@@ -167,6 +172,7 @@ class RoomService:
                         except RpcError as exc:
                             outputs_error = str(exc)
                 return {**room.model_dump(mode="json"), "runtime": info, "outputs": outputs,
+                        "readiness": self.warm_coordinator.room_observation(room.id) if self.warm_coordinator else None,
                         "outputs_error": outputs_error}
             summaries = await asyncio.gather(*(summarize(room) for room in rooms))
             result = {"rooms": summaries, "runtime": {k: v for k, v in snapshot.items() if k != "rooms"},
@@ -246,12 +252,14 @@ class RoomService:
         async with self._mutation:
             await self.sync_phone_volume()
             room = await self._store("update_room", room_id, changes, revision)
+            await self._revoke_changed_readiness()
             self.invalidate()
             return {"room": room.model_dump(mode="json"), **await self.reconcile()}
 
     async def delete(self, room_id: str, revision: int):
         async with self._mutation:
             await self._store("delete_room", room_id, revision)
+            await self._revoke_changed_readiness()
             self.calibrations.remove_room(room_id)
             self.invalidate()
             return {"ok": True, **await self.reconcile()}
@@ -277,6 +285,7 @@ class RoomService:
             # Intent is durable before the broker applies it. Failures remain visible
             # as pending/degraded, never as a fabricated live output state.
             room = await self._store("assign_speakers", room_id, refs, revision)
+            await self._revoke_changed_readiness()
             self.invalidate()
             return {"room": room.model_dump(mode="json"), **await self.reconcile()}
 
@@ -295,6 +304,7 @@ class RoomService:
         async with self._mutation:
             await self.sync_phone_volume()
             room = await self._store("update_speaker_airplay_timing", room_id, speaker_id, airplay_timing, revision)
+            await self._revoke_changed_readiness()
             self.invalidate()
             return {"room": room.model_dump(mode="json"), **await self.reconcile()}
 
@@ -303,6 +313,7 @@ class RoomService:
         if not any(s.id == speaker_id for s in room.speakers):
             raise NotFound("Speaker is not assigned to this room")
         room = await self._store("update_speaker_offset", room_id, speaker_id, offset_ms, revision)
+        await self._revoke_changed_readiness()
         self.invalidate()
         if on_saved is not None:
             on_saved(room)
@@ -314,6 +325,8 @@ class RoomService:
             raise Conflict("Enable this room before sending speech")
         if not room.speakers and payload.get("action", "offer") not in {"close", "finish"}:
             raise Conflict("Assign speakers to this room before sending speech")
+        if self.warm_coordinator is not None and payload.get("action", "offer") in {"offer", "prepare-pcm"}:
+            self.warm_coordinator.touch(room_id)
         result = await self.runtime.call("speech", {**payload, "room_id": room_id, "duck_gain": room.duck_gain})
         return {**result, "admitted_room_id": room.id}
 

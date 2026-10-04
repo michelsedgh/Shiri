@@ -1,0 +1,223 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1-duck1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -309,6 +309,7 @@
+   bool replay;
+   bool restart_outputs;
+   bool restart_timer;
++  bool fresh_music_gain;
+ };
+ 
+ #define SHIRI_SOURCE_SETUP_NS UINT64_C(3000000000)
+@@ -3569,6 +3570,9 @@
+     }
+ 
+   param->restart_timer = (player_state == PLAY_PLAYING && pb_timer_native);
++  param->fresh_music_gain = shiri_source_state.initialized && !shiri_source_state.faulted &&
++    shiri_zero(shiri_source_state.last.owner.session, 16) &&
++    !shiri_zero(param->request.owner.session, 16);
+   shiri_source_flush_failed = shiri_source_start_failed = 0;
+   shiri_source_begin(&shiri_source_state, &param->request);
+   deadline = shiri_source_wait_begin(param);
+@@ -3652,6 +3656,10 @@
+         outputs_shiri_ready(device_streaming_cb);
+       {
+       shiri_source_state.faulted = false;
++      /* Reset only completed idle speech's inaudible restoration, after this
++       * exact new music owner has armed successfully. Existing music pause/
++       * flush and admitted voice keep their current sample-clock envelope. */
++      if (param->fresh_music_gain) shiri_speech_fresh_music();
+       /* END can leave no music session while exact admitted voice still has
+        * a valid tail. Reuse the same timer without fabricating a pipe source. */
+       if (shiri_speech_bed_arm() < 0)
+diff --git a/src/shiri_speech.c b/src/shiri_speech.c
+--- a/src/shiri_speech.c
++++ b/src/shiri_speech.c
+@@ -35,6 +35,9 @@
+ #define SPEECH_FUTURE_NS UINT64_C(5000000)
+ #define SPEECH_FULL_GAIN 65536u
+ #define SPEECH_RESERVE_NS UINT64_C(20000000)
++#define SPEECH_ENVELOPE_MIN_MS 40u
++#define SPEECH_ATTACK_MAX_MS 2000u
++#define SPEECH_RELEASE_MAX_MS 5000u
+ 
+ struct speech_state {
+   uint8_t room[16], launch[16], owner[16];
+@@ -53,6 +56,9 @@
+   int running, underflowing;
+   uint32_t duck;
+   double gain;
++  uint32_t envelope, ramp_frames, ramp_remaining;
++  double ramp_start, ramp_target;
++  int envelope_set;
+   int active;
+ };
+ 
+@@ -99,6 +105,53 @@
+ speech_u64(const uint8_t *p)
+ {
+   return ((uint64_t)speech_u32(p) << 32) | speech_u32(p + 4);
++}
++
++static int
++speech_envelope_valid(uint32_t envelope)
++{
++  unsigned attack = envelope >> 16, release = envelope & 65535u;
++  /* A zero word retains the original per-unit 40/250ms envelope. An optional
++   * producer policy names complete current-gain-to-target durations in ms. */
++  return !envelope || (attack >= SPEECH_ENVELOPE_MIN_MS && attack <= SPEECH_ATTACK_MAX_MS &&
++                      release >= SPEECH_ENVELOPE_MIN_MS && release <= SPEECH_RELEASE_MAX_MS);
++}
++
++static void
++speech_gain_step(struct speech_state *s, double target)
++{
++  double step;
++  if (!s->envelope) {
++    step = 1.0 / (SPEECH_RATE * (target < s->gain ? 0.04 : 0.25));
++    if (target < s->gain) { s->gain -= step; if (s->gain < target) s->gain = target; }
++    else if (target > s->gain) { s->gain += step; if (s->gain > target) s->gain = target; }
++    return;
++  }
++  /* Retarget from the current sample gain, never from unity or the previous
++   * target. EOF/cancel/expiry keep this policy until restoration completes. */
++  if (s->ramp_target != target || (!s->ramp_frames && s->gain != target)) {
++    unsigned duration = target < s->gain ? s->envelope >> 16 : s->envelope & 65535u;
++    s->ramp_start = s->gain; s->ramp_target = target;
++    s->ramp_frames = s->gain == target ? 0 : duration * (SPEECH_RATE / 1000u);
++    s->ramp_remaining = s->ramp_frames;
++  }
++  if (s->ramp_remaining) {
++    --s->ramp_remaining;
++    s->gain = s->ramp_start + (target - s->ramp_start) *
++              (double)(s->ramp_frames - s->ramp_remaining) / s->ramp_frames;
++    if (!s->ramp_remaining) s->gain = target;
++  }
++}
++
++static void
++speech_fresh_music(struct speech_state *s)
++{
++  /* A completed idle utterance had no music to restore. Its suspended fade
++   * must not attenuate the first samples of a later unrelated music source.
++   * Admitted/queued voice still owns its gain through source transitions. */
++  if (s->accepting || s->active || s->running || s->count) return;
++  s->gain = s->ramp_start = s->ramp_target = 1.0;
++  s->ramp_frames = s->ramp_remaining = 0;
+ }
+ 
+ static int
+@@ -172,6 +225,9 @@
+   memcpy(s->owner, owner, 16); s->owner_set = s->accepting = 1;
+   s->head = s->count = 0; s->active = s->running = s->underflowing = 0;
+   s->lease = s->priming_until = 0;
++  /* Preserve an old restoration and its gain until the successor's first
++   * valid packet chooses its own policy. Same-ID BEGIN never resets it. */
++  s->envelope_set = 0;
+   return 0;
+ }
+ 
+@@ -195,8 +251,8 @@
+   memcpy(s->owner, owner, 16); s->owner_set = 1; s->accepting = 0;
+   s->head = s->count = 0; s->active = s->running = s->underflowing = 0;
+   s->lease = s->priming_until = 0;
+-  /* Leave gain unchanged: the original 250ms restoration ramp continues on
+-   * the program clock without pausing, flushing or reconnecting music. */
++  /* Leave gain and its envelope unchanged: restoration continues on the
++   * program clock without pausing, flushing or reconnecting music. */
+   return 0;
+ }
+ 
+@@ -206,7 +262,7 @@
+ speech_receive(struct speech_state *s, const uint8_t *packet, size_t bytes, uint64_t now)
+ {
+   uint64_t sequence, emitted, expires;
+-  uint32_t frames, payload, duck, flags;
++  uint32_t frames, payload, duck, flags, envelope;
+   unsigned i, pos;
+   uint8_t op;
+   if (!packet || bytes < SPEECH_HEADER || !now || now > UINT64_MAX - SPEECH_AGE_NS)
+@@ -214,13 +270,15 @@
+   sequence = speech_u64(packet + 16); emitted = speech_u64(packet + 56);
+   frames = speech_u32(packet + 64); payload = speech_u32(packet + 12);
+   duck = speech_u32(packet + 68); flags = speech_u32(packet + 72); op = packet[9];
++  envelope = speech_u32(packet + 76);
+   if (memcmp(packet, "SHRITTS1", 8) || packet[8] != 2 || packet[10] != 0 || packet[11] != SPEECH_HEADER ||
+       memcmp(packet + 24, s->room, 16) || memcmp(packet + 40, s->launch, 16) ||
+       !s->accepting || !speech_owner_matches(s, packet + 80) ||
+       !sequence || sequence > INT64_MAX || sequence <= s->sequence ||
+       !emitted || emitted > UINT64_MAX - SPEECH_AGE_NS ||
+       (emitted > now ? emitted - now > SPEECH_FUTURE_NS : now - emitted >= SPEECH_AGE_NS) ||
+-      duck > SPEECH_FULL_GAIN || (flags & ~1u) || speech_u32(packet + 76) ||
++      duck > SPEECH_FULL_GAIN || (flags & ~1u) || !speech_envelope_valid(envelope) ||
++      (s->envelope_set && s->envelope != envelope) ||
+       payload != bytes - SPEECH_HEADER)
+     goto refused;
+   if (op == 1) {
+@@ -233,6 +291,10 @@
+ 
+   expires = emitted + SPEECH_AGE_NS;
+   if (expires > now + SPEECH_AGE_NS) expires = now + SPEECH_AGE_NS;
++  if (!s->envelope_set) {
++    if (s->envelope != envelope) s->ramp_frames = s->ramp_remaining = 0;
++    s->envelope = envelope; s->envelope_set = 1;
++  }
+   if (op == 1) {
+     /* Delay only this voice queue by one 20 ms packet. The player's program
+      * continues on its unchanged clock; no source/output command is issued.
+@@ -283,7 +345,7 @@
+ {
+   unsigned i, channel;
+   int voice, value, mixed, playing;
+-  double target, step;
++  double target;
+   if (!pcm || frames <= 0 || frames > (int)(SPEECH_RATE / 5) || rate != SPEECH_RATE || bits != 16 || channels != 2 ||
+       (uint64_t)(unsigned)frames * 4 != bytes)
+     return;
+@@ -296,9 +358,7 @@
+      * EOF or later controls. Only an audible head may override the lease. */
+     target = (s->count && s->audible[s->head]) ? (double)s->gains[s->head] / SPEECH_FULL_GAIN :
+              (s->active ? (double)s->duck / SPEECH_FULL_GAIN : 1.0);
+-    step = 1.0 / (SPEECH_RATE * (target < s->gain ? 0.04 : 0.25));
+-    if (target < s->gain) { s->gain -= step; if (s->gain < target) s->gain = target; }
+-    else if (target > s->gain) { s->gain += step; if (s->gain > target) s->gain = target; }
++    speech_gain_step(s, target);
+     voice = 0;
+     if (playing && s->count) {
+       voice = s->samples[s->head]; s->head = (s->head + 1) % SPEECH_QUEUE; --s->count;
+@@ -509,6 +569,12 @@
+ }
+ 
+ void
++shiri_speech_fresh_music(void)
++{
++  if (speech_fd >= 0) speech_fresh_music(&speech);
++}
++
++void
+ shiri_speech_deinit(void)
+ {
+   struct stat node;
+diff --git a/src/shiri_speech.h b/src/shiri_speech.h
+--- a/src/shiri_speech.h
++++ b/src/shiri_speech.h
+@@ -27,6 +27,7 @@
+ int shiri_speech_begin(const uint8_t owner[16]);
+ int shiri_speech_finish(const uint8_t owner[16]);
+ int shiri_speech_cancel(const uint8_t owner[16]);
++void shiri_speech_fresh_music(void);
+ void shiri_speech_deinit(void);
+ 
+ #endif

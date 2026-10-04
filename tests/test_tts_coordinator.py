@@ -177,12 +177,33 @@ async def test_nobly_binding_is_exact_and_continuations_keep_admitted_uuid(rig):
     assert job.state == "completed" and job.room_id == rig.room.id
     calls = rig.runtime.calls
     assert [call["action"] for call in calls] == ["prepare-pcm", "pcm", "pcm", "finish"]
+    assert calls[0]["duck_on_prepare"] is True
     assert all(call["room_id"] == rig.room.id and call["duck_gain"] == .19 for call in calls)
     assert len({call["session_id"] for call in calls}) == len({call["request_id"] for call in calls}) == 1
     assert [(call["sequence"], call["frame_index"]) for call in calls if call["action"] == "pcm"] == [(1, 0), (2, 960)]
     assert calls[-1]["final_sequence"] == 2 and calls[-1]["final_frame_index"] == 1440
     assert not rig.runtime.streams and all(stream.closed for stream in rig.streams)
     assert coordinator.active is None
+
+
+async def test_generation_endpoint_admits_atomically_without_a_catalog_preflight(rig):
+    coordinator = rig.coordinator()
+    job = await complete(coordinator, await coordinator.admit(request(), room_id=rig.room.id))
+    assert job.state == "completed"
+    assert [value.url.path for value in rig.requests] == ["/v1/generate", "/v1/models"]
+    assert job.metrics["generation_requested_ms"] >= 0
+    assert job.metrics["room_prepare_requested_ms"] >= 0
+
+
+async def test_authoritative_generation_refusal_retires_the_prepared_fade_intent(rig):
+    rig.status = 409
+    coordinator = rig.coordinator()
+    job = await complete(coordinator, await coordinator.admit(request(), external_id="Kitchen/exact"))
+    assert job.state == "failed" and job.error == "Injected worker refusal"
+    assert [value.url.path for value in rig.requests] == ["/v1/generate"]
+    assert [call["action"] for call in rig.runtime.calls] == ["prepare-pcm", "close"]
+    assert rig.runtime.calls[0]["duck_on_prepare"] is True
+    assert not rig.runtime.streams and coordinator.active is None
 
 
 async def test_request_id_replay_keeps_original_uuid_after_binding_moves_without_regenerating(rig):
@@ -818,7 +839,7 @@ async def test_public_lan_api_preserves_separate_worker_credential_and_quiet_ben
             public = await client.get("/api/v1/tts/jobs/" + job.id)
             assert worker_token not in public.text
         assert [request.url.path for request in requests] == [
-            "/v1/models", "/v1/models", "/v1/generate", "/v1/models"]
+            "/v1/models", "/v1/generate", "/v1/models"]
     finally:
         await app.state.tts.close()
         app.state.service.store.close()

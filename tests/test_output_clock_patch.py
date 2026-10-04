@@ -19,8 +19,9 @@ def test_output_clock_builder_and_runtime_contract_are_coherent():
     from shiri.runtime.broker import REQUIRED_OWNTONE_VERSION, _OWNTONE_VERSION_PATTERN
     value = checker()
     assert hashlib.sha256(value.PATCH.read_bytes()).hexdigest() == value.PATCH_SHA
-    assert REQUIRED_OWNTONE_VERSION == value.VERSION
-    assert _OWNTONE_VERSION_PATTERN.search("OwnTone " + value.VERSION)
+    assert REQUIRED_OWNTONE_VERSION == value.VERSION + "-duck1-warm1"
+    assert _OWNTONE_VERSION_PATTERN.search("OwnTone " + REQUIRED_OWNTONE_VERSION)
+    assert not _OWNTONE_VERSION_PATTERN.search("OwnTone " + value.VERSION)
     builder = (ROOT / "install/build_backends.sh").read_text()
     assert "OWNTONE_OUTPUT_CLOCK_SHA=" + value.PATCH_SHA in builder
     assert '"$OWNTONE_OUTPUT_CLOCK_PATCH:$OWNTONE_OUTPUT_CLOCK_SHA"' in builder

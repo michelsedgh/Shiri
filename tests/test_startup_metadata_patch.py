@@ -19,7 +19,7 @@ def test_startup_metadata_builder_and_runtime_contract_are_coherent():
     from shiri.runtime.broker import REQUIRED_OWNTONE_VERSION, _OWNTONE_VERSION_PATTERN
     value = checker()
     assert hashlib.sha256(value.PATCH.read_bytes()).hexdigest() == value.PATCH_SHA
-    assert REQUIRED_OWNTONE_VERSION == value.VERSION + "-coldmusic1-outputclock1"
+    assert REQUIRED_OWNTONE_VERSION == value.VERSION + "-coldmusic1-outputclock1-duck1-warm1"
     assert _OWNTONE_VERSION_PATTERN.search("OwnTone " + REQUIRED_OWNTONE_VERSION)
     assert not _OWNTONE_VERSION_PATTERN.search("OwnTone " + value.VERSION)
     builder = (ROOT / "install/build_backends.sh").read_text()

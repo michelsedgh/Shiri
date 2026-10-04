@@ -24,8 +24,11 @@ class Settings:
     trusted_proxy_ips: str = "127.0.0.1,::1"
     tts_worker_url: str | None = None
     tts_worker_token_file: Path | None = None
+    speaker_readiness: str = "adaptive"
 
     def __post_init__(self):
+        if type(self.speaker_readiness) is not str or self.speaker_readiness not in {"adaptive", "ready", "on_demand"}:
+            raise ValueError("Speaker readiness must be adaptive, ready or on_demand")
         if type(self.allow_unauthenticated) is not bool:
             raise ValueError("Unauthenticated access must be explicitly enabled with a boolean")
         if type(self.api_port) is not int or not 1 <= self.api_port <= 65535:
@@ -76,6 +79,7 @@ class Settings:
             tts_worker_url=os.environ.get("SHIRI_TTS_WORKER_URL") or None,
             tts_worker_token_file=(Path(os.environ["SHIRI_TTS_WORKER_TOKEN_FILE"])
                                    if os.environ.get("SHIRI_TTS_WORKER_TOKEN_FILE") else None),
+            speaker_readiness=os.environ.get("SHIRI_SPEAKER_READINESS", "adaptive"),
         )
 
 

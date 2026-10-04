@@ -21,6 +21,7 @@ from shiri.service import RoomService
 from shiri.settings import Settings
 from shiri.store import Store
 from shiri.tts.coordinator import TextSpeechCoordinator, TextSpeechRequest
+from shiri.readiness import RoomReadinessCoordinator, WarmRequest, WarmRenew
 
 log = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
@@ -170,12 +171,18 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     tts = TextSpeechCoordinator(service, worker_url=settings.tts_worker_url,
                                worker_token=(settings.tts_worker_token_file.read_text().strip()
                                              if settings.tts_worker_url else None))
+    readiness = RoomReadinessCoordinator(service, tts, automatic=(
+        settings.speaker_readiness if not settings.simulation else False))
+    service.warm_coordinator = readiness
     stop = asyncio.Event()
 
     async def reconcile_loop():
         while not stop.is_set():
             try:
-                await service.reconcile()
+                reconciled = await service.reconcile()
+                async with service._mutation:
+                    await readiness.reconcile_locked()
+                    await readiness.maintain_locked(reconciled.get("runtime"))
             except Exception:
                 log.exception("Desired room configuration could not reconcile")
             try:
@@ -192,6 +199,7 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
             stop.set()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            await readiness.close()
             await tts.close()
             store.close()
 
@@ -200,6 +208,7 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     app.state.service = service
     app.state.settings = settings
     app.state.tts = tts
+    app.state.readiness = readiness
     app.add_middleware(BodyLimit)
     login_attempts = defaultdict(deque)
 
@@ -418,6 +427,26 @@ def create_app(settings: Settings | None = None, *, store=None, runtime=None, to
     @app.post("/api/v1/nobly/rooms/{external_id:path}/tts", status_code=202)
     async def nobly_tts(external_id: str, body: TextSpeechRequest):
         return await tts.admit(body, external_id=external_id)
+
+    @app.post("/api/v1/rooms/{room_id}/warm", status_code=202)
+    async def room_warm(room_id: str, body: WarmRequest):
+        return await readiness.acquire(body, room_id=room_id)
+
+    @app.post("/api/v1/nobly/rooms/{external_id:path}/warm", status_code=202)
+    async def nobly_warm(external_id: str, body: WarmRequest):
+        return await readiness.acquire(body, external_id=external_id)
+
+    @app.get("/api/v1/rooms/{room_id}/warm/{lease_id}")
+    async def room_warm_status(room_id: str, lease_id: str):
+        return await readiness.get(room_id, lease_id)
+
+    @app.post("/api/v1/rooms/{room_id}/warm/{lease_id}", status_code=202)
+    async def room_warm_renew(room_id: str, lease_id: str, body: WarmRenew):
+        return await readiness.renew(room_id, lease_id, body)
+
+    @app.delete("/api/v1/rooms/{room_id}/warm/{lease_id}")
+    async def room_warm_release(room_id: str, lease_id: str):
+        return await readiness.release(room_id, lease_id)
 
     @app.get("/api/v1/tts/jobs/{job_id}")
     async def tts_job(job_id: str):

@@ -55,6 +55,35 @@ def test_real_speech_socket_carries_exact_launch_order_pcm_and_gain_without_musi
     assert sender.health()['speech_sent_frames'] == 1920
 
 
+def test_text_envelope_is_identical_on_early_control_pcm_and_release(endpoint):
+    sender, server = endpoint
+    sender.retire(sender.owner.hex())
+    voice = uuid4().hex
+    sender.begin(voice, attack_ms=300, release_ms=600)
+    sender.control(True, .2)
+    sender.push((1000).to_bytes(2, 'little', signed=True) * 960, 960)
+    sender.control(False, .2)
+    headers = [HEADER.unpack(server.recv(4096)[:HEADER_BYTES]) for _ in range(3)]
+    assert [h[2] for h in headers] == [CONTROL, PCM, CONTROL]
+    assert [h[11] for h in headers] == [1, 1, 0]
+    assert all(h[12] == (300 << 16) | 600 for h in headers)
+    assert all(h[13] == sender.owner for h in headers)
+    assert sender.first_active_control_ns == 17_000_000_000
+    with pytest.raises(RpcError, match='envelope cannot change'):
+        sender.begin(voice, attack_ms=200, release_ms=600)
+    assert sender.envelope == (300 << 16) | 600
+
+
+@pytest.mark.parametrize('attack,release', [(True, 600), (300, True), (0, 600), (300, 0),
+                                           (39, 600), (2001, 600), (300, 39), (300, 5001)])
+def test_invalid_envelope_preserves_existing_owner_and_sequence(endpoint, attack, release):
+    sender, _server = endpoint
+    before = sender.owner, sender.sequence, sender.envelope
+    with pytest.raises(ValueError, match='bounded attack'):
+        sender.begin(sender.owner.hex(), attack_ms=attack, release_ms=release)
+    assert (sender.owner, sender.sequence, sender.envelope) == before
+
+
 def test_missing_and_replaced_speech_endpoint_never_builds_a_local_voice_backlog(endpoint):
     sender, server = endpoint
     server.close()

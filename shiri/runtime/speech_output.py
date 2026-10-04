@@ -61,6 +61,8 @@ class SpeechOutput:
         self.error_errno = None
         self._last_control_state = None
         self._last_control_ns = 0
+        self.envelope = 0
+        self.first_active_control_ns = None
 
     def open(self):
         if self.socket is not None:
@@ -80,12 +82,21 @@ class SpeechOutput:
             raise
         self.socket = channel
 
-    def begin(self, speech_id: str):
+    def begin(self, speech_id: str, *, attack_ms=0, release_ms=0):
         """Install only an authenticated player-thread admitted voice ID."""
         owner = identifier(speech_id, launch=True)
+        if (type(attack_ms) is not int or type(release_ms) is not int
+                or not ((attack_ms == release_ms == 0)
+                        or (40 <= attack_ms <= 2000 and 40 <= release_ms <= 5000))):
+            raise ValueError("Speech envelope requires bounded attack and release durations")
+        envelope = (attack_ms << 16) | release_ms
         if self.owner is not None and self.owner != owner:
             raise RpcError("session_conflict", "Another admitted speech voice owns this output")
+        if self.owner == owner and self.envelope != envelope:
+            raise RpcError("session_conflict", "An admitted speech envelope cannot change")
         self.owner = owner
+        self.envelope = envelope
+        self.first_active_control_ns = None
         self.active = False
         self._last_control_state = None
         self._last_control_ns = 0
@@ -108,7 +119,7 @@ class SpeechOutput:
         emitted_ns = self.now_ns()
         message = HEADER.pack(MAGIC, 2, operation, HEADER_BYTES, len(payload), self.sequence,
                               self.room, self.launch, emitted_ns, frames,
-                              round(self.duck_gain*65536), flags, 0, self.owner)+payload
+                              round(self.duck_gain*65536), flags, self.envelope, self.owner)+payload
         try:
             if self.socket is None:
                 self.open()
@@ -126,6 +137,8 @@ class SpeechOutput:
         self.error_errno = None
         self.sent_frames += frames
         self.sent_controls += operation == CONTROL
+        if operation == CONTROL and flags and self.first_active_control_ns is None:
+            self.first_active_control_ns = emitted_ns
         if operation == PCM and flags:
             # Audible PCM establishes a backend lease too. Remember that
             # transition so an EOF after a short utterance cannot coalesce

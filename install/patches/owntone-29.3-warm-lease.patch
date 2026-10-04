@@ -1,0 +1,673 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,7 +1,7 @@
+ dnl Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ([2.60])
+-AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1-duck1])
++AC_INIT([owntone], [29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1-duck1-warm1])
+ 
+ AC_CONFIG_SRCDIR([config.h.in])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -55,6 +55,7 @@
+ #include "shiri_source_json.h"
+ #include "shiri_volume_settings_json.h"
+ #include "shiri_speech_ready_json.h"
++#include "shiri_warm_json.h"
+ #include "remote_pairing.h"
+ #include "settings.h"
+ #include "smartpl_query.h"
+@@ -2106,6 +2107,29 @@
+   return HTTP_OK;
+ }
+ 
++static int
++jsonapi_reply_player_shiri_warm(struct httpd_request *hreq)
++{
++  struct shiri_warm_request request; struct shiri_warm_reply result;
++  json_object *body; const char *reply; unsigned char *raw;
++  size_t length=evbuffer_get_length(hreq->in_body); char text[1025]; int ret;
++  if (!length || length>1024 || !(raw=evbuffer_pullup(hreq->in_body,(ssize_t)length))) return HTTP_BADREQUEST;
++  memcpy(text,raw,length); text[length]=0;
++  if (memchr(text,0,length)) return HTTP_BADREQUEST;
++  body=cast_json_parse(text,1024);
++  if (shiri_warm_parse(body,&request)<0) { if (body) json_object_put(body); return HTTP_BADREQUEST; }
++  ret=player_shiri_warm(&request,&result);
++  if (ret<0) { json_object_put(body); return ret==SHIRI_SOURCE_CONFLICT ? 409 : ret==SHIRI_SOURCE_INVALID ? HTTP_BADREQUEST : HTTP_SERVUNAVAIL; }
++  json_object_object_add(body,"connected",json_object_new_boolean(result.connected));
++  json_object_object_add(body,"pending",json_object_new_boolean(result.pending));
++  json_object_object_add(body,"terminal",json_object_new_boolean(result.terminal));
++  json_object_object_add(body,"prepared_monotonic_ns",json_object_new_int64((int64_t)result.prepared_ns));
++  json_object_object_add(body,"expires_monotonic_ns",json_object_new_int64((int64_t)result.expires_ns));
++  json_object_object_add(body,"output_count",json_object_new_int((int)result.outputs));
++  reply=json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN);
++  evbuffer_add(hreq->out_body,reply,strlen(reply)); json_object_put(body); return HTTP_OK;
++}
++
+ static json_object *
+ shiri_speech_status_hex(const uint8_t id[16])
+ {
+@@ -4882,6 +4906,7 @@
+ 
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-source$",                   jsonapi_reply_player_shiri_source },
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-speech-ready$",             jsonapi_reply_player_shiri_speech_ready },
++    { HTTPD_METHOD_POST,   "^/api/player/shiri-warm$",                     jsonapi_reply_player_shiri_warm },
+     { HTTPD_METHOD_GET,    "^/api/player/shiri-speech-status$",            jsonapi_reply_player_shiri_speech_status },
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-volume$",                   jsonapi_reply_player_shiri_volume },
+     { HTTPD_METHOD_POST,   "^/api/player/shiri-volume-settings$",          jsonapi_reply_player_shiri_volume_settings },
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -29,6 +29,7 @@
+ #include <stdint.h>
+ #include <inttypes.h>
+ #include <limits.h>
++#include <time.h>
+ 
+ #include <event2/event.h>
+ 
+@@ -128,6 +129,7 @@
+ static uint32_t outputs_callback_token;
+ static struct event *outputs_deferredev;
+ static struct timeval outputs_stop_timeout = { OUTPUTS_STOP_TIMEOUT, 0 };
++static uint64_t outputs_shiri_session_serial;
+ 
+ // Last element is a zero terminator
+ static struct output_quality_subscription output_quality_subscriptions[OUTPUTS_MAX_QUALITY_SUBSCRIPTIONS + 1];
+@@ -261,12 +263,30 @@
+     }
+ }
+ 
++/* Keep only a still-selected exact transport; no PCM, retries or callbacks. */
++static uint64_t
++outputs_shiri_warm_remaining(struct output_device *device)
++{
++  struct timespec ts; uint64_t now;
++  if (!device || !device->selected || !device->session || device->session != device->shiri_warm_session ||
++      !device->shiri_session_serial || device->shiri_session_serial!=device->shiri_warm_serial ||
++      !device->shiri_warm_until_ns || clock_gettime(CLOCK_MONOTONIC,&ts)<0) return 0;
++  now=(uint64_t)ts.tv_sec*UINT64_C(1000000000)+(uint64_t)ts.tv_nsec;
++  if (now>=device->shiri_warm_until_ns) return 0;
++  return device->shiri_warm_until_ns-now;
++}
++
+ static void
+ stop_timer_cb(int fd, short what, void *arg)
+ {
+   struct output_device *device = arg;
+   output_status_cb cb = callback_get(device);
+-
++  uint64_t remaining=outputs_shiri_warm_remaining(device);
++  if (remaining) {
++    struct timeval hold={(time_t)(remaining/UINT64_C(1000000000)),(suseconds_t)((remaining%UINT64_C(1000000000)+999)/1000)};
++    if (hold.tv_usec>=1000000) { ++hold.tv_sec; hold.tv_usec-=1000000; }
++    event_add(device->stop_timer,&hold); return;
++  }
+   outputs_device_stop(device, cb);
+ }
+ 
+@@ -731,10 +751,12 @@
+   struct output_device *device;
+ 
+   device = outputs_device_get(device_id);
+-  if (!device)
+-    return -1;
++  if (!device || !session || outputs_shiri_session_serial==UINT64_MAX)
++    return -1; /* A transport incarnation is never reused during this process. */
+ 
+-  device->session = session;
++  device->session=session;
++  device->shiri_session_serial=++outputs_shiri_session_serial;
++  device->shiri_warm_session=NULL; device->shiri_warm_serial=0; device->shiri_warm_until_ns=0;
+   return 0;
+ }
+ 
+@@ -744,8 +766,10 @@
+   struct output_device *device;
+ 
+   device = outputs_device_get(device_id);
+-  if (device)
+-    device->session = NULL;
++  if (device) {
++    device->session=NULL;
++    device->shiri_warm_session=NULL; device->shiri_warm_serial=0; device->shiri_warm_until_ns=0;
++  }
+ 
+   return;
+ }
+@@ -1078,6 +1102,7 @@
+   if (!device->session)
+     return 0; // Device is already stopped, nothing to do
+ 
++  device->shiri_warm_until_ns=0; device->shiri_warm_session=NULL; device->shiri_warm_serial=0;
+   ret = outputs[device->type]->device_stop(device, callback_add(device, cb));
+ 
+   return device_state_update(device, ret);
+@@ -1094,7 +1119,13 @@
+ 
+   outputs[device->type]->device_cb_set(device, callback_add(device, cb));
+ 
+-  event_add(device->stop_timer, &outputs_stop_timeout);
++  uint64_t remaining=outputs_shiri_warm_remaining(device);
++  struct timeval delay=outputs_stop_timeout;
++  if (remaining>(uint64_t)OUTPUTS_STOP_TIMEOUT*UINT64_C(1000000000)) {
++    delay.tv_sec=(time_t)(remaining/UINT64_C(1000000000)); delay.tv_usec=(suseconds_t)((remaining%UINT64_C(1000000000)+999)/1000);
++    if (delay.tv_usec>=1000000) { ++delay.tv_sec; delay.tv_usec-=1000000; }
++  }
++  event_add(device->stop_timer, &delay);
+ 
+   return 1;
+ }
+@@ -1328,8 +1359,35 @@
+ {
+   if (!device || !device->selected || !device->stop_timer) return -1;
+   return event_del(device->stop_timer);
++}
++
++int
++outputs_shiri_warm_hold(struct output_device *device, void *session, uint64_t serial, uint64_t deadline_ns)
++{
++  if (!device || !device->selected || !session || device->session!=session || !serial || device->shiri_session_serial!=serial || !device->stop_timer ||
++      (device->state!=OUTPUT_STATE_CONNECTED && device->state!=OUTPUT_STATE_STREAMING)) return -1;
++  device->shiri_warm_session=session; device->shiri_warm_serial=serial; device->shiri_warm_until_ns=deadline_ns;
++  if (event_pending(device->stop_timer,EV_TIMEOUT,NULL)) {
++    uint64_t remaining=outputs_shiri_warm_remaining(device);
++    struct timeval delay=outputs_stop_timeout;
++    if (remaining>(uint64_t)OUTPUTS_STOP_TIMEOUT*UINT64_C(1000000000)) {
++      delay.tv_sec=(time_t)(remaining/UINT64_C(1000000000)); delay.tv_usec=(suseconds_t)((remaining%UINT64_C(1000000000)+999)/1000);
++      if (delay.tv_usec>=1000000) { ++delay.tv_sec; delay.tv_usec-=1000000; }
++    }
++    event_add(device->stop_timer,&delay);
++  }
++  return 0;
+ }
+ 
++void
++outputs_shiri_warm_release(struct output_device *device, void *session, uint64_t serial)
++{
++  if (!device || !session || !serial || device->shiri_warm_session!=session || device->shiri_warm_serial!=serial) return;
++  device->shiri_warm_session=NULL; device->shiri_warm_serial=0; device->shiri_warm_until_ns=0;
++  if (device->session==session && event_pending(device->stop_timer,EV_TIMEOUT,NULL))
++    event_add(device->stop_timer,&outputs_stop_timeout);
++}
++
+ bool
+ outputs_shiri_callback_pending(uint64_t device_id, output_status_cb callback)
+ {
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -154,6 +154,10 @@
+   int metadata_fd;
+ 
+   struct event *stop_timer;
++
++  /* Finite control-only reservation for this exact connected session. */
++  uint64_t shiri_session_serial, shiri_warm_serial, shiri_warm_until_ns;
++  void *shiri_warm_session;
+ 
+   // Opaque pointers to device and session data
+   void *extra_device_info;
+@@ -394,6 +398,8 @@
+ outputs_shiri_callback_pending(uint64_t device_id, output_status_cb callback);
+ int
+ outputs_shiri_stop_delayed_cancel(struct output_device *device);
++int outputs_shiri_warm_hold(struct output_device *device, void *session, uint64_t serial, uint64_t deadline_ns);
++void outputs_shiri_warm_release(struct output_device *device, void *session, uint64_t serial);
+ 
+ int
+ outputs_shiri_start(output_status_cb cb, output_status_cb ready_cb, int *failed);
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -1353,7 +1353,10 @@
+ session_connected(struct airplay_session *session)
+ {
+   session->state = AIRPLAY_STATE_CONNECTED;
+-
++  /* A control-only warm session needs the existing feedback keepalive even
++   * before its first PCM write. This is not a render/clock readiness ACK. */
++  if (!event_pending(keep_alive_timer,EV_TIMEOUT,NULL))
++    evtimer_add(keep_alive_timer,&keep_alive_tv);
+   session_status(session);
+ }
+ 
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -88,6 +88,7 @@
+ #include "input.h"
+ #include "shiri_speech.h"
+ #include "shiri_speech_ready.h"
++#include "shiri_warm.h"
+ 
+ // Scrobbling
+ #ifdef LASTFM
+@@ -3458,9 +3459,347 @@
+   if (!status) return SHIRI_SOURCE_INVALID;
+   memset(status, 0, sizeof(*status));
+   return commands_exec_sync(cmdbase, shiri_speech_status_get, NULL, status);
++}
++
++/* Connection-only preparation: separate identity/counter from music and voice. */
++struct shiri_warm_output {
++  uint64_t id, session_serial; int type, offset_ms; void *session;
++  bool awaiting, created;
++};
++static struct {
++  struct shiri_warm_request request;
++  struct shiri_warm_output outputs[SHIRI_WARM_OUTPUTS];
++  unsigned count, pending;
++  uint64_t began_ns, prepared_ns;
++  bool initialized, active, connected, terminal, failed;
++} shiri_warm_state;
++static struct event *shiri_warm_event;
++static uint64_t shiri_warm_retired_generation;
++static struct shiri_warm_request shiri_warm_retired_request;
++struct shiri_warm_param { struct shiri_warm_request request; struct shiri_warm_reply reply; };
++static void device_shiri_warm_start_cb(struct output_device *,enum output_device_state);
++static void device_shiri_warm_stop_cb(struct output_device *,enum output_device_state);
++
++static void
++shiri_warm_event_clear(void)
++{
++  if (shiri_warm_event) { event_free(shiri_warm_event); shiri_warm_event=NULL; }
+ }
+ 
+ static bool
++shiri_warm_matches(const struct shiri_warm_request *request)
++{
++  return shiri_warm_state.initialized && request &&
++    request->generation==shiri_warm_state.request.generation &&
++    !memcmp(request->warm,shiri_warm_state.request.warm,16) &&
++    !memcmp(request->room,shiri_warm_state.request.room,16) &&
++    !memcmp(request->launch,shiri_warm_state.request.launch,16);
++}
++
++static int
++shiri_warm_snapshot(bool capture,bool connected)
++{
++  struct output_device *device; unsigned count=0,visited=0,index;
++  for (device=outputs_list();device;device=device->next) {
++    if (++visited>1024) return -1;
++    if (!device->selected) continue;
++    if (count==SHIRI_WARM_OUTPUTS || device->busy || device->prevent_playback) return -1;
++    if (capture) {
++      shiri_warm_state.outputs[count].id=device->id;
++      shiri_warm_state.outputs[count].type=device->type;
++      shiri_warm_state.outputs[count].offset_ms=device->offset_ms;
++      shiri_warm_state.outputs[count].session=device->session;
++      shiri_warm_state.outputs[count].session_serial=device->shiri_session_serial;
++      shiri_warm_state.outputs[count].created=!device->session;
++    } else {
++      for (index=0;index<shiri_warm_state.count;++index)
++        if (shiri_warm_state.outputs[index].id==device->id) break;
++      if (index==shiri_warm_state.count || shiri_warm_state.outputs[index].type!=(int)device->type ||
++          shiri_warm_state.outputs[index].offset_ms!=device->offset_ms ||
++          shiri_warm_state.outputs[index].session!=device->session ||
++          shiri_warm_state.outputs[index].session_serial!=device->shiri_session_serial) return -1;
++    }
++    if (connected && (!device->session || (device->state!=OUTPUT_STATE_CONNECTED && device->state!=OUTPUT_STATE_STREAMING))) return -1;
++    ++count;
++  }
++  if (!count || (!capture && count!=shiri_warm_state.count)) return -1;
++  if (capture) shiri_warm_state.count=count;
++  return 0;
++}
++
++static bool
++shiri_warm_idle_cleanup_allowed(void)
++{
++  struct shiri_speech_status media;
++  if (!shiri_source_state.initialized || shiri_source_state.faulted || shiri_source_wait.active ||
++      !shiri_zero(shiri_source_state.last.owner.session,16) || player_state==PLAY_PLAYING ||
++      shiri_speech_start.pending || shiri_speech_bed_wanted()) return false;
++  shiri_speech_status(&media);
++  return !media.active && !media.running && !media.queue_frames;
++}
++
++static void
++shiri_warm_retire(bool failed)
++{
++  struct output_device *device; unsigned index,visited=0;
++  bool awaiting[SHIRI_WARM_OUTPUTS],cleanup=shiri_warm_idle_cleanup_allowed();
++  for (index=0;index<shiri_warm_state.count;++index) {
++    awaiting[index]=shiri_warm_state.outputs[index].awaiting;
++    shiri_warm_state.outputs[index].awaiting=false;
++  }
++  shiri_warm_state.pending=0;
++  shiri_warm_state.active=false; shiri_warm_state.connected=false; shiri_warm_state.terminal=true;
++  shiri_warm_state.failed=shiri_warm_state.failed || failed;
++  shiri_warm_event_clear();
++  for (device=outputs_list();device && ++visited<=1024;device=device->next)
++    for (index=0;index<shiri_warm_state.count;++index) {
++      struct shiri_warm_output *out=&shiri_warm_state.outputs[index];
++      if (device->id!=out->id || (int)device->type!=out->type || device->offset_ms!=out->offset_ms ||
++          !device->session || device->session!=out->session || device->shiri_session_serial!=out->session_serial) continue;
++      outputs_shiri_warm_release(device,out->session,out->session_serial);
++      if (awaiting[index] && outputs_shiri_callback_pending(device->id,device_shiri_warm_start_cb)) {
++        if (cleanup && out->created) {
++          /* Retire this START token before its later replies can mutate state. */
++          out->awaiting=true; ++shiri_warm_state.pending;
++          if (outputs_device_stop(device,device_shiri_warm_stop_cb)<=0 && out->awaiting) {
++            out->awaiting=false; --shiri_warm_state.pending;
++          }
++        } else outputs_device_cb_set(device,device_streaming_cb);
++      } else if (cleanup && device->selected)
++        outputs_device_stop_delayed(device,device_streaming_cb);
++    }
++}
++
++static void
++shiri_warm_timeout(int fd,short what,void *arg)
++{
++  (void)fd; (void)what;
++  if (!shiri_warm_state.initialized || (uint64_t)(uintptr_t)arg!=shiri_warm_state.request.generation ||
++      !shiri_warm_state.active) return;
++  shiri_warm_retire(!shiri_warm_state.connected);
++}
++
++static int
++shiri_warm_timer_arm(uint64_t now)
++{
++  uint64_t until=shiri_warm_state.request.deadline_ns;
++  struct timeval delay;
++  if (!shiri_warm_state.connected && until>shiri_warm_state.began_ns+SHIRI_WARM_SETUP_NS)
++    until=shiri_warm_state.began_ns+SHIRI_WARM_SETUP_NS;
++  if (!now || now>=until) return -1;
++  delay.tv_sec=(time_t)((until-now)/UINT64_C(1000000000));
++  delay.tv_usec=(suseconds_t)(((until-now)%UINT64_C(1000000000)+999)/1000);
++  if (delay.tv_usec>=1000000) { ++delay.tv_sec; delay.tv_usec-=1000000; }
++  shiri_warm_event_clear();
++  shiri_warm_event=evtimer_new(evbase_player,shiri_warm_timeout,(void *)(uintptr_t)shiri_warm_state.request.generation);
++  return !shiri_warm_event || evtimer_add(shiri_warm_event,&delay)<0 ? -1 : 0;
++}
++
++static void
++device_shiri_warm_stop_cb(struct output_device *device,enum output_device_state status)
++{
++  unsigned index; (void)status;
++  if (!shiri_warm_state.initialized || !shiri_warm_state.terminal || !shiri_warm_state.pending) return;
++  if (!device) { --shiri_warm_state.pending; return; }
++  for (index=0;index<shiri_warm_state.count;++index)
++    if (shiri_warm_state.outputs[index].id==device->id && shiri_warm_state.outputs[index].awaiting) {
++      shiri_warm_state.outputs[index].awaiting=false; --shiri_warm_state.pending; return;
++    }
++}
++
++static void
++device_shiri_warm_start_cb(struct output_device *device,enum output_device_state status)
++{
++  unsigned index; uint64_t now=shiri_speech_ready_now();
++  if (!shiri_warm_state.initialized || !shiri_warm_state.active || !shiri_warm_state.pending) return;
++  if (!device) { --shiri_warm_state.pending; shiri_warm_state.failed=true; return; }
++  for (index=0;index<shiri_warm_state.count;++index)
++    if (shiri_warm_state.outputs[index].id==device->id && shiri_warm_state.outputs[index].awaiting) break;
++  if (index==shiri_warm_state.count) return;
++  struct shiri_warm_output *out=&shiri_warm_state.outputs[index];
++  out->awaiting=false; --shiri_warm_state.pending;
++  if (!device->selected || !device->session || (out->session && (out->session!=device->session || out->session_serial!=device->shiri_session_serial)) || out->type!=(int)device->type ||
++      out->offset_ms!=device->offset_ms || (status!=OUTPUT_STATE_CONNECTED && status!=OUTPUT_STATE_STREAMING) ||
++      !now || now>=shiri_warm_state.request.deadline_ns || now<shiri_warm_state.began_ns ||
++      now-shiri_warm_state.began_ns>=SHIRI_WARM_SETUP_NS)
++    shiri_warm_state.failed=true;
++  else {
++    out->session=device->session; out->session_serial=device->shiri_session_serial;
++    /* Later music/voice callbacks replace this ordinary idle handler normally. */
++    outputs_device_cb_set(device,device_streaming_cb);
++    if (outputs_shiri_warm_hold(device,device->session,device->shiri_session_serial,shiri_warm_state.request.deadline_ns)<0)
++      shiri_warm_state.failed=true;
++  }
++  if (!shiri_warm_state.pending && !shiri_warm_state.failed && shiri_warm_snapshot(false,true)==0) {
++    shiri_warm_state.connected=true; shiri_warm_state.prepared_ns=now;
++    if (shiri_warm_timer_arm(now)<0) shiri_warm_retire(true);
++  }
++}
++
++static void
++shiri_warm_reap(void)
++{
++  unsigned index;
++  for (index=0;index<shiri_warm_state.count;++index)
++    if (shiri_warm_state.outputs[index].awaiting &&
++        !outputs_shiri_callback_pending(shiri_warm_state.outputs[index].id,
++          shiri_warm_state.terminal ? device_shiri_warm_stop_cb : device_shiri_warm_start_cb)) {
++      shiri_warm_state.outputs[index].awaiting=false;
++      if (shiri_warm_state.pending) --shiri_warm_state.pending;
++      shiri_warm_state.failed=true;
++    }
++}
++
++static bool
++shiri_warm_pending_observed(void)
++{
++  unsigned index;
++  for (index=0;index<shiri_warm_state.count;++index)
++    if (shiri_warm_state.outputs[index].awaiting &&
++        outputs_shiri_callback_pending(shiri_warm_state.outputs[index].id,
++          shiri_warm_state.terminal ? device_shiri_warm_stop_cb : device_shiri_warm_start_cb)) return true;
++  return false;
++}
++
++static enum command_state
++shiri_warm_command(void *arg,int *retval)
++{
++  struct shiri_warm_param *param=arg; const struct shiri_warm_request *request=&param->request;
++  struct output_device *device; uint64_t now=shiri_speech_ready_now(); unsigned visited=0,index; int ret;
++  *retval=SHIRI_SOURCE_INVALID;
++  if (!request->generation || request->generation>INT64_MAX || shiri_zero(request->warm,16) ||
++      !shiri_speech_ids_match(request->room,request->launch) || request->action<SHIRI_WARM_ACQUIRE || request->action>SHIRI_WARM_RELEASE)
++    return COMMAND_END;
++  if (request->action==SHIRI_WARM_ACQUIRE || request->action==SHIRI_WARM_DEADLINE) {
++    if (!now || request->deadline_ns<=now || request->deadline_ns>INT64_MAX || request->deadline_ns-now>SHIRI_WARM_MAX_NS) return COMMAND_END;
++  } else if (request->deadline_ns) return COMMAND_END;
++  *retval=SHIRI_SOURCE_CONFLICT;
++  if (request->action==SHIRI_WARM_OBSERVE) {
++    if (!shiri_warm_matches(request)) return COMMAND_END;
++    /* Pure bounded observation: no timer/hold/lease/callback/media mutation. */
++    param->reply.connected=shiri_warm_state.active && shiri_warm_state.connected && now &&
++      now<shiri_warm_state.request.deadline_ns && shiri_warm_snapshot(false,true)==0;
++    param->reply.pending=shiri_warm_pending_observed(); param->reply.terminal=shiri_warm_state.terminal;
++    param->reply.prepared_ns=shiri_warm_state.prepared_ns;
++    param->reply.expires_ns=shiri_warm_state.request.deadline_ns; param->reply.outputs=shiri_warm_state.count;
++    *retval=0; return COMMAND_END;
++  }
++  if (request->action==SHIRI_WARM_RELEASE && !shiri_warm_matches(request) &&
++      request->generation==shiri_warm_retired_generation &&
++      !memcmp(request->warm,shiri_warm_retired_request.warm,16)) {
++    param->reply.terminal=true; *retval=0; return COMMAND_END;
++  }
++  if (request->action==SHIRI_WARM_RELEASE && !shiri_warm_matches(request) &&
++      request->generation>shiri_warm_retired_generation &&
++      (!shiri_warm_state.initialized || request->generation>shiri_warm_state.request.generation)) {
++    /* Retirement can win transport ordering against an uncertain first acquire.
++     * Fence that future counter without disturbing an existing aggregate. */
++    shiri_warm_retired_generation=request->generation; shiri_warm_retired_request=*request;
++    param->reply.terminal=true; *retval=0; return COMMAND_END;
++  }
++  if (request->action!=SHIRI_WARM_ACQUIRE && !shiri_warm_matches(request)) return COMMAND_END;
++  if (request->action==SHIRI_WARM_ACQUIRE && !shiri_warm_matches(request) &&
++      request->generation<=shiri_warm_retired_generation) return COMMAND_END;
++  if (request->action==SHIRI_WARM_ACQUIRE && shiri_warm_state.initialized &&
++      (request->generation<shiri_warm_state.request.generation ||
++       (request->generation==shiri_warm_state.request.generation && !shiri_warm_matches(request)) ||
++       (shiri_warm_state.terminal && !memcmp(request->warm,shiri_warm_state.request.warm,16)))) return COMMAND_END;
++  if (request->action==SHIRI_WARM_RELEASE && shiri_warm_state.terminal) {
++    shiri_warm_reap();
++    param->reply.pending=shiri_warm_pending_observed(); param->reply.terminal=true;
++    param->reply.prepared_ns=shiri_warm_state.prepared_ns;
++    param->reply.expires_ns=shiri_warm_state.request.deadline_ns; param->reply.outputs=shiri_warm_state.count;
++    *retval=0; return COMMAND_END;
++  }
++  if ((request->action==SHIRI_WARM_ACQUIRE || request->action==SHIRI_WARM_DEADLINE) &&
++      shiri_warm_matches(request) && shiri_warm_state.active && now>=shiri_warm_state.request.deadline_ns) {
++    /* Deadline ordering fences expiry even before its queued timer dispatch. */
++    shiri_warm_retire(false); return COMMAND_END;
++  }
++  shiri_warm_reap();
++  if (request->action==SHIRI_WARM_RELEASE) {
++    if (request->generation>shiri_warm_retired_generation) {
++      shiri_warm_retired_generation=request->generation; shiri_warm_retired_request=*request;
++    }
++    shiri_warm_retire(false);
++  }
++  else if (request->action==SHIRI_WARM_ACQUIRE) {
++    if (!shiri_source_state.initialized || shiri_source_state.faulted || shiri_source_wait.active || shiri_speech_start.pending)
++      return COMMAND_END;
++    if (shiri_warm_state.initialized &&
++        (request->generation<shiri_warm_state.request.generation ||
++         (request->generation==shiri_warm_state.request.generation && !shiri_warm_matches(request)) ||
++         (shiri_warm_state.terminal && !memcmp(request->warm,shiri_warm_state.request.warm,16)))) return COMMAND_END;
++    if (!shiri_warm_matches(request)) {
++      if (shiri_warm_state.pending) return COMMAND_END;
++      /* Replacing a connected aggregate transfers existing sessions; no stop. */
++      for (device=outputs_list();device && ++visited<=1024;device=device->next)
++        for (index=0;index<shiri_warm_state.count;++index)
++          if (device->id==shiri_warm_state.outputs[index].id)
++            outputs_shiri_warm_release(device,shiri_warm_state.outputs[index].session,shiri_warm_state.outputs[index].session_serial);
++      shiri_warm_event_clear(); memset(&shiri_warm_state,0,sizeof(shiri_warm_state));
++      shiri_warm_state.request=*request; shiri_warm_state.initialized=true; shiri_warm_state.active=true;
++      shiri_warm_state.began_ns=now;
++      if (shiri_warm_snapshot(true,false)<0) { shiri_warm_retire(true); *retval=SHIRI_SOURCE_FAILURE; return COMMAND_END; }
++      visited=0;
++      for (device=outputs_list();device && ++visited<=1024;device=device->next) {
++        if (!device->selected) continue;
++        for (index=0;index<shiri_warm_state.count;++index)
++          if (shiri_warm_state.outputs[index].id==device->id) break;
++        struct shiri_warm_output *out=&shiri_warm_state.outputs[index];
++        if (device->session) {
++          if ((device->state!=OUTPUT_STATE_CONNECTED && device->state!=OUTPUT_STATE_STREAMING) ||
++              outputs_shiri_warm_hold(device,device->session,device->shiri_session_serial,request->deadline_ns)<0) shiri_warm_state.failed=true;
++          continue;
++        }
++        out->awaiting=true; ++shiri_warm_state.pending;
++        ret=outputs_device_start(device,device_shiri_warm_start_cb,false);
++        out->session=device->session; out->session_serial=device->shiri_session_serial;
++        if (ret<=0 && out->awaiting) { out->awaiting=false; --shiri_warm_state.pending; }
++        if (ret<0 || !out->session) shiri_warm_state.failed=true;
++      }
++      if (visited>1024) shiri_warm_state.failed=true;
++    } else shiri_warm_state.request.deadline_ns=request->deadline_ns;
++  } else if (request->action==SHIRI_WARM_DEADLINE) {
++    if (!shiri_warm_state.active || shiri_warm_state.terminal) return COMMAND_END;
++    shiri_warm_state.request.deadline_ns=request->deadline_ns;
++  }
++  if (shiri_warm_state.active) {
++    if (!now || now>=shiri_warm_state.request.deadline_ns || shiri_warm_state.failed ||
++        (!shiri_warm_state.pending && shiri_warm_snapshot(false,true)<0)) shiri_warm_retire(true);
++    else {
++      if (!shiri_warm_state.pending && !shiri_warm_state.connected) {
++        shiri_warm_state.connected=true; shiri_warm_state.prepared_ns=now;
++      }
++      visited=0;
++      for (device=outputs_list();device && ++visited<=1024;device=device->next)
++        for (index=0;index<shiri_warm_state.count;++index)
++          if (device->id==shiri_warm_state.outputs[index].id && device->session==shiri_warm_state.outputs[index].session &&
++              device->shiri_session_serial==shiri_warm_state.outputs[index].session_serial &&
++              (device->state==OUTPUT_STATE_CONNECTED || device->state==OUTPUT_STATE_STREAMING))
++            outputs_shiri_warm_hold(device,device->session,device->shiri_session_serial,shiri_warm_state.request.deadline_ns);
++      if (shiri_warm_timer_arm(now)<0) shiri_warm_retire(true);
++    }
++  }
++  param->reply.connected=shiri_warm_state.active && shiri_warm_state.connected;
++  param->reply.pending=shiri_warm_pending_observed(); param->reply.terminal=shiri_warm_state.terminal;
++  param->reply.prepared_ns=shiri_warm_state.prepared_ns;
++  param->reply.expires_ns=shiri_warm_state.request.deadline_ns; param->reply.outputs=shiri_warm_state.count;
++  *retval=0; return COMMAND_END;
++}
++
++int
++player_shiri_warm(const struct shiri_warm_request *request,struct shiri_warm_reply *reply)
++{
++  struct shiri_warm_param param; int ret;
++  if (!request || !reply) return SHIRI_SOURCE_INVALID;
++  memset(&param,0,sizeof(param)); param.request=*request;
++  ret=commands_exec_sync(cmdbase,shiri_warm_command,NULL,&param);
++  if (!ret) *reply=param.reply;
++  return ret;
++}
++
++static bool
+ shiri_source_wait_owned(void)
+ {
+   return shiri_source_wait.active && shiri_source_state.initialized
+@@ -5322,6 +5661,7 @@
+  error_evbase_free:
+   commands_base_free(cmdbase);
+   shiri_speech_setup_event_clear();
++  shiri_warm_event_clear();
+   shiri_source_wait_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+@@ -5369,6 +5709,7 @@
+   free(history);
+ 
+   shiri_speech_setup_event_clear();
++  shiri_warm_event_clear();
+   shiri_source_wait_clear();
+   event_free(pb_timer_ev);
+   event_base_free(evbase_player);
+diff --git a/src/shiri_warm.h b/src/shiri_warm.h
+new file mode 100644
+--- /dev/null
++++ b/src/shiri_warm.h
+@@ -0,0 +1,20 @@
++/* Private finite connection lease, independent of voice/media admission. */
++#ifndef SHIRI_WARM_H
++#define SHIRI_WARM_H
++#include "shiri_source.h"
++#define SHIRI_WARM_MAX_NS UINT64_C(300000000000)
++#define SHIRI_WARM_SETUP_NS UINT64_C(3000000000)
++#define SHIRI_WARM_OUTPUTS 128
++ enum shiri_warm_action { SHIRI_WARM_ACQUIRE, SHIRI_WARM_DEADLINE, SHIRI_WARM_OBSERVE, SHIRI_WARM_RELEASE };
++struct shiri_warm_request {
++  uint8_t room[16], launch[16], warm[16];
++  uint64_t generation, deadline_ns;
++  enum shiri_warm_action action;
++};
++struct shiri_warm_reply {
++  bool connected, pending, terminal;
++  uint64_t prepared_ns, expires_ns;
++  unsigned outputs;
++};
++int player_shiri_warm(const struct shiri_warm_request *, struct shiri_warm_reply *);
++#endif
+diff --git a/src/shiri_warm_json.h b/src/shiri_warm_json.h
+new file mode 100644
+--- /dev/null
++++ b/src/shiri_warm_json.h
+@@ -0,0 +1,30 @@
++#ifndef SHIRI_WARM_JSON_H
++#define SHIRI_WARM_JSON_H
++#include "shiri_warm.h"
++#include "shiri_source_json.h"
++static inline int
++shiri_warm_parse(json_object *body, struct shiri_warm_request *request)
++{
++  json_object *room, *launch, *warm, *generation, *deadline, *action;
++  const char *text;
++  if (!body || !json_object_is_type(body,json_type_object) || json_object_object_length(body)!=6 ||
++      !json_object_object_get_ex(body,"room_id",&room) || !json_object_object_get_ex(body,"launch_generation",&launch) ||
++      !json_object_object_get_ex(body,"warm_id",&warm) || !json_object_object_get_ex(body,"lease_generation",&generation) ||
++      !json_object_object_get_ex(body,"deadline_monotonic_ns",&deadline) || !json_object_object_get_ex(body,"action",&action)) return -1;
++  memset(request,0,sizeof(*request));
++  if (shiri_source_hex(room,request->room)<0 || shiri_zero(request->room,16) ||
++      shiri_source_hex(launch,request->launch)<0 || shiri_zero(request->launch,16) ||
++      shiri_source_hex(warm,request->warm)<0 || shiri_zero(request->warm,16) ||
++      shiri_source_integer(generation,&request->generation,true)<0 ||
++      shiri_source_integer(deadline,&request->deadline_ns,false)<0 || !json_object_is_type(action,json_type_string)) return -1;
++  text=json_object_get_string(action);
++  if ((size_t)json_object_get_string_len(action)!=strlen(text)) return -1;
++  if (!strcmp(text,"acquire")) request->action=SHIRI_WARM_ACQUIRE;
++  else if (!strcmp(text,"deadline")) request->action=SHIRI_WARM_DEADLINE;
++  else if (!strcmp(text,"observe")) request->action=SHIRI_WARM_OBSERVE;
++  else if (!strcmp(text,"release")) request->action=SHIRI_WARM_RELEASE;
++  else return -1;
++  return (request->action==SHIRI_WARM_ACQUIRE || request->action==SHIRI_WARM_DEADLINE)
++    ? (!request->deadline_ns ? -1 : 0) : (request->deadline_ns ? -1 : 0);
++}
++#endif

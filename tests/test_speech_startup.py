@@ -68,8 +68,9 @@ class Overlay:
         self.controls = []
         self.owner = None
 
-    def begin(self, speech_id):
+    def begin(self, speech_id, *, attack_ms=0, release_ms=0):
         self.owner = speech_id
+        self.envelope = (attack_ms, release_ms)
 
     def retire(self, speech_id):
         if self.owner == speech_id:

@@ -417,7 +417,7 @@ export class TtsStore {
 const client = new ApiClient();
 const store = new RoomStore(client);
 const tts = new TtsStore(client);
-const view = { roomDraft: null, speakerDraft: null, calibrationDraft: null, calibrationSessions: new Map(), calibrationHistory: new Map(), toastTimer: null, eventsRequest: null, eventsVersion: 0, speech: new Map(), cardSignature: '', pollTimer: null, ttsDraft: null, ttsPollTimer: null, ttsPollCount: 0, ttsPreviewPath: null, ttsPreviewFailed: null, ttsPreviewSuppressedJob: null };
+const view = { roomDraft: null, speakerDraft: null, calibrationDraft: null, calibrationSessions: new Map(), calibrationHistory: new Map(), toastTimer: null, eventsRequest: null, eventsVersion: 0, speech: new Map(), cardSignature: '', pollTimer: null, ttsDraft: null, ttsPollTimer: null, ttsPollCount: 0, ttsPreviewPath: null, ttsPreviewFailed: null, ttsPreviewSuppressedJob: null, ttsWarmLeases: new Map(), ttsWarmInFlight: null };
 const elements = {};
 
 if (typeof document !== 'undefined') {
@@ -467,6 +467,7 @@ function bindEvents() {
   elements.ttsSettings.addEventListener('click', () => openTts());
   elements.ttsForm.addEventListener('submit', (event) => { event.preventDefault(); submitTts(view.ttsDraft?.roomId ? 'speech' : 'benchmark'); });
   elements.ttsBenchmark.addEventListener('click', () => submitTts('benchmark'));
+  elements.ttsPrepare.addEventListener('click', prepareTtsRoom);
   elements.ttsLoadModel.addEventListener('click', loadTtsModel);
   elements.ttsRefresh.addEventListener('click', refreshTts);
   elements.ttsCancel.addEventListener('click', cancelTtsJob);
@@ -600,6 +601,7 @@ function render() {
     view.calibrationSessions.clear();
     view.calibrationHistory.clear();
     view.ttsDraft = null;
+    view.ttsWarmLeases.clear();
     clearTtsPreview();
     clearTimeout(view.ttsPollTimer);
     tts.invalidate();
@@ -897,13 +899,15 @@ function renderTts() {
   notice(elements.ttsModelWarning, model?.experimental === true
     ? 'Experimental voice model: speech quality and timing are still being qualified. Listen to a quiet measurement before using it for room replies.' : '', 'warning');
   const available = !!catalog?.enabled;
-  const ready = available && catalog.worker.state === 'ready' && catalog.worker.model_id === model?.id;
+  const warming = catalog?.worker.state === 'busy' && catalog.worker.operation === 'warming';
+  const ready = available && (catalog.worker.state === 'ready' || warming) && catalog.worker.model_id === model?.id;
   const busy = tts.busy || tts.activeJob();
   const workerModel = models.find((item) => item.id === catalog?.worker.model_id)?.name || 'voice model';
   const workerStatus = !catalog ? 'Checking speech availability…'
     : !available ? 'Voice generation is not configured. Connect Shiri’s optional speech worker to enable models and spoken replies.'
       : catalog.worker.state === 'loading' ? `Loading ${workerModel}…`
-        : catalog.worker.state === 'busy' ? `${workerModel} is generating speech.`
+        : warming ? `${workerModel} is preparing quietly. A spoken reply takes priority.`
+          : catalog.worker.state === 'busy' ? `${workerModel} is generating speech.`
           : catalog.worker.state === 'unavailable' ? 'The speech worker is unreachable. Check it, then refresh availability.'
             : catalog.worker.state === 'failed' ? 'The voice model could not load. Refresh availability or load it again.'
             : ready ? `${workerModel} is ready.` : 'Load the selected model before generating speech.';
@@ -921,6 +925,8 @@ function renderTts() {
   elements.ttsSpeak.hidden = !draft.roomId;
   elements.ttsSpeak.textContent = room ? `Speak in ${room.name}` : 'Speak in room';
   elements.ttsSpeak.disabled = elements.ttsBenchmark.disabled || !roomReady;
+  elements.ttsPrepare.hidden = !draft.roomId;
+  elements.ttsPrepare.disabled = !roomReady || !ready || busy || !!view.ttsWarmInFlight;
   elements.ttsRoomHelp.textContent = draft.roomId
     ? roomReady ? 'The reply plays only in this room. Shiri keeps music advancing while it lowers and restores its level.'
       : 'This room must be on with its assigned speakers ready before a reply can play.'
@@ -949,6 +955,9 @@ function renderTts() {
     ...(job.kind === 'speech' ? [
       ['First audio sent to room', metrics.room_admission_ms, ' ms'],
       ['Outputs connected', metrics.backend_ready_ms, ' ms'],
+      ['Music fade requested', metrics.music_duck_requested_ms, ' ms'],
+      ['Music fade down (configured)', metrics.music_duck_attack_ms, ' ms'],
+      ['Music fade back (configured)', metrics.music_duck_release_ms, ' ms'],
       ['Audio sent to room', metrics.delivered_audio_s, ' s'],
     ] : []),
     ['Generated audio length', metrics.audio_duration_s, ' s'],
@@ -1009,7 +1018,8 @@ async function submitTts(kind) {
   const draft = view.ttsDraft;
   if (!draft || !elements.ttsForm.reportValidity()) return;
   const model = tts.catalog?.models.find((item) => item.id === draft.modelId);
-  if (!model || !tts.catalog?.enabled || tts.catalog.worker.state !== 'ready' || tts.catalog.worker.model_id !== model.id) {
+  const warming = tts.catalog?.worker.state === 'busy' && tts.catalog.worker.operation === 'warming';
+  if (!model || !tts.catalog?.enabled || (!warming && tts.catalog.worker.state !== 'ready') || tts.catalog.worker.model_id !== model.id) {
     notice(elements.ttsError, 'Load the selected voice model before generating speech.');
     return;
   }
@@ -1025,6 +1035,66 @@ async function submitTts(kind) {
     const job = await tts.createJob(path, body);
     if (job) { view.ttsPollCount = 0; scheduleTtsPoll(); }
   } catch (error) { ttsFailure(error); if (tts.activeJob()) { view.ttsPollCount = 0; scheduleTtsPoll(); } }
+}
+
+async function prepareTtsRoom() {
+  const draft = view.ttsDraft;
+  if (!draft?.roomId || !draft.modelId || view.ttsWarmInFlight) return;
+  const key = JSON.stringify([draft.roomId, draft.modelId]);
+  let entry = view.ttsWarmLeases.get(key);
+  if (!entry?.pending && (!entry || entry.validUntil <= performance.now())) {
+    entry = { leaseId: null, validUntil: 0, pending: null };
+    view.ttsWarmLeases.set(key, entry);
+  }
+  if (!entry.pending) {
+    const path = `/rooms/${encodeURIComponent(draft.roomId)}/warm`;
+    entry.pending = {
+      path: entry.leaseId ? `${path}/${encodeURIComponent(entry.leaseId)}` : path,
+      roomId: draft.roomId, leaseId: entry.leaseId,
+      body: { request_id: ttsRequestId(), ttl_seconds: 60,
+        ...(!entry.leaseId ? { purpose: 'interaction', model_id: draft.modelId } : {}) },
+    };
+  }
+  const operation = entry.pending;
+  view.ttsWarmInFlight = operation;
+  tts.error = '';
+  renderTts();
+  const startedAt = performance.now();
+  try {
+    const result = await client.request(operation.path, { method: 'POST', body: operation.body });
+    if (view.ttsWarmLeases.get(key) !== entry) return;
+    if (!result || typeof result.lease_id !== 'string' || !/^[0-9a-f]{32}$/.test(result.lease_id)
+        || result.admitted_room_id !== operation.roomId
+        || operation.leaseId && result.lease_id !== operation.leaseId
+        || !['pending', 'connected', 'degraded', 'released', 'expired', 'revoked', 'failed'].includes(result.state)
+        || !Number.isSafeInteger(result.remaining_ms) || result.remaining_ms < 0 || result.remaining_ms > 300000) {
+      throw new ApiError('Shiri did not confirm this exact room preparation.', { ambiguous: true });
+    }
+    entry.pending = null;
+    if (['released', 'expired', 'revoked', 'failed'].includes(result.state) || result.remaining_ms === 0) {
+      view.ttsWarmLeases.delete(key);
+      tts.error = 'This room preparation has ended. Prepare again to request a new one.';
+      ttsFailure(new ApiError(tts.error));
+      return;
+    }
+    entry.leaseId = result.lease_id;
+    entry.validUntil = startedAt + result.remaining_ms;
+    toast('Room preparation requested for one minute. Music volume stays unchanged.');
+    try { await tts.refreshModels(); } catch (error) { ttsFailure(error); }
+  } catch (error) {
+    if (view.ttsWarmLeases.get(key) !== entry) return;
+    if (error.ambiguous || error.status >= 500) {
+      error = new ApiError('Room preparation is unconfirmed. Click Prepare room quietly to retry the same request.');
+    } else {
+      entry.pending = null;
+      if (!entry.leaseId || [404, 409].includes(error.status)) view.ttsWarmLeases.delete(key);
+    }
+    tts.error = error.message;
+    ttsFailure(error);
+  } finally {
+    if (view.ttsWarmInFlight === operation) view.ttsWarmInFlight = null;
+    renderTts();
+  }
 }
 
 async function cancelTtsJob() {

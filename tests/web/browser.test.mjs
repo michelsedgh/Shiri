@@ -134,7 +134,7 @@ test('room speech sends text only to its explicit room and cancels the exact adm
     if (url.pathname.endsWith('/tts/models')) { await route.fulfill({ json: ttsCatalog() }); return; }
     if (url.pathname === `/api/v1/rooms/${room.id}/tts`) {
       const body = request.postDataJSON(); identifier = body.request_id; writes.push({ path: url.pathname, body });
-      await route.fulfill({ status: 202, json: { id: identifier, kind: 'speech', room_id: room.id, state: 'playing', metrics: { first_worker_pcm_received_ms: 27, room_admission_ms: 28, backend_ready_ms: 18, delivered_audio_s: .02 } } }); return;
+      await route.fulfill({ status: 202, json: { id: identifier, kind: 'speech', room_id: room.id, state: 'playing', metrics: { first_worker_pcm_received_ms: 27, room_admission_ms: 28, backend_ready_ms: 18, delivered_audio_s: .02, music_duck_attack_ms: 40, music_duck_release_ms: 250 } } }); return;
     }
     if (url.pathname.includes('/tts/jobs/')) {
       if (request.method() === 'DELETE') writes.push({ path: url.pathname, method: 'DELETE' });
@@ -153,6 +153,8 @@ test('room speech sends text only to its explicit room and cancels the exact adm
   assert.match(progress, /First audio received27.0 ms/);
   assert.match(progress, /First audio sent to room28.0 ms/);
   assert.match(progress, /Delivery and cleanup durationNot measured/);
+  assert.match(progress, /Music fade down \(configured\)40.0 ms/);
+  assert.match(progress, /Music fade back \(configured\)250.0 ms/);
   assert.match(await page.locator('#tts-metrics-help').textContent(), /it is not the time to first sound/);
   await page.locator('#tts-cancel').click();
   await page.locator('#tts-job-status').filter({ hasText: 'Job stopped' }).waitFor();
@@ -163,6 +165,180 @@ test('room speech sends text only to its explicit room and cancels the exact adm
   assert.equal(await page.locator('#tts-cancel').isDisabled(), true);
   assert.deepEqual(errors, []);
 }));
+
+test('quiet room preparation preserves volume and lets speech preempt model warming', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+  const room = roomValue({ speakers: [{ id: '101', name: 'Speaker', protocol: 'airplay2', offset_ms: 0 }], outputs: [{ id: '101', name: 'Speaker', protocol: 'airplay2', selected: true, available: true, assignable: true }] });
+  const writes = [];
+  let warming = false, identifier;
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request(), url = new URL(request.url());
+    if (url.pathname.endsWith('/tts/models')) {
+      await route.fulfill({ json: ttsCatalog({ worker: { state: warming ? 'busy' : 'ready', operation: warming ? 'warming' : null, model_id: 'qwen' } }) }); return;
+    }
+    if (url.pathname.endsWith('/warm')) {
+      writes.push({ path: url.pathname, body: request.postDataJSON() }); warming = true;
+      await route.fulfill({ status: 202, json: { lease_id: 'b'.repeat(32), admitted_room_id: room.id, state: 'pending', remaining_ms: 60000 } }); return;
+    }
+    if (url.pathname === `/api/v1/rooms/${room.id}/tts`) {
+      const body = request.postDataJSON(); identifier = body.request_id; writes.push({ path: url.pathname, body });
+      await route.fulfill({ status: 202, json: { id: identifier, kind: 'speech', room_id: room.id, state: 'completed', metrics: {} } }); return;
+    }
+    if (url.pathname.includes('/tts/jobs/')) {
+      await route.fulfill({ json: { id: identifier, kind: 'speech', room_id: room.id, state: 'completed', metrics: {} } }); return;
+    }
+    if (request.method() !== 'GET') writes.push({ path: url.pathname, method: request.method() });
+    await route.fulfill({ json: snapshot([room], false) });
+  });
+  await page.goto(base);
+  await page.getByRole('button', { name: 'Speak', exact: true }).click();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  await page.locator('#tts-prepare').click();
+  await page.locator('#tts-worker-status').filter({ hasText: 'A spoken reply takes priority' }).waitFor();
+  await page.locator('#tts-speak:not(:disabled)').waitFor();
+  await page.locator('#tts-text').fill('A real reply takes priority.');
+  await page.locator('#tts-speak').click();
+  await page.locator('#tts-job-status').filter({ hasText: 'completed' }).waitFor();
+  assert.equal(writes.length, 2);
+  assert.match(writes[0].body.request_id, /^[0-9a-f]{32}$/);
+  assert.deepEqual(writes[0], { path: `/api/v1/rooms/${room.id}/warm`, body: { request_id: writes[0].body.request_id, ttl_seconds: 60, purpose: 'interaction', model_id: 'qwen' } });
+  assert.equal(writes[1].path, `/api/v1/rooms/${room.id}/tts`);
+  assert.deepEqual(errors, []);
+}));
+
+test('quiet room preparation renews its lease after reopening and locks concurrent clicks', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+  const room = speechReadyRoom(), writes = [], lease = 'b'.repeat(32);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request(), url = new URL(request.url());
+    if (url.pathname.endsWith('/tts/models')) { await route.fulfill({ json: ttsCatalog() }); return; }
+    if (request.method() === 'POST') {
+      writes.push({ path: url.pathname, body: request.postDataJSON() });
+      if (writes.length === 1) await held;
+      await route.fulfill({ status: 202, json: { lease_id: lease, admitted_room_id: room.id, state: 'pending', remaining_ms: 60000 } }); return;
+    }
+    await route.fulfill({ json: snapshot([room], false) });
+  });
+  await page.goto(base);
+  await page.getByRole('button', { name: 'Speak', exact: true }).click();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  await page.locator('#tts-prepare').click();
+  await page.getByRole('button', { name: 'Close speech voices' }).click();
+  await page.getByRole('button', { name: 'Speak', exact: true }).click();
+  assert.equal(await page.locator('#tts-prepare').isDisabled(), true);
+  assert.equal(writes.length, 1);
+  release();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  await page.locator('#tts-prepare').click();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  assert.equal(writes.length, 2);
+  assert.equal(writes[0].path, `/api/v1/rooms/${room.id}/warm`);
+  assert.equal(writes[1].path, `/api/v1/rooms/${room.id}/warm/${lease}`);
+  assert.match(writes[0].body.request_id, /^[0-9a-f]{32}$/);
+  assert.match(writes[1].body.request_id, /^[0-9a-f]{32}$/);
+  assert.notEqual(writes[0].body.request_id, writes[1].body.request_id);
+  assert.deepEqual(writes[1].body, { request_id: writes[1].body.request_id, ttl_seconds: 60 });
+  assert.deepEqual(errors, []);
+}));
+
+test('an ambiguous quiet acquire replays the exact request only after a manual retry', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+  const room = speechReadyRoom(), writes = [], lease = 'b'.repeat(32);
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request(), url = new URL(request.url());
+    if (url.pathname.endsWith('/tts/models')) { await route.fulfill({ json: ttsCatalog() }); return; }
+    if (request.method() === 'POST') {
+      writes.push({ path: url.pathname, body: request.postDataJSON() });
+      if (writes.length === 1) { await route.abort('failed'); return; }
+      await route.fulfill({ status: 202, json: { lease_id: lease, admitted_room_id: room.id, state: 'connected', remaining_ms: 59000 } }); return;
+    }
+    await route.fulfill({ json: snapshot([room], false) });
+  });
+  await page.goto(base);
+  await page.getByRole('button', { name: 'Speak', exact: true }).click();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  await page.locator('#tts-prepare').click();
+  await page.locator('#tts-error').filter({ hasText: 'retry the same request' }).waitFor();
+  assert.equal(writes.length, 1);
+  await page.getByRole('button', { name: 'Close speech voices' }).click();
+  await page.getByRole('button', { name: 'Speak', exact: true }).click();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  await page.locator('#tts-prepare').click();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  assert.equal(writes.length, 2);
+  assert.deepEqual(writes[1], writes[0]);
+  await page.locator('#tts-prepare').click();
+  await page.locator('#tts-prepare:not(:disabled)').waitFor();
+  assert.equal(writes.length, 3);
+  assert.equal(writes[2].path, `/api/v1/rooms/${room.id}/warm/${lease}`);
+  assert.notEqual(writes[2].body.request_id, writes[0].body.request_id);
+  assert.deepEqual(errors, []);
+}));
+
+for (const mismatch of ['lease', 'room']) {
+  test(`a quiet renewal rejects a different ${mismatch} identity and retains its exact retry`, { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+    const room = speechReadyRoom(), writes = [], lease = 'b'.repeat(32);
+    await page.route('**/api/v1/**', async (route) => {
+      const request = route.request(), url = new URL(request.url());
+      if (url.pathname.endsWith('/tts/models')) { await route.fulfill({ json: ttsCatalog() }); return; }
+      if (request.method() === 'POST') {
+        writes.push({ path: url.pathname, body: request.postDataJSON() });
+        await route.fulfill({ status: 202, json: {
+          lease_id: writes.length === 2 && mismatch === 'lease' ? 'c'.repeat(32) : lease,
+          admitted_room_id: writes.length === 2 && mismatch === 'room' ? 'another-room' : room.id,
+          state: 'connected', remaining_ms: 60000,
+        } }); return;
+      }
+      await route.fulfill({ json: snapshot([room], false) });
+    });
+    await page.goto(base);
+    await page.getByRole('button', { name: 'Speak', exact: true }).click();
+    await page.locator('#tts-prepare:not(:disabled)').waitFor();
+    await page.locator('#tts-prepare').click();
+    await page.locator('#tts-prepare:not(:disabled)').waitFor();
+    await page.locator('#tts-prepare').click();
+    await page.locator('#tts-error').filter({ hasText: 'retry the same request' }).waitFor();
+    assert.equal(writes.length, 2);
+    await page.locator('#tts-prepare').click();
+    await page.locator('#tts-prepare:not(:disabled)').waitFor();
+    assert.equal(writes.length, 3);
+    assert.deepEqual(writes[2], writes[1]);
+    assert.equal(writes[2].path, `/api/v1/rooms/${room.id}/warm/${lease}`);
+    assert.deepEqual(errors, []);
+  }));
+}
+
+for (const ended of ['terminal', 404, 409]) {
+  test(`an ended quiet lease (${ended}) requires a new explicit click before reacquiring`, { skip: !enabled }, async () => withPage(async (page, base, errors) => {
+    const room = speechReadyRoom(), writes = [], lease = 'b'.repeat(32);
+    await page.route('**/api/v1/**', async (route) => {
+      const request = route.request(), url = new URL(request.url());
+      if (url.pathname.endsWith('/tts/models')) { await route.fulfill({ json: ttsCatalog() }); return; }
+      if (request.method() === 'POST') {
+        writes.push({ path: url.pathname, body: request.postDataJSON() });
+        if (writes.length === 2 && ended !== 'terminal') { await route.fulfill({ status: ended, json: { error: 'This room preparation has ended.' } }); return; }
+        await route.fulfill({ status: 202, json: { lease_id: lease, admitted_room_id: room.id,
+          state: writes.length === 2 ? 'expired' : 'connected', remaining_ms: writes.length === 2 ? 0 : 60000 } }); return;
+      }
+      await route.fulfill({ json: snapshot([room], false) });
+    });
+    await page.goto(base);
+    await page.getByRole('button', { name: 'Speak', exact: true }).click();
+    await page.locator('#tts-prepare:not(:disabled)').waitFor();
+    await page.locator('#tts-prepare').click();
+    await page.locator('#tts-prepare:not(:disabled)').waitFor();
+    await page.locator('#tts-prepare').click();
+    await page.locator('#tts-error').filter({ hasText: 'has ended' }).waitFor();
+    assert.equal(writes.length, 2);
+    await page.locator('#tts-prepare').click();
+    await page.locator('#tts-prepare:not(:disabled)').waitFor();
+    assert.equal(writes.length, 3);
+    assert.equal(writes[1].path, `/api/v1/rooms/${room.id}/warm/${lease}`);
+    assert.equal(writes[2].path, `/api/v1/rooms/${room.id}/warm`);
+    assert.notEqual(writes[2].body.request_id, writes[1].body.request_id);
+    assert.notEqual(writes[2].body.request_id, writes[0].body.request_id);
+    assert.deepEqual(errors, []);
+  }));
+}
 
 test('model selection requires loading and resets model-specific voice language and speed controls', { skip: !enabled }, async () => withPage(async (page, base, errors) => {
   let loaded = 'qwen';

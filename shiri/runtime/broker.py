@@ -24,12 +24,14 @@ import shutil
 import signal
 import stat
 import sys
+import time
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
 from shiri.domain import Room, SpeakerRef, local_audio_device_key, speaker_key, validate_local_audio_device
 from shiri.rpc import RpcError, call_rpc, serve_rpc
+from shiri.readiness import transport_fingerprint
 from shiri.settings import RuntimeConfig
 from shiri.source import SourceToken
 from .backend import OwnToneClient, OwnToneRejected
@@ -47,7 +49,7 @@ from .unix_directory import PinnedUnixDirectory
 from .system import OwnedProcess, Runner, RuntimeFailure, atomic_json, read_json, root_directory
 
 log = logging.getLogger(__name__)
-REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1"
+REQUIRED_OWNTONE_VERSION = "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1-duck1-warm1"
 _OWNTONE_VERSION_PATTERN = re.compile(r"(?<![\w.-])" + re.escape(REQUIRED_OWNTONE_VERSION) + r"(?![\w.-])")
 # The pinned receiver appends these feature tokens after its backend marker.
 # Its sysconfdir path is removed before matching, so path text cannot qualify.
@@ -106,6 +108,7 @@ class RuntimeRoom:
     gain_pending: bool = False
     phone_volume_revision: int | None = None
     receiver_volume: dict | None = None
+    activity: dict = field(default_factory=dict)
 
     def snapshot(self):
         offsets = {speaker.id: speaker.offset_ms for speaker in self.desired.speakers}
@@ -128,6 +131,7 @@ class RuntimeRoom:
             "selected_ids": self.selected_ids,
             "outputs": outputs,
             "player": self.player,
+            "activity": self.activity,
             "timing": {"output_buffer_ms": self.timing[0], "common_relay_delay_ms": self.timing[1],
                        "active": self.active_timing == self.timing and self.client is not None},
             "processes": [
@@ -224,7 +228,7 @@ class Broker:
         self.versions["owntone"] = (result.stdout or result.stderr).strip()
         if not _OWNTONE_VERSION_PATTERN.search(self.versions["owntone"]):
             raise RuntimeFailure(
-                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement, saved speaker balance, bounded exact source admission, paused-source speech output and framed metadata event acknowledgement and idle speech output without input refill, natural speech drain and acknowledged startup metadata and timed music input without legacy refill and stable identity speaker clock selection; "
+                f"This runtime requires OwnTone {REQUIRED_OWNTONE_VERSION} with volume, timing, source, PCM, transport, offset, native buffer, converter reset, framed output, partial-write preservation, late speech mixing, cold speech readiness, fresh first-anchor deadline admission bounded speech jitter reserve, exact voice retirement, saved speaker balance, bounded exact source admission, paused-source speech output and framed metadata event acknowledgement and idle speech output without input refill, natural speech drain and acknowledged startup metadata and timed music input without legacy refill and stable identity speaker clock selection and bounded per-voice duck envelopes; "
                 "rebuild pinned backends using install/build_backends.sh"
             )
         if not DHCP_HOOK.is_file() or not os.access(DHCP_HOOK, os.X_OK):
@@ -417,6 +421,8 @@ class Broker:
                 return {"ok": True}
             if operation == "speech":
                 return await self.speech(room, payload)
+            if operation == "warm":
+                return await self.warm(room, payload)
             raise RpcError("unknown_operation", "Unsupported runtime operation")
         except (ValidationError, ValueError, TypeError) as exc:
             raise RpcError("invalid_request", str(exc)) from exc
@@ -1638,6 +1644,45 @@ class Broker:
             self._forget_session(session_id, generation)
         return result
 
+    async def warm(self, room: RuntimeRoom, payload: dict):
+        if payload.get("action") not in {"acquire", "release", "observe"}:
+            raise RpcError("invalid_request", "Unknown room warm action")
+        lease_id = payload.get("lease_id")
+        if not isinstance(lease_id, str) or not re.fullmatch(r"[0-9a-f]{32}", lease_id):
+            raise RpcError("invalid_request", "An exact room warm lease ID is required")
+        keys = {"room_id", "action", "lease_id", "transport_fingerprint", "launch_generation"}
+        if payload["action"] == "acquire":
+            keys.add("deadline_monotonic_ns")
+        if (set(payload) != keys or not isinstance(payload.get("transport_fingerprint"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", payload["transport_fingerprint"])):
+            raise RpcError("invalid_request", "Room warm control requires only its exact routing and expiry fields")
+        if payload["action"] == "acquire":
+            deadline = payload["deadline_monotonic_ns"]
+            now = time.monotonic_ns()
+            if type(deadline) is not int or not now < deadline <= now+300_000_000_000:
+                raise RpcError("invalid_request", "Room warm expiry must be within five minutes")
+        expected_launch = payload.get("launch_generation")
+        if expected_launch is not None and (not isinstance(expected_launch, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", expected_launch)):
+            raise RpcError("invalid_request", "An exact room launch generation is required")
+        async with room.control_lock:
+            generation = room.launch_generation
+            if expected_launch is not None and expected_launch != generation:
+                raise RpcError("session_conflict", "The warmed room launch has changed")
+            if payload.get("action") == "release" and not room.processes.get("audio"):
+                return {"state": "released", "launch_generation": generation}
+            if payload.get("action") != "release":
+                self._client(room)
+                if (not room.desired.enabled or not room.selected_ids
+                        or payload.get("transport_fingerprint") != transport_fingerprint(room.desired)):
+                    raise RpcError("session_conflict", "The warmed room routing has changed")
+            message = {key: value for key, value in payload.items()
+                       if key not in {"room_id", "transport_fingerprint", "launch_generation"}}
+            result = await call_rpc(self._worker_socket(room), "warm", message, timeout=8)
+            if room.launch_generation != generation:
+                raise RpcError("session_conflict", "Room launch changed during warming")
+            return {**result, "launch_generation": generation}
+
     async def _health_monitor(self):
         while not self._closing:
             await asyncio.sleep(5)
@@ -1710,6 +1755,9 @@ class Broker:
                                     health.get("error") or f"Room {name} worker is not ready"
                                 )
                             if name == "audio":
+                                room.activity = {"music_active": health.get("music_media_recent") is True,
+                                                 "speech_active": health.get("speech_session_id") is not None,
+                                                 "observed_monotonic_ns": time.monotonic_ns()}
                                 room.receiver_volume = dict(health.get("receiver_volume") or {})
                                 active_session = health.get("speech_session_id")
                                 for session_id, generation in observed_sessions.items():

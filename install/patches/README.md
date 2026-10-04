@@ -658,3 +658,93 @@ speaker-info and JSON serialization, and NTP/PTP SETUP dispatch. The Linux
 qualification also uses real libconfuse parsing and the existing actual ALAC
 encoding/independent decoding fixture. None of those checks opens a speaker or
 an audio device; physical prefix acceptance is reported separately.
+
+### Per-producer speech fade envelope (`duck1`)
+
+`owntone-29.3-duck-envelope.patch` is additive after the frozen `outputclock1`
+layer. It changes the private late speech mixer, adds a gain-only source ARM
+hook and appends `-duck1` to the native marker. Stable NTP/PTP selection, source ownership, music timestamps,
+packetization and output transport code remain unchanged.
+
+The authenticated version-2 speech header's reserved word at offset 76 accepts
+an optional packed policy: high 16 bits are attack milliseconds and low 16 bits
+are release milliseconds. Both zero retain the exact legacy 40/250 ms per-unit
+gain slope. Otherwise attack must be 40–2000 ms and release 40–5000 ms. The first
+valid PCM or CONTROL packet locks this policy to the admitted speech owner;
+every later packet under that identity must match. Invalid policy, malformed
+media or a stale owner cannot change sequence, queue, lease or envelope state.
+
+An early authenticated CONTROL can duck currently playing music before speech
+PCM is generated. A nonzero policy fades from the current gain to the actual
+new target over the full chosen duration, rather than shortening the duration
+for a small gain change. Repeated lease refreshes keep that ramp running;
+speech PCM never waits for fade completion. Gain applies to each original music
+sample and the original music clock remains in charge.
+
+EOF retains queued speech and its own gain; cancel discards that exact owner's
+voice. Cancellation, normal completion and lease expiry retain the envelope
+for smooth restoration. A successor preserves the current gain and any release
+until its first valid packet adopts its own policy. Fades progress in audio
+samples: stopped playback does not add silence solely to finish restoration,
+and a resumed music mix continues from the retained gain. An exact idle-to-new
+music transition resets only terminal, inactive, empty speech gain after its
+successful source ARM, so an unrelated first phone playback inherits no idle
+speech fade. Ongoing/queued speech and an existing music owner's pause or flush
+retain their envelope and current gain.
+
+`tests/native/check_duck_envelope.py` reverses only this layer before executing
+the unchanged historical source guards. Sanitized fixtures exercise early
+CONTROL without PCM, exact duration endpoints, heartbeat and direction changes,
+policy validation/locking, quiet PCM, queued EOF and cancellation/successor
+restoration. Actual source admission/ARM fixtures verify the full first music
+prefix after terminal idle speech, unchanged ongoing/queued speech gain, paused
+owner continuity, and no gain reset on failed, stale or replayed ARM. The legacy
+zero-word vector compares all 153,600 PCM bytes against
+the actual frozen preimage, and the original admitted-owner fixture runs on the
+new module. These checks open no socket or audio device and do not establish
+physical listening latency or quality.
+
+### Finite connection leases (`warm1`)
+
+`owntone-29.3-warm-lease.patch` follows the frozen `duck1` layer. The private
+`POST /api/player/shiri-warm` accepts exact room/launch identity, a separate
+nonzero warm ID and increasing lease generation, action, and an absolute
+monotonic deadline. A room's audio worker aggregates external callers into
+one native lease. Acquire and deadline adjustment are bounded to five minutes;
+initial transport setup has a separate three-second admission deadline.
+An expired identity cannot renew before a queued expiry callback has run.
+
+Acquire uses existing selected-output START without admitting a music source,
+speech owner, playback clock or PCM. Observe only copies the exact connection
+snapshot. Deadline adjustment changes existing exact-session holds and cannot
+reconnect. Timer expiry never retries a connection. Release is terminal;
+generation tombstones also fence a delayed first acquire when its retirement
+arrives first. Source ownership, mixer gain and audio timestamps are untouched.
+
+Natural OwnTone delayed teardown can be extended only for the same selected
+device/session until its finite lease expires. A process-monotonic session
+serial also fences allocation-address reuse; session add/remove clears old
+holds. Immediate stop, discovery
+removal and transport failure remain authoritative. Lease release or expiry
+cannot stop an admitted music owner, active or queued speech, a preparation
+bed, or a replacement session. Idle cleanup retains OwnTone's ordinary
+ten-second delayed-stop grace. A cancelled unfinished START replaces only
+its own callback before bounded cleanup; it never completes a player command.
+
+AirPlay's existing 25-second `/feedback` timer is armed at connection instead
+of waiting for first PCM. This enables a silent connection lease without
+periodic RTP audio. The protocol's existing timing exchanges remain in place.
+Connection status establishes successful backend setup; it does not prove
+speaker power state, clock lock, acoustic readiness or synchronized playback.
+The AirPlay 2 setup/feedback path has been reviewed for silent retention.
+Other backend types report only OwnTone connection state and still require
+their own standby/traffic qualification.
+
+`tests/native/check_warm_lease.py` strictly inverts this additive layer before
+the unchanged duck/clock/historical guards. Sanitized actual-source fixtures
+exercise initial, inline and failed START, passive observation, deadlines,
+terminal identity ordering, exact session retention, lost/replaced callbacks,
+media-preserving release and direct stop. Strict actual JSON parsing rejects
+wrong types, extra fields, duplicate keys, embedded NULs and unknown actions.
+No fixture opens a socket or audio device; speaker standby and retained-session
+playback require separate physical qualification.

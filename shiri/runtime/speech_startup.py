@@ -51,6 +51,7 @@ class SpeechPreparation:
         self.begin_inflight = False
         self.begin_dispatched = False
         self.retirement_reply = None
+        self.timings = {}
 
     def fail(self, reason):
         if self.error is None:
@@ -158,6 +159,7 @@ class SpeechPreparation:
             "speech_startup_setup_budget_ns": round(SETUP_SECONDS * 1e9),
             "speech_startup_performance_qualified": False,
             "speech_startup_output_bed": self.output_bed,
+            "speech_startup_steps": {name: values.copy() for name, values in self.timings.items()},
         }
 
 
@@ -168,7 +170,18 @@ async def complete(preparation, client, body, *, owned, bed, send, admit, interv
 
     async def exchange(action, *, require_owned=True):
         request = {**body, "action": action}
-        reply = await client.request("POST", "/api/player/shiri-speech-ready", json=request)
+        dispatched_ns = preparation.now_ns()
+        try:
+            reply = await client.request("POST", "/api/player/shiri-speech-ready", json=request)
+        finally:
+            replied_ns = preparation.now_ns()
+            timing = preparation.timings.setdefault(action, {
+                "requests": 0, "first_dispatch_ms": (dispatched_ns - preparation.started_ns) / 1e6,
+                "last_reply_ms": 0.0, "rpc_total_ms": 0.0,
+            })
+            timing["requests"] += 1
+            timing["last_reply_ms"] = (replied_ns - preparation.started_ns) / 1e6
+            timing["rpc_total_ms"] += (replied_ns - dispatched_ns) / 1e6
         expected = set(request) | {
             "connected",
             "ready",

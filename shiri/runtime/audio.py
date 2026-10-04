@@ -21,6 +21,7 @@ import re
 import signal
 import stat
 import time
+from uuid import uuid4
 
 from shiri.rpc import RpcError, call_rpc, serve_rpc
 from .latency import MINIMUM_LOCAL_OUTPUT_BUFFER_MS
@@ -220,6 +221,8 @@ class SpeechSession:
     disposed: bool = False
     natural_eof: bool = False
     pcm: PcmSpeech | None = None
+    duck_on_prepare: bool = False
+    duck_requested_ns: int | None = None
 
 
 class AudioWorker:
@@ -242,6 +245,11 @@ class AudioWorker:
         self._cleanup_error: str | None = None
         self._shutdown: asyncio.Task | None = None
         self._native_cleanup: asyncio.Task | None = None
+        self._warm_lock = asyncio.Lock()
+        self._warm_id = uuid4().hex
+        self._warm_deadlines = {}
+        self._warm_ended = {}
+        self._warm_expiry_task = None
 
     @staticmethod
     def identity(payload):
@@ -254,6 +262,8 @@ class AudioWorker:
         return float(gain)
 
     async def dispatch(self, operation, payload):
+        if operation == "warm":
+            return await self.warm(payload)
         if operation == "health":
             return {**self.mixer.health(), "music_active": self.music_active,
                     "speech_session_id": self.session.session_id if self.session else None,
@@ -317,8 +327,126 @@ class AudioWorker:
             await self._dispose(current)
         return {"ok": True}
 
+    async def warm(self, payload):
+        """Share one connection lease across finite, separately fenced callers."""
+        if not self.native:
+            raise RpcError("unsupported", "Room connection warming requires the native backend")
+        lease_id, action = payload.get("lease_id"), payload.get("action")
+        if (not isinstance(lease_id, str) or not re.fullmatch(r"[0-9a-f]{32}", lease_id)
+                or action not in {"acquire", "release", "observe"}
+                or set(payload) != ({"action", "lease_id", "deadline_monotonic_ns"}
+                                    if action == "acquire" else {"action", "lease_id"})):
+            raise RpcError("invalid_request", "Warm control requires an exact lease and action")
+        async with self._warm_lock:
+            now = time.monotonic_ns()
+            self._warm_ended = {key: ended for key, ended in self._warm_ended.items()
+                                if now-ended < 600_000_000_000}
+            await self._expire_warm_locked(now)
+            if action == "release":
+                if (lease_id not in self._warm_deadlines and lease_id not in self._warm_ended
+                        and len(self._warm_deadlines)+len(self._warm_ended) >= 64):
+                    raise RpcError("session_limit", "Room warm lease retirement capacity is full")
+                self._warm_ended.setdefault(lease_id, now)
+                if lease_id in self._warm_deadlines:
+                    del self._warm_deadlines[lease_id]
+                    self._warm_ended[lease_id] = now
+                    if not self._warm_deadlines:
+                        await self._release_warm_aggregate()
+                    else:
+                        await self._adjust_warm_aggregate()
+                return {"state": "released"}
+            if self._closing or lease_id in self._warm_ended:
+                raise RpcError("session_conflict", "This room warm lease has ended")
+            if action == "observe":
+                if lease_id not in self._warm_deadlines:
+                    raise RpcError("not_found", "This room warm lease does not exist")
+                return await self.native.observe_warm_connection(self._warm_id)
+            deadline = payload["deadline_monotonic_ns"]
+            if type(deadline) is not int or not now < deadline <= now+300_000_000_000:
+                raise RpcError("invalid_request", "Warm expiry must be a future monotonic deadline within five minutes")
+            if lease_id not in self._warm_deadlines and (
+                    len(self._warm_deadlines) >= 4 or len(self._warm_deadlines)+len(self._warm_ended) >= 64):
+                raise RpcError("session_limit", "Room warm lease capacity is full")
+            self._warm_deadlines[lease_id] = max(deadline, self._warm_deadlines.get(lease_id, 0))
+            if self._warm_expiry_task is None or self._warm_expiry_task.done():
+                self._warm_expiry_task = asyncio.create_task(self._expire_warm(), name="room-warm-expiry")
+                self._warm_expiry_task.add_done_callback(self._observe_cleanup)
+            try:
+                result = await self.native.warm_connection(self._warm_id, max(self._warm_deadlines.values()))
+                if time.monotonic_ns() >= self._warm_deadlines[lease_id]:
+                    await self._expire_warm_locked(time.monotonic_ns())
+                    raise RpcError("deadline_exceeded", "Room warm lease expired during preparation")
+                return result
+            except BaseException:
+                if lease_id in self._warm_deadlines:
+                    del self._warm_deadlines[lease_id]
+                    self._warm_ended[lease_id] = time.monotonic_ns()
+                    if not self._warm_deadlines:
+                        await self._release_warm_aggregate()
+                    else:
+                        await self._adjust_warm_aggregate()
+                raise
+
+    async def _release_warm_aggregate(self):
+        identity = self._warm_id
+        task = asyncio.create_task(self.native.release_warm_connection(identity))
+        interrupted = False
+        try:
+            while True:
+                try:
+                    await asyncio.shield(task)
+                    break
+                except asyncio.CancelledError:
+                    if task.cancelled():
+                        raise
+                    interrupted = True
+        finally:
+            # A native aggregate identity is terminal after release/expiry.
+            # A later explicit caller receives a fresh identity, never replay.
+            if self._warm_id == identity:
+                self._warm_id = uuid4().hex
+        if interrupted:
+            raise asyncio.CancelledError
+
+    async def _adjust_warm_aggregate(self):
+        task = asyncio.create_task(self.native.adjust_warm_deadline(
+            self._warm_id, max(self._warm_deadlines.values())))
+        interrupted = False
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                interrupted = True
+        if interrupted:
+            raise asyncio.CancelledError
+
+    async def _expire_warm_locked(self, now):
+        expired = [key for key, deadline in self._warm_deadlines.items() if now >= deadline]
+        for key in expired:
+            del self._warm_deadlines[key]
+            self._warm_ended[key] = now
+        if expired and not self._warm_deadlines:
+            await self._release_warm_aggregate()
+        elif expired:
+            await self._adjust_warm_aggregate()
+
+    async def _expire_warm(self):
+        while not self._closing:
+            async with self._warm_lock:
+                await self._expire_warm_locked(time.monotonic_ns())
+                if not self._warm_deadlines:
+                    return
+                delay = max(.001, (min(self._warm_deadlines.values())-time.monotonic_ns())/1e9)
+            await asyncio.sleep(min(delay, 1))
+
     async def prepare_pcm(self, payload, gain):
         """Admit one paced PCM producer through the ordinary speech barrier."""
+        duck_on_prepare = payload.get("duck_on_prepare", False)
+        if type(duck_on_prepare) is not bool:
+            raise RpcError("invalid_request", "duck_on_prepare must be a boolean")
         if not self.native or getattr(self.mixer, "speech_output", None) is None:
             raise RpcError("audio_unavailable", "Direct speech requires an authenticated native speech output")
         async with self._lock:
@@ -329,13 +457,14 @@ class AudioWorker:
             old = self.session
             if old is not None:
                 if (old.session_id != payload["session_id"] or old.request_id != payload["request_id"]
-                        or old.pcm is None):
+                        or old.pcm is None or old.duck_on_prepare != duck_on_prepare):
                     raise RpcError("session_conflict", "Another speech producer owns this room")
                 if old.answer is not None:
                     return old.answer
                 raise RpcError("conflict", "This direct speech stream is still preparing")
             current = SpeechSession(payload["session_id"], payload["request_id"], None, gain,
-                                    negotiation=asyncio.current_task(), pcm=PcmSpeech())
+                                    negotiation=asyncio.current_task(), pcm=PcmSpeech(),
+                                    duck_on_prepare=duck_on_prepare)
             self.session = current
         try:
             preparation = self.native.begin_speech(current)
@@ -345,7 +474,23 @@ class AudioWorker:
             async with self._lock:
                 if self.session is not current or self._closing:
                     raise RpcError("session_conflict", "Direct speech ended during preparation")
+                if current.duck_on_prepare:
+                    # Exact native BEGIN has admitted this voice. Apply the
+                    # text request's envelope before its first generated PCM;
+                    # a failed or cancelled preparation never gains a lease.
+                    self.mixer.set_speech_gain(current.duck_gain)
+                    if not self.mixer.speech_output.control(True, current.duck_gain):
+                        raise RpcError("audio_unavailable", "Speech preparation could not start its music fade")
+                    current.duck_requested_ns = getattr(
+                        self.mixer.speech_output, "first_active_control_ns", None
+                    ) or self.mixer.now_ns()
                 current.answer = current.pcm.prepared(current.session_id, current.request_id)
+                current.answer.update(
+                    duck_requested_monotonic_ns=current.duck_requested_ns,
+                    duck_attack_ms=300 if current.duck_on_prepare else None,
+                    duck_release_ms=600 if current.duck_on_prepare else None,
+                    backend_startup_steps=preparation.timings,
+                )
                 current.negotiation = None
                 return current.answer
         except BaseException as exc:
@@ -601,7 +746,11 @@ class AudioWorker:
             await self._release(current, wait=False)
             current = None
         recent = bool(current and current.last_audible and now - current.last_audible < 0.25)
-        self.mixer.tick(music_active=self.music_active, speech_active=recent,
+        preparation = getattr(self.mixer, "speech_preparation", None)
+        requested = bool(current and current.duck_on_prepare and preparation
+                         and preparation.identity is current and not preparation.retired
+                         and preparation.phase == "ready" and preparation.owned())
+        self.mixer.tick(music_active=self.music_active, speech_active=recent or requested,
                         duck_gain=current.duck_gain if current else 0.28, elapsed=elapsed)
 
     async def close(self):
@@ -617,6 +766,13 @@ class AudioWorker:
             task.exception()
 
     async def _close_resources(self):
+        if self._warm_expiry_task is not None:
+            self._warm_expiry_task.cancel()
+            await asyncio.gather(self._warm_expiry_task, return_exceptions=True)
+        async with self._warm_lock:
+            if self._warm_deadlines:
+                self._warm_deadlines.clear()
+                await self._release_warm_aggregate()
         async with self._lock:
             current, self.session = self.session, None
         if current:

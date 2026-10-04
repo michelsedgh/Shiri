@@ -272,6 +272,102 @@ disconnected cancelling caller. Unconfirmed cleanup is reported explicitly.
 Switching models performs a new load and warmup. Speech and quiet measurements
 share one active job slot; changing models during an active job is refused.
 
+## Preparing for an anticipated reply
+
+The loaded model is shared across rooms. Its `ready` state confirms reusable
+model and decoder state; it does not promise that the GPU will emit the next
+chunk in 55 ms after any idle interval. Speaker connection readiness is a
+separate observation.
+
+Nobly can request a finite room hold while forming a reply, using the
+[room readiness API](ROOM_READINESS.md):
+
+```http
+POST /api/v1/nobly/rooms/Living%20Room/warm
+Content-Type: application/json
+
+{"request_id":"0123456789abcdef0123456789abcdef","ttl_seconds":60,"purpose":"interaction","model_id":"qwen3-0.6b-customvoice"}
+```
+
+An interaction hint starts speaker preparation and one quiet model prime in
+parallel. The prime uses the already loaded, matching model and its default
+voice/language. It receives the first PCM record from `Hi.`, discards that
+record and joins the existing decoder reset before publishing completion.
+Additional generated frames can already be in flight and are drained during
+retirement. No priming audio is sent to a room, and the hint does not duck music.
+There is no periodic model priming loop. A presence hint only observes model
+state; it does not generate discarded speech or load a different model.
+
+Actual speech takes priority over an owned prime and joins that prime's bounded
+reset before using the decoder. Invalid or wrong-model generation requests
+cannot cancel it; a late cancellation of an ended prime cannot cancel speech.
+The optional hint's HTTP response does not hold the router's speech admission
+lock. If speech wins admission first, the worker skips the later hint. A busy,
+unloaded or mismatched-model hint is reported as skipped rather than queued.
+
+The room lease's model result is its initial hint observation. `requested` or a
+receipt marked `preparing` does not confirm completed model priming. The model
+catalog reports the latest worker `model_warm` receipt, including state, age,
+first PCM and reset/retirement timings. A completed receipt confirms decoder
+retirement; it does not certify continuing GPU warmth or acoustic readiness.
+
+The worker's private authenticated control interface is:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| POST | `/v1/warm` | Submit `{ "model_id": "qwen3-0.6b-customvoice", "request_id": "32 lowercase hex characters" }`; returns 202 and an admission receipt |
+| GET | `/v1/warm/{request_id}` | Observe that exact retained prime |
+| POST | `/v1/warm/cancel` | Retire only the prime named by `{ "request_id": "..." }` |
+
+Receipt states are `preparing`, `completed`, `cancelled`, `failed` and `skipped`.
+First PCM has a two-second deadline, followed by the existing bounded decoder
+cancellation/reset path. Reset failure cannot claim readiness; uncertain
+cleanup terminates the child. Terminal receipts remain for ten minutes in
+memory, within a capacity of 128. Capacity refusal preserves retained receipt
+identities. Retrying a retained ID returns the same receipt, including a skipped
+receipt; a later intentional prime needs a fresh ID. A worker restart ends that
+retention guarantee.
+
+### Quiet Qwen priming measurements
+
+October 3 probes used the already loaded pinned 0.6B CustomVoice model on this
+Mac, Ryan/English, seed 42, temperature 0.9, full-text conditioning and an 80 ms
+generation interval. They used only the private worker HTTP API, with no model
+reload, room preparation or speaker output. Each priming arm followed a
+controlled 15-second idle interval. One control request produced its first HTTP
+PCM in **474.9 ms**; it also followed an earlier uncontrolled long idle, so it
+does not establish a universal priming speedup.
+
+The successor text was `Hello. This is Shiri speaking in your room.`:
+
+| Priming method | Wait after prime retired | Prime through reusable-worker confirmation | Prime child CPU time | Successor first HTTP PCM | Prime time + successor first PCM |
+| --- | --- | --- | --- | --- | --- |
+| First PCM, then cancel/reset | 1 s | 169.5 ms | 0.13 s | 97.8 ms | 267.4 ms |
+| First PCM, then cancel/reset | 3 s | 187.1 ms | 0.13 s | 138.1 ms | 325.2 ms |
+| First PCM, then cancel/reset | 5 s | 184.0 ms | 0.14 s | 150.5 ms | 334.5 ms |
+| Entire `Hi.` through natural EOS | 1 s | 2,774.9 ms | 1.25 s | 89.6 ms | 2,864.5 ms |
+| Entire `Hi.` through natural EOS | 3 s | 2,837.2 ms | 1.32 s | 137.7 ms | 2,974.9 ms |
+| Entire `Hi.` through natural EOS | 5 s | 2,707.5 ms | 1.21 s | 197.4 ms | 2,904.9 ms |
+
+The final column includes preparation work but excludes the deliberate wait.
+Anticipation can place that work before the actual text arrives; it does not
+make the work free or improve an already warm direct request by the same amount.
+Child CPU time comes from cumulative `ps` accounting with 10 ms granularity;
+it excludes GPU work and energy. These are six observations on one setup,
+not a house latency guarantee or an energy measurement. Generating all of the
+discarded greeting produced 5.36 seconds of audio and costs substantially more
+than retiring its first record; it is not the implemented priming method.
+
+All six successor utterances completed naturally at 4.64 seconds and matched
+the existing reference PCM SHA-256
+`092e0eba4e104cac39d2331cbb165f59fffe9429cc4b78058647560c911ea6aa`.
+The same model child was preserved. This establishes unchanged successor bytes
+for the tested request, not subjective quality across other voices or speaker
+onset. The retained private experiment summary is `shiri-model-prime-aimd1ah3/summary.json`,
+SHA-256 `ab89d2dd4f94371a9c843ba636d1713f3cb8c1e4d9857cf83ee904a88355fa12`.
+These measurements exercised the existing generation/cancellation mechanism;
+they do not establish that the new warm endpoint has been deployed.
+
 ## Public text API
 
 | Method | Endpoint | Purpose |

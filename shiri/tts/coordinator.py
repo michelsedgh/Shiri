@@ -134,6 +134,43 @@ class TextSpeechCoordinator:
             except (httpx.HTTPError, ValueError) as exc:
                 raise RpcError("audio_unavailable", "Generation worker is unreachable or returned an invalid response") from exc
 
+    async def warm(self, model_id, *, purpose="presence"):
+        """Observe presence; prime only for an explicitly anticipated reply."""
+        if not self.url:
+            return {"state": "disabled", "model_id": model_id}
+        if purpose == "presence":
+            worker = (await self.catalog())["worker"]
+            return {"state": "observed", "model_id": model_id, "worker": worker}
+        async with self._lock:
+            if self.active:
+                return {"state": "busy", "model_id": model_id}
+        # Optional preparation must not hold speech admission behind its HTTP
+        # response. If speech wins this race, the worker skips the later hint;
+        # if the hint wins, real generation preempts its exact reset owner.
+        request_id = uuid4().hex
+        try:
+            response = await self.client.post(self.url+"/v1/warm", json={
+                "request_id": request_id, "model_id": model_id,
+            }, timeout=5)
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Invalid model warm response")
+            if response.status_code == 409:
+                return {"state": "not_admitted", "model_id": model_id}
+            if response.status_code != 202:
+                raise ValueError("Model warm request refused")
+            warm = result.get("warm")
+            if (not isinstance(warm, dict) or warm.get("model_id") != model_id
+                    or warm.get("request_id") != request_id
+                    or type(warm.get("accepted")) is not bool
+                    or warm.get("state") not in {"preparing", "completed", "cancelled", "failed", "skipped"}
+                    or (warm["state"] == "skipped") != (not warm["accepted"])):
+                raise ValueError("Invalid model warm receipt")
+            return {"state": "requested" if warm["accepted"] else "skipped", "model_id": model_id,
+                    "request_id": request_id, "observation": result}
+        except (httpx.HTTPError, ValueError):
+            return {"state": "unavailable", "model_id": model_id}
+
     async def admit(self, payload: TextSpeechRequest, *, room_id=None, external_id=None, benchmark=False):
         self.require_worker()
         fingerprint = hashlib.sha256(json.dumps({"request": payload.model_dump(), "room_id": room_id,
@@ -153,6 +190,9 @@ class TextSpeechCoordinator:
                 if not room.enabled or not room.speakers:
                     raise Conflict("Enable the target room and select its speakers before speaking")
                 room_id = room.id
+                readiness = getattr(self.service, "warm_coordinator", None)
+                if readiness is not None:
+                    readiness.touch(room_id)
             async with self._lock:
                 if self.active:
                     raise Conflict("A speech job is already active; finish or cancel it first")
@@ -225,23 +265,35 @@ class TextSpeechCoordinator:
         pace_start = None
         job.metrics.update(received_audio_s=0.0, delivered_audio_s=0.0)
         try:
-            catalog = await self.catalog()
-            worker = catalog["worker"]
-            if worker.get("state") != "ready" or worker.get("model_id") != payload.model_id:
-                raise Conflict("Load and warm the selected model before speaking")
+            # The generation endpoint atomically validates the warmed model
+            # and acquires its slot. A catalog preflight adds a network round
+            # trip and can become stale before that authoritative admission.
             job.state = "generating"
             if job.kind == "speech":
                 async def prepare_room():
-                    receipt = await self.service.speech(job.room_id, {**identity, "action": "prepare-pcm"})
+                    prepare_sent_ns = time.monotonic_ns()
+                    job.metrics["room_prepare_requested_ms"] = (time.monotonic() - started) * 1000
+                    receipt = await self.service.speech(job.room_id, {
+                        **identity, "action": "prepare-pcm", "duck_on_prepare": True,
+                    })
                     if receipt.get("ok") and receipt.get("stream_id"):
                         # Preparation and generation run concurrently. Record
                         # confirmation here rather than when PCM later joins
                         # the ready backend; that would include model wait.
                         job.metrics["backend_ready_ms"] = (time.monotonic() - started) * 1000
+                        duck_ns = receipt.get("duck_requested_monotonic_ns")
+                        verified = type(duck_ns) is int and prepare_sent_ns <= duck_ns <= time.monotonic_ns()
+                        job.metrics["music_duck_clock_verified"] = verified
+                        if verified:
+                            job.metrics["music_duck_requested_ms"] = (duck_ns / 1e9 - started) * 1000
+                            job.metrics["music_duck_attack_ms"] = receipt.get("duck_attack_ms")
+                            job.metrics["music_duck_release_ms"] = receipt.get("duck_release_ms")
+                        job.metrics["backend_startup_steps"] = receipt.get("backend_startup_steps", {})
                     return receipt
 
                 preparation = asyncio.create_task(prepare_room())
             generation_attempted = True
+            job.metrics["generation_requested_ms"] = (time.monotonic() - started) * 1000
             async with self.client.stream("POST", self.url + "/v1/generate",
                                           json=payload.model_dump(exclude_none=True, exclude={"request_id"})) as response:
                 if response.status_code != 200:

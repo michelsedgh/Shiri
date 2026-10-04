@@ -19,7 +19,7 @@ def test_cold_music_builder_and_runtime_contract_are_coherent():
     from shiri.runtime.broker import REQUIRED_OWNTONE_VERSION, _OWNTONE_VERSION_PATTERN
     value = checker()
     assert hashlib.sha256(value.PATCH.read_bytes()).hexdigest() == value.PATCH_SHA
-    assert REQUIRED_OWNTONE_VERSION == value.VERSION + "-outputclock1"
+    assert REQUIRED_OWNTONE_VERSION == value.VERSION + "-outputclock1-duck1-warm1"
     assert _OWNTONE_VERSION_PATTERN.search("OwnTone " + REQUIRED_OWNTONE_VERSION)
     builder = (ROOT / "install/build_backends.sh").read_text()
     assert "OWNTONE_COLD_MUSIC_SHA=" + value.PATCH_SHA in builder
