@@ -8,7 +8,7 @@ AirPlay input, saved per-speaker clock selection and common presentation plan.
 ## Installed release
 
 The live VM and Mac worker use the same 61-file wheel:
-`50bd36241ad6dbcab880ca1c397f6cee77896cb49eb696fab51d7075af9722ec`.
+`d11563a487786772c957139b32501dad4b8c7d1f3211a555d1ea9583f369d3e9`.
 OwnTone ends `outputclock1-duck1-warm1`, binary SHA-256
 `3d31ad79d937a0661222f32a10945bccc958f4f8318e7a7f7a46fdd57c2b7ba4`.
 The backend manifest SHA-256 is
@@ -26,9 +26,9 @@ The first worker rollout detected that model mismatch and restored its prior
 wheel. The second installed the qualified wheel and explicit Qwen startup.
 
 Private VM recovery files are in
-`/var/lib/shiri-tts-ready-checkpoint-20261003`; recovery retains the current
+`/var/lib/shiri-tts-ready-checkpoint-20261003-03`; recovery retains the current
 schema4 database rather than restoring older user intent. The Mac checkpoint
-is `~/Library/Application Support/Shiri/TTS/checkpoint-tts-ready-20261003-02`.
+is `~/Library/Application Support/Shiri/TTS/checkpoint-tts-ready-20261003-03`.
 No credentials or database copies belong in the public evidence bundle.
 
 ## Readiness and speech behavior
@@ -52,7 +52,21 @@ voice and restore its envelope. These are smooth software envelopes, not
 measured speaker fade/onset values. The existing program timeline keeps
 advancing. Quiet preparation alone does not lower music.
 
+The final refresh changes only the optional model-prime timeout to a Python
+3.10-compatible same-task deadline. Its preflight-only first attempt stopped
+on a missing rollout-wrapper import before stopping or installing anything;
+the corrected retry verified the same native binary and preserved current room
+settings. Quiet endpoint verification on the final wheel received first PCM in
+139.66 ms and completed reset in 185.25 ms, sent no room audio, and acknowledged
+release. The recovery checkpoint above belongs to that corrected refresh.
+
 ## Live software measurements
+
+The listening and streaming observations below belong to the preceding
+readiness wheel
+`50bd36241ad6dbcab880ca1c397f6cee77896cb49eb696fab51d7075af9722ec`.
+The final wheel keeps its native transport and speech generation code unchanged;
+its new quiet model-prime endpoint check is recorded separately above.
 
 A controlled connection-only hold stayed connected for 35.69 seconds, beyond
 the AirPlay feedback interval. The passive header-only capture observed 40
@@ -66,7 +80,7 @@ The subsequent explicit quiet Qwen prime received its first PCM in 133.8 ms and
 finished reset in 181.2 ms total. Its discarded 20 ms chunk never went to the room.
 The following request said “Hello. This is Shiri speaking in your room.”:
 
-| Software boundary | Observed time from speech job start |
+| Software boundary | Observed time (job clock unless noted) |
 | --- | ---: |
 | Room preparation requested |0.77ms |
 | Owned music duck requested |26.31ms |
@@ -83,8 +97,8 @@ includes realtime utterance delivery and does not represent initial latency.
 
 These observations do not measure first acoustic sound. The saved AirPlay
 route still has B 500 ms/H 600 ms software lead; holding the connection does not
-remove that lead or the receiver's internal buffering. The user confirmed the complete greeting, including “Hello,” on this installed
-build after the quiet hold. That listening result does not measure exact onset.
+remove that lead or the receiver's internal buffering. The user confirmed the complete greeting, including “Hello,” on that
+readiness wheel after the quiet hold. That listening result does not measure exact onset.
 Power, amplifier standby, long-duration/network-fault behavior, Bluetooth
 speaker-group behavior and whole-house microphone sync remain hardware
 qualification work. Previous phone pause/volume acceptance is historical;
@@ -92,8 +106,15 @@ this update has no new human iPhone regression result yet.
 
 ## Validation
 
-The frozen source passed 4529 Python tests with 85 explicit/platform skips,
-67 frontend tests without skips, Ruff and whitespace checks. The isolated Linux
+The final source passed 4529 Mac Python tests with 85 explicit/platform skips;
+focused compatibility tests passed 190 with one skip on both Python 3.10 and
+3.12. The unchanged frontend passed 67 tests without skips; Ruff and whitespace
+checks passed. The initial Linux CI exposed Python 3.10's missing
+`asyncio.timeout`; the portable deadline and production-equivalent fixture
+readiness barrier fix that failure without increasing production timeouts.
+The exact old deadline reproduces two meaningful failures in the corrected
+Python 3.10 tests. Both the failed observation and final CI receipt belong in
+the additive evidence bundle. The isolated Linux
 build applied the exact duck/warm patches over the qualified outputclock1
 base. Address/undefined sanitizers checked owned duck envelopes, legacy PCM
 identity, fresh music prefixes,225 warm lifecycle and 20 actual JSON-parser

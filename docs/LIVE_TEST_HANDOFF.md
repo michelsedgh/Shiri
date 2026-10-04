@@ -12,16 +12,19 @@ repeated clicks renew the same exact room/model hold. Preparation leaves music
 volume unchanged, and an actual speech request begins smooth ducking.
 
 The current 61-file wheel is
-`50bd36241ad6dbcab880ca1c397f6cee77896cb49eb696fab51d7075af9722ec`;
+`d11563a487786772c957139b32501dad4b8c7d1f3211a555d1ea9583f369d3e9`;
 OwnTone ends `outputclock1-duck1-warm1` with SHA-256
 `3d31ad79d937a0661222f32a10945bccc958f4f8318e7a7f7a46fdd57c2b7ba4`.
 Saved room volume 26/revision 84 and Sonos NTP timing were preserved.
 
-The controlled held-connection Qwen request admitted its first PCM to the room
+The preceding readiness wheel's controlled held-connection Qwen request admitted its first PCM to the room
 in 79.15 ms, before generation completed; all 4.64 seconds were delivered with
 zero dropped frames. This is software admission, not first audible sound.
 The AirPlay route still retains its 500 ms output buffer/600 ms common horizon.
-The user heard the complete greeting, including “Hello,” after the quiet hold.
+The user heard the complete greeting, including “Hello,” on that wheel after the
+quiet hold. The final wheel changes only the optional model-prime deadline for
+Python 3.10 compatibility; its quiet endpoint check completed first PCM/reset
+without sending audio. The native speaker transport remains identical.
 No new microphone, power or whole-house synchronization measurement is claimed.
 See [the current checkpoint](CHECKPOINT_TTS_READINESS_2026-10-03.md) for exact
 installed artifacts, recovery paths, test counts and measurement boundaries.

@@ -20,10 +20,16 @@ SUCCESSOR_PCM = b"\x00\x20" * 960
 
 def actual_backend_child(connection, cancel, entered, reset_gate, first_gate, reset_fails):
     """Production child/backend/resampler with a controlled non-MLX decoder."""
+    from importlib import import_module
+
     import numpy as np
     import shiri.tts.backend as backend_module
     from shiri.tts.models import get_model
     from shiri.tts.worker import _child
+
+    # The production loader imports PyAV before publishing model readiness.
+    # Keep fresh native-library loading outside this fixture's PCM/reset gates.
+    import_module("av")
 
     class Decoder:
         dirty = False
@@ -88,7 +94,7 @@ async def spawn_worker(*, reset_blocked=False, first_blocked=False, reset_fails=
 
 
 async def settled(worker, request_id=ID):
-    async with asyncio.timeout(4):
+    async def observe():
         while True:
             result = worker.warm_status(request_id)
             if result and result["state"] != "preparing":
@@ -96,6 +102,18 @@ async def settled(worker, request_id=ID):
                 if result["total_ms"] is not None:
                     return result
             await asyncio.sleep(.005)
+    return await asyncio.wait_for(observe(), 4)
+
+
+async def first_pcm_observed(worker, request_id=ID):
+    async def observe():
+        while True:
+            result = worker.warm_status(request_id)
+            assert result is not None and result["state"] == "preparing", result
+            if result["first_pcm_ms"] is not None:
+                return result
+            await asyncio.sleep(.005)
+    return await asyncio.wait_for(observe(), 2)
 
 
 async def successor(worker):
@@ -133,8 +151,8 @@ async def test_speech_priority_during_reset_joins_same_owner_without_killing_chi
     generation = None
     try:
         await worker.warm(QWEN_MODEL_ID, ID)
+        pending = await first_pcm_observed(worker)
         assert await asyncio.to_thread(entered.wait, 2)
-        pending = worker.warm_status(ID)
         assert pending["state"] == "preparing" and pending["first_pcm_ms"] is not None
         assert pending["total_ms"] is None
         generation = asyncio.create_task(successor(worker))

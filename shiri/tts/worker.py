@@ -15,7 +15,7 @@ import re
 import stat
 import time
 
-from anyio import CancelScope
+from anyio import CancelScope, fail_after
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -207,7 +207,7 @@ class ModelWorker:
         try:
             if json.loads(first).get("type") != "format":
                 raise ValueError("Model priming did not establish its PCM format")
-            async with asyncio.timeout(WARM_FIRST_PCM_SECONDS):
+            with fail_after(WARM_FIRST_PCM_SECONDS):
                 event = json.loads(await iterator.__anext__())
                 if event.get("type") != "pcm":
                     raise ValueError("Model priming did not produce a first PCM chunk")
