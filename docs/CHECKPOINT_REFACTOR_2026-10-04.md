@@ -1,15 +1,15 @@
 # Live refactor checkpoint — October 4, 2026
 
-The user authorized pushing the reviewed refactor and restarting the live
-installation for testing. Source commit `1d24454e09ecbe0d11409e46fbb8fe34d8dadf02`
-is pushed on `codex/shiri-rebuild`. The Ubuntu API/runtime and native Mac model
-worker now use the same verified package. Native audio binaries, service units,
-credentials, model cache and saved room configuration were preserved.
+The refactor and subsequent speech-delivery repair are installed. Source commit
+`cd931f538fc60319ec1e13a0235c17a669dcbf95` is pushed on `codex/shiri-rebuild`.
+The Ubuntu API/runtime and native Mac model worker use the same verified package.
+Native audio binaries, model credentials/cache and saved room configuration
+were preserved. The private TTS connection now uses the VM management link.
 
 ## Installed artifacts and recovery
 
 The 61-file application wheel SHA-256 is
-`5592e3d2dbf7f00c5968f3bd18b3909d92fdd4e81737e7ab3302090b5980fa38`.
+`a2d46a084c17073cbfa4cbdec8bb5c42c24aa6e3fb3c3fdd7b51ed0056a3d61b`.
 Every installed package file matches the wheel on both hosts; the removed
 `runtime/local_output.py` is absent. Dependency checks pass and dependency
 requirements are unchanged. Installation used the existing environments without
@@ -24,11 +24,11 @@ The backend manifest remains
 
 Private rollback checkpoints:
 
-- VM: `/var/lib/shiri-refactor-checkpoint-20261004-131900`
-- Mac: `~/Library/Application Support/Shiri/TTS/checkpoint-refactor-20261004-pl_jvcdi`
+- VM: `/var/lib/shiri-delivery-checkpoint-20261004-02`
+- Mac: `~/Library/Application Support/Shiri/TTS/checkpoint-delivery-20261004-ek7w3yxn`
 
 Both retain the previous verified wheel, SHA-256
-`d11563a487786772c957139b32501dad4b8c7d1f3211a555d1ea9583f369d3e9`.
+`5592e3d2dbf7f00c5968f3bd18b3909d92fdd4e81737e7ab3302090b5980fa38`.
 The VM checkpoint also contains the stopped-state SQLite backup, configuration
 observations, ownership manifests, install log and quiet smoke receipts. These
 private artifacts and credentials are not committed to Git.
@@ -37,6 +37,53 @@ Rollback is an orderly service stop, exact resource retirement, reinstall of
 the retained previous wheel and service restart. Keep current schema4 data and
 user intent; no database downgrade is required. Do not restore the stopped
 backup over later room edits merely to roll back application code.
+Keep the new loopback TTS route when rolling back application code: restoring
+the old bridged route would restore the demonstrated network fault.
+
+## Delivery fault and transport repair
+
+The reported `Speech missed its admitted sample calendar` job delivered only
+99.333 ms of speech. Three neighboring 4.64-second jobs completed. A constant
+five-second native stream passed, and Mac-local model output remained faster
+than playback. The Linux-to-Mac HTTP capture then reproduced a 230.991 ms gap
+inside the second generated burst, sufficient to miss the existing 150 ms
+calendar guard. That guard predates this refactor.
+
+Guest packet headers showed incorrect checksums, selective acknowledgments and
+retransmission of the missing data. Three bridged requests increased TCP checksum
+error counters by 54, 51 and 55. Both HTTP endpoints already disabled Nagle;
+the measured failure was packet corruption/recovery, not slow inference or an
+application flush timer. Post-connect MSS-option trials did not fix it. A proposed
+pre-connect trial was never run.
+
+The Mac reboot report at October 4, 13:46:34 records a kernel panic in
+`in_finalize_cksum`, with an invalid TCP checksum offset. It occurred during this
+investigation; the exact triggering request is not established. The reboot left
+UTM stopped until the user signed back in and the test VM was started. Do not
+repeat the bridged/MSS experiments on this host.
+
+The VM now uses `SHIRI_TTS_WORKER_URL=http://127.0.0.1:8091`.
+Mac LaunchAgent `org.shiri.tts-link` holds an SSH reverse forward from VM loopback
+8091 to Mac loopback 8091, through the existing localhost management port 22096.
+It bypasses the faulty bridged path, pins the existing SSH host key, binds only
+loopback, retains worker bearer authentication, and reconnects automatically.
+Its private key/known-hosts files are under `TTS/link` in Application Support;
+LaunchAgent access to Documents is not assumed. Speaker and phone LAN routes
+are unchanged. This is a live-test VM workaround, not a new deployment dependency
+for ordinary Linux installations.
+
+Three quiet 4.64-second requests on the replacement link completed naturally.
+Maximum PCM gaps were 40.508, 39.732 and 39.044 ms, with zero TCP checksum errors,
+retransmissions or playback-calendar deficits. Evidence is retained privately
+in `Shiri-Live-Test/management/tts-safe-link-cadence-20261004.json`.
+
+The worker also now uses its existing 100 ms packet-end allowance, sending full
+20 ms packets up to 80 ms before their nominal start. This adds no first-packet
+wait. Native-code replay verifies every sample in order through modeled 40–100 ms
+delivery pauses, with the same 20 ms native onset; a 120 ms pause deliberately
+exposes a 20 ms gap. Bounds, expiry, exact ownership and the late-calendar guard
+remain enforced. These tests do not claim immunity to arbitrary network outages.
+Job receipts now retain the largest worker-record gap and room PCM call duration.
 
 ## Restart and preservation
 
@@ -56,20 +103,36 @@ renewed deadline advanced while the same room launch and prepared connection
 remained in use. The software route retains B500/H600. No new speaker power or
 acoustic-readiness measurement is implied.
 
-The Mac LaunchAgent retained its original token, cache and explicit Qwen preload.
-The new worker loaded and warmed `qwen3-0.6b-customvoice`, saved the successful
-selection in a private mode-0600 `selected-model.json`, and restored that selection
-after a second graceful restart. Final status is ready, idle, with automatic
-recovery enabled.
+The Mac LaunchAgent retained its original token, cache, selected-model state and
+explicit Qwen preload. The worker loaded and warmed `qwen3-0.6b-customvoice` after
+the update. Final status is ready, idle, with automatic recovery enabled. Both
+Mac LaunchAgents run after user login; the Shiri Speaker Test VM must be running.
 
 ## Verification
 
-[GitHub CI for the deployed source](https://github.com/michelsedgh/Shiri/actions/runs/37223668512)
-passed: 4,373 Python tests, 17 explicit/platform skips, native checks and the
-frontend/browser suite. The earlier Mac and isolated ARM Linux review results
-remain in [the repository review](REPO_REVIEW_2026-10-04.md).
+The repair passed 265 focused tests: 94 coordinator tests, 73 pacing/stream/PCM
+tests, and 98 audio/startup/ownership/deadline tests, plus Ruff and diff checks.
+[CI for this source](https://github.com/michelsedgh/Shiri/actions/runs/37257414094)
+passed: 4,381 Python tests, 17 explicit/platform skips, native checks, and 76
+frontend/browser checks with no failures. The original refactor's successful
+full-CI and isolated Linux results remain in
+[the repository review](REPO_REVIEW_2026-10-04.md).
 
-Live checks passed:
+The repaired live installation passed three complete model/coordinator/native
+checks with outgoing samples replaced by zeros immediately before room IPC:
+364,800, 353,280 and 387,840 samples (23.04 seconds total). All 1,105,920 generated
+samples were admitted and mixed, with exact FINISH receipts, zero expired or
+refused samples, zero native underflows, empty final queues and retired sessions.
+Maximum dispatch gap was 41.49 ms. All database tables and room revision/volume
+were unchanged. These are digital delivery checks, not acoustic recordings.
+The VM checkpoint and its Mac management copy retain `silent-integration.json`.
+
+A controlled idle termination of the SSH link produced a new managed process
+and restored model access automatically; the API again reported the model ready.
+`link-reconnect.json` retains that observation. Final HTTP access to the live UI
+returns 200, and the model, room and retained speaker connection are ready.
+
+The initial refactor's live checks passed:
 
 - Readiness endpoint returns ready with simulation disabled.
 - Exact binary stream admission through both Unix-socket hops accepts three

@@ -1,9 +1,17 @@
 # Live test handoff — October 4, 2026
 
-The refactor is installed on the Ubuntu VM and Mac worker. Open
+The refactor and speech-delivery repair are installed on the Ubuntu VM and Mac worker. Open
 **http://shiri-speaker-test.local:8080/** and refresh the page. Qwen is loaded
 and ready; Living Room Test is running with its saved Sonos assignment and
 an always-ready connection. Both Linux services remain enabled for boot.
+
+The intermittent sample-calendar error came from corrupted TCP packets on the
+Mac/VM bridge. TTS now crosses an authenticated loopback SSH link managed by
+`org.shiri.tts-link`; three replacement-link checks had no checksum errors or
+retransmissions. Bounded ahead-of-playback delivery also absorbs short stalls.
+The Mac's reboot was a kernel checksum panic, not an intentional Shiri restart.
+After a Mac reboot, sign in and start **Shiri Speaker Test** in UTM; the model
+worker and its link start at login, and Linux services start with the VM.
 
 Use **Speak** to test replies, or select **Shiri Test Living Room** in the
 phone's AirPlay controls for music. Each room now keeps one active reply and
@@ -166,7 +174,9 @@ Today's update restarted both normally; it did not reboot the VM.
 The Mac's `org.shiri.tts` LaunchAgent starts its native worker after this user's
 login and keeps it running. Models and its private environment live at
 `/Users/homr/Library/Application Support/Shiri/TTS`. The VM reaches it through
-`Homrs-MacBook-Air.local:8091`. Wait for the selected model to become ready;
+the loopback forward `127.0.0.1:8091`, maintained by `org.shiri.tts-link` over the
+existing VM management connection. The earlier `Homrs-MacBook-Air.local:8091`
+route was retired after its bridged packet checksum fault. Wait for the selected model to become ready;
 first loading and compilation are intentionally separate from normal speech.
 
 The live LAN UI has the requested `SHIRI_ALLOW_UNAUTHENTICATED=1` opt-in, with
