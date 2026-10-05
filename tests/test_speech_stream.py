@@ -64,7 +64,9 @@ async def test_binary_two_hop_stream_paces_in_worker_and_finishes_exactly(ready_
         first = await session.send_pcm(pcm, 1, 0)
         for index in range(1, 150):
             last = await session.send_pcm(pcm, index + 1, index * 960)
-        assert last["last_pcm_admitted_monotonic_ns"] - first["first_pcm_admitted_monotonic_ns"] >= 2_978_000_000
+        # Packet ends stay within the existing 100 ms leading bound; the
+        # final packet starts 80 ms before its nominal sample position.
+        assert last["last_pcm_admitted_monotonic_ns"] - first["first_pcm_admitted_monotonic_ns"] >= 2_900_000_000
         result = await session.finish(150, 144000)
         assert result["finished"] and result["admitted_frames"] == 144000
         assert len(overlay.sent) == 150 and overlay.sent[0][0] == pcm
@@ -272,16 +274,32 @@ async def test_disconnect_retires_exact_worker_owner(ready_worker, tmp_path):
         assert worker.session is None and not control.sessions and not zone.speech_streams
 
 
-async def test_cancel_during_pcm_consumes_ack_before_exact_close(ready_worker, tmp_path):
+async def test_cancel_during_pcm_consumes_ack_before_exact_close(ready_worker, tmp_path, monkeypatch):
     worker, *_ = ready_worker
+    entered, release = asyncio.Event(), asyncio.Event()
+    admit = worker.direct_pcm
+
+    async def held_reply(payload, **kwargs):
+        result = await admit(payload, **kwargs)
+        if payload.get("sequence") == 2:
+            entered.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(worker, "direct_pcm", held_reply)
     async with endpoints(worker, tmp_path) as (socket, payload, _control, _zone):
         session = await open_speech(socket, payload)
         await session.send_pcm(b"\0\0" * 960, 1, 0)
         sending = asyncio.create_task(session.send_pcm(b"\0\0" * 960, 2, 960))
-        await asyncio.sleep(0.001)
-        sending.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await sending
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            sending.cancel()
+            await asyncio.sleep(0)
+            assert not sending.done()
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await sending
         closed = await session.close()
         assert closed["admitted_frames"] == 1920 and worker.session is None
 

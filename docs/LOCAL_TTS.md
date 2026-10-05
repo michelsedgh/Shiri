@@ -548,6 +548,8 @@ metrics answer different questions:
   a receiver clock-lock or acoustic-readiness measurement.
 - `first_worker_pcm_received_ms`: router request entry to its first received worker
   PCM record, before waiting for the room. Available while generation continues.
+- `max_worker_pcm_gap_ms`: longest interval between received worker PCM records;
+  includes generation, network and router scheduling delays, excluding startup.
 - `received_audio_s`: duration of validated PCM consumed from the worker so far.
 - `delivered_audio_s`: duration accepted by the room so far, or retained in the
   sample for a quiet benchmark. A refused frame does not advance it.
@@ -555,6 +557,9 @@ metrics answer different questions:
 - `first_pcm_dispatch_ms`: router request entry to sending its first binary PCM frame.
 - `first_pcm_rpc_ms`: retained field name for the first frame's acknowledged
   round trip on the persistent stream; no new frame RPC connection is opened.
+- `max_room_pcm_call_ms`: longest room PCM call, including pacing and failed or
+  cancelled calls. Compare with worker record gaps to locate delivery stalls;
+  neither metric measures speaker output.
 - `generation_released_ms`: request entry through decoder retirement, after
   which the next room can generate even if this room is still speaking.
 - `worker_cleanup_confirmed`: whether bounded worker retirement was observed

@@ -78,7 +78,11 @@ Delivered speaker audio can have a bounded tail after cancellation; Shiri
 never flushes the music transport to shorten it.
 
 The Mac supplies generated audio, not speaker timestamps. The Linux worker
-paces its persistent PCM stream using a monotonic sample calendar. Model time
+paces its persistent PCM stream using a monotonic sample calendar. It admits
+each packet's end at most 100 ms ahead, allowing a full 20 ms packet to arrive
+80 ms before its nominal start. This fills the existing bounded queue without
+adding a first-packet wait. The native 20 ms reserve and 250 ms expiry remain
+unchanged; pauses beyond available headroom can still cause gaps. Model time
 to first PCM, route preparation, local frame acknowledgment and first audible
 sound have different meanings; [local TTS metrics](LOCAL_TTS.md) distinguish them.
 

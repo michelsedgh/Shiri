@@ -322,6 +322,7 @@ class TextSpeechCoordinator:
                 job.state = "generating"
                 got_format, got_end = False, False
                 received_frames = 0
+                last_pcm_at = None
                 end_metrics = {}
                 try:
                     attempted = True
@@ -354,7 +355,12 @@ class TextSpeechCoordinator:
                                 received_frames += len(pcm) // 2
                                 if received_frames > 48000 * MAX_GENERATED_SECONDS:
                                     raise ValueError("Speech exceeds the audio duration limit")
-                                job.metrics.setdefault("first_worker_pcm_received_ms", (time.monotonic() - started) * 1000)
+                                received_at = time.monotonic()
+                                job.metrics.setdefault("first_worker_pcm_received_ms", (received_at - started) * 1000)
+                                if last_pcm_at is not None:
+                                    job.metrics["max_worker_pcm_gap_ms"] = max(
+                                        job.metrics.get("max_worker_pcm_gap_ms", 0), (received_at - last_pcm_at) * 1000)
+                                last_pcm_at = received_at
                                 job.metrics["received_audio_s"] = received_frames / 48000
                                 await records.put(("pcm", pcm))
                             elif kind == "end":
@@ -478,8 +484,12 @@ class TextSpeechCoordinator:
                         raise Conflict(prepared.get("error", "Room did not become ready"))
                 if job.kind == "speech":
                     sent_ns = time.monotonic_ns()
-                    receipt = await channel.send_pcm(pcm, sequence, frame_index)
-                    replied_ns = time.monotonic_ns()
+                    try:
+                        receipt = await channel.send_pcm(pcm, sequence, frame_index)
+                    finally:
+                        replied_ns = time.monotonic_ns()
+                        job.metrics["max_room_pcm_call_ms"] = max(
+                            job.metrics.get("max_room_pcm_call_ms", 0), (replied_ns - sent_ns) / 1_000_000)
                     if not receipt.get("ok") or receipt.get("next_sequence") != sequence + 1:
                         raise Conflict(receipt.get("error", "Room refused speech audio"))
                     if pace_start is None:

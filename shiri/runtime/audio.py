@@ -25,7 +25,7 @@ from uuid import uuid4
 from shiri.rpc import AdmissionRefused, RpcError, StreamReply, serve_rpc
 from shiri.speech_stream import MAX_FRAMES as MAX_SPEECH_FRAMES, serve_speech
 from .latency import MINIMUM_LOCAL_OUTPUT_BUFFER_MS
-from .pcm_speech import PcmSpeech
+from .pcm_speech import MAX_LEAD_NS, PcmSpeech
 
 log = logging.getLogger(__name__)
 RATE = 48000
@@ -340,7 +340,13 @@ class AudioWorker:
                     raise RpcError("invalid_media", "Speech sequence or frame position does not match")
                 if stream.first_admitted_ns is not None:
                     target_ns = stream.first_admitted_ns + frame_index * 1_000_000_000 // RATE
-                    await asyncio.sleep(max(0, target_ns - time.monotonic_ns()) / 1e9)
+                    # Fill the existing bounded receiver allowance before the
+                    # native mix needs it. Waiting for each packet's nominal
+                    # start leaves only the backend's 20 ms jitter reserve.
+                    # Cap the packet END, including partial model chunks, at
+                    # 100 ms ahead; a full 20 ms packet can arrive 80 ms early.
+                    end_ns = stream.first_admitted_ns + (frame_index + len(pcm)//2) * 1_000_000_000 // RATE
+                    await asyncio.sleep(max(0, end_ns - MAX_LEAD_NS - time.monotonic_ns()) / 1e9)
                     if time.monotonic_ns() - target_ns > 150_000_000:
                         raise RpcError("media_underrun", "Speech missed its admitted sample calendar")
                 return await worker.direct_pcm({**identity, "action": "pcm", "sequence": sequence,

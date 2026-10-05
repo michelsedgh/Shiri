@@ -319,6 +319,7 @@ async def test_initial_pcm_uses_actual_receiver_clock_and_preserves_post_admissi
     job = await complete(coordinator, await coordinator.admit(request(), room_id=rig.room.id))
     assert job.metrics["first_pcm_dispatch_ms"] == pytest.approx(0)
     assert job.metrics["first_pcm_rpc_ms"] == pytest.approx(180)
+    assert job.metrics["max_room_pcm_call_ms"] == pytest.approx(180)
     assert not rig.runtime.streams and job.metrics["worker_cleanup_confirmed"] is True
     assert len([r for r in rig.requests if r.url.path == "/v1/generate"]) == 1
     if delayed_reply:
@@ -487,6 +488,7 @@ async def test_received_progress_precedes_room_readiness_and_engine_completion(r
     assert job.state == "completed"
     assert job.metrics["first_worker_pcm_received_ms"] == pytest.approx(0)
     assert job.metrics["received_audio_s"] == job.metrics["delivered_audio_s"] == .03
+    assert job.metrics["max_worker_pcm_gap_ms"] == pytest.approx(620)
     assert job.metrics["first_pcm_ms"] == 12  # A separate engine clock, received only at EOS.
 
 
