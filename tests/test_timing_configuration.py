@@ -95,3 +95,35 @@ def test_small_output_buffer_cannot_silently_ignore_a_selected_negative_correcti
         backend_configs(room, tmp_path/'room', {'interface': 'room-lan'},
                         all_receiver_names=[],
                         password='test-private-password', output_buffer_ms=500, audio_uid=1234)
+
+
+def test_buffered_phone_alignment_uses_common_horizon_across_mixed_room_buffers(tmp_path):
+    # A grouped local receiver and AirPlay receiver must advance equally;
+    # choosing the advance from each room's B would split their final clock.
+    for buffer in (40, 250, 500):
+        sha, own = render(tmp_path/str(buffer), output_buffer_ms=buffer, relay_delay_ms=600)
+        assert 'buffered_audio_advance_ms = 600;' in sha.read_text()
+        assert 'audio_backend_latency_offset_in_seconds = 0.0;' in sha.read_text()
+        assert 'audio_backend_buffer_desired_length_in_seconds = 0.15;' in sha.read_text()
+        assert f'start_buffer_ms = {buffer}\n' in own.read_text()
+
+
+@pytest.mark.parametrize('horizon,advance', [(None, 0), (140, 140), (350, 350), (599, 599),
+                                           (600, 600), (601, 600), (2140, 600), (2600, 600)])
+def test_buffered_advance_is_bounded_without_a_discontinuity_at_the_qualified_maximum(tmp_path, horizon, advance):
+    sha, _own = render(tmp_path, relay_delay_ms=horizon)
+    assert f'buffered_audio_advance_ms = {advance};' in sha.read_text()
+    assert 'audio_backend_latency_offset_in_seconds = 0.0;' in sha.read_text()
+
+
+@pytest.mark.parametrize('horizon', [True, 600.0, '600', 139, 2601])
+def test_invalid_common_horizon_fails_before_backend_files_are_created(tmp_path, horizon):
+    with pytest.raises(RuntimeFailure, match='bounded common relay horizon'):
+        render(tmp_path, relay_delay_ms=horizon)
+    assert not (tmp_path/'host-room').exists()
+
+
+def test_shared_horizon_cannot_shortchange_the_frozen_output_buffer(tmp_path):
+    with pytest.raises(RuntimeFailure, match='cannot precede'):
+        render(tmp_path, output_buffer_ms=700, relay_delay_ms=600)
+    assert not (tmp_path/'host-room').exists()

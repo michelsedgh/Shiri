@@ -90,7 +90,16 @@ def forward_audio(before, expected):
 def preimage_source(source):
     """Restore ONLY the exact new publisher; immutable AP2 overlay guards remain."""
     source = Path(source)
-    audio = inverse_audio((source / "audio_shiri.c").read_text(), composed=True)
+    # The buffered-only phone mapping has its own exact native gate. Restore
+    # only that verified overlay before checking these unchanged older layers.
+    phone = {}
+    if '"-phone1"' in (source / "common.c").read_text():
+        phone = module("check_shairport_buffered_timing").preimage_files(source)
+    audio_bytes = phone.get("audio_shiri.c")
+    audio = inverse_audio(
+        audio_bytes.decode() if audio_bytes is not None else (source / "audio_shiri.c").read_text(),
+        composed=True,
+    )
     for name, expected in (
         ("shiri_pcm.h", PCM_HEADER),
         ("shiri_timing.h", TIMING_HEADER),
@@ -110,7 +119,10 @@ def preimage_source(source):
         target = Path(temporary)
         for name in names:
             (target / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source / name, target / name)
+            if name in phone:
+                (target / name).write_bytes(phone[name])
+            else:
+                shutil.copyfile(source / name, target / name)
         (target / "audio_shiri.c").write_text(audio)
         yield target
 

@@ -1,8 +1,8 @@
 # Initial music onset diagnostics
 
-The reported issue is **fast AirPlay connection followed by slower first sound
-than a later pause/resume**. It is not an observed delay in the connection
-spinner. The cause remains unattributed until a fresh phone session is captured.
+Use these diagnostics to distinguish connection setup, source preparation,
+incoming PCM and first FIFO delivery. A fast AirPlay connection does not by
+itself establish when sound should begin.
 
 The audio worker exposes `music_startup` in its private `health` response.
 The API also returns this bounded trace from
@@ -20,7 +20,7 @@ phone address, source token or arbitrary exception text is retained.
 | `backend_prepare` | Time spent in the existing exact-source output preparation request, including its selected-output readiness barrier |
 | `grant_ready_monotonic_ns` | Native source admission completed |
 | `grant_sent_monotonic_ns` | The native socket GRANT was sent; null for a direct fixture or failed reply |
-| `first_pcm` | First accepted native block, original clock/presentation, measured clock uncertainty, declared relay lead and original frame position |
+| `first_pcm` | First accepted native block, native presentation, measured clock uncertainty, declared relay lead and original frame position |
 | `first_nonzero_input_pcm_monotonic_ns` | First accepted input block with a nonzero sample; this still does not establish audible sound |
 | `first_fifo_write` | First actual PCM bytes written to the timed FIFO, with that block's preserved output presentation |
 | `fifo_dropped_bytes_before_first_write` | PCM refused by FIFO backpressure or absence of a reader before the first successful write |
@@ -32,6 +32,12 @@ for the source's presentation calendar before releasing native audio; an early
 phone connection alone does not establish when its first sound was scheduled.
 The pinned upstream describes source-negotiated latency and preserves source
 timing. [Shairport timing documentation](https://github.com/mikebrady/shairport-sync/blob/7bad231c18368dbd26f298577f6210e36e4b0797/README.md#latency-stuffing-timing).
+
+With `phone1`, buffered music's native presentation already includes the
+private receiver advance. These traces do not separately expose the original
+phone anchor; use [the timing contract](TIMING_RESEARCH.md) when interpreting
+the relay's added H. Upstream can discard expired packets before the native
+callback, so zero FIFO drops alone cannot prove an intact original prefix.
 
 Compare a new session's BEGIN with its later FLUSH records. A FLUSH may happen
 at the beginning of a pause, so a long FLUSH-to-PCM interval can contain the

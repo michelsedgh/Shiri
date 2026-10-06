@@ -900,7 +900,7 @@ async def inner(profile_path, *, parent_namespace, original_netns_fd, run_direct
         broker = IsolatedBroker(settings, parent_namespace)
         await broker.start(serve=False)
         require(broker.ready, broker.error or "Actual production Broker did not become ready")
-        require(REQUIRED_OWNTONE_VERSION.endswith("-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1"),
+        require(REQUIRED_OWNTONE_VERSION == "29.3-shiri-swvol1-timed1-source1-guard1-transport1-offset1-buffer1-resample1-framed1-alsa1-speech1-ready1-anchor1-jitter1-owner1-balance1-transition1-bed1-event1-idle1-drain1-startupmeta1-coldmusic1-outputclock1-duck1-warm1",
                 "Gate cannot run an earlier production version contract")
         report["versions"] = broker.versions
         rig = Rig(broker, root/"rig", lan.interface)

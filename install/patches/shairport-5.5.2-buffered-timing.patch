@@ -1,0 +1,65 @@
+diff --git a/audio_shiri.c b/audio_shiri.c
+index 728beea..c5d50e9 100644
+--- a/audio_shiri.c
++++ b/audio_shiri.c
+@@ -441,6 +441,13 @@ static int init(int argc, char **argv) {
+     die("Shiri native PCM socket path is too long.");
+   if (!config_lookup_non_empty_string(config.cfg,"shiri.volume_socket",&volume_path) || volume_init(volume_path))
+     die("Shiri backend requires a private receiver volume endpoint.");
++  config.shiri_buffered_audio_advance_ms = 0;
++  if (config_lookup(config.cfg, "shiri.buffered_audio_advance_ms") &&
++      (!config_lookup_int(config.cfg, "shiri.buffered_audio_advance_ms",
++                          &config.shiri_buffered_audio_advance_ms) ||
++       config.shiri_buffered_audio_advance_ms < 0 ||
++       config.shiri_buffered_audio_advance_ms > 600))
++    die("Shiri buffered_audio_advance_ms must be an integer from 0 to 600.");
+   config.audio_backend_buffer_desired_length = 0.15;
+   config.audio_backend_latency_offset = 0;
+   parse_audio_options("shiri", (1u << SPS_FORMAT_S16_LE), (1u << SPS_RATE_48000), (1u << 2));
+diff --git a/common.c b/common.c
+index 94a871f..0a5f9aa 100644
+--- a/common.c
++++ b/common.c
+@@ -1952,6 +1952,7 @@ char *get_version_string() {
+     strcat(version_string, "-shiri-timed3");
+     strcat(version_string, "-startup1");
+     strcat(version_string, "-volume2");
++    strcat(version_string, "-phone1");
+ #endif
+ #ifdef CONFIG_SOXR
+     strcat(version_string, "-soxr");
+diff --git a/common.h b/common.h
+index 11a10fc..bae24b2 100644
+--- a/common.h
++++ b/common.h
+@@ -326,6 +326,10 @@ typedef struct {
+ 
+   double audio_backend_latency_offset; // this will be the offset in seconds to compensate for any
+                                        // fixed latency there might be in the audio path
++#ifdef CONFIG_SHIRI
++  // Read once by the private backend. Never rewritten by per-stream latency guards.
++  int shiri_buffered_audio_advance_ms;
++#endif
+   int audio_backend_silent_lead_in_time_auto; // true if the lead-in time should be from as soon as
+                                               // packets are received
+   double audio_backend_silent_lead_in_time; // the length of the silence that should precede a play.
+diff --git a/rtp.c b/rtp.c
+index ec71896..afc30d7 100644
+--- a/rtp.c
++++ b/rtp.c
+@@ -1492,6 +1492,15 @@ int get_ptp_anchor_local_time_info(rtsp_conn_info *conn, uint32_t *anchorRTP,
+         // Use the current rate in case the stream format has changed.
+         int32_t added_latency = (int32_t)(config.audio_backend_latency_offset * conn->input_rate);
+         *anchorRTP = conn->last_anchor_rtptime - added_latency;
++#ifdef CONFIG_SHIRI
++        // Advance buffered AP2 within the bounded private handoff budget.
++        // Advance only this backend mapping; retain the source clock/anchor and
++        // leave realtime/AP1 latency negotiation and fallback behaviour unchanged.
++        if (config.output && strcmp(config.output->name, "shiri") == 0 &&
++            conn->airplay_type == ap_2 && conn->airplay_stream_type == buffered_stream)
++          *anchorRTP += (uint32_t)(((uint64_t)config.shiri_buffered_audio_advance_ms *
++                                    conn->input_rate) / 1000);
++#endif
+       }
+       if (anchorLocalTime != NULL)
+         *anchorLocalTime = conn->last_anchor_local_time;

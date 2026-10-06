@@ -23,14 +23,32 @@ Local offset −2000 ms uses B2040/H2140; AirPlay uses B2500/H2600.
 The complete validated plan is frozen for a program incarnation. Discovery
 outages cannot shrink it, and speech never changes it.
 
-For the phone's native presentation time P, the relay carries `P + H`.
-OwnTone's framed input subtracts B before arming its existing player timer;
-output buffering adds B back. Independently arriving receivers from the same
-iPhone group therefore retain the same final program deadline. A fresh FIFO
-read timestamp or independent player startup would lose that relationship.
-An initial `P + H − B` anchor that is already late is rejected even if the final
-presentation time remains in the future. Shiri does not rewrite a late anchor
-to arrival time.
+For buffered AirPlay 2 music, every receiver uses the same bounded advance
+`A = min(H, 600 ms)`. Shairport hands off the phone's samples earlier with a
+presentation time `P − A`; the relay then carries `P + H − A`. The standard
+AirPlay plan therefore reaches the original phone deadline P instead of
+adding another 600 ms. Local-only and Cast-only plans recover their smaller
+H; plans enlarged by speaker corrections retain the residual `H − 600 ms`.
+The 600 ms ceiling is the largest advance tried with the live iPhone/Sonos
+route. It is not a measured speaker-DSP correction or a claim of exact lyric
+alignment on every device.
+
+The private `shiri.buffered_audio_advance_ms` setting applies only to buffered
+AirPlay 2 (type103) through the Shiri backend. AirPlay 1 and realtime AirPlay 2
+retain their existing `P + H` behavior. The general backend latency offset
+stays zero: upstream may reset it for a short realtime stream, so using it for
+this correction would silently change later music sessions. The private
+advance is immutable after startup and cannot be cleared by that fallback.
+
+OwnTone's framed input subtracts B before arming its player timer; output
+buffering adds B back. Receivers of the same buffered iPhone group use common
+H and A even when their own B differs. Shairport's normal handoff is at
+`P − A − 150 ms`; OwnTone's input target is `P + H − A − B`. Their separation
+remains `H − B + 150 ms`, at least 250 ms, independent of the advance. No
+speaker buffer is shortened. Late initial anchors are still rejected; Shiri
+does not replace them with callback arrival time. Mixed input modes do not
+share this new absolute phone alignment, and physical grouping still needs
+measurement.
 
 B and H are software settings, not measured acoustic latency. AirPlay's 500 ms
 floor preserves the actual pinned sender/receiver arithmetic: the receiver
@@ -44,7 +62,7 @@ buffering and speaker DSP delay are not eliminated by these calculations.
 ## Preserving clock provenance
 
 The patched Shairport backend provides the actual first-sample presentation
-anchor after resampling and partial-frame skipping, together with original RTP
+anchor after buffered advance, resampling and partial-frame skipping, together with original RTP
 frame position, a fresh connection identity and native flush generation.
 It supplies paired `CLOCK_MONOTONIC_RAW` / `CLOCK_MONOTONIC` observations so the
 Linux audio worker can map P without assuming a constant offset between clocks.
@@ -108,6 +126,9 @@ real device measurements under [calibration](CALIBRATION.md) and
 - Native checkers compile extracted production callbacks under sanitizers:
   receiver clock handling, framed input, both player timer variants, output
   packet timestamps, speech content/drain and transport cleanup.
+- The buffered-clock checker covers sample-rate conversion and RTP wrap,
+  private-setting bounds, and realtime-to-buffered source changes. A short
+  realtime stream must not erase the next buffered stream's advance.
 - The current Linux music-minimum/grouping harnesses use the same latency plan
   as production. Observers compare independent arrivals against the common
   presentation timeline and reject truncated or retimed output.

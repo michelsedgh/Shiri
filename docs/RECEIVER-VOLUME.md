@@ -100,11 +100,13 @@ instead of blocking later controls or connection teardown.
 
 Pinned receiver Git HEAD remains 7bad231c18368dbd26f298577f6210e36e4b0797.
 Keep its real Git metadata through staged builds: the receiver reports its
-truthful dirty Git origin and feature `-shiri-timed3-startup1-volume2`.
+truthful dirty Git origin and feature `-shiri-timed3-startup1-volume2-phone1`.
 The builder retains the original SHA-pinned volume layer at manifest argument
 28, then adds the separately pinned bounded-metadata layer at argument 30.
 OwnTone transition27 and paused-speech29 remain independent. Historical
 volume1 receipts and the original volume checker remain unchanged.
+The later `phone1` layer adds only buffered-music timing; it leaves these
+volume/event fences intact. See [the timing contract](TIMING_RESEARCH.md).
 
 `tests/native/check_receiver_events.py --source <composed backend> --sanitize`
 compiles the exact added transport and receiver lane with controlled pairing

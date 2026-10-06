@@ -1,5 +1,26 @@
 # OwnTone 29.3 room-local software volume
 
+## Buffered phone music timing
+
+`shairport-5.5.2-buffered-timing.patch` follows the bounded-events receiver
+layer on the same pinned Shairport commit. It adds `-phone1` and the private
+integer `shiri.buffered_audio_advance_ms` setting (0–600). The value is read
+once and advances only the Shiri backend's buffered AirPlay 2 anchor mapping.
+It leaves the source PTP clock, realtime/AP1 negotiation, speech, and output
+buffers unchanged. The runtime uses the shared frozen `min(H, 600 ms)` value;
+the standard AirPlay H600 plan therefore cancels its extra relay delay.
+
+Using the upstream general latency offset instead would let a short realtime
+session reset the correction for later music in that process. The private
+field is independent of that fallback. The exact composed-source checker
+`tests/native/check_shairport_buffered_timing.py` covers rate conversion, RTP
+wrap, bounded setting parsing, source changes and timestamp mapping with the
+private backend disabled under sanitizers. Build and deploy the matching Python/native pair;
+the runtime rejects receivers without `phone1`. See
+[timing and physical limits](../../docs/TIMING_RESEARCH.md).
+
+## Software volume foundation
+
 `owntone-29.3-software-volume.patch` applies only to reviewed upstream commit
 `d6fb3edf5831de38134ebd92fcf09a730ddd37aa`. Its SHA256 is
 `f9250ebec36873ea39fff78ca3bbc5c424b023ead267868331f985ad0da1fe15`.

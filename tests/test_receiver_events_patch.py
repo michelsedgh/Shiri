@@ -43,7 +43,9 @@ def test_builder_pins_both_historical_and_new_layers():
 def test_preflight_cannot_accept_previous_receiver_or_prefix_collision():
     text = (ROOT / "shiri/runtime/broker.py").read_text()
     pattern = re.compile(re.search(r'_SHAIRPORT_TIMED_PATTERN = re.compile\(\s*r"([^"]+)"', text).group(1))
-    assert pattern.search("5.5.2-AirPlay2-smi10-shiri-timed3-startup1-volume2-soxr-metadata")
+    assert pattern.search("5.5.2-AirPlay2-smi10-shiri-timed3-startup1-volume2-phone1-soxr-metadata")
+    assert not pattern.search("5.5.2-AirPlay2-smi10-shiri-timed3-startup1-volume2-soxr-metadata")
+    assert not pattern.search("5.5.2-AirPlay2-smi10-shiri-timed3-startup1-volume2-phone10-soxr-metadata")
     assert not pattern.search("5.5.2-AirPlay2-smi10-shiri-timed3-startup1-volume1-soxr-metadata")
     assert not pattern.search("5.5.2-AirPlay2-smi10-shiri-timed3-startup1-volume20-soxr-metadata")
 

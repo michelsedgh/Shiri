@@ -1,0 +1,18 @@
+{
+  "upstream_commit": "7bad231c18368dbd26f298577f6210e36e4b0797",
+  "upstream_url": "https://github.com/mikebrady/shairport-sync/tree/7bad231c18368dbd26f298577f6210e36e4b0797",
+  "patch_sha256": "0bbd200c49f57df9890c92521e664de42ab21515b623106d460a6520c42d763e",
+  "excerpt_sha256": "03fe1f389ed2aa2c0e9b7122a0ec6dfaf87e30a0ffbd8861d58b139e9bd872f5",
+  "preimage_sha256": {
+    "audio_shiri.c": "c1b8d3faf39b00626b2d3c9e86971b78563d2d4f642d57ef9b7e407d1a7859d6",
+    "common.c": "f70fe84343403c33a5b73a4e11326000ec31739e94eb1255c5a5448bc6811df7",
+    "common.h": "52baf320f3a693e6af72f3908dfe30a7dca95064966a1c2c3057a600f04b9c84",
+    "rtp.c": "15cc76cd4ef3ef03758aecc184dc58ef36a033032d77f03bb1986316ccd37d6d"
+  },
+  "postimage_sha256": {
+    "audio_shiri.c": "9add02a57775e3685bd07592fd121202669be62446376c57d2906d58c54bc986",
+    "common.c": "34905ef0ad20fb3f6e8eaab95881ccb10ae226dfdb1b0c55f0e4a04bf7058492",
+    "common.h": "1b6e224207f1cdb6c26991c6644b893861912e8169ac72236789b677ad2a2cc4",
+    "rtp.c": "0fef9a62840cc560e8047f911896792e39e347873deef9b09bd5a4b7c3e204be"
+  }
+}

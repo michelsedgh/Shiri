@@ -13,7 +13,7 @@ from xml.sax.saxutils import escape
 
 from .system import RuntimeFailure
 from .latency import (
-    MINIMUM_LOCAL_OUTPUT_BUFFER_MS, room_buffer_ms, speaker_lead_ms,
+    MINIMUM_LOCAL_OUTPUT_BUFFER_MS, buffered_audio_advance_ms, room_buffer_ms, speaker_lead_ms,
 )
 
 
@@ -123,6 +123,7 @@ def backend_configs(
     framed_output: dict | None = None,
     speech_output: dict | None = None,
     output_buffer_ms: int | None = None,
+    relay_delay_ms: int | None = None,
 ) -> tuple[Path, Path]:
     if type(audio_uid) is not int or not 0 < audio_uid < 2**32:
         raise RuntimeFailure("Native timing requires the exact private audio worker UID")
@@ -131,6 +132,12 @@ def backend_configs(
         output_buffer_ms = room_buffer_ms(room)
     if type(output_buffer_ms) is not int or not MINIMUM_LOCAL_OUTPUT_BUFFER_MS <= output_buffer_ms <= 4250:
         raise RuntimeFailure("OwnTone output buffering requires a bounded protocol lead")
+    try:
+        receiver_advance_ms = 0 if relay_delay_ms is None else buffered_audio_advance_ms(relay_delay_ms)
+    except ValueError as exc:
+        raise RuntimeFailure(str(exc)) from exc
+    if relay_delay_ms is not None and relay_delay_ms < output_buffer_ms:
+        raise RuntimeFailure("Common relay horizon cannot precede the output buffer")
     # The broker has already admitted the hardware device before replacing it
     # with the private mapped PCM name. Validate the selected speaker leads
     # here without reinterpreting that internal name as a public device.
@@ -199,6 +206,7 @@ def backend_configs(
   output_rate = 48000;
   output_format = "S16_LE";
   output_channels = 2;
+  buffered_audio_advance_ms = {receiver_advance_ms};
 }};
 """
     write_private(

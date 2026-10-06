@@ -55,7 +55,7 @@ _OWNTONE_VERSION_PATTERN = re.compile(r"(?<![\w.-])" + re.escape(REQUIRED_OWNTON
 # The pinned receiver appends these feature tokens after its backend marker.
 # Its sysconfdir path is removed before matching, so path text cannot qualify.
 _SHAIRPORT_TIMED_PATTERN = re.compile(
-    r"-shiri-timed3-startup1-volume2(?=$|\s|(?:-soxr)?(?:-convolution)?(?:-metadata)?(?:-mqtt)?(?:-dbus)?(?:-mpris)?$)"
+    r"-shiri-timed3-startup1-volume2-phone1(?=$|\s|(?:-soxr)?(?:-convolution)?(?:-metadata)?(?:-mqtt)?(?:-dbus)?(?:-mpris)?$)"
 )
 
 
@@ -209,7 +209,7 @@ class Broker:
         if "AirPlay2" not in receiver_features or not _SHAIRPORT_TIMED_PATTERN.search(receiver_features):
             raise RuntimeFailure(
                 "Shairport Sync must include AirPlay 2 and the shiri-timed3 private PCM backend "
-                "with bounded clock sampling and recovery, synchronous selected-output preparation and exact receive-thread cleanup; rebuild pinned backends using install/build_backends.sh"
+                "with bounded clock sampling and recovery, synchronous selected-output preparation, exact receive-thread cleanup and buffered-only phone alignment (phone1); rebuild pinned backends using install/build_backends.sh"
             )
         pinned_shairport = False
         if self.config.binary_dir:
@@ -1116,7 +1116,7 @@ class Broker:
             room.directory, room.receiver, all_receiver_names=sorted(self._receiver_names()), password=password,
             view_directory=VIEW, output_state_directory=VIEW / "state", own_username=output["name"],
             audio_uid=audio["uid"], music_socket=VIEW / "input" / "music.sock",
-            output_buffer_ms=output_buffer_ms,
+            output_buffer_ms=output_buffer_ms, relay_delay_ms=relay_delay_ms,
             speech_output={"socket": VIEW / "overlay" / "speech.sock", "peer_uid": audio["uid"],
                            "room_id": starting.id, "launch_generation": generation},
             pcm_identity_file=VIEW / "credentials" / "pcm-identity.json" if pin else None,

@@ -7,7 +7,7 @@ import pytest
 
 from shiri.domain import Room, SpeakerRef
 from shiri.runtime.configuration import backend_configs
-from shiri.runtime.latency import latency_plan, room_buffer_ms, speaker_lead_ms
+from shiri.runtime.latency import buffered_audio_advance_ms, latency_plan, room_buffer_ms, speaker_lead_ms
 from shiri.runtime.native import NativeMixer
 from shiri.runtime.system import RuntimeFailure
 from test_native_audio import Writer
@@ -63,6 +63,22 @@ def test_corrected_mixed_endpoint_room_requires_every_exact_route_margin():
         SpeakerRef(id="2",name="AirPlay",protocol="airplay2",offset_ms=-2000)]})
     assert room_buffer_ms(local) == 2500
     assert latency_plan([local]).common_horizon_ms == 2600
+
+
+@pytest.mark.parametrize('horizon,residual', [(140, 0), (350, 0), (599, 0), (600, 0), (601, 1), (2600, 2000)])
+def test_buffered_source_alignment_is_continuous_and_preserves_downstream_lead(horizon, residual):
+    phone_p = 100_000
+    advance = buffered_audio_advance_ms(horizon)
+    receiver_p = phone_p - advance
+    assert receiver_p + horizon == phone_p + residual
+    # Receivers in the same plan keep one final calendar despite different B.
+    for buffer in (40, 250, 500, 2500):
+        if buffer + 100 > horizon:
+            continue
+        release = receiver_p - 150
+        input_target = receiver_p + horizon - buffer
+        assert input_target - release >= 250
+        assert input_target + buffer == phone_p + residual
 
 
 def test_bluealsa_group_uses_one_local_candidate_and_disabled_rooms_do_not_charge_live_horizon():

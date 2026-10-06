@@ -40,7 +40,7 @@ The current runtime requires the matching
 changes alone against the old OwnTone build is unsupported.
 
 The composed Shairport candidate includes the separate AP2 event-channel
-backport and requires `startup1-volume2`. Its bounded receiver control path uses
+backport and requires `startup1-volume2-phone1`. Its bounded receiver control path uses
 exact launch/session fences and phone echo suppression; see
 [receiver volume feedback](RECEIVER-VOLUME.md) for its limits and pending phone
 acceptance. A successful OwnTone volume readback proves backend intent,

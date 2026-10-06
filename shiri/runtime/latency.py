@@ -1,6 +1,6 @@
 """Pure route buffer policy; no physical latency or runtime admission claim.
 
-OwnTone's timed input subtracts B from the native final presentation P + H;
+OwnTone's timed input subtracts B from the receiver presentation P + H;
 each output then adds B and its saved offset. All enabled rooms therefore need
 the same H, even when their required B differs. A disabled room does not affect
 the plan until it is enabled.
@@ -15,6 +15,8 @@ The speaker lead is 500 ms for AirPlay1/2, 250 ms for Cast/Pulse, and two
 native20ms periods for ALSA, including the private framed A2DP output.
 Every enabled room shares H=max(B)+100ms; selected corrections retain each
 endpoint's required lead. These are software buffers, not device measurements.
+Buffered AirPlay2 sources advance their receiver presentation by min(H,600ms)
+before entering this relay; the common H and all output buffers stay intact.
 The exact pinned Shairport AP2 consumer subtracts 250 ms protocol
 latency and its 150 ms backend buffer from this lead; 500 ms retains the same
 100 ms packet window as the ordinary zero-offset route. A 250 ms lead becomes
@@ -39,6 +41,24 @@ NEGATIVE_OFFSET_MARGIN_MS = 250
 AIRPLAY_SPEAKER_LEAD_MS = 500
 MINIMUM_LOCAL_OUTPUT_BUFFER_MS = 40
 MINIMUM_COMMON_HORIZON_MARGIN_MS = 100
+# Maximum earlier handoff qualified with buffered iPhone music. Larger saved
+# speaker corrections retain their extra relay delay instead of demanding
+# arbitrarily early source data.
+MAX_BUFFERED_AIRPLAY_ADVANCE_MS = 600
+
+
+def buffered_audio_advance_ms(common_horizon_ms: int) -> int:
+    """Recover up to 600 ms of the common relay delay for buffered phone music.
+
+    Every receiver in a plan uses the same advance, including receivers
+    whose own output buffer is smaller. Realtime/AP1 clocks and speech never
+    use this private receiver setting. Larger corrections must not request
+    arbitrarily early source data. The bounded advance leaves any excess H
+    intact and never shrinks an output's buffer or its selected offset margin.
+    """
+    if type(common_horizon_ms) is not int or not 140 <= common_horizon_ms <= 2600:
+        raise ValueError("Buffered music timing requires a bounded common relay horizon")
+    return min(common_horizon_ms, MAX_BUFFERED_AIRPLAY_ADVANCE_MS)
 
 
 @dataclass(frozen=True, slots=True)
